@@ -605,7 +605,7 @@ fn usecase_with_state(
         prs: prs.clone(),
         clock: Arc::new(FixedClock),
         state,
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     (u, board, sessions, prs)
 }
@@ -662,7 +662,7 @@ fn peak_usecase(
         prs: prs.clone(),
         clock: Arc::new(PeakClock),
         state,
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     (u, board, sessions, prs)
 }
@@ -692,7 +692,7 @@ fn usecase_with_sessions(
         prs: prs.clone(),
         clock: Arc::new(FixedClock),
         state,
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     (u, board, sessions, prs)
 }
@@ -1431,7 +1431,7 @@ async fn undelivered_comment_is_not_marked_seen() {
             prs: prs.clone(),
             clock: Arc::new(FixedClock),
             state: state.clone(),
-            spawn_model: None,
+            models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         };
         (uc, board, sess, prs)
     };
@@ -1487,7 +1487,7 @@ async fn undelivered_comment_is_not_marked_seen() {
         }),
         clock: Arc::new(FixedClock),
         state,
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     let out = u2.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.wakeups, 1, "коммент доставлен после завершения хода");
@@ -1554,7 +1554,7 @@ async fn multi_comment_tail_delivered_together() {
         }),
         clock: Arc::new(FixedClock),
         state: state.clone(),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.wakeups, 1);
@@ -1615,7 +1615,7 @@ async fn inflight_comment_delivered_after_agent_reply() {
         }),
         clock: Arc::new(FixedClock),
         state,
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.wakeups, 1, "in-flight коммент доставлен после ответа");
@@ -1677,7 +1677,7 @@ async fn busy_session_not_pinged_early() {
         }),
         clock: Arc::new(BigClock),
         state: Arc::new(MemState(Mutex::default())),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
@@ -1735,7 +1735,7 @@ async fn soft_ping_wakes_idle_session_without_transaction() {
         }),
         clock: Arc::new(BigClock),
         state: Arc::new(MemState(Mutex::default())),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.soft_pings, 1, "мягкий пинг ушёл в сессию");
@@ -2309,6 +2309,8 @@ async fn analyst_three_real_rounds_escalate_with_honest_message() {
             rows: row(status),
             log: Mutex::default(),
             comments: vec![],
+            fields_fails: false,
+            set_session_fails: false,
         })
     };
     let mut u = AnalystUseCase {
@@ -2317,6 +2319,7 @@ async fn analyst_three_real_rounds_escalate_with_honest_message() {
         sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         state: state.clone(),
         clock: clock.clone(),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     let pair = |state: &Arc<MemState>| {
         state
@@ -3130,7 +3133,7 @@ fn tick_with_clock(
         prs: prs.clone(),
         clock,
         state,
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     (u, board, sessions, prs)
 }
@@ -3323,7 +3326,7 @@ async fn enrichment_failure_skips_row() {
         }),
         clock: Arc::new(FixedClock),
         state: Arc::new(MemState(Mutex::default())),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.enrich_skipped, 1, "строка пропущена, не решена");
@@ -3358,7 +3361,7 @@ async fn orphan_deleted_when_set_session_fails() {
         }),
         clock: Arc::new(FixedClock),
         state: Arc::new(MemState(Mutex::default())),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.actions_failed, 1, "отказ записи ячейки виден");
@@ -3492,4 +3495,26 @@ fn env_repo_dir_formula_is_pinned() {
     // одной функцией; формат пинится тестом (расхождение = тихая слепота)
     assert_eq!(board_plan().env_repo_dir(50), "/tmp/env/50");
     assert_eq!(board_plan().env_repo_dir(1), "/tmp/env/1");
+}
+
+#[tokio::test]
+async fn stage_spawn_carries_model_from_server_map() {
+    // #1154 (решение владельца 17.11): модель спавна — карта сервера
+    // (SpawnModels), каждый спавн несёт её в теле сессии; деф-файлы
+    // агентов моделей не несут. Dev-стадия — default-ключ карты.
+    // Arrange
+    let (u, _, sessions, _) = usecase(vec![task(1, Status::InProgress)], PrState::Missing);
+
+    // Act
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+
+    // Assert
+    assert_eq!(out.spawns_done, 1, "спавн стадии состоялся");
+    let specs = sessions.specs.lock().unwrap();
+    assert_eq!(specs.len(), 2, "bootstrap + work");
+    let want = uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.3").unwrap();
+    for spec in specs.iter() {
+        assert_eq!(spec.model, want.model, "модель спавна = default карты");
+        assert_eq!(spec.variant, None, "default — без варианта");
+    }
 }

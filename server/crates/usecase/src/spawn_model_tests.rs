@@ -164,6 +164,14 @@ impl TaskBoardRepo for DraftBoard {
     async fn set_session(&self, _b: &str, _n: u64, _s: Slot, _sess: &str) -> UsecaseResult<()> {
         Ok(())
     }
+    async fn set_branch(
+        &self,
+        _b: &str,
+        _n: u64,
+        _branch: &uwuwu_domain::BranchName,
+    ) -> UsecaseResult<()> {
+        Ok(())
+    }
     async fn clear_session(&self, _b: &str, _n: u64, _s: Slot) -> UsecaseResult<()> {
         Ok(())
     }
@@ -279,6 +287,7 @@ async fn dreamer_spawn_carries_model_from_server_map() {
     let sessions = CaptureSessions::new(vec![SessionInfo {
         id: "ses_dev1".into(),
         agent: "developer".into(),
+        directory: String::new(),
         updated_ms: 0,
         outcome: "stop".into(),
         total_tokens: 42_000,
