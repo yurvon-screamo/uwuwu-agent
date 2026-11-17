@@ -167,10 +167,15 @@ pub struct TaskFields {
 pub enum Vcs {
     Local,
     Branch(BranchName),
-    PullRequest { branch: BranchName, url: PrUrl },
+    PullRequest {
+        branch: BranchName,
+        url: PrUrl,
+    },
     /// PR-ячейка несёт URL без ветки кода (docs-only артефакт, чужой
     /// вендор) — fm рендерит pr, branch остаётся пустым.
-    Artifact { url: PrUrl },
+    Artifact {
+        url: PrUrl,
+    },
 }
 
 impl Default for TaskFields {
@@ -606,7 +611,10 @@ mod tests {
         let mut f = TaskFields::default();
         f.set_artifact(PrUrl::parse("https://x/1").unwrap());
         f.set_branch(BranchName::parse("work/task-1").unwrap());
-        assert!(matches!(f.vcs(), Vcs::Branch(_)), "ветка вытесняет артефакт");
+        assert!(
+            matches!(f.vcs(), Vcs::Branch(_)),
+            "ветка вытесняет артефакт"
+        );
         assert!(f.pr().is_none());
         f.open_pr(PrUrl::parse("https://x/2").unwrap()).unwrap();
         assert!(matches!(f.vcs(), Vcs::PullRequest { .. }));

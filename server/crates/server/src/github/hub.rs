@@ -1481,6 +1481,37 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // живой прогон: GH_TOKEN + сеть к api.github.com (read-only)
+    fn live_issue_fields_render_branchless_pr_cells() {
+        // #1155: docs-only ячейки рендерятся против реального hub —
+        // #52 (uwuwu, issue-URL) и #379 (true-washing, forgejo-pull):
+        // значения в носителях живы (пробы #1157/#1251), fm обязан показывать
+        let repo =
+            std::env::var("UWUWU_HUB_REPO").unwrap_or_else(|_| "yurvon-screamo/uwuwu-hub".into());
+        let token = std::env::var("GH_TOKEN").expect("GH_TOKEN");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (uwuwu52, tw379): (uwuwu_domain::TaskFields, uwuwu_domain::TaskFields) =
+            rt.block_on(async {
+                let hub = GitHubHub::new(repo, token);
+                let a = hub.issue_fields(52).await.expect("#52 issue_fields");
+                let b = hub.issue_fields(379).await.expect("#379 issue_fields");
+                (a, b)
+            });
+        let uwuwu52_url = uwuwu52.pr().map(|u| u.as_str()).unwrap_or_default();
+        assert!(
+            uwuwu52_url.contains("github.com/yurvon-screamo/uwuwu-hub/issues/52"),
+            "#52: issue-URL в fm, got {uwuwu52_url:?}"
+        );
+        assert!(uwuwu52.branch().is_none(), "#52: ветки кода нет");
+        let tw379_url = tw379.pr().map(|u| u.as_str()).unwrap_or_default();
+        assert!(
+            tw379_url.contains("git.true-wash.com/true-wash/deploy/pulls/9"),
+            "#379: forgejo-pull в fm, got {tw379_url:?}"
+        );
+        assert!(tw379.branch().is_none(), "#379: ветки кода нет");
+    }
+
+    #[test]
     fn item_values_maps_board_columns() {
         let item = json!({
             "content": { "__typename": "Issue", "number": 1, "title": "t", "state": "open" },
