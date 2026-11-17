@@ -145,7 +145,13 @@ MOCK_MODE=dead MOCK_PORT=$MOCK2_PORT \
   ./target/debug/mock_opencode >"$LOG_MOCK2" 2>&1 &
 MOCK2_PID=$!
 sleep 1
-UWUWU_SERVER_CONFIG=$PWD/ops/config.memory-multi.toml UWUWU_SERVER_MODE=live \
+# конфиг фазы 3 — в ран-дир (state.json пишется рядом с конфигом; конфиг
+# в ops/ делал state общим между прогонами — луп-гварды персистили и
+# эскалировали свежие строки мгновенно, #1231 конфликт-kickoff)
+CONFIG_MULTI="$RUN_DIR/config-memory-multi.toml"
+sed "s|http://127.0.0.1:8099|http://127.0.0.1:$PORT_MOCK|; s|http://127.0.0.1:8098|http://127.0.0.1:$MOCK2_PORT|" \
+  ops/config.memory-multi.toml > "$CONFIG_MULTI"
+UWUWU_SERVER_CONFIG=$CONFIG_MULTI UWUWU_SERVER_MODE=live \
   UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
   UWUWU_MOCK_SEED="Задачи uwuwu:$SEED_N:Design;Задачи 1xgames-mock:2047:Design" \
   RUST_LOG=info ./target/debug/uwuwu-server >"$LOG_SRV_MULTI" 2>&1 &

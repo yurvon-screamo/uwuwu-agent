@@ -278,6 +278,8 @@ impl TickUseCase {
             wakeups_deferred = out.wakeups_deferred,
             autodone = out.autodone_done,
             held_live = out.held_live,
+            observed = out.observed,
+            spawns_allowed = out.spawns_allowed,
             enrich_skipped = out.enrich_skipped,
             mode = ?plan.mode,
             failed = out.actions_failed,
