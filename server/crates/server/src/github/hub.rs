@@ -50,6 +50,11 @@ const QUERY: &str = r#"
                   ...on ProjectV2ItemFieldSingleSelectValue{
                     name field{ ...on ProjectV2FieldCommon{ name } }
                   }
+                  ...on ProjectV2ItemIssueFieldValue{
+                    field{ ...on ProjectV2FieldCommon{ name } }
+                    issueFieldValue{ __typename
+                      ...on IssueFieldSingleSelectValue{ name } }
+                  }
                 }
               }
             }
@@ -457,7 +462,13 @@ fn item_values(item: &Value) -> ItemValues {
     if let Some(vals) = item["fieldValues"]["nodes"].as_array() {
         for v in vals {
             let field = v["field"]["name"].as_str().unwrap_or_default();
-            let value = v["name"].as_str().unwrap_or_default();
+            // Pv2-own поля несут значение на верхнем уровне узла;
+            // issue-backed (каталог /user/issue-fields: «Приоритет»,
+            // «Autodone») — вложенным issueFieldValue (#1174)
+            let value = v["name"]
+                .as_str()
+                .or(v["issueFieldValue"]["name"].as_str())
+                .unwrap_or_default();
             match field {
                 "Status" => out.status = value.to_string(),
                 crate::github::fields::F_PRIORITY | "Priority" => out.priority = value.to_string(),
@@ -514,7 +525,7 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
     // VCS-жизненный цикл явный; PR без ветки — кривые данные носителя,
     // отбрасываем (домен PullRequest требует ветку)
     let vcs = match (
-        raw.get("Branch")
+        raw.get(crate::github::fields::F_BRANCH)
             .and_then(|s| uwuwu_domain::BranchName::parse(s)),
         raw.get("PR").and_then(|s| uwuwu_domain::PrUrl::parse(s)),
     ) {
@@ -587,6 +598,23 @@ impl TaskBoardRepo for GitHubHub {
             .await
     }
 
+    async fn set_branch(
+        &self,
+        _board: &str,
+        number: u64,
+        branch: &uwuwu_domain::BranchName,
+    ) -> UsecaseResult<()> {
+        self.fields
+            .store(
+                number,
+                &[(
+                    crate::github::fields::F_BRANCH,
+                    Some(branch.as_str().to_string()),
+                )],
+            )
+            .await
+    }
+
     async fn clear_session(
         &self,
         _board: &str,
@@ -605,8 +633,8 @@ impl TaskBoardRepo for GitHubHub {
         self.fields.store(number, &[(name, None)]).await
     }
 
-    async fn post_comment(&self, number: u64, body: &str) -> UsecaseResult<()> {
-        let (status, _) = self
+    async fn post_comment(&self, number: u64, body: &str) -> UsecaseResult<String> {
+        let (status, resp) = self
             .rest(
                 reqwest::Method::POST,
                 &format!("/repos/{}/issues/{number}/comments", self.repo),
@@ -618,7 +646,9 @@ impl TaskBoardRepo for GitHubHub {
                 "comment #{number}: HTTP {status}"
             )));
         }
-        Ok(())
+        // node_id — та же идентичность, что в журнале latest_comments;
+        // пусто (нестандартный ответ) — маркировка невозможна, fail-open.
+        Ok(resp["node_id"].as_str().unwrap_or_default().to_string())
     }
 
     async fn close_issue(&self, number: u64) -> UsecaseResult<()> {
@@ -863,6 +893,46 @@ impl uwuwu_usecase::IssueIndexSource for GitHubHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uwuwu_domain::{gate, Gate, PeakWindow, Priority, SpawnPolicy, UtcMinute};
+
+    #[test]
+    fn issue_backed_priority_reaches_peak_gate() {
+        // #1174 (потребительский чекпоинт ревью плана): приоритет, прочитанный
+        // с issue-backed ячейки снапшота, доезжает до пик-гейта — до фикса
+        // снапшот всегда был пуст и high-строки деферились (инцидент #1170)
+        let item = json!({
+            "id": "IT_x",
+            "content": { "__typename": "Issue", "number": 1, "title": "t", "state": "open" },
+            "fieldValues": { "nodes": [
+                { "__typename": "ProjectV2ItemIssueFieldValue",
+                  "field": { "__typename": "ProjectV2SingleSelectField", "name": "Приоритет" },
+                  "issueFieldValue": { "__typename": "IssueFieldSingleSelectValue",
+                                       "name": "high", "value": "high", "optionId": "IFSSO_x" } },
+            ]}
+        });
+        let mut meta = BoardMeta::default();
+        let task = &parse_page(&[item], &mut meta)[0];
+        assert_eq!(task.priority(), Priority::High);
+
+        let policy = SpawnPolicy {
+            cup: 2,
+            peak: PeakWindow {
+                enabled: true,
+                start_min: 360,
+                end_min: 600,
+            },
+        };
+        let in_peak = UtcMinute {
+            minute_of_day: 540,
+            weekday: 3,
+        };
+        let spawn = uwuwu_domain::decide(task);
+        assert_eq!(
+            gate(task, &spawn, policy, 0, in_peak),
+            Gate::Allowed,
+            "high с снапшота проходит пик-окно"
+        );
+    }
 
     #[test]
     fn ttl_cache_hits_within_ttl_and_misses_after() {
@@ -901,6 +971,75 @@ mod tests {
                 .is_none(),
             "после дедлайна — разблокирован"
         );
+    }
+
+    #[test]
+    fn item_values_parses_issue_backed_cells() {
+        // #1174: поля каталога /user/issue-fields («Приоритет», «Autodone»)
+        // приходят в Pv2 типом ProjectV2ItemIssueFieldValue с вложенным
+        // issueFieldValue — шейп живой пробы доски «Задачи uwuwу»
+        let item = json!({
+            "content": { "__typename": "Issue", "number": 1174, "title": "t", "state": "open" },
+            "fieldValues": { "nodes": [
+                { "__typename": "ProjectV2ItemFieldRepositoryValue" },
+                { "__typename": "ProjectV2ItemFieldLabelValue" },
+                {
+                    "__typename": "ProjectV2ItemIssueFieldValue",
+                    "field": { "__typename": "ProjectV2SingleSelectField", "name": "Приоритет" },
+                    "issueFieldValue": {
+                        "__typename": "IssueFieldSingleSelectValue",
+                        "name": "medium", "value": "medium", "optionId": "IFSSO_x"
+                    }
+                },
+                {
+                    "__typename": "ProjectV2ItemIssueFieldValue",
+                    "field": { "__typename": "ProjectV2SingleSelectField", "name": "Autodone" },
+                    "issueFieldValue": {
+                        "__typename": "IssueFieldSingleSelectValue",
+                        "name": "on", "value": "on", "optionId": "IFSSO_y"
+                    }
+                },
+                { "__typename": "ProjectV2ItemFieldSingleSelectValue",
+                  "name": "Design", "field": { "__typename": "ProjectV2FieldCommon", "name": "Status" } },
+            ]}
+        });
+        let v = item_values(&item);
+        assert_eq!(v.priority, "medium");
+        assert!(v.autodone);
+        assert_eq!(v.status, "Design");
+    }
+
+    #[test]
+    #[ignore] // живой прогон: GH_TOKEN + сеть к api.github.com (read-only)
+    fn live_snapshot_reads_issue_backed_priorities() {
+        // #1174: живой e2e read-path — снапшот доски «Задачи uwuwu»
+        // против реального hub; сверка с REST-носителем issue_field_values
+        let repo =
+            std::env::var("UWUWU_HUB_REPO").unwrap_or_else(|_| "yurvon-screamo/uwuwu-hub".into());
+        let token = std::env::var("GH_TOKEN").expect("GH_TOKEN");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let rows: Vec<Task> = rt
+            .block_on(async {
+                let hub = GitHubHub::new(repo, token);
+                hub.read_board("Задачи uwuwu").await
+            })
+            .expect("read_board");
+        assert!(!rows.is_empty(), "доска не пуста");
+
+        // #1174: на носителе medium (REST issue_field_values) — снапшот
+        // обязан показать то же; до фикса priority был всегда Empty
+        let t = rows
+            .iter()
+            .find(|t| t.number() == 1174)
+            .expect("#1174 на доске");
+        assert_eq!(t.priority(), Priority::Medium);
+
+        let filled = rows
+            .iter()
+            .filter(|t| t.priority() != Priority::Empty)
+            .count();
+        println!("строк с приоритетом на снапшоте: {filled}");
+        assert!(filled > 0, "снапшот видит приоритеты строк");
     }
 
     #[test]

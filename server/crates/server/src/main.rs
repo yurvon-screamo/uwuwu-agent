@@ -208,7 +208,7 @@ async fn run(
     let (raw_default, sessions) = build_sessions(&cfg, &secrets, clock.clone())?;
     let prs = Arc::new(github::GhPrGateway::new(secrets.gh_token.clone()));
     let state_path = cfg.state_path(&config_path);
-    let state = Arc::new(state::JsonStateStore::load(state_path));
+    let state = Arc::new(state::JsonStateStore::load(state_path, clock.clone()));
     let spawn_model_cfg = cfg
         .executor
         .spawn_model
@@ -298,6 +298,8 @@ async fn run(
             board: board.clone(),
             fields: field_store,
             boards: boards_cfg.clone(),
+            clock: clock.clone(),
+            state: state.clone(),
         }),
         wiki: wiki.clone(),
         sessions: sessions.clone(),

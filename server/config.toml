@@ -22,7 +22,7 @@ provider = "zai-coding-plan"
 id = "glm-5.3-flash"
 
 [policy]
-cup = 7
+cup = 12
 # пик-окно GLM: будни 06:00–10:00 UTC (минуты от полуночи UTC), off = false
 peak = { enabled = true, start_min = 360, end_min = 600 }
 
