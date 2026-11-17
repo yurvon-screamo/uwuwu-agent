@@ -18,7 +18,7 @@
 //! Запуск рядом с локальным uwuwu-server (executor.url = http://127.0.0.1:8099).
 
 use axum::{
-    extract::Path,
+    extract::{Path, Query},
     http::{HeaderMap, StatusCode},
     routing::{delete, get, post},
     Json, Router,
@@ -234,7 +234,7 @@ async fn main() {
             "/api/session",
             get({
                 let store = store.clone();
-                move || list_sessions(store)
+                move |q: Query<ListQuery>| list_sessions(store, q)
             }),
         )
         .route(
@@ -335,16 +335,58 @@ async fn create_session(
     (StatusCode::OK, Json(json!({ "data": { "id": id } })))
 }
 
-async fn list_sessions(store: Arc<Store>) -> Resp {
+#[derive(serde::Deserialize)]
+struct ListQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+async fn list_sessions(store: Arc<Store>, q: Query<ListQuery>) -> Resp {
     let sessions = store.sessions.lock().expect("store");
     // мёртвые вне списка: list и GET согласованы (сессии, которых serve
     // не знает, 404-ят и в list не попадают) — контракт second source #1163
-    let list: Vec<Value> = sessions
+    let mut list: Vec<Value> = sessions
         .values()
         .filter(|s| !s.dead)
         .map(session_json)
         .collect();
-    (StatusCode::OK, Json(Value::Array(list)))
+    list.sort_by(|a, b| {
+        a["id"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["id"].as_str().unwrap_or_default())
+    });
+    let page = std::env::var("MOCK_PAGE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0);
+    let Some(page_size) = page else {
+        return (StatusCode::OK, Json(Value::Array(list)));
+    };
+    // пагинация newest-first не моделируем — стабильный порядок по id:
+    // контракт для сервера тот же (страница + cursor.next), iteration
+    // по курсору e2e-фазой 4 (MOCK_PAGE_LIMIT=1)
+    let offset = q
+        .cursor
+        .as_deref()
+        .and_then(|c| c.strip_prefix("p"))
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or(0);
+    let chunk: Vec<Value> = list
+        .iter()
+        .skip(offset)
+        .take(q.limit.unwrap_or(page_size).min(page_size))
+        .cloned()
+        .collect();
+    let next = if offset + chunk.len() < list.len() {
+        format!("p{}", offset + chunk.len())
+    } else {
+        String::new()
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "data": chunk, "cursor": { "next": next } })),
+    )
 }
 
 fn session_json(s: &MockSession) -> Value {

@@ -49,6 +49,15 @@ pub struct BoardPlan {
     pub env_root: String,
 }
 
+impl BoardPlan {
+    /// Env-директория строки: `<env_root>/<row>` — единственная формула
+    /// для спавна и env-гарда (ревью Low #1163: расхождение копий =
+    /// тихая слепота гарда).
+    pub fn env_repo_dir(&self, number: u64) -> String {
+        format!("{}/{}", self.env_root, number)
+    }
+}
+
 /// План тика: режим + политика + доски.
 #[derive(Debug, Clone)]
 pub struct TickPlan {
@@ -109,18 +118,18 @@ pub struct TickUseCase {
 
 /// Контекст строки тика: данные union-скана и enrichment, общие для
 /// прохода доски (#1163). Не решение — вход решений.
-struct RowContext<'a> {
+pub(crate) struct RowContext<'a> {
     /// Слепки сессий исполнителя (strict); None — скан недоступен,
     /// гард спавна пропущен (never worse).
-    sightings: Option<&'a [SessionSighting]>,
+    pub(crate) sightings: Option<&'a [SessionSighting]>,
     /// Строки с отказом enrichment — тиком пропускаются.
-    enrich_failed: &'a HashSet<u64>,
+    pub(crate) enrich_failed: &'a HashSet<u64>,
 }
 
 impl TickUseCase {
     /// Гард сработал: в env строки живёт сессия той же семьи (second
     /// source #1163). Скан недоступен — не держит (never worse).
-    fn spawn_held_by_live(
+    pub(crate) fn spawn_held_by_live(
         &self,
         ctx: &RowContext<'_>,
         board: &BoardPlan,
@@ -131,8 +140,7 @@ impl TickUseCase {
         let Some(list) = ctx.sightings else {
             return false;
         };
-        let env_repo = format!("{}/{}", board.env_root, task.number());
-        spawn_guard(list, &env_repo, slot, now_ms) == SpawnGuard::Hold
+        spawn_guard(list, &board.env_repo_dir(task.number()), slot, now_ms) == SpawnGuard::Hold
     }
 
     pub async fn run(&self, plan: &TickPlan) -> UsecaseResult<TickOutcome> {
@@ -526,15 +534,8 @@ impl TickUseCase {
                 }
                 Action::Observe { awaits } => {
                     if plan.mode == Mode::Live && awaits == Awaits::StageSession {
-                        self.observe_stage_session(
-                            board,
-                            plan,
-                            task,
-                            active_now,
-                            ctx.sightings,
-                            &mut out,
-                        )
-                        .await;
+                        self.observe_stage_session(board, plan, task, active_now, ctx, &mut out)
+                            .await;
                     } else {
                         out.observed += 1;
                     }
@@ -555,11 +556,11 @@ impl TickUseCase {
         plan: &TickPlan,
         task: &Task,
         active_now: &mut usize,
-        sightings: Option<&[SessionSighting]>,
+        ctx: &RowContext<'_>,
         out: &mut TickOutcome,
     ) {
         match self
-            .wakeup_if_fresh(board, plan.policy, task, *active_now, sightings)
+            .wakeup_if_fresh(board, plan.policy, task, *active_now, ctx)
             .await
         {
             Ok(WakeAct::Woke) => out.wakeups += 1,
@@ -568,6 +569,7 @@ impl TickUseCase {
                 *active_now += 1;
             }
             Ok(WakeAct::Deferred) => out.wakeups_deferred += 1,
+            Ok(WakeAct::Guarded) => out.held_live += 1,
             Ok(WakeAct::None) => match self.stall_pass(board, task).await {
                 Ok(StallAct::None) => {}
                 Ok(StallAct::Pinged) => out.stall_pings += 1,

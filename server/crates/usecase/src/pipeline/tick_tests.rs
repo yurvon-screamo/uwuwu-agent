@@ -3234,3 +3234,48 @@ async fn orphan_deleted_when_prompt_fails() {
         "work-сессия без промпта удалена: {deleted:?}"
     );
 }
+
+#[tokio::test]
+async fn dead_respawn_held_when_orphan_in_env() {
+    // ревью Common-2: сеанс ячейки мёртв по-настоящему (вне списка), но
+    // в env строки живёт сирота из crash-окна — респавн держится env-гардом
+    let mut t = task(60, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dead_60").unwrap(),
+    );
+    t.apply_fields(f);
+    let state = Arc::new(MemState(Mutex::default()));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((60, Status::InProgress));
+    let sessions = FakeSessions::with_env_session("ses_orphan_60", "/tmp/env/60", "", "", 2000);
+    let (u, _, sessions, _) = usecase_with_sessions(vec![t], PrState::Missing, sessions, state);
+    sessions
+        .dead_sessions
+        .lock()
+        .unwrap()
+        .push("ses_dead_60".into());
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert!(
+        sessions.spawned.lock().unwrap().is_empty(),
+        "респавн поверх живой сироты env не состоялся"
+    );
+    assert_eq!(
+        out.held_live, 1,
+        "env-гард держит и считает hold на респавне"
+    );
+    assert_eq!(out.wakeups_deferred, 0);
+}
+
+#[test]
+fn env_repo_dir_formula_is_pinned() {
+    // ревью Low: формула env-директории одна — спавн и гард строят путь
+    // одной функцией; формат пинится тестом (расхождение = тихая слепота)
+    assert_eq!(board_plan().env_repo_dir(50), "/tmp/env/50");
+    assert_eq!(board_plan().env_repo_dir(1), "/tmp/env/1");
+}

@@ -16,6 +16,51 @@ pub struct OpencodeClient {
 /// Хвост журнала (order=desc): является ли самый свежий содержательный
 /// блок (user|assistant) ассистентским. Служебные записи поверх ответа
 /// (idle и пр., #1150/#1206 Common-1) пропускаются.
+/// Страница списка сессий: сессии + курсор следующей страницы.
+/// Курсор валиден только после ПОЛНОЙ страницы — opencode ставит
+/// `cursor.next` даже на исчерпанном списке (проба живого API 17.11),
+/// терминация пагинации — по неполной странице.
+fn parse_session_page(
+    resp: &serde_json::Value,
+    limit: usize,
+) -> (Vec<SessionInfo>, Option<String>) {
+    let raw = if resp.is_array() {
+        resp.clone()
+    } else {
+        resp["data"].clone()
+    };
+    let sessions: Vec<SessionInfo> = raw
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|s| {
+                    Some(SessionInfo {
+                        id: s["id"].as_str()?.to_string(),
+                        agent: s["agent"].as_str().unwrap_or_default().to_string(),
+                        directory: s["location"]["directory"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                        updated_ms: s["time"]["updated"].as_u64().unwrap_or_default(),
+                        outcome: s["outcome"].as_str().unwrap_or_default().to_string(),
+                        total_tokens: s["tokens"]["input"].as_u64().unwrap_or_default()
+                            + s["tokens"]["output"].as_u64().unwrap_or_default(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let next = if sessions.len() >= limit {
+        resp["cursor"]["next"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    } else {
+        None
+    };
+    (sessions, next)
+}
+
 fn latest_meaningful_is_assistant(msgs: &[serde_json::Value]) -> bool {
     msgs.iter()
         .find(|m| matches!(m["type"].as_str(), Some("user") | Some("assistant")))
@@ -185,36 +230,31 @@ impl AgentSessionGateway for OpencodeClient {
     }
 
     async fn list_sessions(&self) -> UsecaseResult<Vec<SessionInfo>> {
-        let (status, resp) = self
-            .call("/session?limit=100", reqwest::Method::GET, None)
-            .await?;
-        Self::check(status, "list sessions")?;
-        let raw = if resp.is_array() {
-            resp
-        } else {
-            resp["data"].clone()
-        };
-        Ok(raw
-            .as_array()
-            .map(|list| {
-                list.iter()
-                    .filter_map(|s| {
-                        Some(SessionInfo {
-                            id: s["id"].as_str()?.to_string(),
-                            agent: s["agent"].as_str().unwrap_or_default().to_string(),
-                            directory: s["location"]["directory"]
-                                .as_str()
-                                .unwrap_or_default()
-                                .to_string(),
-                            updated_ms: s["time"]["updated"].as_u64().unwrap_or_default(),
-                            outcome: s["outcome"].as_str().unwrap_or_default().to_string(),
-                            total_tokens: s["tokens"]["input"].as_u64().unwrap_or_default()
-                                + s["tokens"]["output"].as_u64().unwrap_or_default(),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default())
+        // Пагинация (#1163 ревью Common-1): список пагинирован newest-first —
+        // слепая зона «новейших-100» прятала ходы в полёте с тишиной
+        // провайдера (#1150: 72 мин без движения time.updated) от second
+        // source и env-гарда: churn спавнов кладёт новые сессии наверх.
+        const PAGE_LIMIT: usize = 1000;
+        const MAX_PAGES: usize = 100;
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let mut url = format!("/session?limit={PAGE_LIMIT}");
+            if let Some(c) = &cursor {
+                url.push_str(&format!("&cursor={c}"));
+            }
+            let (status, resp) = self.call(&url, reqwest::Method::GET, None).await?;
+            Self::check(status, "list sessions")?;
+            let (page, next) = parse_session_page(&resp, PAGE_LIMIT);
+            out.extend(page);
+            let Some(next) = next else {
+                return Ok(out);
+            };
+            cursor = Some(next);
+        }
+        Err(UsecaseError::Session(format!(
+            "list sessions: пагинация не сошлась за {MAX_PAGES} страниц — список искажён, тик пропустит"
+        )))
     }
 
     async fn export_session(&self, session: &str) -> UsecaseResult<String> {
@@ -337,6 +377,63 @@ mod tests {
             liveness_of_status(reqwest::StatusCode::BAD_GATEWAY),
             Liveness::Unknown
         );
+    }
+
+    fn page_item(id: &str, directory: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "agent": null,
+            "location": { "directory": directory },
+            "time": { "created": 1, "updated": 2 },
+            "outcome": null,
+            "tokens": { "input": 3, "output": 4 }
+        })
+    }
+
+    #[test]
+    fn session_page_full_page_yields_next_cursor() {
+        // полная страница + непустой cursor.next → продолжение пагинации
+        let resp = serde_json::json!({
+            "data": [page_item("a", "/x"), page_item("b", "/y")],
+            "cursor": { "next": "c2" }
+        });
+        let (page, next) = parse_session_page(&resp, 2);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].directory, "/x");
+        assert_eq!(page[0].total_tokens, 7);
+        assert_eq!(next.as_deref(), Some("c2"));
+    }
+
+    #[test]
+    fn session_page_partial_page_terminates_even_with_cursor() {
+        // неполная страница — конец: opencode ставит cursor.next и на
+        // исчерпанном списке (живая проба 17.11)
+        let resp = serde_json::json!({
+            "data": [page_item("a", "/x")],
+            "cursor": { "next": "stale-cursor" }
+        });
+        let (page, next) = parse_session_page(&resp, 2);
+        assert_eq!(page.len(), 1);
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn session_page_cursor_shapes() {
+        // пустой/отсутствующий курсор на полной странице — конец
+        let empty_next = serde_json::json!({
+            "data": [page_item("a", "/x")],
+            "cursor": { "next": "" }
+        });
+        assert_eq!(parse_session_page(&empty_next, 1).1, None);
+        let no_cursor = serde_json::json!({ "data": [page_item("a", "/x")] });
+        assert_eq!(parse_session_page(&no_cursor, 1).1, None);
+        // data-обёртка отсутствует (plain array) — тоже парсится
+        let plain = serde_json::json!([page_item("a", "/x")]);
+        assert_eq!(parse_session_page(&plain, 1).0.len(), 1);
+        // сессия без location — вне раскладки (пустая директория)
+        let no_loc = serde_json::json!([serde_json::json!({ "id": "z" })]);
+        let (page, _) = parse_session_page(&no_loc, 1);
+        assert_eq!(page[0].directory, "");
     }
 
     #[test]

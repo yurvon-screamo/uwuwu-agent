@@ -3,12 +3,12 @@
 
 use crate::error::UsecaseResult;
 use crate::naming;
-use crate::pipeline::tick::{BoardPlan, TickUseCase};
+use crate::pipeline::tick::{BoardPlan, RowContext, TickUseCase};
 use crate::ports::{CommentRef, Liveness, SessionSpec};
 use crate::router::Gateway;
 use uwuwu_domain::{
-    gate, sighting_known, Action, Agent, AgentSlot, Gate, LoopOutcome, Priority, SessionSighting,
-    Slot, SpawnLoop, SpawnPolicy, Status, Task,
+    gate, sighting_known, Action, Agent, AgentSlot, Gate, LoopOutcome, Priority, Slot, SpawnLoop,
+    SpawnPolicy, Status, Task,
 };
 
 /// Итог попытки будильника/респавна stage-сессии.
@@ -20,6 +20,8 @@ pub enum WakeAct {
     Respawned,
     /// Запуск агента отложен политикой (пик/CUP) — сталл-пасс не нужен.
     Deferred,
+    /// Гард «живая сессия в env» держит запуск (#1163).
+    Guarded,
     /// Нечего будить: тишина, коммент уже отработан или луп-эскалация.
     None,
 }
@@ -35,7 +37,7 @@ impl TickUseCase {
         slot: Slot,
     ) -> UsecaseResult<String> {
         let sessions = self.sessions.project(&board.project);
-        let env_repo = format!("{}/{}", board.env_root, task.number());
+        let env_repo = board.env_repo_dir(task.number());
         let title = format!("#{} {}", task.number(), task.title());
         let bootstrap = sessions
             .create_session(&SessionSpec {
@@ -97,13 +99,13 @@ impl TickUseCase {
     /// Политика запуска едина для всех путей (UC-05, #1200): пик-окно
     /// откладывает не-high и будильник, и респавн; CUP-кап держит респавн
     /// (новая сессия — новый LLM-слот; будильник будит уже учтённую строку).
-    pub async fn wakeup_if_fresh(
+    pub(crate) async fn wakeup_if_fresh(
         &self,
         board: &BoardPlan,
         policy: SpawnPolicy,
         task: &Task,
         global_active: usize,
-        sightings: Option<&[SessionSighting]>,
+        ctx: &RowContext<'_>,
     ) -> UsecaseResult<WakeAct> {
         let now = self.clock.utc_minute();
         let Some(slot) = task.stage_slot() else {
@@ -148,11 +150,25 @@ impl TickUseCase {
                 // этим чеком — кулдаун-чек на респавн не вешается: он
                 // замедлял бы attention-механику (луп-гвард) в 5 раз
                 // (эскалация петли час вместо ~15 мин).
-                if sighting_known(sightings.unwrap_or(&[]), session) {
+                if sighting_known(ctx.sightings.unwrap_or(&[]), session) {
                     tracing::warn!(event = "wakeup.second_source_alive", number = task.number(),
                         session = %session,
                         "Проба Dead при живой сессии в списке исполнителя — респавн отменён");
                     return Ok(WakeAct::None);
+                }
+                // Env-гард на респавне (ревью Common-2): сеанс ячейки мёртв
+                // по-настоящему, но в env строки может жить сирота из
+                // crash-окна (падение процесса между prompt и set_session
+                // до зачистки) — респавн поверх живого хода = тот же класс
+                // дубля, что и на plain-пути.
+                if self.spawn_held_by_live(ctx, board, task, slot, self.clock.now_ms()) {
+                    tracing::warn!(
+                        event = "respawn.held_live_session",
+                        number = task.number(),
+                        slot = naming::slot_key(slot),
+                        "Респавн держится: живая сессия в env строки (second source #1163)"
+                    );
+                    return Ok(WakeAct::Guarded);
                 }
                 // респавн = фактический спавн — полный гейт (пик + CUP)
                 let spawn = Action::Spawn { slot };

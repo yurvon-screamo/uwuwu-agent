@@ -166,9 +166,11 @@ say "фаза 4: гард «одна живая сессия на строку»
 # стек фазы 3 вычищен её хвостом; свой state с нуля
 rm -f "$STATE"
 # pre-create живой сеанс в env строки (сирота спавна/клейм): спавн держится
-# вторым источником — list_sessions матчит директорию <env_root>/<row>
+# вторым источником — list_sessions матчит директорию <env_root>/<row>.
+# MOCK_PAGE_LIMIT=1: сервер итерирует пагинацию list (ревью Common-1) —
+# гард обязан видеть сироту и в многостраничном списке
 ENV_DIR="/home/yurvon/agents-env/$SEED_N"
-MOCK_MODE=plain MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=1500 \
+MOCK_MODE=plain MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=1500 MOCK_PAGE_LIMIT=1 \
   ./target/debug/mock_opencode >"$LOG_MOCK" 2>&1 &
 sleep 1
 ORPHAN_RESP=$(curl -s --max-time 5 -X POST "http://127.0.0.1:$PORT_MOCK/api/session" \
