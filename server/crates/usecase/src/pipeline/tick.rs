@@ -68,7 +68,7 @@ pub struct TickOutcome {
     pub wakeups: usize,
     /// Будильников/респавнов, отложенных политикой (пик/CUP — #1200).
     pub wakeups_deferred: usize,
-    /// Мержей автомержа (#1232: строка остаётся в Review).
+    /// Мержей автомержа: строка остаётся в Review (#1232).
     pub automerged: usize,
     /// Строк, переведённых в Needs attention спавн-петлёй.
     pub attention_flagged: usize,
@@ -413,10 +413,14 @@ impl TickUseCase {
                 }
                 Action::Automerge => {
                     if plan.mode == Mode::Live {
-                        out.automerged += 1;
-                        self.automerge(board, task)
+                        let merged = self
+                            .automerge(board, task)
                             .await
                             .map_err(|e| self.log_action_failed(task, e))?;
+                        // счётчик — факты мержа: bounce/pending/no-op не считаются
+                        if merged {
+                            out.automerged += 1;
+                        }
                     } else {
                         tracing::info!(
                             event = "automerge.probe",

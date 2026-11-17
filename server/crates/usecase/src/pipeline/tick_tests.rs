@@ -668,21 +668,29 @@ async fn cup_holds_spawn_in_live() {
     );
 }
 
+/// Фикстура носителя мержа: ветка (+PR) + automerge — для кейсов
+/// действия Automerge.
+fn carrier(t: &mut Task, n: u64, with_pr: bool) {
+    let mut f = TaskFields::default();
+    f.set_branch(BranchName::parse(&format!("work/task-{n}")).unwrap());
+    if with_pr {
+        f.open_pr(PrUrl::parse(&format!("https://github.com/a/c/pull/{n}")).unwrap())
+            .unwrap();
+    }
+    t.apply_fields(f);
+    t.set_automerge(true);
+}
+
 #[tokio::test]
 async fn automerge_merged_is_noop_row_stays_review() {
     // #1232: PR уже влит (вручную/раньше) — no-op: merge-API не зовётся,
     // Done/close не ставятся, строка ждёт владельца в Review
     // (инцидент #1151/#1162 — ложный bounce смерженной строки недопустим)
     let mut t = task(3, Status::UserReview);
-    let mut f = TaskFields::default();
-    f.set_branch(BranchName::parse("work/task-3").unwrap());
-    f.open_pr(PrUrl::parse("https://github.com/a/c/pull/3").unwrap())
-        .unwrap();
-    t.apply_fields(f);
-    t.set_automerge(true);
+    carrier(&mut t, 3, true);
     let (u, board, _, prs) = usecase(vec![t], PrState::Merged);
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
-    assert_eq!(out.automerged, 1);
+    assert_eq!(out.automerged, 0, "no-op не считается мержем");
     assert_eq!(prs.merges.lock().unwrap().len(), 0, "merge-API не зовётся");
     let log = board.log.lock().unwrap();
     assert!(
@@ -695,12 +703,7 @@ async fn automerge_merged_is_noop_row_stays_review() {
 #[tokio::test]
 async fn automerge_red_ci_bounces_to_in_progress() {
     let mut t = task(4, Status::UserReview);
-    let mut f = TaskFields::default();
-    f.set_branch(BranchName::parse("work/task-4").unwrap());
-    f.open_pr(PrUrl::parse("https://github.com/a/c/pull/4").unwrap())
-        .unwrap();
-    t.apply_fields(f);
-    t.set_automerge(true);
+    carrier(&mut t, 4, true);
     let (u, board, _, _) = usecase(
         vec![t],
         PrState::Open {
@@ -726,12 +729,7 @@ async fn automerge_green_merges_row_stays_review() {
     // #1232: зелёный мержит, но строка остаётся в Review — Done всегда
     // за владельцем
     let mut t = task(5, Status::UserReview);
-    let mut f = TaskFields::default();
-    f.set_branch(BranchName::parse("work/task-5").unwrap());
-    f.open_pr(PrUrl::parse("https://github.com/a/c/pull/9").unwrap())
-        .unwrap();
-    t.apply_fields(f);
-    t.set_automerge(true);
+    carrier(&mut t, 5, true);
     let (u, board, _, prs) = usecase(
         vec![t],
         PrState::Open {
@@ -753,12 +751,7 @@ async fn automerge_green_merges_row_stays_review() {
 #[tokio::test]
 async fn automerge_conflict_bounces_to_in_progress() {
     let mut t = task(8, Status::UserReview);
-    let mut f = TaskFields::default();
-    f.set_branch(BranchName::parse("work/task-8").unwrap());
-    f.open_pr(PrUrl::parse("https://github.com/a/c/pull/8").unwrap())
-        .unwrap();
-    t.apply_fields(f);
-    t.set_automerge(true);
+    carrier(&mut t, 8, true);
     let (u, board, _, _) = usecase(
         vec![t],
         PrState::Open {
@@ -777,10 +770,7 @@ async fn automerge_conflict_bounces_to_in_progress() {
 #[tokio::test]
 async fn automerge_missing_pr_with_branch_bounces() {
     let mut t = task(6, Status::UserReview);
-    let mut f = TaskFields::default();
-    f.set_branch(BranchName::parse("work/task-6").unwrap());
-    t.apply_fields(f);
-    t.set_automerge(true);
+    carrier(&mut t, 6, false);
     let (u, board, _, _) = usecase(vec![t], PrState::Missing);
     u.run(&plan(Mode::Live, 7)).await.unwrap();
     let log = board.log.lock().unwrap();
@@ -795,12 +785,7 @@ async fn automerge_pending_is_quiet() {
     // mergeable считается / чеки бегут — вердикт следующего тика,
     // строку не трогаем (#1232: ложный конфликт/green недопустим)
     let mut t = task(9, Status::UserReview);
-    let mut f = TaskFields::default();
-    f.set_branch(BranchName::parse("work/task-9").unwrap());
-    f.open_pr(PrUrl::parse("https://github.com/a/c/pull/10").unwrap())
-        .unwrap();
-    t.apply_fields(f);
-    t.set_automerge(true);
+    carrier(&mut t, 9, true);
     let (u, board, _, _) = usecase(vec![t], PrState::Pending);
     u.run(&plan(Mode::Live, 7)).await.unwrap();
     let log = board.log.lock().unwrap();

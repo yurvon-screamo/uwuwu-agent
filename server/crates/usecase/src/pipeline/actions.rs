@@ -299,7 +299,8 @@ impl TickUseCase {
     /// всегда за владельцем) / bounce в работу. Ветка без PR — возврат в
     /// работу (PR ещё не создан); docs-only до сюда не доходит (домен
     /// automerge_ready не прощупывает Vcs::Local).
-    pub async fn automerge(&self, board: &BoardPlan, task: &Task) -> UsecaseResult<()> {
+    /// Возвращает true — PR смержен этим вызовом (счётчик тика).
+    pub async fn automerge(&self, board: &BoardPlan, task: &Task) -> UsecaseResult<bool> {
         use crate::ports::PrState;
         let state = self
             .prs
@@ -315,7 +316,7 @@ impl TickUseCase {
                 number = task.number(),
                 "Automerge: PR pending (mergeable/чекси считаются) — ждём следующего тика"
             );
-            return Ok(());
+            return Ok(false);
         }
         match state {
             PrState::Pending => unreachable!("pending обработан выше"),
@@ -328,15 +329,28 @@ impl TickUseCase {
                     number = task.number(),
                     "Automerge: PR уже смержен — строка ждёт владельца в Review"
                 );
+                Ok(false)
             }
-            PrState::Missing => self.bounce(board, task, "ветка есть, PR не найден").await?,
-            PrState::Closed => self.bounce(board, task, "PR закрыт без мержа").await?,
+            PrState::Missing => {
+                self.bounce(board, task, "ветка есть, PR не найден").await?;
+                Ok(false)
+            }
+            PrState::Closed => {
+                self.bounce(board, task, "PR закрыт без мержа").await?;
+                Ok(false)
+            }
             PrState::Open {
                 mergeable: false, ..
-            } => self.bounce(board, task, "PR в конфликте с master").await?,
+            } => {
+                self.bounce(board, task, "PR в конфликте с master").await?;
+                Ok(false)
+            }
             PrState::Open {
                 ci_green: false, ..
-            } => self.bounce(board, task, "красный CI у PR").await?,
+            } => {
+                self.bounce(board, task, "красный CI у PR").await?;
+                Ok(false)
+            }
             PrState::Open {
                 mergeable: true,
                 ci_green: true,
@@ -351,15 +365,16 @@ impl TickUseCase {
                             number = task.number(),
                             "Automerge: PR смержен — строка остаётся в Review"
                         );
+                        Ok(true)
                     }
                     Err(e) => {
                         self.bounce(board, task, &format!("мерж не прошёл: {e}"))
-                            .await?
+                            .await?;
+                        Ok(false)
                     }
                 }
             }
         }
-        Ok(())
     }
 
     async fn bounce(&self, board: &BoardPlan, task: &Task, why: &str) -> UsecaseResult<()> {
