@@ -191,7 +191,6 @@ impl IssueFields {
     }
 
     /// Создать глобальное поле, если его нет (каталог дрогнуть).
-    #[allow(dead_code)] // применяется при заведении «Тип» первым create
     pub async fn ensure_field(&self, name: &str) -> UsecaseResult<()> {
         let catalog = self.catalog().await?;
         if resolve_field(&catalog, name).is_some() {
