@@ -18,7 +18,7 @@
 //! Запуск рядом с локальным uwuwu-server (executor.url = http://127.0.0.1:8099).
 
 use axum::{
-    extract::Path,
+    extract::{Path, Query},
     http::{HeaderMap, StatusCode},
     routing::{delete, get, post},
     Json, Router,
@@ -34,6 +34,8 @@ struct MockSession {
     id: String,
     agent: String,
     title: String,
+    /// Директория сессии (location из create) — гард спавна (#1163).
+    directory: String,
     updated_ms: u64,
     outcome: String,
     tokens_in: u64,
@@ -203,6 +205,13 @@ async fn main() {
     tracing::info!(event = "mock.started", %mode, port, mcp_url = %mcp_url,
         verdicts_left, "mock-opencode up");
     let counter = Arc::new(AtomicU64::new(1));
+    // случайный префикс id: инстансы на стенде не должны делить id-пространство
+    // (second source #1163 матчит сессии по id в union-скане — коллизия
+    // детерминированных id двух моков ложноположительно «знает» чужую сессию)
+    let id_salt = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
 
     let app = Router::new()
         .route(
@@ -210,12 +219,14 @@ async fn main() {
             post({
                 let store = store.clone();
                 let counter = counter.clone();
+                let salt = id_salt;
                 let mode = mode.clone();
                 move |headers: HeaderMap, Json(body): Json<Value>| {
                     let store = store.clone();
                     let counter = counter.clone();
+                    let salt = salt;
                     let mode = mode.clone();
-                    async move { create_session(store, counter, mode, headers, body).await }
+                    async move { create_session(store, counter, salt, mode, headers, body).await }
                 }
             }),
         )
@@ -223,7 +234,7 @@ async fn main() {
             "/api/session",
             get({
                 let store = store.clone();
-                move || list_sessions(store)
+                move |q: Query<ListQuery>| list_sessions(store, q)
             }),
         )
         .route(
@@ -291,16 +302,21 @@ type Resp = (StatusCode, Json<Value>);
 async fn create_session(
     store: Arc<Store>,
     counter: Arc<AtomicU64>,
+    salt: u32,
     mode: String,
     _headers: HeaderMap,
     body: Value,
 ) -> Resp {
     let n = counter.fetch_add(1, Ordering::SeqCst);
-    let id = format!("ses_mock{n:04}");
+    let id = format!("ses_mock{n:04}{salt:08x}");
     let session = MockSession {
         id: id.clone(),
         agent: body["agent"].as_str().unwrap_or_default().to_string(),
         title: body["title"].as_str().unwrap_or_default().to_string(),
+        directory: body["location"]["directory"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
         updated_ms: now_ms(),
         outcome: String::new(),
         tokens_in: 0,
@@ -319,10 +335,58 @@ async fn create_session(
     (StatusCode::OK, Json(json!({ "data": { "id": id } })))
 }
 
-async fn list_sessions(store: Arc<Store>) -> Resp {
+#[derive(serde::Deserialize)]
+struct ListQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+async fn list_sessions(store: Arc<Store>, q: Query<ListQuery>) -> Resp {
     let sessions = store.sessions.lock().expect("store");
-    let list: Vec<Value> = sessions.values().map(session_json).collect();
-    (StatusCode::OK, Json(Value::Array(list)))
+    // мёртвые вне списка: list и GET согласованы (сессии, которых serve
+    // не знает, 404-ят и в list не попадают) — контракт second source #1163
+    let mut list: Vec<Value> = sessions
+        .values()
+        .filter(|s| !s.dead)
+        .map(session_json)
+        .collect();
+    list.sort_by(|a, b| {
+        a["id"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["id"].as_str().unwrap_or_default())
+    });
+    let page = std::env::var("MOCK_PAGE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0);
+    let Some(page_size) = page else {
+        return (StatusCode::OK, Json(Value::Array(list)));
+    };
+    // пагинация newest-first не моделируем — стабильный порядок по id:
+    // контракт для сервера тот же (страница + cursor.next), iteration
+    // по курсору e2e-фазой 4 (MOCK_PAGE_LIMIT=1)
+    let offset = q
+        .cursor
+        .as_deref()
+        .and_then(|c| c.strip_prefix("p"))
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or(0);
+    let chunk: Vec<Value> = list
+        .iter()
+        .skip(offset)
+        .take(q.limit.unwrap_or(page_size).min(page_size))
+        .cloned()
+        .collect();
+    let next = if offset + chunk.len() < list.len() {
+        format!("p{}", offset + chunk.len())
+    } else {
+        String::new()
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "data": chunk, "cursor": { "next": next } })),
+    )
 }
 
 fn session_json(s: &MockSession) -> Value {
@@ -330,6 +394,7 @@ fn session_json(s: &MockSession) -> Value {
         "id": s.id,
         "agent": if s.agent.is_empty() { Value::Null } else { json!(s.agent) },
         "title": s.title,
+        "location": { "directory": s.directory },
         "time": { "created": s.updated_ms, "updated": s.updated_ms },
         "outcome": if s.outcome.is_empty() { Value::Null } else { json!(s.outcome) },
         "tokens": { "input": s.tokens_in, "output": s.tokens_out },

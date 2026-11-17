@@ -6,7 +6,12 @@
 #     2+ тика — счётчики спавн-петель НЕ заряжаются (state.json чист);
 #   фаза 2 (live-цикл с ре-энтри): полный цикл Design → … → Review,
 #     где ревью результата один раз даёт request_changes (In Progress →
-#     повторный dev-круг → …) — луп-гвард не эскалирует, цикл замыкается.
+#     повторный dev-круг → …) — луп-гвард не эскалирует, цикл замыкается;
+#   фаза 3 (мульти-экзекьютор): маршрутизация проект → executor, отказ
+#     исполнителя без паралича тика (#1203);
+#   фаза 4 (гард #1163): живая сессия в env строки при пустой ячейке —
+#     спавн держится вторым источником (spawn.held_live_session), после
+#     удаления сироты спавн происходит.
 #
 # Запуск: server/ops/stand/e2e.sh   (из каталога server; cargo build сам)
 # Выход: 0 — ок; 1 — провал с диагнозом. Логи: /tmp/uwuwu-stand-*.log
@@ -42,6 +47,12 @@ print(t.split(chr(10))[0].split('— ')[-1])" 2>/dev/null
 
 say "сборка…"
 cargo build -q --bin uwuwu-server --bin mock_opencode
+# пред-чистка стека: утечка сервера прошлого прогона (убитая сессия не
+# отвела trap) занимает 8090 — новый сервер молча exit(1) по bind_failed,
+# а цикл ведёт чужой процесс (инцидент прогона тестировщика 17.11)
+pkill -f 'target/debug/uwuwu-server' 2>/dev/null || true
+pkill -f 'target/debug/mock_opencode' 2>/dev/null || true
+sleep 1
 rm -f "$STATE"
 
 say "фаза 1: observe не заряжает счётчики петель"
@@ -88,7 +99,7 @@ case "$S" in *Review*) ;; *) fail "цикл не замкнут за 5 мин, �
 
 grep -q "loop_escalated" "$LOG_SRV_LIVE" && fail "loop_escalated в live-логе"
 # ре-энти был: два dev-спавна (круг 1 + после request_changes)
-DEV_SPAWNS=$(grep -oE '"event":"spawn.done","number":'$SEED_N',"slot":"Dev"' "$LOG_SRV_LIVE" | wc -l)
+DEV_SPAWNS=$(grep -oE '"event":"spawn.done","number":'$SEED_N',"slot":"Dev"' "$LOG_SRV_LIVE" | wc -l || true)
 [ "$DEV_SPAWNS" -ge 2 ] || fail "ре-энтри не случился (dev-спавнов: $DEV_SPAWNS)"
 say "фаза 2 ок: ре-энтри круг пройден (dev-спавнов: $DEV_SPAWNS), эскалаций нет"
 
@@ -119,17 +130,14 @@ UWUWU_SERVER_CONFIG=$PWD/ops/config.memory-multi.toml UWUWU_SERVER_MODE=live \
   UWUWU_MOCK_SEED="Задачи uwuwu:$SEED_N:Design;Задачи 1xgames-mock:2047:Design" \
   RUST_LOG=info ./target/debug/uwuwu-server >"$LOG_SRV_MULTI" 2>&1 &
 sleep 25   # 2+ тика: оба проекта спавнятся каждый на своём исполнителе
-sessions_of() { curl -s --max-time 5 "http://127.0.0.1:$1/api/session" 2>/dev/null | \
-  python3 -c "
-import json,sys
-d = json.load(sys.stdin)
-rows = d if isinstance(d, list) else d.get('data', [])
-print(' '.join(str(s.get('title') or s.get('id','')) for s in rows))" 2>/dev/null || true; }
-M1="$(sessions_of $PORT_MOCK)"; M2="$(sessions_of $MOCK2_PORT)"
-echo "$M1" | grep -q "#$SEED_N" || fail "мок-1 не получил сессию uwuwu (дефолт-маршрут сломан): [$M1]"
-echo "$M2" | grep -q "#2047" || fail "мок-2 не получил сессию 1xgames-mock (маршрутизация не работает): [$M2]"
-echo "$M1" | grep -q "#2047" && fail "кросс-маршрут: 1xgames-mock ушел на дефолтный исполнитель"
-echo "$M2" | grep -q "#$SEED_N" && fail "кросс-маршрут: uwuwu ушел на mock2"
+# диагностика маршрутизации — по журналам моков (list endpoint честно
+# фильтрует мёртвые: #1163, dead-сессии mock-2 в list не попадают;
+# grep по номеру строки — tracing рендерит поля с ANSI-кодами)
+M1="$(grep -c "#$SEED_N" "$LOG_MOCK" 2>/dev/null || true)"; M2="$(grep -c "#2047" "$LOG_MOCK2" 2>/dev/null || true)"
+[ "$M1" -ge 1 ] || fail "мок-1 не получил сессию uwuwu (дефолт-маршрут сломан): журналов #$SEED_N нет"
+[ "$M2" -ge 1 ] || fail "мок-2 не получил сессию 1xgames-mock (маршрутизация не работает): журналов #2047 нет"
+grep -q "#2047" "$LOG_MOCK" && fail "кросс-маршрут: 1xgames-mock ушел на дефолтный исполнитель"
+grep -q "#$SEED_N" "$LOG_MOCK2" && fail "кросс-маршрут: uwuwu ушел на mock2"
 say "маршрутизация ок: uwuwu → мок-1, 1xgames-mock → мок-2 (без кроссов)"
 
 task_status_num() { mcp task_get "{\"number\":$1,\"project\":\"$2\"}" | python3 -c "
@@ -160,4 +168,42 @@ pkill -f 'target/debug/mock_opencode' 2>/dev/null || true
 sleep 1
 say "фаза 3 ок: маршрутизация по проектам, отказ исполнителя без паралича"
 
-say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + мульти-экзекьютор)"
+say "фаза 4: гард «одна живая сессия на строку» — сирота в env держит спавн (#1163)"
+# стек фазы 3 вычищен её хвостом; свой state с нуля
+rm -f "$STATE"
+# pre-create живой сеанс в env строки (сирота спавна/клейм): спавн держится
+# вторым источником — list_sessions матчит директорию <env_root>/<row>.
+# MOCK_PAGE_LIMIT=1: сервер итерирует пагинацию list (ревью Common-1) —
+# гард обязан видеть сироту и в многостраничном списке
+ENV_DIR="/home/yurvon/agents-env/$SEED_N"
+MOCK_MODE=plain MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=1500 MOCK_PAGE_LIMIT=1 \
+  ./target/debug/mock_opencode >"$LOG_MOCK" 2>&1 &
+sleep 1
+ORPHAN_RESP=$(curl -s --max-time 5 -X POST "http://127.0.0.1:$PORT_MOCK/api/session" \
+  -H 'Content-Type: application/json' \
+  -d "{\"title\":\"orphan-1163\",\"location\":{\"directory\":\"$ENV_DIR\"}}")
+ORPHAN_ID=$(echo "$ORPHAN_RESP" | python3 -c "
+import json,sys
+d = json.load(sys.stdin)
+row = d.get('data') or d
+print(row.get('id',''))")
+[ -n "$ORPHAN_ID" ] || fail "мок не создал сироту-сессию: [$ORPHAN_RESP]"
+UWUWU_SERVER_CONFIG=$PWD/ops/config.memory.toml UWUWU_SERVER_MODE=live \
+  UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
+  UWUWU_MOCK_SEED="$SEED_N:In Progress" RUST_LOG=info \
+  ./target/debug/uwuwu-server >"$LOG_SRV_LIVE" 2>&1 &
+sleep 25   # 2+ тика: спавн держится гардом
+SPAWNS=$(grep -oE '"event":"spawn.done","number":'$SEED_N "$LOG_SRV_LIVE" | wc -l || true)
+[ "$SPAWNS" -eq 0 ] || fail "спавн случился поверх живой сессии env (гард молчит): $SPAWNS"
+grep -q '"event":"spawn.held_live_session"' "$LOG_SRV_LIVE" || fail "нет spawn.held_live_session (гард не сработал)"
+say "гард держит: сирота в env, спавнов 0"
+# релиз: удаляем сироту — спавн происходит
+curl -s --max-time 5 -X DELETE "http://127.0.0.1:$PORT_MOCK/api/session/$ORPHAN_ID" >/dev/null
+sleep 25   # тик после релиза
+grep -q '"event":"spawn.done","number":'$SEED_N "$LOG_SRV_LIVE" || fail "спавна нет после удаления сироты (гард перегораживает)"
+pkill -f 'target/debug/uwuwu-server' 2>/dev/null || true
+pkill -f 'target/debug/mock_opencode' 2>/dev/null || true
+sleep 1
+say "фаза 4 ок: гард держит спавн при живой сессии env и отпускает после её смерти"
+
+say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + мульти-экзекьютор + гард #1163)"
