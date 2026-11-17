@@ -46,8 +46,9 @@ impl AnalystReviewUseCase {
             return Ok(0);
         }
         // CUP-гвард (#1231): ревью-волна — запуск хода, отложка при полном
-        // капе; гарды строк не заряжаются (отложка — не спавн).
-        let busy = crate::router::busy_count(&scan);
+        // капе; гарды строк не заряжаются (отложка — не спавн). Счётчик на
+        // тик: спавны волн текущего тика занимают слоты (#1244-класс).
+        let mut busy = crate::router::busy_count(&scan);
         if busy >= self.cup {
             tracing::info!(
                 event = "analys_review.held_cup",
@@ -110,6 +111,18 @@ impl AnalystReviewUseCase {
             if wave.is_empty() {
                 continue;
             }
+            // CUP-гвард на доску (#1231): волны предыдущих досок этого тика
+            // заняли слоты — при полном капе доска откладывается целиком
+            if busy >= self.cup {
+                tracing::info!(
+                    event = "analys_review.held_cup",
+                    board = %tb.board,
+                    active = busy,
+                    cap = self.cup,
+                    "Ревью-волна доски отложена: CUP cap"
+                );
+                continue;
+            }
             // Спавн ДО зарядки счётчиков (канон «failed spawn не заряжает»):
             // сбой гейтвея не тратит попытку ревью и не заряжает кулдаун.
             let spec = SessionSpec {
@@ -127,6 +140,7 @@ impl AnalystReviewUseCase {
             // построены в одном проходе) — здесь порядок не трогаем (L1)
             let prompt = analyst_review_prompt(&tb.project, &wave);
             sessions.prompt(&session, &prompt).await?;
+            busy += 1; // спавн этого тика занимает слот капа
             for (t, guard) in wave.iter().zip(guards.iter()) {
                 self.state.set_analys_review_loop(
                     &tb.board,

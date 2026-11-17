@@ -301,8 +301,10 @@ struct MemStateInner {
     /// (number, status, repeats) — цикл-гвард ревью-контура
     analys_review_loops: Vec<(u64, Status, u32)>,
     /// (number, ts) — кулдауны волн аналитика/ревьювера
-    analys_ms: Vec<(u64, u64)>,
-    analys_review_ms: Vec<(u64, u64)>,
+    /// (board, number, ts) — ключи борд-скоупные, как в реальном store
+    /// ({board}:{number}:analys); number-only маскировал мультиборд-оверселл
+    analys_ms: Vec<(String, u64, u64)>,
+    analys_review_ms: Vec<(String, u64, u64)>,
     resets: Vec<(u64, Status)>,
     /// сталл-детект: (number, статус раунда, ms пинга)
     stalls: Vec<(u64, Status, u64)>,
@@ -341,31 +343,35 @@ impl TickStateStore for MemState {
     }
     fn mark_spawn(&self, _b: &str, _n: u64, _s: Slot, _at: u64) {}
     fn clear_spawn_ms(&self, _b: &str, _n: u64, _s: Slot) {}
-    fn last_analys_ms(&self, _b: &str, n: u64) -> Option<u64> {
+    fn last_analys_ms(&self, b: &str, n: u64) -> Option<u64> {
         self.0
             .lock()
             .unwrap()
             .analys_ms
             .iter()
             .rev()
-            .find(|(num, _)| *num == n)
-            .map(|(_, ts)| *ts)
+            .find(|(board, num, _)| board == b && *num == n)
+            .map(|(_, _, ts)| *ts)
     }
-    fn mark_analys_spawn(&self, _b: &str, n: u64, at: u64) {
-        self.0.lock().unwrap().analys_ms.push((n, at));
+    fn mark_analys_spawn(&self, b: &str, n: u64, at: u64) {
+        self.0.lock().unwrap().analys_ms.push((b.into(), n, at));
     }
-    fn last_analys_review_ms(&self, _b: &str, n: u64) -> Option<u64> {
+    fn last_analys_review_ms(&self, b: &str, n: u64) -> Option<u64> {
         self.0
             .lock()
             .unwrap()
             .analys_review_ms
             .iter()
             .rev()
-            .find(|(num, _)| *num == n)
-            .map(|(_, ts)| *ts)
+            .find(|(board, num, _)| board == b && *num == n)
+            .map(|(_, _, ts)| *ts)
     }
-    fn mark_analys_review_spawn(&self, _b: &str, n: u64, at: u64) {
-        self.0.lock().unwrap().analys_review_ms.push((n, at));
+    fn mark_analys_review_spawn(&self, b: &str, n: u64, at: u64) {
+        self.0
+            .lock()
+            .unwrap()
+            .analys_review_ms
+            .push((b.into(), n, at));
     }
     fn analys_loop(&self, _b: &str, n: u64) -> Option<(Status, u32)> {
         self.0
@@ -2073,6 +2079,52 @@ fn review_uc_with_cup(
     (u, board)
 }
 
+#[tokio::test]
+async fn analyst_multiboard_no_oversell_within_tick() {
+    // #1244-класс (ревью #1231, раунд 2): снимок CUP один, спавны волн
+    // тика занимают слоты — при busy == cap−1 волна второй доски
+    // откладывается, а не спавнится поверх (оверселл cap+N−1).
+    let state = Arc::new(MemState(Mutex::default()));
+    let sessions = Arc::new(FakeSessions::new());
+    sessions
+        .extra
+        .lock()
+        .unwrap()
+        .push(fake_session("ses_stage", "developer", "", 100, true));
+    let board = Arc::new(FakeBoard {
+        rows: vec![
+            titled(400, "заявка 1", Status::Analys),
+            titled(401, "заявка 2", Status::Analys),
+        ],
+        log: Mutex::default(),
+        comments: vec![],
+    });
+    let u = AnalystUseCase {
+        board: board.clone(),
+        boards: vec![
+            AnalystBoard {
+                project: "p".into(),
+                board: "B1".into(),
+                checkout: "/checkout-1".into(),
+            },
+            AnalystBoard {
+                project: "p".into(),
+                board: "B2".into(),
+                checkout: "/checkout-2".into(),
+            },
+        ],
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        state,
+        clock: Arc::new(FixedClock),
+        cup: 2,
+    };
+    let spawned = u.tick().await.unwrap();
+    assert_eq!(spawned, 1, "вторая волна отложена занятым слотом");
+    let specs = sessions.specs.lock().unwrap();
+    assert_eq!(specs.len(), 1, "спавн только первой доски");
+    assert_eq!(specs[0].directory, "/checkout-1");
+}
+
 fn titled(n: u64, title: &str, status: Status) -> Task {
     Task::new(n, title.into(), status)
 }
@@ -2328,7 +2380,7 @@ async fn analyst_skips_cron_and_empty_titles() {
 #[tokio::test]
 async fn analyst_cooldown_holds_row() {
     let inner = MemStateInner {
-        analys_ms: vec![(1, 2000)],
+        analys_ms: vec![("B".into(), 1, 2000)],
         ..Default::default()
     };
     let state = Arc::new(MemState(Mutex::new(inner)));
@@ -2534,7 +2586,7 @@ async fn reviewer_alive_skip_and_cooldown() {
     assert_eq!(u.tick().await.unwrap(), 0);
     // кулдаун по строке
     let inner = MemStateInner {
-        analys_review_ms: vec![(1, 2000)],
+        analys_review_ms: vec![("B".into(), 1, 2000)],
         ..Default::default()
     };
     let state = Arc::new(MemState(Mutex::new(inner)));

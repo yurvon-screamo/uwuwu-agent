@@ -60,8 +60,10 @@ impl AnalystUseCase {
         }
         // CUP-гвард (#1231): волна — запуск хода, ей нужен свободный слот
         // единого капа. Отложка — не спавн: кулдауны/цикл-гарды строк не
-        // заряжаются (канон «failed spawn не заряжает»).
-        let busy = crate::router::busy_count(&scan);
+        // заряжаются (канон «failed spawn не заряжает»). Счётчик на тик:
+        // спавны волн текущего тика занимают слоты — иначе мультиборд при
+        // busy == cap−1 оверселлит до cap+N−1 (#1244-класс, ревью #1231).
+        let mut busy = crate::router::busy_count(&scan);
         if busy >= self.cup {
             tracing::info!(
                 event = "analys.held_cup",
@@ -166,6 +168,18 @@ impl AnalystUseCase {
             if wave.is_empty() {
                 continue;
             }
+            // CUP-гвард на доску (#1231): волны предыдущих досок этого тика
+            // заняли слоты — при полном капе доска откладывается целиком
+            if busy >= self.cup {
+                tracing::info!(
+                    event = "analys.held_cup",
+                    board = %tb.board,
+                    active = busy,
+                    cap = self.cup,
+                    "Волна доски отложена: CUP cap"
+                );
+                continue;
+            }
             // порядок пачки — приоритет очереди (high → … → пусто)
             wave.sort_by_key(|t| t.priority().rank());
             // Спавн ДО зарядки счётчиков (канон «failed spawn не заряжает»,
@@ -184,6 +198,7 @@ impl AnalystUseCase {
             let session = sessions.create_session(&spec).await?;
             let prompt = analyst_prompt(&tb.project, &wave);
             sessions.prompt(&session, &prompt).await?;
+            busy += 1; // спавн этого тика занимает слот капа
             for t in &wave {
                 let rounds = self
                     .state
