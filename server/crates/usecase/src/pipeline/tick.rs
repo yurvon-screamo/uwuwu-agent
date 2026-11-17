@@ -295,14 +295,6 @@ impl TickUseCase {
                             .unwrap_or(u64::MAX)
                     };
                     if cooldown_left < SPAWN_COOLDOWN_MS {
-                        // диагностика 17.11: строка в Spawn-руке под кулдауном
-                        tracing::info!(
-                            event = "spawn.cooldown_block",
-                            number = task.number(),
-                            status = ?task.status(),
-                            cooldown_left_ms = cooldown_left,
-                            "Spawn arm: кулдаун держит строку"
-                        );
                         out.observed += 1;
                         continue;
                     }
@@ -435,17 +427,6 @@ impl TickUseCase {
                 }
                 Action::Observe { awaits } => {
                     if plan.mode == Mode::Live && awaits == Awaits::StageSession {
-                        // диагностика 17.11: видит ли тик сессию стадии
-                        tracing::info!(
-                            event = "observe.enter",
-                            number = task.number(),
-                            status = ?task.status(),
-                            session = task
-                                .stage_slot()
-                                .and_then(|s| task.session_of(s))
-                                .unwrap_or("НЕТ"),
-                            "observe_stage_session: вход"
-                        );
                         self.observe_stage_session(board, plan, task, active_now, &mut out)
                             .await;
                     } else {
@@ -601,16 +582,7 @@ impl TickUseCase {
         if silence < STALL_SOFT_SILENCE_MS {
             return Ok(StallAct::None);
         }
-        // диагностика «строки стоят, сессии спят» (17.11): вход stall_pass
         let idle = self.session_idle(board, &session).await;
-        tracing::info!(
-            event = "stall.probe",
-            number = task.number(),
-            session = %session,
-            silence_ms = silence,
-            idle,
-            "stall_pass: проба тишины/idle"
-        );
         let (gate, every, soft) = if idle {
             (STALL_SOFT_SILENCE_MS, STALL_SOFT_EVERY_MS, true)
         } else {
