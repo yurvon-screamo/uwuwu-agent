@@ -28,7 +28,10 @@ cd "$(dirname "$0")/../.."   # server/
 PORT_MOCK="${PORT_MOCK:-8099}"; PORT_SRV="${PORT_SRV:-8090}"
 BEARER="${UWUWU_SERVER_BEARER:-stand-e2e-bearer}"
 SEED_N=2046
-RUN_DIR="$(mktemp -d /tmp/uwuwu-stand-XXXXXX)"
+# Рандир логов/state: /tmp по умолчанию; UWUWU_STAND_RUN_DIR — оверрайд
+# (параллельные прогоны и внешние чистки /tmp — изоляция в scratch канона)
+RUN_DIR="${UWUWU_STAND_RUN_DIR:-$(mktemp -d /tmp/uwuwu-stand-XXXXXX)}"
+mkdir -p "$RUN_DIR"
 LOG_MOCK="$RUN_DIR/mock.log"
 LOG_SRV_OBS="$RUN_DIR/server-observe.log"
 LOG_SRV_LIVE="$RUN_DIR/server-live.log"
