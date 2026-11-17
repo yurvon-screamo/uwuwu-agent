@@ -2149,7 +2149,10 @@ async fn idle_sessions_do_not_hold_cup() {
         out.spawns_done, 1,
         "кандидат спавнится: спящие idle-сессии кап не держат"
     );
-    assert_eq!(out.held_cup, 0, "active = busy, очередь кандидатов кап не держит (#1244)");
+    assert_eq!(
+        out.held_cup, 0,
+        "active = busy, очередь кандидатов кап не держит (#1244)"
+    );
 }
 
 #[tokio::test]
