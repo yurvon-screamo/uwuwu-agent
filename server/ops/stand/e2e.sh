@@ -14,6 +14,9 @@
 #     удаления сироты спавн происходит;
 #   фаза 5 (self-эхо #1204): медленный мок (акт 11с при тике 10с) —
 #     собственные MCP-комменты срезаются живьём, эхо-доставок нет.
+#   фаза 6 (слепой hold #1263): исполнитель недоступен — спавн держится
+#     (spawn.held_blind_scan, спавнов 0), после возврата исполнителя
+#     спавн происходит.
 #
 # Запуск: server/ops/stand/e2e.sh   (из каталога server; cargo build сам)
 # Выход: 0 — ок; 1 — провал с диагнозом. Логи/state/config — mktemp-рандир
@@ -275,4 +278,39 @@ SLICED=$(grep -c '"event":"wakeup.self_echo_sliced"' "$LOG_SRV_ECHO" || true)
 [ "$DELIVERED" -eq 0 ] || fail "wake-доставок: $DELIVERED (ожидался 0 — эхо?)"
 say "фаза 5 ок: sliced=$SLICED, delivered=0 — свои комменты не будят"
 
-say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + мульти-экзекьютор + гард #1163 + self-эхо); логи: $RUN_DIR"
+say "фаза 6: слепой hold — список исполнителя недоступен, спавн без зрения невозможен (#1263)"
+# Гасим СВОИ остатки (pid-scoped); мок НЕ поднимаем — union-скан падает
+# на каждом тике, инверсия деградации держит спавн до восстановления
+kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+SRV_PID=""; MOCK_PID=""
+sleep 1
+rm -f "$STATE"
+LOG_SRV_BLIND="$RUN_DIR/server-blind.log"
+UWUWU_SERVER_CONFIG=$CONFIG UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
+  UWUWU_SERVER_MODE=live \
+  UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
+  UWUWU_MOCK_SEED="$SEED_N:In Progress" \
+  RUST_LOG=info ./target/debug/uwuwu-server >"$LOG_SRV_BLIND" 2>&1 &
+SRV_PID=$!
+sleep 25   # 2+ тика на слепоте: спавн держится
+SPAWNS=$(grep -oE '"event":"spawn.done"' "$LOG_SRV_BLIND" | wc -l || true)
+[ "$SPAWNS" -eq 0 ] || fail "спавн случился при недоступном исполнителе (слепой спавн): $SPAWNS"
+grep -q '"event":"spawn.held_blind_scan"' "$LOG_SRV_BLIND" \
+  || fail "нет spawn.held_blind_scan (слепой hold не сработал)"
+grep -q '"event":"tick.completed"' "$LOG_SRV_BLIND" || fail "тик умер на слепоте"
+say "слепой hold держит: исполнитель недоступен, спавнов 0, тик живёт"
+# восстановление: мок возвращаем — спавн происходит
+MOCK_MODE=plain MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=1500 \
+  ./target/debug/mock_opencode >"$LOG_MOCK" 2>&1 &
+MOCK_PID=$!
+sleep 25
+grep -q '"event":"spawn.done"' "$LOG_SRV_BLIND" \
+  || fail "спавна нет после возврата исполнителя (hold перегораживает)"
+kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+SRV_PID=""; MOCK_PID=""
+sleep 1
+say "фаза 6 ок: слепой hold держит спавн при мёртвом исполнителе и отпускает после возврата"
+
+say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + мульти-экзекьютор + гард #1163 + self-эхо + слепой hold #1263); логи: $RUN_DIR"
