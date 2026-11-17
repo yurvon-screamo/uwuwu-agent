@@ -646,6 +646,32 @@ async fn live_spawns_and_claims_session() {
         .any(|l| l.starts_with("session#1")));
 }
 
+/// Тайтл спавн-сессии несёт эмодзи-маркер стадии между номером и тайтлом
+/// (задача #1212); bootstrap наследует тем же значением.
+#[tokio::test]
+async fn spawn_title_carries_stage_marker() {
+    // Dev-слот (In Progress): маркер 🔨, bootstrap и work — одинаково
+    let (u, _, sessions, _) = usecase(vec![task(1, Status::InProgress)], PrState::Missing);
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    {
+        let specs = sessions.specs.lock().unwrap();
+        assert_eq!(specs.len(), 2, "bootstrap + work");
+        assert_eq!(specs[0].title, "bootstrap #1 🔨 t1");
+        assert_eq!(specs[1].title, "#1 🔨 t1");
+    }
+
+    // PlanReview-слот: маркер 🔍 и агент plan-reviewer
+    let (u, _, sessions, _) = usecase(vec![task(2, Status::ReviewPlan)], PrState::Missing);
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    let specs = sessions.specs.lock().unwrap();
+    let work = specs.last().expect("рабочая сессия");
+    assert_eq!(work.title, "#2 🔍 t2");
+    assert!(
+        matches!(work.agent, AgentSlot::Role(Agent::PlanReviewer)),
+        "ревью-план спавнится кастомным агентом"
+    );
+}
+
 #[tokio::test]
 async fn cup_holds_spawn_in_live() {
     // #1244: кап держат фактические запуски (busy + состоявшиеся спавны
