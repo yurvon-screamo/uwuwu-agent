@@ -749,6 +749,8 @@ fn wake_usecase(
         rows,
         log: Mutex::default(),
         comments,
+        fields_fails: false,
+        set_session_fails: false,
     });
     let sessions = Arc::new(FakeSessions {
         prompts: Mutex::default(),
@@ -757,6 +759,8 @@ fn wake_usecase(
         dead_sessions: Mutex::default(),
         list_fails: false,
         idle_reply,
+        prompt_fails: false,
+        deleted: Mutex::default(),
         specs: Mutex::default(),
         live: Mutex::default(),
     });
@@ -989,6 +993,8 @@ async fn mcp_comment_marks_registry_with_node_id() {
         rows: vec![],
         log: Mutex::default(),
         comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
     });
     let state = Arc::new(MemState(Mutex::default()));
     let writer = crate::tasks::write::TaskWriteUseCase {
