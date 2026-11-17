@@ -56,9 +56,12 @@ def _media_message(body):
     FILES[file_id] = raw.encode() if isinstance(raw, str) else raw
     # too_big: oversize БЕЗ file_size в апдейте — getFile отвечает
     # перманентным 400 (эмуляция второй гарды раннера, #1171)
-    SIZES[file_id] = FILE_LIMIT + 1 if body.get("too_big") else (
-        size if size is not None else len(FILES[file_id])
-    )
+    if body.get("too_big"):
+        SIZES[file_id] = FILE_LIMIT + 1
+    elif size is not None:
+        SIZES[file_id] = size
+    else:
+        SIZES[file_id] = len(FILES[file_id])
     media = {"file_id": file_id}
     if size is not None:
         media["file_size"] = size
