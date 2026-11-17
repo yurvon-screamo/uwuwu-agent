@@ -78,10 +78,13 @@ fn build_sessions(
     cfg: &Config,
     secrets: &config::Secrets,
     clock: Arc<dyn uwuwu_usecase::Clock>,
-) -> (
-    Arc<dyn uwuwu_usecase::AgentSessionGateway>,
-    Arc<uwuwu_usecase::SessionRouter>,
-) {
+) -> Result<
+    (
+        Arc<dyn uwuwu_usecase::AgentSessionGateway>,
+        Arc<uwuwu_usecase::SessionRouter>,
+    ),
+    String,
+> {
     let raw_default: Arc<dyn uwuwu_usecase::AgentSessionGateway> =
         Arc::new(executor::OpencodeClient::new(
             cfg.executor.url.clone(),
@@ -125,10 +128,15 @@ fn build_sessions(
         // именованный маршрут — только явная ссылка на НЕ дефолтного
         // исполнителя (None/дефолт/пусто → бюджетный дефолт-хэндл)
         let handle = match p.executor.as_deref().map(str::trim) {
-            Some(target) if !target.is_empty() && target != cfg.executor.name => named_gateways
-                .get(target)
-                .expect("конфиг валиден: ссылка проекта резолвится")
-                .clone(),
+            Some(target) if !target.is_empty() && target != cfg.executor.name => {
+                let gateway = named_gateways.get(target).ok_or_else(|| {
+                    format!(
+                        "конфиг: проект «{}»: executor «{}» не собран (валидация пропустила?)",
+                        p.name, target
+                    )
+                })?;
+                gateway.clone()
+            }
             _ => budgeted_default.clone(),
         };
         by_project.insert(p.name.trim().to_string(), handle);
@@ -136,23 +144,21 @@ fn build_sessions(
     let named: Vec<(String, Arc<dyn uwuwu_usecase::AgentSessionGateway>)> = cfg
         .executors
         .iter()
-        .map(|e| {
-            (
-                e.name.clone(),
-                named_gateways
-                    .get(&e.name)
-                    .expect("гейтвей именованного исполнителя")
-                    .clone(),
-            )
+        .map(|e| match named_gateways.get(&e.name) {
+            Some(gateway) => Ok((e.name.clone(), gateway.clone())),
+            None => Err(format!(
+                "конфиг: executor «{}» не собран (валидация пропустила?)",
+                e.name
+            )),
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()?;
     let router = Arc::new(uwuwu_usecase::SessionRouter::new(
         &cfg.executor.name,
         budgeted_default,
         named,
         by_project,
     ));
-    (raw_default, router)
+    Ok((raw_default, router))
 }
 
 async fn run(
@@ -196,7 +202,7 @@ async fn run(
     };
     // Исполнители и роутер «проект → executor» (#1203); боты — raw-дефолт
     let clock = Arc::new(clock::SystemClock);
-    let (raw_default, sessions) = build_sessions(&cfg, &secrets, clock.clone());
+    let (raw_default, sessions) = build_sessions(&cfg, &secrets, clock.clone())?;
     let prs = Arc::new(github::GhPrGateway::new(secrets.gh_token.clone()));
     let state_path = cfg.state_path(&config_path);
     let state = Arc::new(state::JsonStateStore::load(state_path));
