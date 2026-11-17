@@ -2,12 +2,12 @@
 //! (private-only + owner), сборка промпта (шапка + методичка + текст),
 //! чанкование реплая, диф-действие супервизора.
 
-use crate::bots::ports::TgMessage;
+use crate::bots::ports::{Incoming, TgMessage};
 use uwuwu_domain::{BotAction, BotSpec};
 
 /// Классификация входящего: private-only (группы/каналы игнорируются),
-/// owner — дополнительный фильтр. Ok — текст сообщения.
-pub fn classify_message(msg: &TgMessage, owner: Option<&str>) -> Option<String> {
+/// owner — дополнительный фильтр. Ok — текст или media-факт (#1171).
+pub fn classify_message(msg: &TgMessage, owner: Option<&str>) -> Option<Incoming> {
     if msg.chat_type != "private" {
         return None;
     }
@@ -21,11 +21,24 @@ pub fn classify_message(msg: &TgMessage, owner: Option<&str>) -> Option<String> 
             return None;
         }
     }
-    msg.text
+    let text = msg
+        .text
         .as_deref()
         .map(str::trim)
         .filter(|t| !t.is_empty())
-        .map(String::from)
+        .map(String::from);
+    match text {
+        Some(t) => Some(Incoming::Text(t)),
+        None => msg.media.clone().map(|media| Incoming::Media {
+            caption: msg
+                .caption
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(String::from),
+            media,
+        }),
+    }
 }
 
 /// Промпт сессии бота: методичка — префикс каждого сообщения (горячая
@@ -82,6 +95,7 @@ pub fn plan_action(running: &BotSpec, desired: &BotSpec) -> Option<BotAction> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bots::ports::MediaKind;
 
     fn msg(chat_type: &str, username: Option<&str>, text: Option<&str>) -> TgMessage {
         TgMessage {
@@ -89,6 +103,25 @@ mod tests {
             chat_id: 42,
             from_username: username.map(String::from),
             text: text.map(String::from),
+            caption: None,
+            media: None,
+        }
+    }
+
+    fn photo(caption: Option<&str>) -> TgMessage {
+        TgMessage {
+            chat_type: "private".into(),
+            chat_id: 42,
+            from_username: Some("yurvon".into()),
+            text: None,
+            caption: caption.map(String::from),
+            media: Some(crate::bots::ports::TgMedia {
+                kind: MediaKind::Photo,
+                file_id: "agg-file".into(),
+                file_name: None,
+                file_size: Some(10_000),
+                mime: Some("image/jpeg".into()),
+            }),
         }
     }
 
@@ -96,7 +129,7 @@ mod tests {
     fn private_only_and_owner_filter() {
         assert_eq!(
             classify_message(&msg("private", Some("yurvon"), Some("привет")), None),
-            Some("привет".into())
+            Some(Incoming::Text("привет".into()))
         );
         assert_eq!(
             classify_message(&msg("group", Some("yurvon"), Some("привет")), None),
@@ -118,13 +151,41 @@ mod tests {
         // кейс username нечувствителен
         assert_eq!(
             classify_message(&msg("private", Some("Yurvon"), Some("x")), Some("yurvon")),
-            Some("x".into())
+            Some(Incoming::Text("x".into()))
         );
         // пустой текст не проходит
         assert_eq!(
             classify_message(&msg("private", Some("yurvon"), Some("  ")), None),
             None
         );
+    }
+
+    /// #1171: медиа от владельца — не тихий skip, а Incoming::Media
+    /// (caption как подпись; без caption — None).
+    #[test]
+    fn owner_media_classified_even_without_text() {
+        let got = classify_message(&photo(Some("от МПНЧ")), Some("yurvon"));
+        assert_eq!(
+            got,
+            Some(Incoming::Media {
+                caption: Some("от МПНЧ".into()),
+                media: crate::bots::ports::TgMedia {
+                    kind: MediaKind::Photo,
+                    file_id: "agg-file".into(),
+                    file_name: None,
+                    file_size: Some(10_000),
+                    mime: Some("image/jpeg".into()),
+                },
+            })
+        );
+        // чужое медиа — прежний owner-фильтр
+        let mut stranger = photo(None);
+        stranger.from_username = Some("stranger".into());
+        assert_eq!(classify_message(&stranger, Some("yurvon")), None);
+        // медиа в группе — молча
+        let mut group = photo(None);
+        group.chat_type = "group".into();
+        assert_eq!(classify_message(&group, None), None);
     }
 
     #[test]
