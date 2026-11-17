@@ -58,7 +58,7 @@ impl CronUseCase {
         // слот единого капа. Strict union (#1203): отказ скана — файр
         // откладывается (ран не считается состоявшимся, журнал не пишется).
         let busy = match self.sessions.list_sessions_strict().await {
-            Ok(list) => list.iter().filter(|s| s.busy).count(),
+            Ok(list) => crate::router::busy_count(&list),
             Err(e) => {
                 tracing::warn!(
                     event = "cron.list_sessions_failed",

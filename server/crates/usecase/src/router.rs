@@ -6,6 +6,20 @@ use crate::error::{UsecaseError, UsecaseResult};
 use crate::ports::{AgentSessionGateway, SessionInfo};
 use std::collections::HashMap;
 use std::sync::Arc;
+use uwuwu_domain::Agent;
+
+/// Число busy-сессий union-скана — занятые слоты единого капа (#1231).
+pub fn busy_count(list: &[SessionInfo]) -> usize {
+    list.iter().filter(|s| s.busy).count()
+}
+
+/// Есть ли среди busy-сессий агент данной роли: alive-гвард «≤1 живого»
+/// (#1231). «Живой» = ход в полёте: outcome — атрибут последнего финала
+/// и при новом ходе не очищается.
+pub fn has_busy_agent(list: &[SessionInfo], agent: Agent) -> bool {
+    list.iter()
+        .any(|s| s.busy && crate::naming::parse_agent(&s.agent) == Some(agent))
+}
 
 /// Гейтвей одного исполнителя (OpencodeClient или бюджетный декоратор).
 pub type Gateway = Arc<dyn AgentSessionGateway>;

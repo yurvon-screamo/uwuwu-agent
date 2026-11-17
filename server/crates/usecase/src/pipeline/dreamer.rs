@@ -43,15 +43,12 @@ impl DreamerUseCase {
         let list = self.sessions.list_sessions_strict().await?;
         // ≤1 живого дримера — busy-признак (ход в полёте, #1231): outcome
         // при новом ходе не очищается, дубль-дример на 2+ ходе был незаметен
-        if list
-            .iter()
-            .any(|s| s.busy && naming::parse_agent(&s.agent) == Some(Agent::Dreamer))
-        {
+        if crate::router::has_busy_agent(&list, Agent::Dreamer) {
             tracing::debug!(event = "dreamer.alive_skip", "Живой дример — спавна нет");
             return Ok(0);
         }
         // CUP-гвард (#1231): дример-спавн откладывается при полном капе.
-        let busy = list.iter().filter(|s| s.busy).count();
+        let busy = crate::router::busy_count(&list);
         if busy >= self.cup {
             tracing::info!(
                 event = "dreamer.held_cup",

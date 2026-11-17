@@ -54,17 +54,14 @@ impl AnalystUseCase {
         // должен порождать дубль-спавн волны на другом — как CUP, отказ
         // любого исполнителя честно останавливает волну до следующего тика
         let scan = self.sessions.list_sessions_strict().await?;
-        if scan
-            .iter()
-            .any(|s| s.busy && crate::naming::parse_agent(&s.agent) == Some(Agent::Analyst))
-        {
+        if crate::router::has_busy_agent(&scan, Agent::Analyst) {
             tracing::debug!(event = "analys.alive_skip", "Живой аналитик — волна ждёт");
             return Ok(0);
         }
         // CUP-гвард (#1231): волна — запуск хода, ей нужен свободный слот
         // единого капа. Отложка — не спавн: кулдауны/цикл-гарды строк не
         // заряжаются (канон «failed spawn не заряжает»).
-        let busy = scan.iter().filter(|s| s.busy).count();
+        let busy = crate::router::busy_count(&scan);
         if busy >= self.cup {
             tracing::info!(
                 event = "analys.held_cup",

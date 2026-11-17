@@ -38,9 +38,10 @@ impl AnalystReviewUseCase {
         // аналитика — живой ревьювер волны на офлайн-исполнителе не
         // порождает дубль-спавн на другом
         let scan = self.sessions.list_sessions_strict().await?;
-        if scan.iter().any(|s| {
-            s.busy && crate::naming::parse_agent(&s.agent) == Some(Agent::AnalystReviewer)
-        }) {
+        if scan
+            .iter()
+            .any(|s| s.busy && crate::naming::parse_agent(&s.agent) == Some(Agent::AnalystReviewer))
+        {
             tracing::debug!(
                 event = "analys_review.alive_skip",
                 "Живой ревьювер — волна ждёт"
@@ -49,7 +50,7 @@ impl AnalystReviewUseCase {
         }
         // CUP-гвард (#1231): ревью-волна — запуск хода, отложка при полном
         // капе; гарды строк не заряжаются (отложка — не спавн).
-        let busy = scan.iter().filter(|s| s.busy).count();
+        let busy = crate::router::busy_count(&scan);
         if busy >= self.cup {
             tracing::info!(
                 event = "analys_review.held_cup",
