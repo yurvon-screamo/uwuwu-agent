@@ -29,7 +29,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /build/uwuwu-server /usr/local/bin/uwuwu-server
-COPY config.example.toml /app/config.toml
+COPY config.toml /app/config.toml
 WORKDIR /app
 ENV UWUWU_SERVER_CONFIG=/app/config.toml
 EXPOSE 8090

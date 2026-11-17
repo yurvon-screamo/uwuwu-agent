@@ -1,0 +1,76 @@
+# uwuwu-server — конфиг контура (секреты — env, не здесь; канон живого прод-конфига, #1211-хвост)
+# Путь к конфигу: env UWUWU_SERVER_CONFIG (дефолт server/config.toml).
+#
+# mode:
+#   observe — тик читает доски и логирует решения, мутаций нет (обкатка)
+#   live    — полный конвейер: спавны, будильники, автодон
+mode = "observe"
+poll_sec = 180
+port = 8090
+
+[hub]
+repo = "yurvon-screamo/uwuwu-hub"
+# токен: env GH_TOKEN
+
+[executor]
+name = "kisa"
+url = "https://opencode.uwuwu.net"
+# basic-пароль опенкода: env UWUWU_OPENCODE_PASSWORD
+
+[executor.spawn_model]
+provider = "zai-coding-plan"
+id = "glm-5.3-flash"
+
+[policy]
+cup = 7
+# пик-окно GLM: будни 06:00–10:00 UTC (минуты от полуночи UTC), off = false
+peak = { enabled = true, start_min = 360, end_min = 600 }
+
+[[project]]
+name = "uwuwu"
+board = "Задачи uwuwu"
+repo = "yurvon-screamo/uwuwu-agent"
+# мастер-чекаут проекта на исполнителе (cwd bootstrap-сессии)
+checkout = "/home/yurvon/uwuwu-agent"
+# корень env задач на исполнителе (~/agents-env)
+env_root = "/home/yurvon/agents-env"
+
+# Подключены 16.11 (доски смигрированы: fm→колонки/поля, ∅→Todo); строки
+# вне действующих стадий — конвейер не спавнит (владелец: «в работу не берём»).
+# true-washing/foilcap: каркасные GitHub-репо (основной код в Gitea —
+# см. их Деплоймент в вики).
+[[project]]
+name = "origa"
+board = "Задачи origa"
+repo = "yurvon-screamo/origa"
+checkout = "/home/yurvon/origa"
+env_root = "/home/yurvon/agents-env"
+
+[[project]]
+name = "true-washing"
+board = "Задачи true-washing"
+repo = "yurvon-screamo/true-washing"
+checkout = "/home/yurvon/true-washing"
+env_root = "/home/yurvon/agents-env"
+
+[[project]]
+name = "foilcap"
+board = "Задачи foilcap"
+repo = "yurvon-screamo/foilcap"
+checkout = "/home/yurvon/foilcap"
+env_root = "/home/yurvon/agents-env"
+
+# Мульти-экзекьютор (#1203): redmi — второй исполнитель (ноут-2, через релей).
+# 1xgames: каркасное GitHub-репо (основной код в проприетарном GitLab,
+# доступ только у redmi; агент в MR 1xGames не пишет — комменты владельца).
+[[executors]]
+name = "redmi"
+url = "http://relay.railway.internal:2336"
+
+[[project]]
+name = "1xgames"
+board = "Задачи 1xgames"
+repo = "yurvon-screamo/1xgames"
+checkout = "D:/1xgames/game-service"
+env_root = "D:/agents-env"
+executor = "redmi"
