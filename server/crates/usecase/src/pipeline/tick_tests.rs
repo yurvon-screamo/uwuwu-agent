@@ -36,7 +36,11 @@ impl TaskBoardRepo for FakeBoard {
         Ok(())
     }
     async fn row_status(&self, _b: &str, n: u64) -> UsecaseResult<Option<Status>> {
-        Ok(self.rows.iter().find(|t| t.number() == n).map(|t| t.status()))
+        Ok(self
+            .rows
+            .iter()
+            .find(|t| t.number() == n)
+            .map(|t| t.status()))
     }
     async fn set_session(&self, _b: &str, n: u64, _slot: Slot, s: &str) -> UsecaseResult<()> {
         if self.set_session_fails {
@@ -3275,10 +3279,7 @@ impl TaskBoardRepo for CloseBoard {
         Ok(())
     }
     async fn row_status(&self, board: &str, n: u64) -> UsecaseResult<Option<Status>> {
-        Ok(self
-            .board_of(board)?
-            .contains(&n)
-            .then_some(Status::Todo))
+        Ok(self.board_of(board)?.contains(&n).then_some(Status::Todo))
     }
     async fn set_session(&self, _: &str, _: u64, _: Slot, _: &str) -> UsecaseResult<()> {
         Ok(())

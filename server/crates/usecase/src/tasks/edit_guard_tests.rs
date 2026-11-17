@@ -112,10 +112,7 @@ struct NopFields;
 
 #[async_trait]
 impl IssueFieldStore for NopFields {
-    async fn load(
-        &self,
-        _: u64,
-    ) -> UsecaseResult<std::collections::HashMap<String, String>> {
+    async fn load(&self, _: u64) -> UsecaseResult<std::collections::HashMap<String, String>> {
         Ok(std::collections::HashMap::new())
     }
 

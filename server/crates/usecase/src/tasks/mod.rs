@@ -1,8 +1,8 @@
 //! Задачи: запись (write) и вьюхи (views).
 
-mod md_section;
 #[cfg(test)]
 mod edit_guard_tests;
+mod md_section;
 #[cfg(test)]
 mod md_section_tests;
 pub mod views;
