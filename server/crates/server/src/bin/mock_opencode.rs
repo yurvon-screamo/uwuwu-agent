@@ -46,6 +46,10 @@ struct MockSession {
     /// Реплай для message_tail: (created_ms, текст) — бот-контур (#1150)
     /// читает хвост как ответ сессии.
     reply: Option<(u64, String)>,
+    /// Многосообщный ход (#1209): момент промпта с маркером «turn probe».
+    /// Хвост строится фазами пробы: стрим → ловушка (шаг finish='tool-calls')
+    /// → финал (finish='stop').
+    turn_ms: Option<u64>,
 }
 
 #[derive(Default)]
@@ -324,6 +328,7 @@ async fn create_session(
         busy: false,
         dead: mode == "dead",
         reply: None,
+        turn_ms: None,
     };
     tracing::info!(event = "mock.session_created", id = %id,
         agent = %session.agent, title = %session.title, "POST /session");
@@ -436,6 +441,13 @@ async fn prompt(
     let mut sessions = store.sessions.lock().expect("store");
     if let Some(s) = sessions.get_mut(&id) {
         s.updated_ms = now_ms();
+        // Маркер turn probe (#1209): сессия отвечает многосообщным ходом —
+        // мгновенный реплай не ставится, message_tail строит фазы пробы
+        if text.contains("turn probe") {
+            s.turn_ms = Some(now_ms());
+            s.reply = None;
+            return (StatusCode::OK, Json(json!({ "data": { "id": id } })));
+        }
         // реплай бота готов сразу (storm — исключение: прерывание без ответа)
         if mode != "storm" {
             let tail = text
@@ -653,9 +665,58 @@ async fn work_like_agent(
     tracing::info!(event = "mock.agent_done", id = %session.id, "сессия завершена");
 }
 
+/// Фазы многосообщного хода (#1209, наблюдённая модель пробы): стрим
+/// (finish=None) → ловушка для старого условия (шаг finish='tool-calls',
+/// is_latest=true — зазор после тула) → финал finish='stop'. Окна —
+/// константы под поллинг раннера 2с (reply_poll_ms).
+fn turn_tail(turn_ms: u64) -> Value {
+    const STREAM_MS: u64 = 1_200;
+    const TRAP_MS: u64 = 3_500;
+    const STEP_TEXT: &str = "промежуточный шаг хода";
+    const FINAL_TEXT: &str = "turn final ok";
+    let now = now_ms();
+    let step1 = json!({
+        "type": "assistant",
+        "role": "assistant",
+        "time": { "created": turn_ms, "updated": now },
+        "content": [
+            { "type": "text", "text": STEP_TEXT },
+            { "type": "tool", "state": { "status": "completed" } },
+        ],
+    });
+    let user = json!({
+        "type": "user",
+        "time": { "created": turn_ms - 100, "updated": turn_ms - 100 },
+    });
+    if now < turn_ms + STREAM_MS {
+        // стримится: без finish — не ответ
+        let mut msg = step1.clone();
+        msg["finish"] = Value::Null;
+        return json!([msg, user]);
+    }
+    if now < turn_ms + TRAP_MS {
+        // шаг завершён, ход продолжается — ловушка finished+is_latest
+        let mut msg = step1.clone();
+        msg["finish"] = json!("tool-calls");
+        return json!([msg, user]);
+    }
+    let final_msg = json!({
+        "type": "assistant",
+        "role": "assistant",
+        "time": { "created": turn_ms + TRAP_MS, "updated": now },
+        "finish": "stop",
+        "content": [{ "type": "text", "text": FINAL_TEXT }],
+    });
+    json!([final_msg, step1, user])
+}
+
 async fn message_tail(store: Arc<Store>, id: String) -> Resp {
     let sessions = store.sessions.lock().expect("store");
     match sessions.get(&id) {
+        Some(s) if s.turn_ms.is_some() => {
+            let tail = turn_tail(s.turn_ms.expect("turn_ms checked"));
+            (StatusCode::OK, Json(tail))
+        }
         Some(s) => {
             // Форма — живой опенкод 2.3.0 (проба #1150): тип в поле `type`,
             // у ассистента finish/content[].text/time.created; time.updated

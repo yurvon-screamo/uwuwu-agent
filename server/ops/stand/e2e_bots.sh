@@ -11,12 +11,15 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."   # server/
-PORT_TG=8098; PORT_MOCK=8099; PORT_SRV=8090
+# Порты — env-перезаписываемые: параллельные стенды разных задач на одной
+# машине не дерутся (инцидент 17.11: чужой e2e занял дефолтные 8090–8099)
+PORT_TG="${E2E_PORT_TG:-8098}"; PORT_MOCK="${E2E_PORT_MOCK:-8099}"; PORT_SRV="${E2E_PORT_SRV:-8090}"
 BEARER="${UWUWU_SERVER_BEARER:-stand-e2e-bearer}"
 TOKEN="tok-e2e-probe"
-LOG_TG=/tmp/uwuwu-stand-bots-tg.log
-LOG_MOCK=/tmp/uwuwu-stand-bots-mock.log
-LOG_SRV=/tmp/uwuwu-stand-bots-server.log
+# логи per-run (суффикс порта): параллельные стенды не пишут в один файл
+LOG_TG=/tmp/uwuwu-stand-bots-$PORT_TG-tg.log
+LOG_MOCK=/tmp/uwuwu-stand-bots-$PORT_MOCK-mock.log
+LOG_SRV=/tmp/uwuwu-stand-bots-$PORT_SRV-server.log
 STATE=ops/state.json
 
 say()  { printf '\033[1;34m[e2e-bots]\033[0m %s\n' "$*"; }
@@ -27,7 +30,7 @@ fail() { printf '\033[1;31m[e2e-bots FAIL]\033[0m %s\n' "$*"; exit 1; }
 SRV_PID=""; MOCK_PID=""; TG_PID=""
 cleanup() { for pid in "$SRV_PID" "$MOCK_PID" "$TG_PID"; do
               [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-            done; }
+            done; rm -f ops/config.memory.e2e.toml; }
 trap cleanup EXIT
 
 mcp() { # MCP-вызов на локальный сервер (health-проба)
@@ -40,10 +43,18 @@ say "сборка…"
 cargo build -q --bin uwuwu-server --bin mock_opencode
 rm -f "$STATE"
 
-say "стенд: mock_tg ($PORT_TG) + mock_opencode ($PORT_MOCK)"
-python3 ops/stand/mock_tg.py >"$LOG_TG" 2>&1 &
+# конфиг стенда с executor-url прогона (дефолтный config.memory.toml не
+# трогаем; порт сервера в TOML не читается — config.rs: port() = env PORT
+# > дефолт, поэтому серверный порт задаётся env-ом при запуске ниже)
+sed -e "s|http://127.0.0.1:8099|http://127.0.0.1:$PORT_MOCK|" \
+    ops/config.memory.toml > ops/config.memory.e2e.toml
+
+say "стенд: mock_tg ($PORT_TG) + mock_opencode ($PORT_MOCK) + сервер ($PORT_SRV)"
+MOCK_TG_PORT=$PORT_TG python3 ops/stand/mock_tg.py >"$LOG_TG" 2>&1 &
 TG_PID=$!
-MOCK_MODE=plain MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=200 ./target/debug/mock_opencode >"$LOG_MOCK" 2>&1 &
+MOCK_MODE=plain MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=200 \
+  MOCK_MCP_URL="http://127.0.0.1:$PORT_SRV/mcp" \
+  ./target/debug/mock_opencode >"$LOG_MOCK" 2>&1 &
 MOCK_PID=$!
 sleep 1
 
@@ -51,7 +62,8 @@ sleep 1
 BOT_DOC='{"Projects/uwuwu/Боты/Проба-раннера": "---\ntitle: Проба раннера\nmodel: zai-coding-plan/glm-5.3-flash\ntoken_env: UWUWU_BOT_TOKEN_E2E\nowner: yurvon\nworkspace: /tmp/opencode\ngreeting: привет от стенда\n---\n\nОтвечай кратко, одной строкой."}'
 
 say "сервер (live, memory-hub, вики в памяти)"
-UWUWU_SERVER_CONFIG=$PWD/ops/config.memory.toml \
+UWUWU_SERVER_CONFIG=$PWD/ops/config.memory.e2e.toml \
+PORT=$PORT_SRV \
 UWUWU_SERVER_MODE=live \
 UWUWU_SERVER_BEARER="$BEARER" \
 UWUWU_OPENCODE_PASSWORD=mockpass \
@@ -123,7 +135,8 @@ PY
 say "рестарт сервера…"
 kill "$SRV_PID" 2>/dev/null || true
 sleep 1
-UWUWU_SERVER_CONFIG=$PWD/ops/config.memory.toml \
+UWUWU_SERVER_CONFIG=$PWD/ops/config.memory.e2e.toml \
+PORT=$PORT_SRV \
 UWUWU_SERVER_MODE=live \
 UWUWU_SERVER_BEARER="$BEARER" \
 UWUWU_OPENCODE_PASSWORD=mockpass \
@@ -143,10 +156,32 @@ CREATED_AFTER=$(grep -c '"event":"bot.session_created"' "$LOG_SRV" || true)
 [ "$CREATED_AFTER" -eq "$CREATED_BEFORE" ] || fail "после рестарта сессия пересоздана ($CREATED_BEFORE → $CREATED_AFTER)"
 say "рестарт: бот восстановлен, сессия переиспользована (созданий: $CREATED_AFTER)"
 
+# многосообщный ход (#1209): «turn probe» → фазы пробы → только финал в ТГ
+say "инжект turn probe (двухсообщный ход)…"
+curl -s -X POST "http://127.0.0.1:$PORT_TG/inject" -H 'Content-Type: application/json' \
+  -d '{"update_id":4,"chat_id":42,"username":"yurvon","text":"turn probe"}' >/dev/null
+TURN=""
+for _ in $(seq 1 20); do
+  sleep 1
+  TURN=$(curl -s "http://127.0.0.1:$PORT_TG/sent" | python3 -c "
+import json,sys
+sent=json.load(sys.stdin)['sent']
+hits=[m['text'] for m in sent if 'turn final ok' in m['text']]
+print(hits[0] if hits else '')" 2>/dev/null)
+  [ -n "$TURN" ] && break
+done
+[ -n "$TURN" ] || fail "финал turn-хода не дошёл до ТГ за 20с (лог: $LOG_SRV)"
+INTERM=$(curl -s "http://127.0.0.1:$PORT_TG/sent" | python3 -c "
+import json,sys
+sent=json.load(sys.stdin)['sent']
+print(sum(1 for m in sent if 'промежуточный шаг' in m['text']))" 2>/dev/null)
+[ "$INTERM" = "0" ] || fail "промежуточный шаг хода ушёл в ТГ ($INTERM шт) — тихая обрезка вернулась"
+say "turn-ход доставлен: только финал, промежуточный шаг не уходит"
+
 # групповое сообщение поглощается (private-only)
 say "инжект группового сообщения…"
 curl -s -X POST "http://127.0.0.1:$PORT_TG/inject" -H 'Content-Type: application/json' \
-  -d '{"update_id":3,"chat_id":-100,"chat_type":"group","username":"yurvon","text":"из группы"}' >/dev/null
+  -d '{"update_id":5,"chat_id":-100,"chat_type":"group","username":"yurvon","text":"из группы"}' >/dev/null
 sleep 5
 grep -q '"event":"bot.skipped"' "$LOG_SRV" || fail "групповое сообщение не поглощено (bot.skipped нет)"
 say "группа поглощена: private-only работает"

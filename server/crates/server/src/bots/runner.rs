@@ -182,18 +182,25 @@ async fn ensure_session(deps: &BotDeps) -> UsecaseResult<String> {
     Ok(id)
 }
 
-/// Опрос хвоста сессии: ассистентский ответ, созданный после baseline
-/// и с finish-маркером. None — потолок ожидания исчерпан.
+/// Опрос хвоста сессии: финальное сообщение завершённого хода (после
+/// baseline). None — потолок ожидания исчерпан.
 async fn wait_reply(deps: &BotDeps, session: &str, baseline_ms: u64) -> Option<String> {
     let deadline = Instant::now() + Duration::from_millis(deps.reply_cap_ms);
     loop {
         tokio::time::sleep(Duration::from_millis(deps.reply_poll_ms)).await;
         if let Ok(Some(r)) = deps.sessions.last_assistant_reply(session).await {
-            // промежуточные tool-call сообщения finished-без-текста НЕ
-            // считаем ответом (помощник зовёт uwuwu_task_create до
-            // финального текста — инцидент 16.11: мгновенный фоллбек
-            // «Не успел ответить» за минуту); ждём текстовое сообщение
-            if r.created_ms > baseline_ms && r.finished && !r.text.trim().is_empty() {
+            // Ход завершён = свежее содержательное сообщение ассистента с
+            // finish-маркером НЕ 'tool-calls' (и не None — ещё стримится).
+            // Промежуточный шаг хода несёт 'tool-calls' и с is_latest=true
+            // наблюдается поллингом в зазоре «тул исполнен — следующий
+            // шаг ещё не создан» (живая проба #1209, opencode 2.3.0:
+            // finish ставится после тула, зазор 0.8–1.5с при полле 2с —
+            // ~40% на шаг); finished-без-текста покрывается проверкой
+            // текста (инцидент 16.11: фоллбек за минуту).
+            if r.created_ms > baseline_ms
+                && matches!(r.finish.as_deref(), Some(f) if f != "tool-calls")
+                && !r.text.trim().is_empty()
+            {
                 return Some(r.text);
             }
         }
