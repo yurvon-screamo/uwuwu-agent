@@ -64,6 +64,4 @@ tools/*.npz
 /target/
 /wt/
 
-# uwuwu-server: локальный конфиг (пример — server/config.example.toml)
-server/config.toml
 server/target/

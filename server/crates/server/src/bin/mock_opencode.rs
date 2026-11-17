@@ -18,7 +18,7 @@
 //! Запуск рядом с локальным uwuwu-server (executor.url = http://127.0.0.1:8099).
 
 use axum::{
-    extract::Path,
+    extract::{Path, Query},
     http::{HeaderMap, StatusCode},
     routing::{delete, get, post},
     Json, Router,
@@ -34,6 +34,8 @@ struct MockSession {
     id: String,
     agent: String,
     title: String,
+    /// Директория сессии (location из create) — гард спавна (#1163).
+    directory: String,
     updated_ms: u64,
     outcome: String,
     tokens_in: u64,
@@ -44,6 +46,10 @@ struct MockSession {
     /// Реплай для message_tail: (created_ms, текст) — бот-контур (#1150)
     /// читает хвост как ответ сессии.
     reply: Option<(u64, String)>,
+    /// Многосообщный ход (#1209): момент промпта с маркером «turn probe».
+    /// Хвост строится фазами пробы: стрим → ловушка (шаг finish='tool-calls')
+    /// → финал (finish='stop').
+    turn_ms: Option<u64>,
 }
 
 #[derive(Default)]
@@ -203,6 +209,13 @@ async fn main() {
     tracing::info!(event = "mock.started", %mode, port, mcp_url = %mcp_url,
         verdicts_left, "mock-opencode up");
     let counter = Arc::new(AtomicU64::new(1));
+    // случайный префикс id: инстансы на стенде не должны делить id-пространство
+    // (second source #1163 матчит сессии по id в union-скане — коллизия
+    // детерминированных id двух моков ложноположительно «знает» чужую сессию)
+    let id_salt = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
 
     let app = Router::new()
         .route(
@@ -210,12 +223,14 @@ async fn main() {
             post({
                 let store = store.clone();
                 let counter = counter.clone();
+                let salt = id_salt;
                 let mode = mode.clone();
                 move |headers: HeaderMap, Json(body): Json<Value>| {
                     let store = store.clone();
                     let counter = counter.clone();
+                    let salt = salt;
                     let mode = mode.clone();
-                    async move { create_session(store, counter, mode, headers, body).await }
+                    async move { create_session(store, counter, salt, mode, headers, body).await }
                 }
             }),
         )
@@ -223,7 +238,7 @@ async fn main() {
             "/api/session",
             get({
                 let store = store.clone();
-                move || list_sessions(store)
+                move |q: Query<ListQuery>| list_sessions(store, q)
             }),
         )
         .route(
@@ -291,16 +306,21 @@ type Resp = (StatusCode, Json<Value>);
 async fn create_session(
     store: Arc<Store>,
     counter: Arc<AtomicU64>,
+    salt: u32,
     mode: String,
     _headers: HeaderMap,
     body: Value,
 ) -> Resp {
     let n = counter.fetch_add(1, Ordering::SeqCst);
-    let id = format!("ses_mock{n:04}");
+    let id = format!("ses_mock{n:04}{salt:08x}");
     let session = MockSession {
         id: id.clone(),
         agent: body["agent"].as_str().unwrap_or_default().to_string(),
         title: body["title"].as_str().unwrap_or_default().to_string(),
+        directory: body["location"]["directory"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
         updated_ms: now_ms(),
         outcome: String::new(),
         tokens_in: 0,
@@ -308,6 +328,7 @@ async fn create_session(
         busy: false,
         dead: mode == "dead",
         reply: None,
+        turn_ms: None,
     };
     tracing::info!(event = "mock.session_created", id = %id,
         agent = %session.agent, title = %session.title, "POST /session");
@@ -319,10 +340,58 @@ async fn create_session(
     (StatusCode::OK, Json(json!({ "data": { "id": id } })))
 }
 
-async fn list_sessions(store: Arc<Store>) -> Resp {
+#[derive(serde::Deserialize)]
+struct ListQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+async fn list_sessions(store: Arc<Store>, q: Query<ListQuery>) -> Resp {
     let sessions = store.sessions.lock().expect("store");
-    let list: Vec<Value> = sessions.values().map(session_json).collect();
-    (StatusCode::OK, Json(Value::Array(list)))
+    // мёртвые вне списка: list и GET согласованы (сессии, которых serve
+    // не знает, 404-ят и в list не попадают) — контракт second source #1163
+    let mut list: Vec<Value> = sessions
+        .values()
+        .filter(|s| !s.dead)
+        .map(session_json)
+        .collect();
+    list.sort_by(|a, b| {
+        a["id"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["id"].as_str().unwrap_or_default())
+    });
+    let page = std::env::var("MOCK_PAGE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0);
+    let Some(page_size) = page else {
+        return (StatusCode::OK, Json(Value::Array(list)));
+    };
+    // пагинация newest-first не моделируем — стабильный порядок по id:
+    // контракт для сервера тот же (страница + cursor.next), iteration
+    // по курсору e2e-фазой 4 (MOCK_PAGE_LIMIT=1)
+    let offset = q
+        .cursor
+        .as_deref()
+        .and_then(|c| c.strip_prefix("p"))
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or(0);
+    let chunk: Vec<Value> = list
+        .iter()
+        .skip(offset)
+        .take(q.limit.unwrap_or(page_size).min(page_size))
+        .cloned()
+        .collect();
+    let next = if offset + chunk.len() < list.len() {
+        format!("p{}", offset + chunk.len())
+    } else {
+        String::new()
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "data": chunk, "cursor": { "next": next } })),
+    )
 }
 
 fn session_json(s: &MockSession) -> Value {
@@ -330,6 +399,7 @@ fn session_json(s: &MockSession) -> Value {
         "id": s.id,
         "agent": if s.agent.is_empty() { Value::Null } else { json!(s.agent) },
         "title": s.title,
+        "location": { "directory": s.directory },
         "time": { "created": s.updated_ms, "updated": s.updated_ms },
         "outcome": if s.outcome.is_empty() { Value::Null } else { json!(s.outcome) },
         "tokens": { "input": s.tokens_in, "output": s.tokens_out },
@@ -371,6 +441,13 @@ async fn prompt(
     let mut sessions = store.sessions.lock().expect("store");
     if let Some(s) = sessions.get_mut(&id) {
         s.updated_ms = now_ms();
+        // Маркер turn probe (#1209): сессия отвечает многосообщным ходом —
+        // мгновенный реплай не ставится, message_tail строит фазы пробы
+        if text.contains("turn probe") {
+            s.turn_ms = Some(now_ms());
+            s.reply = None;
+            return (StatusCode::OK, Json(json!({ "data": { "id": id } })));
+        }
         // реплай бота готов сразу (storm — исключение: прерывание без ответа)
         if mode != "storm" {
             let tail = text
@@ -588,9 +665,58 @@ async fn work_like_agent(
     tracing::info!(event = "mock.agent_done", id = %session.id, "сессия завершена");
 }
 
+/// Фазы многосообщного хода (#1209, наблюдённая модель пробы): стрим
+/// (finish=None) → ловушка для старого условия (шаг finish='tool-calls',
+/// is_latest=true — зазор после тула) → финал finish='stop'. Окна —
+/// константы под поллинг раннера 2с (reply_poll_ms).
+fn turn_tail(turn_ms: u64) -> Value {
+    const STREAM_MS: u64 = 1_200;
+    const TRAP_MS: u64 = 3_500;
+    const STEP_TEXT: &str = "промежуточный шаг хода";
+    const FINAL_TEXT: &str = "turn final ok";
+    let now = now_ms();
+    let step1 = json!({
+        "type": "assistant",
+        "role": "assistant",
+        "time": { "created": turn_ms, "updated": now },
+        "content": [
+            { "type": "text", "text": STEP_TEXT },
+            { "type": "tool", "state": { "status": "completed" } },
+        ],
+    });
+    let user = json!({
+        "type": "user",
+        "time": { "created": turn_ms - 100, "updated": turn_ms - 100 },
+    });
+    if now < turn_ms + STREAM_MS {
+        // стримится: без finish — не ответ
+        let mut msg = step1.clone();
+        msg["finish"] = Value::Null;
+        return json!([msg, user]);
+    }
+    if now < turn_ms + TRAP_MS {
+        // шаг завершён, ход продолжается — ловушка finished+is_latest
+        let mut msg = step1.clone();
+        msg["finish"] = json!("tool-calls");
+        return json!([msg, user]);
+    }
+    let final_msg = json!({
+        "type": "assistant",
+        "role": "assistant",
+        "time": { "created": turn_ms + TRAP_MS, "updated": now },
+        "finish": "stop",
+        "content": [{ "type": "text", "text": FINAL_TEXT }],
+    });
+    json!([final_msg, step1, user])
+}
+
 async fn message_tail(store: Arc<Store>, id: String) -> Resp {
     let sessions = store.sessions.lock().expect("store");
     match sessions.get(&id) {
+        Some(s) if s.turn_ms.is_some() => {
+            let tail = turn_tail(s.turn_ms.expect("turn_ms checked"));
+            (StatusCode::OK, Json(tail))
+        }
         Some(s) => {
             // Форма — живой опенкод 2.3.0 (проба #1150): тип в поле `type`,
             // у ассистента finish/content[].text/time.created; time.updated

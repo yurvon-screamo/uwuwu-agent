@@ -9,9 +9,11 @@ use crate::mockhub::MemoryHub;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use uwuwu_domain::{Slot, Status};
 use uwuwu_usecase::{
     AgentSessionGateway, DocsView, IssueFieldStore, Liveness, PersonView, SearchUseCase,
-    SessionInfo, SessionSpec, TaskBoardRepo, TaskView, TaskWriteUseCase, UsecaseResult, WikiRepo,
+    SessionInfo, SessionSpec, TaskBoardRepo, TaskView, TaskWriteUseCase, TickStateStore,
+    UsecaseResult, WikiRepo,
 };
 
 struct StubWiki;
@@ -71,6 +73,69 @@ impl AgentSessionGateway for StubSessions {
     }
 }
 
+/// No-op TickStateStore: писателю нужен факт вызова mark_own_comment,
+/// состояние в пробе диспетчера не проверяется.
+struct StubState;
+
+impl TickStateStore for StubState {
+    fn last_comment_id(&self, _: &str, _: u64) -> Option<String> {
+        None
+    }
+    fn last_seen_status(&self, _: &str, _: u64) -> Option<Status> {
+        None
+    }
+    fn set_last_seen_status(&self, _: &str, _: u64, _: Status) {}
+    fn set_last_comment_id(&self, _: &str, _: u64, _: &str) {}
+    fn dreamer_done(&self, _: &str) -> bool {
+        false
+    }
+    fn mark_dreamer_done(&self, _: &str) {}
+    fn dreamer_day_spawns(&self, _: &str) -> u32 {
+        0
+    }
+    fn mark_dreamer_spawn(&self, _: &str) {}
+    fn last_spawn_ms(&self, _: &str, _: u64, _: Slot) -> Option<u64> {
+        None
+    }
+    fn mark_spawn(&self, _: &str, _: u64, _: Slot, _: u64) {}
+    fn clear_spawn_ms(&self, _: &str, _: u64, _: Slot) {}
+    fn last_analys_ms(&self, _: &str, _: u64) -> Option<u64> {
+        None
+    }
+    fn mark_analys_spawn(&self, _: &str, _: u64, _: u64) {}
+    fn last_analys_review_ms(&self, _: &str, _: u64) -> Option<u64> {
+        None
+    }
+    fn mark_analys_review_spawn(&self, _: &str, _: u64, _: u64) {}
+    fn analys_loop(&self, _: &str, _: u64) -> Option<(Status, u32)> {
+        None
+    }
+    fn set_analys_loop(&self, _: &str, _: u64, _: Status, _: u32) {}
+    fn clear_analys_loop(&self, _: &str, _: u64) {}
+    fn analys_review_loop(&self, _: &str, _: u64) -> Option<(Status, u32)> {
+        None
+    }
+    fn set_analys_review_loop(&self, _: &str, _: u64, _: Status, _: u32) {}
+    fn clear_analys_review_loop(&self, _: &str, _: u64) {}
+    fn prune_analys_guards(&self, _: &std::collections::HashSet<String>) {}
+    fn stall_ping(&self, _: &str, _: u64) -> Option<(Status, u64, u32)> {
+        None
+    }
+    fn mark_stall_ping(&self, _: &str, _: u64, _: Status, _: u64) {}
+    fn spawn_loop(&self, _: &str, _: u64, _: Slot) -> Option<(Status, u32)> {
+        None
+    }
+    fn set_spawn_loop(&self, _: &str, _: u64, _: Slot, _: Status, _: u32) {}
+    fn reset_stale_spawn_loops(&self, _: &str, _: u64, _: Status) {}
+    fn own_comment(&self, _: &str) -> bool {
+        false
+    }
+    fn mark_own_comment(&self, _: &str, _: u64) {}
+    fn save(&self) -> UsecaseResult<()> {
+        Ok(())
+    }
+}
+
 /// Фикстура поверхности: ToolHub целиком на MemoryHub + стабах вики/сессий.
 /// Возвращает тот же hub, что сидит в писателе — тело читается напрямую.
 fn hub() -> (Arc<ToolHub>, Arc<MemoryHub>) {
@@ -90,6 +155,8 @@ fn hub() -> (Arc<ToolHub>, Arc<MemoryHub>) {
             board: board.clone(),
             fields,
             boards,
+            clock: Arc::new(SystemClock),
+            state: Arc::new(StubState),
         }),
         wiki,
         sessions,
@@ -557,6 +624,8 @@ async fn fast_track_from_draft_and_todo() {
             board: board.clone(),
             fields,
             boards,
+            clock: Arc::new(SystemClock),
+            state: Arc::new(StubState),
         }),
         wiki,
         sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(sessions)),
@@ -590,4 +659,35 @@ async fn fast_track_from_draft_and_todo() {
     )
     .await
     .expect("fast-track Todo → In Progress");
+}
+
+/// #1166: фабрика записала Branch при спавне — `task edit --pr` без
+/// сопутствующего `--branch` остаётся видимым на карточке (рид гейтится
+/// веткой; инцидент #1152 — «pr: —» при живом URL).
+#[tokio::test]
+async fn task_get_renders_pr_after_factory_branch_without_manual_branch_edit() {
+    let (tools, memory) = hub();
+    let (number, _) = create_task(&tools, "t: branch at spawn", "## Постановка\n\nx.\n").await;
+
+    // Фабрика: task-env создал env → Branch-ячейка от имени ветки ворктри.
+    let branch = uwuwu_domain::BranchName::parse("work/task-8").unwrap();
+    memory
+        .set_branch("Задачи uwuwu", number, &branch)
+        .await
+        .expect("set_branch");
+
+    // Агент финализирует PR одной командой без --branch.
+    call(
+        &tools,
+        "task_edit",
+        json!({ "number": number, "pr": "https://github.com/o/r/pull/9" }),
+    )
+    .await
+    .expect("pr edit");
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    assert!(card.contains("branch: work/task-8"), "{card}");
+    assert!(card.contains("pr: https://github.com/o/r/pull/9"), "{card}");
 }
