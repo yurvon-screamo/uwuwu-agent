@@ -658,7 +658,7 @@ fn wake_usecase(
     });
     let u = TickUseCase {
         board,
-        sessions: sessions.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
