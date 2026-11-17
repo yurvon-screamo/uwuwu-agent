@@ -199,27 +199,53 @@ impl TaskWriter for TaskWriteUseCase {
                 "проект «{project}» вне конфига"
             )));
         }
-        let need_rows = patch.status.is_some() || patch.title.is_some();
+        let need_rows = patch.title.is_some();
         let rows = if need_rows {
             self.board.read_board(&board).await?
         } else {
             Vec::new()
         };
         if let Some(status) = patch.status {
-            // канон переходов — домен: запрещённое ребро = громкая ошибка
-            let current = rows
-                .iter()
-                .find(|t| t.number() == number)
-                .map(|t| t.status())
-                .ok_or_else(|| {
-                    UsecaseError::Board(format!("строка #{number} не на доске «{board}»"))
-                })?;
+            // канон переходов — домен: запрещённое ребро = громкая ошибка.
+            // current — свежий статус носителя, не снапшот доски: стэйл-
+            // снапшот пропускал нелегальную перезапись как легальную,
+            // строка уезжала в Analys посреди конвейера (#1235)
+            let current = match self.board.row_status(&board, number).await? {
+                None => {
+                    return Err(UsecaseError::Board(format!(
+                        "строка #{number} не на доске «{board}» \
+                         (статус на носителе отсутствует)"
+                    )))
+                }
+                Some(Status::Empty) => {
+                    return Err(UsecaseError::Board(format!(
+                        "статус носителя #{number} не читается — запись без \
+                         верифицированного current запрещена (класс разбираемого \
+                         бага #1235), разбор владельца"
+                    )))
+                }
+                Some(current) => current,
+            };
             if !uwuwu_domain::Status::can_transition(current, status) {
+                tracing::warn!(
+                    event = "board.guard_rejected",
+                    number,
+                    from = %naming::status_name(current),
+                    to = %naming::status_name(status),
+                    "Гард канона: переход запрещён (fresh row_status)"
+                );
                 return Err(UsecaseError::Board(format!(
                     "переход {:?} → {:?} вне канона конвейера",
                     current, status
                 )));
             }
+            tracing::info!(
+                event = "board.status_transition",
+                number,
+                from = %naming::status_name(current),
+                to = %naming::status_name(status),
+                "Гард канона пропустил переход"
+            );
             self.board.set_status(&board, number, status).await?;
         }
         if let Some(title) = &patch.title {
