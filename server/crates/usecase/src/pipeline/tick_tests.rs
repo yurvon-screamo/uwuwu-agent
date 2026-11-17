@@ -34,6 +34,18 @@ impl TaskBoardRepo for FakeBoard {
         self.log.lock().unwrap().push(format!("session#{n}={s}"));
         Ok(())
     }
+    async fn set_branch(
+        &self,
+        _b: &str,
+        n: u64,
+        branch: &uwuwu_domain::BranchName,
+    ) -> UsecaseResult<()> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("branch#{n}={}", branch.as_str()));
+        Ok(())
+    }
     async fn clear_session(&self, _b: &str, n: u64, slot: Slot) -> UsecaseResult<()> {
         self.log
             .lock()
@@ -644,6 +656,27 @@ async fn live_spawns_and_claims_session() {
         .unwrap()
         .iter()
         .any(|l| l.starts_with("session#1")));
+}
+
+#[tokio::test]
+async fn live_spawn_writes_branch_cell_from_worktree_name() {
+    // #1166: фабрика пишет Branch при спавне — PR-финализация без ручного
+    // `--branch` перестаёт рендериться «—» (рид гейтится веткой).
+    let (u, board, _sessions, _) = usecase(vec![task(7, Status::InProgress)], PrState::Missing);
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.spawns_done, 1);
+    let log = board.log.lock().unwrap().clone();
+    let branch = log
+        .iter()
+        .find(|l| l.starts_with("branch#7="))
+        .expect("Branch-ячейка записана фабрикой");
+    assert_eq!(branch, "branch#7=work/task-7", "имя ветки ворктри task-env");
+    let branch_pos = log.iter().position(|l| l.starts_with("branch#")).unwrap();
+    let session_pos = log.iter().position(|l| l.starts_with("session#")).unwrap();
+    assert!(
+        branch_pos < session_pos,
+        "ячейка пишется до привязки сессии (env уже готов)"
+    );
 }
 
 #[tokio::test]
@@ -2255,6 +2288,9 @@ impl TaskBoardRepo for FakeMultiBoard {
     async fn set_session(&self, _b: &str, _n: u64, _s: Slot, _sess: &str) -> UsecaseResult<()> {
         Ok(())
     }
+    async fn set_branch(&self, _: &str, _: u64, _: &uwuwu_domain::BranchName) -> UsecaseResult<()> {
+        Ok(())
+    }
     async fn clear_session(&self, _b: &str, _n: u64, _s: Slot) -> UsecaseResult<()> {
         Ok(())
     }
@@ -2647,6 +2683,9 @@ impl TaskBoardRepo for CloseBoard {
         Ok(())
     }
     async fn set_session(&self, _: &str, _: u64, _: Slot, _: &str) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn set_branch(&self, _: &str, _: u64, _: &uwuwu_domain::BranchName) -> UsecaseResult<()> {
         Ok(())
     }
     async fn clear_session(&self, _: &str, _: u64, _: Slot) -> UsecaseResult<()> {

@@ -512,7 +512,7 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
     // VCS-жизненный цикл явный; PR без ветки — кривые данные носителя,
     // отбрасываем (домен PullRequest требует ветку)
     let vcs = match (
-        raw.get("Branch")
+        raw.get(crate::github::fields::F_BRANCH)
             .and_then(|s| uwuwu_domain::BranchName::parse(s)),
         raw.get("PR").and_then(|s| uwuwu_domain::PrUrl::parse(s)),
     ) {
@@ -582,6 +582,23 @@ impl TaskBoardRepo for GitHubHub {
         };
         self.fields
             .store(number, &[(name, Some(session.to_string()))])
+            .await
+    }
+
+    async fn set_branch(
+        &self,
+        _board: &str,
+        number: u64,
+        branch: &uwuwu_domain::BranchName,
+    ) -> UsecaseResult<()> {
+        self.fields
+            .store(
+                number,
+                &[(
+                    crate::github::fields::F_BRANCH,
+                    Some(branch.as_str().to_string()),
+                )],
+            )
             .await
     }
 

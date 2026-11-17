@@ -1,7 +1,7 @@
 //! Действия тика: спавн стадии (bootstrap /command → сессия в env),
 //! wakeup по свежим комментам, автодон (проба PR → мерж/Done/bounce).
 
-use crate::error::UsecaseResult;
+use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
 use crate::pipeline::tick::{BoardPlan, TickUseCase};
 use crate::ports::{CommentRef, Liveness, SessionSpec};
@@ -67,6 +67,21 @@ impl TickUseCase {
     ) -> UsecaseResult<String> {
         sessions
             .run_command(bootstrap, "task-env", &task.number().to_string())
+            .await?;
+        // Фабрика пишет Branch-ячейку: env готов, ветка work/task-N
+        // существует (ADR-041 «ячейки доски пишет фабрика»); без неё PR
+        // финализации невидим на карточке (инцидент #1152). Сбой записи =
+        // сбой спавна: bootstrap гасится, ретрай следующим тиком (без
+        // LLM-бюджета — bootstrap мимо кассы, рабочая сессия не создана).
+        let branch = uwuwu_domain::BranchName::parse(&format!("work/task-{}", task.number()))
+            .ok_or_else(|| {
+                UsecaseError::Board(format!(
+                    "ветка work/task-{} не проходит BranchName::parse",
+                    task.number()
+                ))
+            })?;
+        self.board
+            .set_branch(&board.board, task.number(), &branch)
             .await?;
         let work = sessions
             .create_session(&SessionSpec {

@@ -591,3 +591,34 @@ async fn fast_track_from_draft_and_todo() {
     .await
     .expect("fast-track Todo → In Progress");
 }
+
+/// #1166: фабрика записала Branch при спавне — `task edit --pr` без
+/// сопутствующего `--branch` остаётся видимым на карточке (рид гейтится
+/// веткой; инцидент #1152 — «pr: —» при живом URL).
+#[tokio::test]
+async fn task_get_renders_pr_after_factory_branch_without_manual_branch_edit() {
+    let (tools, memory) = hub();
+    let (number, _) = create_task(&tools, "t: branch at spawn", "## Постановка\n\nx.\n").await;
+
+    // Фабрика: task-env создал env → Branch-ячейка от имени ветки ворктри.
+    let branch = uwuwu_domain::BranchName::parse("work/task-8").unwrap();
+    memory
+        .set_branch("Задачи uwuwu", number, &branch)
+        .await
+        .expect("set_branch");
+
+    // Агент финализирует PR одной командой без --branch.
+    call(
+        &tools,
+        "task_edit",
+        json!({ "number": number, "pr": "https://github.com/o/r/pull/9" }),
+    )
+    .await
+    .expect("pr edit");
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    assert!(card.contains("branch: work/task-8"), "{card}");
+    assert!(card.contains("pr: https://github.com/o/r/pull/9"), "{card}");
+}
