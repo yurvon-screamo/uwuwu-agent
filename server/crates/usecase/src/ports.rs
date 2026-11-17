@@ -16,6 +16,11 @@ pub type FmMutator =
 pub trait TaskBoardRepo: Send + Sync {
     async fn read_board(&self, board: &str) -> UsecaseResult<Vec<Task>>;
     async fn set_status(&self, board: &str, number: u64, status: Status) -> UsecaseResult<()>;
+    /// Свежий статус строки с носителя, мимо кэшей доски — гард канона
+    /// edit() обязан сверяться с носителем, не со снапшотом (#1235).
+    /// None — Status-значения на носителе нет (строки нет на доске /
+    /// поле не задано); Some(Empty) — значение носителя непарсящееся.
+    async fn row_status(&self, board: &str, number: u64) -> UsecaseResult<Option<Status>>;
     /// Заявка сессии в слот (claim/спавн-привязка).
     async fn set_session(
         &self,
@@ -191,7 +196,7 @@ pub struct SessionInfo {
     pub busy: bool,
 }
 
-/// Состояние PR проекта: источник вердиктов автодона.
+/// Состояние PR проекта: источник вердиктов автомержа.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrState {
     /// PR не найден ни по ячейке, ни по ветке.

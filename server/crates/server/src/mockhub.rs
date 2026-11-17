@@ -186,6 +186,20 @@ impl TaskBoardRepo for MemoryHub {
         })
     }
 
+    async fn row_status(&self, board: &str, number: u64) -> UsecaseResult<Option<Status>> {
+        self.with_state(|state| {
+            self.ensure_seed(state);
+            Ok(state
+                .tasks
+                .get(&number)
+                .filter(|t| match state.board_tags.get(&t.number()) {
+                    Some(tag) => tag == board,
+                    None => true,
+                })
+                .map(|t| t.status()))
+        })
+    }
+
     async fn set_session(
         &self,
         _board: &str,
@@ -455,5 +469,62 @@ impl IssueFieldStore for MemoryHub {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Пины порта на MemoryHub (#1235): досочный фильтр row_status и
+    //! свежесть носителя после записи. Гард канона edit() сверяется с
+    //! row_status — семантика носителя (борд-уважение, read-your-writes)
+    //! не должна ползти.
+
+    use super::*;
+
+    #[tokio::test]
+    async fn row_status_respects_board_tag() {
+        let hub = MemoryHub::with_seeds(vec![SeedRow {
+            board: Some("Задачи uwuwu".into()),
+            number: 11,
+            status: Status::Analys,
+        }]);
+        let own = hub
+            .row_status("Задачи uwuwu", 11)
+            .await
+            .expect("чтение своей доски");
+        assert_eq!(own, Some(Status::Analys));
+        // номер на чужой доске — None («строка не на доске»), а не статус
+        // чужой доски: код-ревью #1235 Low-1, носители борд-уважающие
+        let foreign = hub
+            .row_status("Задачи origa", 11)
+            .await
+            .expect("чтение чужой доски");
+        assert_eq!(foreign, None, "строка другой доски — None");
+        // без тега — видна на любой доске стенда
+        let hub_free = MemoryHub::with_seed(Some((7, Status::InProgress)));
+        let any = hub_free
+            .row_status("какая-то доска", 7)
+            .await
+            .expect("чтение без тега");
+        assert_eq!(any, Some(Status::InProgress));
+    }
+
+    #[tokio::test]
+    async fn set_status_is_visible_to_row_status_immediately() {
+        // read-your-writes на носителе: запись статусного пути видна
+        // свежему чтению без окна стэйла (#1235). Порядок — как в edit():
+        // гард читает row_status ДО set_status (заодно материализует сид).
+        let hub = MemoryHub::with_seed(Some((7, Status::Analys)));
+        let current = hub.row_status("B", 7).await.expect("чтение до записи");
+        assert_eq!(current, Some(Status::Analys));
+        hub.set_status("B", 7, Status::ReviewAnalys)
+            .await
+            .expect("легальное ребро Analys → Review Analys");
+        let fresh = hub.row_status("B", 7).await.expect("чтение после записи");
+        assert_eq!(
+            fresh,
+            Some(Status::ReviewAnalys),
+            "свежая запись видна сразу"
+        );
     }
 }

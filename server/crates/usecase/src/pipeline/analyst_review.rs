@@ -127,7 +127,7 @@ impl AnalystReviewUseCase {
             // сбой гейтвея не тратит попытку ревью и не заряжает кулдаун.
             let spec = SessionSpec {
                 directory: tb.checkout.clone(),
-                title: "ревью аналитики".into(),
+                title: format!("{} ревью аналитики", Agent::AnalystReviewer.emoji()),
                 agent: AgentSlot::Role(Agent::AnalystReviewer),
                 custom_agent: None,
                 model: None,

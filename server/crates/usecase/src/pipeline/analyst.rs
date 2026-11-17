@@ -187,7 +187,7 @@ impl AnalystUseCase {
             // сбой гейтвея не сжигает круг волны и не заряжает кулдаун.
             let spec = SessionSpec {
                 directory: tb.checkout.clone(),
-                title: "аналитика волны".into(),
+                title: format!("{} аналитика волны", Agent::Analyst.emoji()),
                 agent: AgentSlot::Role(Agent::Analyst),
                 custom_agent: None,
                 model: None,

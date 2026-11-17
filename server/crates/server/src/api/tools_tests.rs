@@ -663,6 +663,91 @@ async fn fast_track_from_draft_and_todo() {
     .expect("fast-track Todo → In Progress");
 }
 
+// ===== Автомерж #1232: MCP-поверхность (schema, legacy-ключ, edit-патч) =====
+
+#[test]
+fn descriptors_expose_automerge() {
+    let list = tool_descriptors();
+    let find = |name: &str| {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("{name} на поверхности"))["inputSchema"]["properties"]
+            .clone()
+    };
+    let create = find("task_create");
+    assert!(
+        create.get("automerge").is_some(),
+        "create рекламит automerge: {create:?}"
+    );
+    assert!(
+        create.get("autodone").is_none(),
+        "legacy-ключ не рекламится (но читается)"
+    );
+    let edit = find("task_edit");
+    assert!(
+        edit.get("automerge").is_some(),
+        "edit рекламит automerge (до-пометка старых строк): {edit:?}"
+    );
+}
+
+/// Legacy-ключ `autodone` читается как automerge (back-compat MCP-клиентов
+/// 14.11); выключенный automerge создаёт строку без ошибок.
+#[tokio::test]
+async fn task_create_accepts_automerge_and_legacy_key() {
+    let (tools, _memory) = hub();
+    call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "auto on (новый ключ)", "body": "б", "automerge": true }),
+    )
+    .await
+    .expect("новый ключ accepted");
+    call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "auto on (legacy ключ)", "body": "б", "autodone": true }),
+    )
+    .await
+    .expect("legacy autodone читается как automerge");
+    call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "auto off", "body": "б", "automerge": false }),
+    )
+    .await
+    .expect("выключенный automerge accepted");
+}
+
+/// task_edit с одним automerge — непустой патч: до фикса edit не нёс
+/// automerge и патч падал «пустой патч» (инструмент до-пометки старых строк).
+#[tokio::test]
+async fn task_edit_automerge_patch_is_not_empty_at_surface() {
+    let (tools, _memory) = hub();
+    let created = call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "под automerge-патч", "body": "б" }),
+    )
+    .await
+    .expect("create ок");
+    let n: u64 = created
+        .trim()
+        .split('#')
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .and_then(|s| s.parse().ok())
+        .expect("номер в ответе");
+    call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": n, "automerge": true }),
+    )
+    .await
+    .expect("automerge-only патч не «пустой»");
+}
+
 /// #1166: фабрика записала Branch при спавне — `task edit --pr` без
 /// сопутствующего `--branch` остаётся видимым на карточке (рид гейтится
 /// веткой; инцидент #1152 — «pr: —» при живом URL).

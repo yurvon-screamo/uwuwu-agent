@@ -84,7 +84,11 @@ impl DreamerUseCase {
         };
         let spec = SessionSpec {
             directory: self.checkout.clone(),
-            title: format!("дример {}", &target.id[..12.min(target.id.len())]),
+            title: format!(
+                "{} дример {}",
+                Agent::Dreamer.emoji(),
+                &target.id[..12.min(target.id.len())]
+            ),
             custom_agent: None,
             agent: AgentSlot::Role(Agent::Dreamer),
             model: self.spawn_model.clone(),

@@ -74,7 +74,7 @@ pub fn tool_descriptors() -> Value {
                 "body": string("markdown-тело (Постановка…)"),
                 "type": string("bug|spike|analys|docs|other|feature|refactoring|legacy|idea|qa|infrastructure"),
                 "priority": string("high|medium|low; дефолт medium"),
-                "autodone": json!({"type":"boolean","description":"автодон: мерж PR на Review; дефолт true"})
+                "automerge": json!({"type":"boolean","description":"автомерж: мерж PR при входе в Review, строка остаётся в Review; дефолт true"})
             }))
         ),
         tool(
@@ -87,7 +87,8 @@ pub fn tool_descriptors() -> Value {
                 "branch": string("имя ветки"),
                 "pr": string("URL PR"),
                 "priority": string("high|medium|low"),
-                "title": string("новый тайтл")
+                "title": string("новый тайтл"),
+                "automerge": json!({"type":"boolean","description":"автомерж on/off (до-пометка старых строк)"})
             }))
         ),
         tool(
@@ -246,13 +247,13 @@ impl ToolHub {
         let number = need_number(args)?;
         let view = self.tasks.card(project, number).await.map_err(view_err)?;
         let mut out = format!(
-            "#{} {} — {}\n\n--- fm ---\nbranch: {}\npr: {}\nautodone: {}\nbody_hash: {}\n\n",
+            "#{} {} — {}\n\n--- fm ---\nbranch: {}\npr: {}\nautomerge: {}\nbody_hash: {}\n\n",
             view.task.number(),
             view.task.title(),
             uwuwu_usecase::status_name(view.task.status()),
             view.task.branch().map(|b| b.as_str()).unwrap_or("—"),
             view.task.pr().map(|u| u.as_str()).unwrap_or("—"),
-            view.task.autodone(),
+            view.task.automerge(),
             uwuwu_usecase::body_hash(&view.body),
         );
         out.push_str(&view.body);
@@ -391,10 +392,10 @@ impl ToolHub {
             body_md: arg_str(args, "body"),
             kind: uwuwu_usecase::parse_task_type(&raw_kind),
             priority: arg_str(args, "priority"),
-            autodone: args
-                .get("autodone")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true),
+            automerge: match args.get("automerge").or_else(|| args.get("autodone")) {
+                Some(v) => v.as_bool().unwrap_or(true),
+                None => true,
+            },
         };
         let n = self
             .writer
@@ -414,6 +415,7 @@ impl ToolHub {
             pr: str_arg(args, "pr"),
             priority: str_arg(args, "priority"),
             title: str_arg(args, "title"),
+            automerge: args.get("automerge").and_then(|v| v.as_bool()),
         };
         if patch.is_empty() {
             return Err("пустой патч: укажи хотя бы одно поле".into());
