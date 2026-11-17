@@ -124,13 +124,10 @@ UWUWU_SERVER_CONFIG=$PWD/ops/config.memory-multi.toml UWUWU_SERVER_MODE=live \
   UWUWU_MOCK_SEED="Задачи uwuwu:$SEED_N:Design;Задачи 1xgames-mock:2047:Design" \
   RUST_LOG=info ./target/debug/uwuwu-server >"$LOG_SRV_MULTI" 2>&1 &
 sleep 25   # 2+ тика: оба проекта спавнятся каждый на своём исполнителе
-sessions_of() { curl -s --max-time 5 "http://127.0.0.1:$1/api/session" 2>/dev/null | \
-  python3 -c "
-import json,sys
-d = json.load(sys.stdin)
-rows = d if isinstance(d, list) else d.get('data', [])
-print(' '.join(str(s.get('title') or s.get('id','')) for s in rows))" 2>/dev/null || true; }
-M1="$(sessions_of $PORT_MOCK)"; M2="$(sessions_of $MOCK2_PORT)"
+# диагностика маршрутизации — по журналам моков (list endpoint честно
+# фильтрует мёртвые: #1163, dead-сессии mock-2 в list не попадают)
+titles_in() { grep -o 'title=[^ ,]*' "$1" 2>/dev/null | sort -u | tr '\n' ' '; }
+M1="$(titles_in "$LOG_MOCK")"; M2="$(titles_in "$LOG_MOCK2")"
 echo "$M1" | grep -q "#$SEED_N" || fail "мок-1 не получил сессию uwuwu (дефолт-маршрут сломан): [$M1]"
 echo "$M2" | grep -q "#2047" || fail "мок-2 не получил сессию 1xgames-mock (маршрутизация не работает): [$M2]"
 echo "$M1" | grep -q "#2047" && fail "кросс-маршрут: 1xgames-mock ушел на дефолтный исполнитель"

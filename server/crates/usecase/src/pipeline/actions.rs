@@ -3,7 +3,7 @@
 
 use crate::error::UsecaseResult;
 use crate::naming;
-use crate::pipeline::tick::{BoardPlan, TickUseCase, SPAWN_COOLDOWN_MS};
+use crate::pipeline::tick::{BoardPlan, TickUseCase};
 use crate::ports::{CommentRef, Liveness, SessionSpec};
 use uwuwu_domain::{
     gate, sighting_known, Action, Agent, AgentSlot, Gate, LoopOutcome, Priority, SessionSighting,
@@ -158,26 +158,23 @@ impl TickUseCase {
                 // Second source (#1072→#1163): сессия в списке исполнителя —
                 // проба солгала (serve-шторм 13.11 давал 404 живым ходам);
                 // респавн отменяется, вердикт уйдёт wakeup-путём на тике,
-                // когда проба вернётся к правде.
+                // когда проба вернётся к правде. Штормы false-dead закрыты
+                // этим чеком — кулдаун-чек на респавн не вешается: он
+                // замедлял бы attention-механику (луп-гвард) в 5 раз
+                // (эскалация петли час вместо ~15 мин).
                 if sighting_known(sightings.unwrap_or(&[]), session) {
                     tracing::warn!(event = "wakeup.second_source_alive", number = task.number(),
                         session = %session,
                         "Проба Dead при живой сессии в списке исполнителя — респавн отменён");
                     return Ok(WakeAct::None);
                 }
-                // респавн = фактический спавн — полный гейт (кулдаун + пик + CUP)
+                // респавн = фактический спавн — полный гейт (пик + CUP)
                 let spawn = Action::Spawn { slot };
-                let cooldown_left = {
-                    let last = self.state.last_spawn_ms(&board.board, task.number(), slot);
-                    last.map(|ts| self.clock.now_ms().saturating_sub(ts))
-                        .unwrap_or(u64::MAX)
-                };
-                let gated = gate(task, &spawn, policy, global_active, now);
-                if cooldown_left < SPAWN_COOLDOWN_MS || gated != Gate::Allowed {
+                if gate(task, &spawn, policy, global_active, now) != Gate::Allowed {
                     tracing::info!(
                         event = "respawn.held_by_policy",
                         number = task.number(),
-                        "Respawn held: кулдаун/пик-окно/CUP"
+                        "Respawn held: пик-окно/CUP"
                     );
                     return Ok(WakeAct::Deferred);
                 }

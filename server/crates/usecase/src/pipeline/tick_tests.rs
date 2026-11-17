@@ -3096,11 +3096,12 @@ async fn dead_respawn_cancelled_when_serve_lists_session() {
 }
 
 #[tokio::test]
-async fn dead_respawn_held_by_cooldown() {
-    // респавн = фактический спавн: кулдаун слота едина с plain-путём
-    // (ночь 15.11: респавн-шторм 7–10 мин без mark_spawn)
+async fn respawn_not_held_by_cooldown_attention_speed() {
+    // кулдаун-ЧЕК на респавн не вешается (#1163): он замедлял бы
+    // attention-механику (луп-гвард эскалирует час вместо ~15 мин).
+    // Свежий mark_spawn respawn не держит — спавн идёт, mark обновляется
+    // (единый учёт темпа слота: plain-путь держит по нему спавн).
     let mut t = task(55, Status::InProgress);
-    t.set_priority(uwuwu_domain::Priority::High);
     let mut f = TaskFields::default();
     f.set_session(
         Slot::Dev,
@@ -3118,38 +3119,6 @@ async fn dead_respawn_held_by_cooldown() {
         .unwrap()
         .statuses
         .push((55, Status::InProgress));
-    let (u, _, sessions, _) =
-        usecase_with_sessions(vec![t], PrState::Missing, FakeSessions::new(), state);
-    sessions
-        .dead_sessions
-        .lock()
-        .unwrap()
-        .push("ses_dead_55".into());
-    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
-    assert!(
-        sessions.spawned.lock().unwrap().is_empty(),
-        "респавн в кулдауне слота отложен"
-    );
-    assert_eq!(out.wakeups_deferred, 1);
-}
-
-#[tokio::test]
-async fn respawn_marks_spawn_cooldown() {
-    // состоявшийся респавн заряжает кулдаун слота (едина с plain-путём)
-    let mut t = task(56, Status::InProgress);
-    let mut f = TaskFields::default();
-    f.set_session(
-        Slot::Dev,
-        uwuwu_domain::SessionRef::parse("ses_dead_56").unwrap(),
-    );
-    t.apply_fields(f);
-    let state = Arc::new(MemState(Mutex::default()));
-    state
-        .0
-        .lock()
-        .unwrap()
-        .statuses
-        .push((56, Status::InProgress));
     let (u, _, sessions, _) = usecase_with_sessions(
         vec![t],
         PrState::Missing,
@@ -3160,12 +3129,16 @@ async fn respawn_marks_spawn_cooldown() {
         .dead_sessions
         .lock()
         .unwrap()
-        .push("ses_dead_56".into());
+        .push("ses_dead_55".into());
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
-    assert_eq!(out.spawns_done, 1);
+    assert_eq!(
+        out.spawns_done, 1,
+        "респавн мёртвой сессии не замедлен кулдауном"
+    );
+    assert_eq!(out.wakeups_deferred, 0);
     let marks = state.0.lock().unwrap().spawn_ms.clone();
     assert!(
-        marks.iter().any(|(n, s, _)| *n == 56 && *s == Slot::Dev),
+        marks.iter().any(|(n, s, _)| *n == 55 && *s == Slot::Dev),
         "респавн заряжает mark_spawn: {marks:?}"
     );
 }
