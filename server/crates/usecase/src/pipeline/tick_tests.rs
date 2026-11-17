@@ -143,6 +143,8 @@ struct FakeSessions {
     specs: Mutex<Vec<SessionSpec>>,
     /// живые сессии исполнителя: (agent-имя, outcome; пустой outcome = живая)
     live: Mutex<Vec<(String, String)>>,
+    /// токены live-сессий (дример-кандидат требует total_tokens > 0)
+    live_tokens: u64,
 }
 
 impl FakeSessions {
@@ -152,6 +154,7 @@ impl FakeSessions {
             spawned: Mutex::default(),
             specs: Mutex::default(),
             live: Mutex::default(),
+            live_tokens: 0,
             activity_ms: 1000,
             dead_sessions: Mutex::default(),
             list_fails: false,
@@ -161,6 +164,14 @@ impl FakeSessions {
     fn with_live(agent: &str) -> Self {
         Self {
             live: Mutex::new(vec![(agent.into(), String::new())]),
+            ..Self::new()
+        }
+    }
+    /// Завершённая сессия с финалом и токенами — дример-кандидат.
+    fn with_finished(agent: &str, outcome: &str) -> Self {
+        Self {
+            live: Mutex::new(vec![(agent.into(), outcome.into())]),
+            live_tokens: 1000,
             ..Self::new()
         }
     }
@@ -235,7 +246,7 @@ impl AgentSessionGateway for FakeSessions {
                 agent: agent.clone(),
                 updated_ms: 0,
                 outcome: outcome.clone(),
-                total_tokens: 0,
+                total_tokens: self.live_tokens,
             });
         }
         Ok(out)
@@ -549,6 +560,7 @@ fn peak_usecase(
         activity_ms: 1000,
         dead_sessions: Mutex::default(),
         list_fails: false,
+        live_tokens: 0,
         idle_reply: false,
         specs: Mutex::default(),
         live: Mutex::default(),
@@ -1026,6 +1038,7 @@ async fn dead_stage_session_holds_cup_when_list_unavailable() {
         activity_ms: 1000,
         dead_sessions: Mutex::default(),
         list_fails: true,
+        live_tokens: 0,
         idle_reply: false,
         specs: Mutex::default(),
         live: Mutex::default(),
@@ -1311,6 +1324,7 @@ async fn undelivered_comment_is_not_marked_seen() {
             activity_ms: 5000,
             dead_sessions: Mutex::default(),
             list_fails: false,
+            live_tokens: 0,
             idle_reply: false,
             specs: Mutex::default(),
             live: Mutex::default(),
@@ -1363,6 +1377,7 @@ async fn undelivered_comment_is_not_marked_seen() {
         activity_ms: 1000,
         dead_sessions: Mutex::default(),
         list_fails: false,
+        live_tokens: 0,
         idle_reply: false,
         specs: Mutex::default(),
         live: Mutex::default(),
@@ -1425,6 +1440,7 @@ async fn multi_comment_tail_delivered_together() {
         activity_ms: 900,
         dead_sessions: Mutex::default(),
         list_fails: false,
+        live_tokens: 0,
         idle_reply: false,
         specs: Mutex::default(),
         live: Mutex::default(),
@@ -2807,4 +2823,84 @@ async fn task_close_missing_row_is_a_loud_error_without_mutations() {
         log.is_empty(),
         "промах close не мутирует доски, лог: {log:?}"
     );
+}
+
+// ===== Тайтлы вневых ролей — эмодзи-маркер (#1212): спавн-тайтл каждой
+// роли несёт маркер таблицы Agent::emoji; если маппинг отломают — тест падает.
+
+#[tokio::test]
+async fn analyst_wave_title_carries_marker() {
+    // 🧠 в тайтле волновой сессии аналитика (свой юзкейс, вне конвейерного тика)
+    let state = Arc::new(MemState(Mutex::default()));
+    let sessions = Arc::new(FakeSessions::new());
+    let (u, _) = analyst_uc(
+        vec![titled(1, "заявка", Status::Analys)],
+        state,
+        sessions.clone(),
+    );
+    assert_eq!(u.tick().await.unwrap(), 1);
+    let specs = sessions.specs.lock().unwrap();
+    let spec = specs.last().expect("волновая сессия");
+    assert_eq!(
+        spec.title,
+        format!("{} аналитика волны", Agent::Analyst.emoji())
+    );
+    assert!(matches!(spec.agent, AgentSlot::Role(Agent::Analyst)));
+}
+
+#[tokio::test]
+async fn analyst_review_title_carries_marker() {
+    // ⚖️ в тайтле парной сессии ревью-аналитики
+    let state = Arc::new(MemState(Mutex::default()));
+    let sessions = Arc::new(FakeSessions::new());
+    let (r, _) = review_uc(
+        vec![titled(1, "заявка", Status::ReviewAnalys)],
+        state,
+        sessions.clone(),
+    );
+    assert_eq!(r.tick().await.unwrap(), 1);
+    let specs = sessions.specs.lock().unwrap();
+    let spec = specs.last().expect("сессия ревью-аналитики");
+    assert_eq!(
+        spec.title,
+        format!("{} ревью аналитики", Agent::AnalystReviewer.emoji())
+    );
+    assert!(matches!(
+        spec.agent,
+        AgentSlot::Role(Agent::AnalystReviewer)
+    ));
+}
+
+#[tokio::test]
+async fn dreamer_title_carries_marker() {
+    // 🌙 в тайтле дример-сессии пост-обработки (кандидат: финал + токены + idle)
+    use std::sync::atomic::{AtomicU64, Ordering};
+    struct FarClock(AtomicU64);
+    impl crate::ports::Clock for FarClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    let sessions = Arc::new(FakeSessions::with_finished("dev", "готово"));
+    let u = crate::pipeline::dreamer::DreamerUseCase {
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        state: Arc::new(MemState(Mutex::default())),
+        clock: Arc::new(FarClock(AtomicU64::new(2_000_000))), // > idle-порога 30 мин
+        spawn_model: None,
+        checkout: "/tmp/checkout".into(),
+    };
+    assert_eq!(u.tick().await.unwrap(), 1);
+    let specs = sessions.specs.lock().unwrap();
+    let spec = specs.last().expect("дример-сессия");
+    assert_eq!(
+        spec.title,
+        format!("{} дример ses_live_dev", Agent::Dreamer.emoji())
+    );
+    assert!(matches!(spec.agent, AgentSlot::Role(Agent::Dreamer)));
 }
