@@ -1033,6 +1033,32 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // живой прогон: GH_TOKEN + сеть к api.github.com (read-only)
+    fn live_read_issue_sees_automerge() {
+        // БАГ-ПИН ручного прогона #1232 (tester, 17.11): fm-вью task_get
+        // показывает automerge: false при Autodone=on на носителе —
+        // read_issue собирает Task через map_task_fields, который не мапит
+        // automerge из issue_field_values (тик-снапшот item_values видит
+        // верно). Красный до фикса; зелёный — после. Строка sandbox #1265
+        // («Автомерж-bounce: битый PR») выставлена в on ручным прогоном.
+        let repo =
+            std::env::var("UWUWU_HUB_REPO").unwrap_or_else(|_| "yurvon-screamo/uwuwu-hub".into());
+        let token = std::env::var("GH_TOKEN").expect("GH_TOKEN");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let view = rt
+            .block_on(async {
+                let hub = GitHubHub::new(repo, token);
+                hub.read_issue("Задачи sandbox", 1265).await
+            })
+            .expect("read_issue");
+        assert!(
+            view.task.automerge(),
+            "fm-вью read_issue слеп к automerge-носителю (Autodone=on у #1265): \
+             баг-пин ручного прогона #1232"
+        );
+    }
+
+    #[test]
     fn item_values_maps_board_columns() {
         let item = json!({
             "content": { "__typename": "Issue", "number": 1, "title": "t", "state": "open" },
