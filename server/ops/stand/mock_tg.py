@@ -42,7 +42,7 @@ def _reply(handler, payload, status=200):
     data = json.dumps(payload).encode()
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json")
-    handler.send_header("Content-Length", str(data and len(data) or 0))
+    handler.send_header("Content-Length", str(len(data)))
     handler.end_headers()
     handler.wfile.write(data)
 
@@ -54,7 +54,11 @@ def _media_message(body):
     size = body.get("file_size")
     raw = body.get("bytes", "mock-file-bytes")
     FILES[file_id] = raw.encode() if isinstance(raw, str) else raw
-    SIZES[file_id] = size if size is not None else len(FILES[file_id])
+    # too_big: oversize БЕЗ file_size в апдейте — getFile отвечает
+    # перманентным 400 (эмуляция второй гарды раннера, #1171)
+    SIZES[file_id] = FILE_LIMIT + 1 if body.get("too_big") else (
+        size if size is not None else len(FILES[file_id])
+    )
     media = {"file_id": file_id}
     if size is not None:
         media["file_size"] = size

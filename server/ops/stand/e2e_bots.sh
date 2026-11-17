@@ -210,10 +210,11 @@ done
 [ -n "$MEDIA_REPLY" ] || fail "реплай с media-инструкцией не дошёл до ТГ"
 say "фото доставлено: getFile → asset → URL в промпте сессии"
 
-# oversize (>20 MiB): getFile 400 too big → явный отказ, тишины нет
-say "инжект oversized-документа…"
+# oversize без file_size в апдейте: pre-check молчит, getFile отвечает
+# 400 too big (эмуляция mock) → типизированный TelegramTooBig → явный отказ
+say "инжект oversized-документа (без file_size — 400-маршрут getFile)…"
 curl -s -X POST "http://127.0.0.1:$PORT_TG/inject" -H 'Content-Type: application/json' \
-  -d '{"update_id":7,"chat_id":42,"username":"yurvon","media":{"kind":"document","file_id":"big-e2e","file_size":31457280,"file_name":"big.bin"}}' >/dev/null
+  -d '{"update_id":7,"chat_id":42,"username":"yurvon","media":{"kind":"document","file_id":"big-e2e","too_big":true,"file_name":"big.bin"}}' >/dev/null
 OVER=""
 for _ in $(seq 1 20); do
   sleep 1
@@ -225,8 +226,8 @@ print(hits[0] if hits else '')" 2>/dev/null)
   [ -n "$OVER" ] && break
 done
 [ -n "$OVER" ] || fail "oversize-отказ владельцу не отправлен (лог: $LOG_SRV)"
-grep -q '"event":"bot.media_oversize"' "$LOG_SRV" || fail "нет bot.media_oversize в логе"
-say "oversize: getFile 400 → явный отказ владельцу"
+grep -q '"kind":"get_file_400"' "$LOG_SRV" || fail "400-маршрут getFile не прогнан (bot.media_oversize kind=get_file_400 нет)"
+say "oversize: getFile 400 (эмуляция mock) → типизированный отказ владельцу"
 
 # не-текстовый тип (видео): явный отказ «не принимаю»
 say "инжект видео…"

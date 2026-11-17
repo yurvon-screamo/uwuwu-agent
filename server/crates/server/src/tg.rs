@@ -149,6 +149,10 @@ impl TelegramClient {
 
     /// Перманентный отказ getFile на файл > 20 MiB (`400 file is too
     /// big`) — отдельный типизированный маршрут, не общий сбой (#1171).
+    /// Матч по строке описания Bot API: формулировка стабильна годами;
+    /// при смене маршрут деградирует до общего «не смог забрать» (отказ
+    /// остаётся явным) — пин ревью #398; формат держит юнит
+    /// get_file_too_big_error_is_typed.
     fn classify_download_err(e: UsecaseError) -> UsecaseError {
         if e.to_string().contains("file is too big") {
             UsecaseError::TelegramTooBig(e.to_string())

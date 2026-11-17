@@ -157,7 +157,7 @@ async fn process_media(
             return send(deps, chat_id, REFUSE_OVERSIZE).await;
         }
         Err(_) => {
-            tracing::info!(event = "bot.media_refused", slug = %deps.slug,
+            tracing::warn!(event = "bot.media_refused", slug = %deps.slug,
                 kind = "download_failed", "Скачивание не удалось — явный отказ");
             return send(deps, chat_id, REFUSE_FAILED).await;
         }
@@ -169,7 +169,7 @@ async fn process_media(
     {
         Ok(u) => u,
         Err(_) => {
-            tracing::info!(event = "bot.media_refused", slug = %deps.slug,
+            tracing::warn!(event = "bot.media_refused", slug = %deps.slug,
                 kind = "upload_failed", "Загрузка ассета не удалась — явный отказ");
             return send(deps, chat_id, REFUSE_FAILED).await;
         }
