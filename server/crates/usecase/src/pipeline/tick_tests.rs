@@ -847,6 +847,56 @@ async fn unknown_activity_fails_open_and_delivers_tail() {
 }
 
 #[tokio::test]
+async fn mcp_comment_marks_registry_with_node_id() {
+    // #1204 (Low-1 ревью): единственная точка маркировки — writer.comment()
+    // кладёт node_id ответа поста в реестр; own-тест wake-пути режет эхо
+    // именно по этому id.
+    let board = Arc::new(FakeBoard {
+        rows: vec![],
+        log: Mutex::default(),
+        comments: Vec::default(),
+    });
+    let state = Arc::new(MemState(Mutex::default()));
+    let writer = crate::tasks::write::TaskWriteUseCase {
+        board: board.clone(),
+        fields: Arc::new(FakeFields),
+        boards: vec![("uwuwu".into(), "B".into())],
+        clock: Arc::new(FixedClock),
+        state: state.clone(),
+    };
+    use crate::tasks::write::TaskWriter;
+    writer.comment(61, "мой отчёт", None).await.unwrap();
+    assert!(
+        state.own_comment("posted-1"),
+        "MCP-пост промаркирован node_id ответа"
+    );
+}
+
+#[tokio::test]
+async fn empty_node_id_post_is_not_marked() {
+    // #1204 (ветка fail-open маркировки): пустой node_id (нестандартный
+    // ответ POST) не попадает в реестр — коммент доставлен, срез не врёт.
+    let board = Arc::new(CloseBoard {
+        boards: vec![("B".into(), vec![61])],
+        log: Mutex::default(),
+    });
+    let state = Arc::new(MemState(Mutex::default()));
+    let writer = crate::tasks::write::TaskWriteUseCase {
+        board: board.clone(),
+        fields: Arc::new(FakeFields),
+        boards: vec![("uwuwu".into(), "B".into())],
+        clock: Arc::new(FixedClock),
+        state: state.clone(),
+    };
+    use crate::tasks::write::TaskWriter;
+    writer.comment(61, "текст", None).await.unwrap();
+    assert!(
+        !state.own_comment(""),
+        "пустой id не маркируется — иначе empty-id класс давал бы ложные срезы"
+    );
+}
+
+#[tokio::test]
 async fn observe_never_touches_ports() {
     let (u, board, sessions, _) = usecase(vec![task(1, Status::InProgress)], PrState::Missing);
     let out = u.run(&plan(Mode::Observe, 7)).await.unwrap();
