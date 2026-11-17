@@ -107,12 +107,12 @@ describe("ci.yml — контракт автодеплоя uwuwu-server (uwuwu#1
     expect(step).toContain("cd server &&")
   })
 
-  test("deploy ждёт результат билда: railway up без -d (sync-наблюдаемость)", () => {
-    // С -d джоба зеленела бы сразу после аплоада при красном билде —
-    // fail-open наблюдаемость. Пин: только --ci, без --detach.
+  test("deploy ждёт результат билда: railway up без detach (sync-наблюдаемость)", () => {
+    // С -d/--detach джоба зеленела бы сразу после аплоада при красном билде —
+    // fail-open наблюдаемость. Пин: без --detach (субстринг «-d» не матчим —
+    // любой будущий --dry-… дал бы ложный красный без нарушения контракта).
     const step = deploy.split("\n").find((line) => line.includes("railway up --ci --project"))
     expect(step).toBeDefined()
-    expect(step).not.toContain("-d")
     expect(step).not.toContain("--detach")
   })
 })
