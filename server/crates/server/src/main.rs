@@ -312,6 +312,7 @@ async fn run(
                 .first()
                 .map(|b| b.checkout.clone())
                 .unwrap_or_default(),
+            cup: plan.policy.cup,
         }),
     });
 
@@ -349,6 +350,7 @@ async fn run(
             clock: clock.clone(),
             spawn_model: spawn_model_cfg.clone(),
             checkout: checkout.clone(),
+            cup: plan.policy.cup,
         });
         let project = project.clone();
 

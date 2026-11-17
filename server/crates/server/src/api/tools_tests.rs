@@ -102,6 +102,7 @@ fn hub() -> (Arc<ToolHub>, Arc<MemoryHub>) {
             clock: Arc::new(SystemClock),
             spawn_model: None,
             checkout: String::new(),
+            cup: 7,
         }),
     });
     (tools, memory)
@@ -569,6 +570,7 @@ async fn fast_track_from_draft_and_todo() {
             clock: Arc::new(SystemClock),
             spawn_model: None,
             checkout: String::new(),
+            cup: 7,
         }),
     });
     call(

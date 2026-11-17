@@ -26,6 +26,10 @@ pub struct CronUseCase {
     pub clock: Arc<dyn Clock>,
     pub spawn_model: Option<ModelRef>,
     pub checkout: String,
+    /// Единый кап активных ходов исполнителя (policy.cup): файр при
+    /// полном капе откладывается до свободного тика — журнальная строка
+    /// не пишется, ран не считается состоявшимся (#1231).
+    pub cup: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +54,20 @@ impl CronUseCase {
     /// Один проход: мастера проекта, due → журнальная строка + спавн рана.
     pub async fn tick(&self, project: &str) -> UsecaseResult<Vec<FireOutcome>> {
         let mut fired = Vec::new();
+        // CUP-гвард (#1231): крон-ран — запуск хода, ему нужен свободный
+        // слот единого капа. Strict union (#1203): отказ скана — файр
+        // откладывается (ран не считается состоявшимся, журнал не пишется).
+        let busy = match self.sessions.list_sessions_strict().await {
+            Ok(list) => list.iter().filter(|s| s.busy).count(),
+            Err(e) => {
+                tracing::warn!(
+                    event = "cron.list_sessions_failed",
+                    error = %e,
+                    "Кроны: union-скан недоступен — файр отложен"
+                );
+                return Ok(fired);
+            }
+        };
         let dir = crons_dir(project);
         // list_docs даёт пути от docs/ целиком: прямые дети = мастера,
         // подпапки (журнал/ассеты) — нет
@@ -76,6 +94,16 @@ impl CronUseCase {
                 }
             }
             if !master.schedule.is_due(now, last_run_ms(&journal_md)) {
+                continue;
+            }
+            if busy >= self.cup {
+                tracing::info!(
+                    event = "cron.held_cup",
+                    cron = %slug,
+                    active = busy,
+                    cap = self.cup,
+                    "Крон-файр отложен: CUP cap — ран не считается состоявшимся"
+                );
                 continue;
             }
             let stamp = jst_stamp(now);
@@ -265,6 +293,8 @@ fn run_prompt(project: &str, master: &CronMaster, journal: &str) -> String {
 mod tests {
     use super::*;
 
+    use std::sync::{Arc, Mutex};
+
     #[test]
     fn master_requires_valid_schedule() {
         let md = "---\ntitle: Тест\nschedule: 5m\n---\n\nТело";
@@ -328,5 +358,215 @@ mod tests {
             (secs * 1000) as u64
         };
         assert_eq!(jst_stamp(ms), "2026-11-15T01:30:00+09:00");
+    }
+
+    /// Тик-харнесс: ин-мемори вики + сессии (CUP-гвард файра, #1231).
+    struct MemWiki(Mutex<std::collections::HashMap<String, String>>);
+    #[async_trait::async_trait]
+    impl WikiRepo for MemWiki {
+        async fn read_doc(&self, slug: &str) -> UsecaseResult<Option<String>> {
+            Ok(self.0.lock().unwrap().get(slug).cloned())
+        }
+        async fn list_docs(&self, prefix: &str) -> UsecaseResult<Vec<String>> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|s| s.starts_with(prefix))
+                .cloned()
+                .collect())
+        }
+        async fn doc_shas(&self) -> UsecaseResult<Vec<(String, String)>> {
+            Ok(Vec::new())
+        }
+        async fn write_doc(&self, slug: &str, content: &str, _m: &str) -> UsecaseResult<()> {
+            self.0.lock().unwrap().insert(slug.into(), content.into());
+            Ok(())
+        }
+        async fn append_doc(&self, slug: &str, line: &str, _m: &str) -> UsecaseResult<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .entry(slug.into())
+                .or_default()
+                .push_str(&format!("{line}\n"));
+            Ok(())
+        }
+    }
+
+    struct TicksClock;
+    impl Clock for TicksClock {
+        fn utc_minute(&self) -> uwuwu_domain::UtcMinute {
+            uwuwu_domain::UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            2000
+        }
+    }
+
+    struct MemSessions {
+        busy: std::sync::atomic::AtomicUsize,
+        spawned: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::ports::AgentSessionGateway for MemSessions {
+        async fn create_session(&self, _spec: &crate::ports::SessionSpec) -> UsecaseResult<String> {
+            let id = format!("ses_{}", self.spawned.lock().unwrap().len() + 1);
+            self.spawned.lock().unwrap().push(id.clone());
+            Ok(id)
+        }
+        async fn prompt(&self, _s: &str, _t: &str) -> UsecaseResult<()> {
+            Ok(())
+        }
+        async fn run_command(&self, _s: &str, _n: &str, _a: &str) -> UsecaseResult<()> {
+            Ok(())
+        }
+        async fn liveness(&self, _s: &str) -> crate::ports::Liveness {
+            crate::ports::Liveness::Alive
+        }
+        async fn delete_session(&self, _s: &str) -> UsecaseResult<()> {
+            Ok(())
+        }
+        async fn last_activity_ms(&self, _s: &str) -> UsecaseResult<Option<u64>> {
+            Ok(None)
+        }
+        async fn last_assistant_reply(
+            &self,
+            _s: &str,
+        ) -> UsecaseResult<Option<crate::ports::AssistantReply>> {
+            Ok(None)
+        }
+        async fn list_sessions(&self) -> UsecaseResult<Vec<crate::ports::SessionInfo>> {
+            Ok((0..self.busy.load(std::sync::atomic::Ordering::SeqCst))
+                .map(|n| crate::ports::SessionInfo {
+                    id: format!("ses_busy_{n}"),
+                    agent: String::new(),
+                    updated_ms: 0,
+                    outcome: String::new(),
+                    total_tokens: 0,
+                    busy: true,
+                })
+                .collect())
+        }
+        async fn export_session(&self, _s: &str) -> UsecaseResult<String> {
+            Ok(String::new())
+        }
+    }
+
+    fn cron_uc(wiki: Arc<MemWiki>, sessions: Arc<MemSessions>, cup: usize) -> CronUseCase {
+        CronUseCase {
+            wiki,
+            sessions: Arc::new(SessionRouter::uniform(sessions)),
+            clock: Arc::new(TicksClock),
+            spawn_model: None,
+            checkout: "/tmp/checkout".into(),
+            cup,
+        }
+    }
+
+    fn master_wiki() -> Arc<MemWiki> {
+        Arc::new(MemWiki(Mutex::new(std::collections::HashMap::from([(
+            "Projects/uwuwu/Кроны/тест".into(),
+            "---\ntitle: Тест\nschedule: 5m\n---\nТело".into(),
+        )]))))
+    }
+
+    #[tokio::test]
+    async fn cron_fire_held_when_cup_full() {
+        // Единый кап (#1231): крон-файр — запуск хода; при полном капе
+        // файр откладывается, журнальная строка НЕ пишется — ран не
+        // считается состоявшимся, расписание перезапустит файр.
+        let wiki = master_wiki();
+        let sessions = Arc::new(MemSessions {
+            busy: 1.into(),
+            spawned: Mutex::default(),
+        });
+        let u = cron_uc(wiki.clone(), sessions.clone(), 1);
+        let fired = u.tick("uwuwu").await.unwrap();
+        assert!(fired.is_empty(), "файр при полном капе отложен");
+        assert!(sessions.spawned.lock().unwrap().is_empty(), "спавна нет");
+        assert!(
+            !wiki
+                .0
+                .lock()
+                .unwrap()
+                .contains_key("Projects/uwuwu/Кроны/тест/Журнал"),
+            "журнальная строка не пишется — ран не состоялся"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_fire_deferred_when_scan_fails() {
+        // Отказная ветка: union-скан strict-Err (исполнитель недоступен) —
+        // файр откладывается до свободного тика, ран не считается
+        // состоявшимся (консистентно с конвейером).
+        struct FailingSessions;
+        #[async_trait::async_trait]
+        impl crate::ports::AgentSessionGateway for FailingSessions {
+            async fn create_session(&self, _: &crate::ports::SessionSpec) -> UsecaseResult<String> {
+                Ok("ses_x".into())
+            }
+            async fn prompt(&self, _: &str, _: &str) -> UsecaseResult<()> {
+                Ok(())
+            }
+            async fn run_command(&self, _: &str, _: &str, _: &str) -> UsecaseResult<()> {
+                Ok(())
+            }
+            async fn liveness(&self, _: &str) -> crate::ports::Liveness {
+                crate::ports::Liveness::Unknown
+            }
+            async fn delete_session(&self, _: &str) -> UsecaseResult<()> {
+                Ok(())
+            }
+            async fn last_activity_ms(&self, _: &str) -> UsecaseResult<Option<u64>> {
+                Ok(None)
+            }
+            async fn last_assistant_reply(
+                &self,
+                _: &str,
+            ) -> UsecaseResult<Option<crate::ports::AssistantReply>> {
+                Ok(None)
+            }
+            async fn list_sessions(&self) -> UsecaseResult<Vec<crate::ports::SessionInfo>> {
+                Err(crate::error::UsecaseError::Session(
+                    "исполнитель недоступен".into(),
+                ))
+            }
+            async fn export_session(&self, _: &str) -> UsecaseResult<String> {
+                Ok(String::new())
+            }
+        }
+        let wiki = master_wiki();
+        let sessions = Arc::new(FailingSessions);
+        let u = CronUseCase {
+            wiki,
+            sessions: Arc::new(SessionRouter::uniform(sessions)),
+            clock: Arc::new(TicksClock),
+            spawn_model: None,
+            checkout: "/tmp/checkout".into(),
+            cup: 7,
+        };
+        let fired = u.tick("uwuwu").await.unwrap();
+        assert!(fired.is_empty(), "отказ скана — файр отложен");
+    }
+
+    #[tokio::test]
+    async fn cron_fire_passes_with_free_slot() {
+        // Свободный слот: файр состоявшийся — журнальная строка + спавн.
+        let wiki = master_wiki();
+        let sessions = Arc::new(MemSessions {
+            busy: 0.into(),
+            spawned: Mutex::default(),
+        });
+        let u = cron_uc(wiki.clone(), sessions.clone(), 1);
+        let fired = u.tick("uwuwu").await.unwrap();
+        assert_eq!(fired.len(), 1, "файр при свободном слоте");
+        assert_eq!(sessions.spawned.lock().unwrap().len(), 1);
+        let journal = wiki.0.lock().unwrap()["Projects/uwuwu/Кроны/тест/Журнал"].clone();
+        assert!(journal.contains("запуск (демон)"), "{journal}");
     }
 }

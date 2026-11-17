@@ -80,6 +80,7 @@ fn hub() -> Arc<ToolHub> {
             clock: Arc::new(SystemClock),
             spawn_model: None,
             checkout: String::new(),
+            cup: 7,
         }),
     })
 }
