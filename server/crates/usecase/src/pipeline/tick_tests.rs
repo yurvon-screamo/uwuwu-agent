@@ -2061,31 +2061,35 @@ async fn analyst_verdictless_waves_do_not_burn_cycles() {
     );
 }
 
+/// Скаффолдинг круг-наблюдения (#1241): прелоад пары → тик → пара после.
+/// Различие тестов — статус строки и ожидаемая пара.
+async fn analyst_pair_after_tick(preload: (Status, u32), row_status: Status) -> (Status, u32) {
+    let inner = MemStateInner {
+        analys_loops: vec![(1, preload.0, preload.1)],
+        ..Default::default()
+    };
+    let state = Arc::new(MemState(Mutex::new(inner)));
+    let (u, _) = analyst_uc(
+        vec![titled(1, "строка круга", row_status)],
+        state.clone(),
+        Arc::new(FakeSessions::new()),
+    );
+    u.tick().await.unwrap();
+    let guard = state.0.lock().unwrap();
+    guard
+        .analys_loops
+        .iter()
+        .find(|(n, _, _)| *n == 1)
+        .map(|(_, st, r)| (*st, *r))
+        .unwrap()
+}
+
 #[tokio::test]
 async fn analyst_real_circle_increments_counter() {
     // #1241: реальный круг — последняя увиденная пара (ReviewAnalys, R),
     // строка снова в Analys: наблюдение инкрементит счётчик
-    let inner = MemStateInner {
-        analys_loops: vec![(1, Status::ReviewAnalys, 1)],
-        ..Default::default()
-    };
-    let state = Arc::new(MemState(Mutex::new(inner)));
-    let sessions = Arc::new(FakeSessions::new());
-    let (u, _) = analyst_uc(
-        vec![titled(1, "вернулась из ревью", Status::Analys)],
-        state.clone(),
-        sessions,
-    );
-    u.tick().await.unwrap();
-    let g = state.0.lock().unwrap();
-    let (_, st, r) = g
-        .analys_loops
-        .iter()
-        .find(|(n, _, _)| *n == 1)
-        .copied()
-        .unwrap();
     assert_eq!(
-        (st, r),
+        analyst_pair_after_tick((Status::ReviewAnalys, 1), Status::Analys).await,
         (Status::Analys, 2),
         "реальный круг засчитан, пара — (Analys, 2)"
     );
@@ -2095,27 +2099,8 @@ async fn analyst_real_circle_increments_counter() {
 async fn analyst_review_seen_updates_pair_without_increment() {
     // строка ушла в Review Analys — наблюдение фиксирует пару без
     // инкремента: круг завершится только возвратом в Analys
-    let inner = MemStateInner {
-        analys_loops: vec![(1, Status::Analys, 1)],
-        ..Default::default()
-    };
-    let state = Arc::new(MemState(Mutex::new(inner)));
-    let sessions = Arc::new(FakeSessions::new());
-    let (u, _) = analyst_uc(
-        vec![titled(1, "на ревью", Status::ReviewAnalys)],
-        state.clone(),
-        sessions,
-    );
-    u.tick().await.unwrap();
-    let g = state.0.lock().unwrap();
-    let (_, st, r) = g
-        .analys_loops
-        .iter()
-        .find(|(n, _, _)| *n == 1)
-        .copied()
-        .unwrap();
     assert_eq!(
-        (st, r),
+        analyst_pair_after_tick((Status::Analys, 1), Status::ReviewAnalys).await,
         (Status::ReviewAnalys, 1),
         "наблюдение ревью без инкремента"
     );
