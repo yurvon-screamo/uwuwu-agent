@@ -13,6 +13,14 @@ pub struct OpencodeClient {
     http: reqwest::Client,
 }
 
+/// Тело ответа message-эндпоинта opencode: голый массив ИЛИ обёртка
+/// {data: [...]} (обе формы в живом проде, opencode 2.3 — инцидент
+/// «строки стоят, сессии спят» 17.11: last_activity_ms не знал обёртки,
+/// вечное Ok(None) выключало сталл-детект целиком).
+fn message_array(resp: &Value) -> Option<&Vec<Value>> {
+    resp.as_array().or_else(|| resp["data"].as_array())
+}
+
 /// Хвост журнала (order=desc): является ли самый свежий содержательный
 /// блок (user|assistant) ассистентским. Служебные записи поверх ответа
 /// (idle и пр., #1150/#1206 Common-1) пропускаются.
@@ -241,8 +249,9 @@ impl AgentSessionGateway for OpencodeClient {
             )
             .await?;
         Self::check(status, &format!("message tail {session}"))?;
-        Ok(resp
-            .as_array()
+        // обе формы ответа: массив и {data:[...]} (opencode 2.3) — иначе
+        // вечное Ok(None) гасит сталл-детект (инцидент 17.11)
+        Ok(message_array(&resp)
             .and_then(|msgs| msgs.first())
             .and_then(|m| m["time"]["updated"].as_u64()))
     }
@@ -260,12 +269,7 @@ impl AgentSessionGateway for OpencodeClient {
             )
             .await?;
         Self::check(status, &format!("message tail {session}"))?;
-        let raw = if resp.is_array() {
-            resp
-        } else {
-            resp["data"].clone()
-        };
-        let msgs = raw.as_array();
+        let msgs = message_array(&resp);
         // Самый свежий СОДЕРЖАТЕЛЬНЫЙ блок журнала (order=desc): служебные
         // события поверх финального ответа (#1150: «в хвосте могут висеть
         // idle») не делают завершённую сессию busy — пропускаем их
@@ -297,6 +301,17 @@ impl AgentSessionGateway for OpencodeClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_array_takes_both_response_shapes() {
+        // 17.11: opencode 2.3 отдаёт {data:[...]} — last_activity_ms знал
+        // только голый массив, вечное Ok(None) гасил сталл-детект
+        let bare = serde_json::json!([{ "type": "assistant" }]);
+        let wrapped = serde_json::json!({ "data": [{ "type": "assistant" }] });
+        assert_eq!(message_array(&bare).map(Vec::len), Some(1));
+        assert_eq!(message_array(&wrapped).map(Vec::len), Some(1));
+        assert!(message_array(&serde_json::json!({})).is_none());
+    }
 
     #[test]
     fn latest_meaningful_skips_service_events() {
