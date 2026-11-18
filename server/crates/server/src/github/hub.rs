@@ -527,6 +527,9 @@ impl GitHubHub {
             VerifyOutcome::Mismatch => {
                 self.invalidate_snapshot(board);
                 self.status_cache.invalidate(&number.to_string());
+                // write-through Pv2Rest — тот же инвариант: возможно-ложное
+                // значение не доживает TTL-окно (ревью 1 Common-3)
+                self.pv2.invalidate_status(board, number);
                 return Err(UsecaseError::Board(format!(
                     "статус #{number}: запись «{}» не подтвердилась чтением — \
                      GitHub отдаёт лаг или мутация не применилась; не ретраить слепо",
@@ -745,6 +748,10 @@ impl TaskBoardRepo for GitHubHub {
             Some(raw) if raw.trim().is_empty() => Ok(None),
             Some(raw) => Ok(Some(uwuwu_usecase::parse_status(&raw))),
         }
+    }
+
+    async fn row_exists(&self, board: &str, number: u64) -> UsecaseResult<bool> {
+        Ok(self.pv2.item_id(board, number).await?.is_some())
     }
 
     async fn set_session(

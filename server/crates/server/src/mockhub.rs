@@ -213,6 +213,19 @@ impl TaskBoardRepo for MemoryHub {
                 .map(|t| t.status()))
         })
     }
+    async fn row_exists(&self, board: &str, number: u64) -> UsecaseResult<bool> {
+        self.with_state(|state| {
+            self.ensure_seed(state);
+            Ok(state
+                .tasks
+                .get(&number)
+                .filter(|t| match state.board_tags.get(&t.number()) {
+                    Some(tag) => tag == board,
+                    None => true,
+                })
+                .is_some())
+        })
+    }
 
     async fn set_session(
         &self,

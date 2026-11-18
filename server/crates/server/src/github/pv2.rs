@@ -9,7 +9,7 @@
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 use super::hub::TtlCache;
@@ -23,7 +23,9 @@ pub(crate) struct Pv2Meta {
     pub(crate) options: HashMap<String, String>,
 }
 
-/// Ответ REST с заголовком пагинации: list items ходит по Link-курсору.
+/// Ответ REST: не-2xx отдаётся наверх со статусом — толерантные ветки
+/// (404 снесённой строки) разбирают сами (прецедент hub.rest/fields.rest);
+/// Err — только transport/gherr-классы (403/429).
 struct RestResponse {
     status: reqwest::StatusCode,
     link: Option<String>,
@@ -34,9 +36,11 @@ pub(crate) struct Pv2Rest {
     repo: String,
     token: String,
     http: reqwest::Client,
-    /// Мета стабильна (номер проекта/поле/опции) — кеш без TTL,
-    /// сброс только при громком отказе носителя.
-    meta: Mutex<Option<Arc<Pv2Meta>>>,
+    /// Мета по имени доски (мультиборд: один GitHubHub обслуживает все
+    /// доски конфига — ключирование обязательно, ревью 1 High-1 #1236).
+    /// TTL 10 мин: хирургия владельца над Status-полем доски
+    /// восстанавливает мутации без рестарта сервера.
+    meta: TtlCache<Pv2Meta>,
     /// issue number → Pv2 item id: list items пагинацией; TTL и
     /// refresh-on-miss — строки добавляются/сносятся вне сервера.
     items: TtlCache<HashMap<u64, u64>>,
@@ -49,6 +53,7 @@ pub(crate) struct Pv2Rest {
 const ITEM_PAGES: usize = 10;
 const ITEMS_TTL: std::time::Duration = std::time::Duration::from_secs(240);
 const STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+const META_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 impl Pv2Rest {
     pub(crate) fn new(repo: String, token: String) -> Self {
@@ -59,7 +64,7 @@ impl Pv2Rest {
                 .user_agent(concat!("uwuwu-server/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .expect("reqwest client"),
-            meta: Mutex::new(None),
+            meta: TtlCache::new(META_TTL),
             items: TtlCache::new(ITEMS_TTL),
             status_wt: TtlCache::new(STATUS_TTL),
         }
@@ -117,12 +122,6 @@ impl Pv2Rest {
         } else {
             serde_json::from_str(&text).unwrap_or(Value::Null)
         };
-        if !status.is_success() {
-            return Err(UsecaseError::Board(format!(
-                "gh api {path}: HTTP {status}: {}",
-                text.chars().take(140).collect::<String>()
-            )));
-        }
         Ok(RestResponse {
             status,
             link,
@@ -132,7 +131,8 @@ impl Pv2Rest {
 
     /// Мета доски: резолв номера проекта по тайтлу + каталог Status-поля.
     pub(crate) async fn meta(&self, board: &str) -> UsecaseResult<Arc<Pv2Meta>> {
-        if let Some(hit) = self.meta.lock().expect("pv2 meta lock").clone() {
+        let now = std::time::Instant::now();
+        if let Some(hit) = self.meta.get(board, now) {
             return Ok(hit);
         }
         let owner = self.owner()?;
@@ -143,6 +143,12 @@ impl Pv2Rest {
                 None,
             )
             .await?;
+        if !projects.status.is_success() {
+            return Err(UsecaseError::Board(format!(
+                "projectsV2 {owner}: HTTP {}",
+                projects.status
+            )));
+        }
         let number = projects
             .body
             .as_array()
@@ -161,9 +167,14 @@ impl Pv2Rest {
                 None,
             )
             .await?;
-        let meta = Arc::new(parse_field_catalog(number, &fields.body, board)?);
-        *self.meta.lock().expect("pv2 meta lock") = Some(meta.clone());
-        Ok(meta)
+        if !fields.status.is_success() {
+            return Err(UsecaseError::Board(format!(
+                "доска «{board}»: каталог полей HTTP {}",
+                fields.status
+            )));
+        }
+        let meta = parse_field_catalog(number, &fields.body, board)?;
+        Ok(self.meta.put(board, meta, now))
     }
 
     /// item id строки: живой кеш → рефреш индекса → мисса (не на доске).
@@ -189,6 +200,12 @@ impl Pv2Rest {
         );
         for _ in 0..ITEM_PAGES {
             let resp = self.rest(reqwest::Method::GET, &url, None).await?;
+            if !resp.status.is_success() {
+                return Err(UsecaseError::Board(format!(
+                    "доска «{board}»: list items HTTP {}",
+                    resp.status
+                )));
+            }
             if let Some(list) = resp.body.as_array() {
                 for item in list {
                     if let Some((number, id)) = parse_item_entry(item) {
@@ -234,9 +251,16 @@ impl Pv2Rest {
             )
             .await?;
         if resp.status == reqwest::StatusCode::NOT_FOUND {
-            // индекс застал (строку снесли) — сброс, следующий рефреш
+            // индекс застал (строку снесли) — сброс, следующий рефреш;
+            // ветка жива: rest() отдаёт не-2xx наверх (ревью 1 Common-1)
             self.items.invalidate(board);
             return Ok(None);
+        }
+        if !resp.status.is_success() {
+            return Err(UsecaseError::Board(format!(
+                "строка #{number}: GET item HTTP {}",
+                resp.status
+            )));
         }
         Ok(Some(
             parse_status_value(&resp.body["fields"]).unwrap_or_default(),
@@ -302,6 +326,13 @@ impl Pv2Rest {
         Ok(parse_status_value(&resp.body["fields"]))
     }
 
+    /// Откат write-through статуса: verify зафиксировал Mismatch —
+    /// возможно-ложное значение не доживает TTL-окно (ревью 1 Common-3:
+    /// инвариант «откат write-through» обязан покрывать и этот кеш).
+    pub(crate) fn invalidate_status(&self, board: &str, number: u64) {
+        self.status_wt.invalidate(&format!("{board}#{number}"));
+    }
+
     /// POST add строки на доску (по issue number, node_id не нужен) +
     /// инкремент живого индекса. Возврат — numeric item id.
     pub(crate) async fn add_item(&self, board: &str, number: u64) -> UsecaseResult<u64> {
@@ -333,11 +364,16 @@ impl Pv2Rest {
             .and_then(Value::as_u64)
             .ok_or_else(|| UsecaseError::Board(format!("add #{number}: нет item id")))?;
         let now = std::time::Instant::now();
-        if let Some(hit) = self.items.get(board, now) {
-            let mut map = (*hit).clone();
-            map.insert(number, id);
-            self.items.put(board, map, now);
-        }
+        // всегда кладём id в индекс (и при пустом кеше): list items не
+        // видит свежедобавленную строку в read-лаг (живая проба
+        // мультиборда) — частичный map обслужит set_status сразу после
+        // add; полный список дотянет refresh-on-miss чужой строки
+        let mut map = match self.items.get(board, now) {
+            Some(hit) => (*hit).clone(),
+            None => HashMap::new(),
+        };
+        map.insert(number, id);
+        self.items.put(board, map, now);
         Ok(id)
     }
 }

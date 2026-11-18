@@ -50,6 +50,9 @@ impl TaskBoardRepo for StaleBoard {
             .find(|t| t.number() == n)
             .map(|t| t.status()))
     }
+    async fn row_exists(&self, _b: &str, n: u64) -> UsecaseResult<bool> {
+        Ok(self.carrier.iter().any(|t| t.number() == n))
+    }
 
     async fn set_session(&self, _: &str, _: u64, _: Slot, _: &str) -> UsecaseResult<()> {
         Ok(())
