@@ -25,7 +25,7 @@ pub struct GitHubHub {
     /// TTL-кеш снапшотов досок (#1243): мутации одного тика шарят снимок —
     /// без кеша каждый set_status тянул полную доску пагинацией и выжигал
     /// GraphQL-бюджет (инцидент 17.11: конвейер fail-loop до reset окна).
-    snap_cache: TtlCache<(Vec<Task>, BoardMeta)>,
+    snap_cache: TtlCache<Vec<Task>>,
     /// TTL-кеш статусов строк: board_status — самый горячий GraphQL-путь
     /// (task_get/MCP), 60 сек свежести не разрывают консистентность ходов.
     status_cache: TtlCache<String>,
@@ -43,12 +43,10 @@ const QUERY: &str = r#"
     repository(owner:$owner, name:$name){
       projectsV2(first:20, query:$board){
         nodes{
-          id title
-          field(name:"Status"){ ...on ProjectV2SingleSelectField{ id options{ id name } } }
+          title
           items(first:100, after:$after){
             pageInfo{ hasNextPage endCursor }
             nodes{
-              id
               content{ __typename ...on Issue{ number title state } }
               fieldValues(first:30){
                 nodes{ __typename
@@ -146,14 +144,6 @@ fn gh_tagged(fail: &crate::gherr::GhFail) -> UsecaseError {
 fn is_rate_limited(e: &UsecaseError) -> bool {
     let text = e.to_string().to_lowercase();
     text.contains("gh graphql [rate_limited]") || text.contains("gh rest [rate_limited]")
-}
-
-#[derive(Default, Clone)]
-struct BoardMeta {
-    project_id: String,
-    status_field_id: String,
-    options: std::collections::HashMap<String, String>,
-    items: std::collections::HashMap<u64, String>,
 }
 
 impl GitHubHub {
@@ -290,7 +280,7 @@ impl GitHubHub {
     /// TTL-кеш (#1243): тик и его мутации шарят один снимок. Строка,
     /// добавленная на доску младше TTL, может не иметь item-id в мете —
     /// мутация по ней ошибётся и самолечится следующим тиком (свежий снимок).
-    async fn snapshot(&self, board: &str) -> UsecaseResult<Arc<(Vec<Task>, BoardMeta)>> {
+    async fn snapshot(&self, board: &str) -> UsecaseResult<Arc<Vec<Task>>> {
         let now = std::time::Instant::now();
         if let Some(hit) = self.snap_cache.get(board, now) {
             return Ok(hit);
@@ -312,12 +302,14 @@ impl GitHubHub {
         Ok(arc)
     }
 
-    /// Полное чтение доски пагинацией (мимо кеша).
-    async fn snapshot_fetch(&self, board: &str) -> UsecaseResult<(Vec<Task>, BoardMeta)> {
+    /// Полное чтение доски пагинацией (мимо кеша). Рид-минимум QUERY:
+    /// мутационная мета (project id, Status-опции, item node id) ушла
+    /// в Pv2Rest — REST-поверхности нужны numeric id, а не GraphQL
+    /// node-id (#1236).
+    async fn snapshot_fetch(&self, board: &str) -> UsecaseResult<Vec<Task>> {
         let (owner, name) = self.repo.split_once('/').ok_or_else(|| {
             UsecaseError::Board(format!("repo в форме owner/name: {}", self.repo))
         })?;
-        let mut meta = BoardMeta::default();
         let mut rows: Vec<Task> = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_PAGES {
@@ -346,31 +338,12 @@ impl GitHubHub {
                         nodes.len()
                     ))
                 })?;
-            if meta.project_id.is_empty() {
-                meta.project_id = project["id"].as_str().unwrap_or_default().to_string();
-                meta.status_field_id = project["field"]["id"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string();
-                if let Some(options) = project["field"]["options"].as_array() {
-                    for o in options {
-                        if let (Some(id), Some(n)) = (o["id"].as_str(), o["name"].as_str()) {
-                            meta.options.insert(n.to_string(), id.to_string());
-                        }
-                    }
-                }
-                if meta.project_id.is_empty() {
-                    return Err(UsecaseError::Board(format!(
-                        "доска «{board}»: нет project id"
-                    )));
-                }
-            }
             let items = &project["items"];
             if let Some(page) = items["nodes"].as_array() {
-                rows.extend(parse_page(page, &mut meta));
+                rows.extend(parse_page(page));
             }
             if items["pageInfo"]["hasNextPage"].as_bool() != Some(true) {
-                return Ok((rows, meta));
+                return Ok(rows);
             }
             cursor = items["pageInfo"]["endCursor"].as_str().map(String::from);
         }
@@ -446,11 +419,11 @@ impl GitHubHub {
         let Some(hit) = self.snap_cache.get(board, now) else {
             return;
         };
-        let (mut rows, meta) = hit.as_ref().clone();
+        let mut rows = hit.as_ref().clone();
         for task in rows.iter_mut().filter(|t| t.number() == number) {
             task.override_status(status);
         }
-        self.snap_cache.put(board, (rows, meta), now);
+        self.snap_cache.put(board, rows, now);
     }
 
     /// Write-through статусного кэша строки (task_get читает отсюда).
@@ -480,7 +453,7 @@ impl GitHubHub {
         let Some(hit) = self.snap_cache.get(board, now) else {
             return; // снимка нет — нечего гигиенить, фетч увидит поля
         };
-        let (mut rows, meta) = hit.as_ref().clone();
+        let mut rows = hit.as_ref().clone();
         let row_present = rows.iter_mut().any(|t| t.number() == number);
         if !row_present {
             // окно create: снимок мог закешироваться без полей — сброс,
@@ -496,7 +469,7 @@ impl GitHubHub {
                 task.set_automerge(a);
             }
         }
-        self.snap_cache.put(board, (rows, meta), now);
+        self.snap_cache.put(board, rows, now);
     }
 
     /// Контрольное чтение после мутации статуса (семья #1213): ответ
@@ -604,7 +577,7 @@ impl GitHubHub {
     }
 }
 
-fn parse_page(items: &[Value], meta: &mut BoardMeta) -> Vec<Task> {
+fn parse_page(items: &[Value]) -> Vec<Task> {
     items
         .iter()
         .filter_map(|item| {
@@ -625,8 +598,6 @@ fn parse_page(items: &[Value], meta: &mut BoardMeta) -> Vec<Task> {
             let mut task = Task::new(number, title, status);
             task.set_priority(uwuwu_usecase::parse_priority(&v.priority));
             task.set_automerge(v.automerge);
-            meta.items
-                .insert(number, item["id"].as_str().unwrap_or_default().to_string());
             Some(task)
         })
         .collect()
@@ -730,7 +701,7 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
 #[async_trait]
 impl TaskBoardRepo for GitHubHub {
     async fn read_board(&self, board: &str) -> UsecaseResult<Vec<Task>> {
-        Ok(self.snapshot(board).await?.0.clone())
+        Ok((*self.snapshot(board).await?).clone())
     }
 
     async fn set_status(&self, board: &str, number: u64, status: Status) -> UsecaseResult<()> {
@@ -750,9 +721,7 @@ impl TaskBoardRepo for GitHubHub {
         self.write_through_status_cache(number, status);
         // verify-after-write (семья #1213): ответ мутации — быстрый путь,
         // иначе до 3 чтений носителя; rate limit — ретраи не продолжаются.
-        let outcome = self
-            .verify_status(board, number, status, confirmed)
-            .await;
+        let outcome = self.verify_status(board, number, status, confirmed).await;
         self.settle_write_through(board, number, outcome, status)?;
         tracing::info!(
             event = "board.set_status",
@@ -1134,8 +1103,7 @@ mod tests {
                                        "name": "high", "value": "high", "optionId": "IFSSO_x" } },
             ]}
         });
-        let mut meta = BoardMeta::default();
-        let task = &parse_page(&[item], &mut meta)[0];
+        let task = &parse_page(&[item])[0];
         assert_eq!(task.priority(), Priority::High);
 
         let policy = SpawnPolicy {
@@ -1164,7 +1132,7 @@ mod tests {
         let hub = GitHubHub::new("o/r".into(), "t".into());
         let now = std::time::Instant::now();
         let rows = vec![Task::new(number, "строка".into(), Status::Analys)];
-        hub.snap_cache.put(board, (rows, BoardMeta::default()), now);
+        hub.snap_cache.put(board, rows, now);
         hub.write_through_status(board, number, status);
         hub.write_through_status_cache(number, status);
         hub
@@ -1180,7 +1148,7 @@ mod tests {
             .get("B", std::time::Instant::now())
             .expect("снапшот жив");
         assert_eq!(
-            snap.0.iter().find(|t| t.number() == 7).unwrap().status(),
+            snap.iter().find(|t| t.number() == 7).unwrap().status(),
             Status::InProgress
         );
         assert_eq!(
@@ -1241,10 +1209,7 @@ mod tests {
         let hub = GitHubHub::new("o/r".into(), "t".into());
         hub.snap_cache.put(
             "B",
-            (
-                vec![Task::new(7, "строка".into(), Status::Analys)],
-                BoardMeta::default(),
-            ),
+            vec![Task::new(7, "строка".into(), Status::Analys)],
             std::time::Instant::now(),
         );
         hub.settle_board_cells("B", 7, Some("high"), Some(true));
@@ -1253,7 +1218,6 @@ mod tests {
             .get("B", std::time::Instant::now())
             .expect("снапшот жив");
         let t = snap
-            .0
             .iter()
             .find(|t| t.number() == 7)
             .expect("строка в снапшоте");
@@ -1268,10 +1232,7 @@ mod tests {
         let hub = GitHubHub::new("o/r".into(), "t".into());
         hub.snap_cache.put(
             "B",
-            (
-                vec![Task::new(8, "другая строка".into(), Status::Analys)],
-                BoardMeta::default(),
-            ),
+            vec![Task::new(8, "другая строка".into(), Status::Analys)],
             std::time::Instant::now(),
         );
         hub.settle_board_cells("B", 7, Some("high"), None);
@@ -1449,14 +1410,14 @@ mod tests {
         let hub = GitHubHub::new("o/r".into(), "t".into());
         let now = std::time::Instant::now();
         let rows = vec![Task::new(7, "строка".into(), Status::Analys)];
-        hub.snap_cache.put("B", (rows, BoardMeta::default()), now);
+        hub.snap_cache.put("B", rows, now);
         hub.write_through_status("B", 7, Status::InProgress);
         let snap = hub
             .snap_cache
             .get("B", std::time::Instant::now())
             .expect("write-through сохраняет ключ");
         assert_eq!(
-            snap.0.iter().find(|t| t.number() == 7).unwrap().status(),
+            snap.iter().find(|t| t.number() == 7).unwrap().status(),
             Status::InProgress,
             "собственная запись видна из кэша сразу (read-your-writes #1235)"
         );
@@ -1481,15 +1442,19 @@ mod tests {
         let hub = GitHubHub::new("o/r".into(), "t".into());
         let now = std::time::Instant::now();
         let rows = vec![Task::new(8, "другая строка".into(), Status::Todo)];
-        hub.snap_cache.put("B", (rows, BoardMeta::default()), now);
+        hub.snap_cache.put("B", rows, now);
         hub.write_through_status("B", 7, Status::InProgress);
         let snap = hub
             .snap_cache
             .get("B", std::time::Instant::now())
             .expect("ключ снапшота жив");
-        assert_eq!(snap.0.len(), 1, "мусор в снапшот не добавлен");
-        assert_eq!(snap.0[0].number(), 8, "чужие строки не тронуты");
-        assert_eq!(snap.0[0].status(), Status::Todo);
+        assert_eq!(snap.len(), 1, "мусор в снапшот не добавлен");
+        assert_eq!(
+            snap.first().map(|t| t.number()).unwrap_or_default(),
+            8,
+            "чужие строки не тронуты"
+        );
+        assert_eq!(snap.first().map(|t| t.status()), Some(Status::Todo));
     }
 
     #[test]
@@ -1692,15 +1657,13 @@ mod tests {
 
     #[test]
     fn parse_page_marks_closed_done() {
-        let mut meta = BoardMeta::default();
         let items = vec![json!({
             "id": "IT_x",
             "content": { "__typename": "Issue", "number": 7, "title": "t", "state": "closed" },
             "fieldValues": { "nodes": [] }
         })];
-        let rows = parse_page(&items, &mut meta);
+        let rows = parse_page(&items);
         assert_eq!(rows[0].status(), Status::Done);
-        assert_eq!(meta.items.get(&7).map(String::as_str), Some("IT_x"));
     }
 }
 
