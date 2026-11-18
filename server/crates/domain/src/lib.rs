@@ -33,6 +33,6 @@ pub use task_type::TaskType;
 // внутренние виды расписания — параметр Schedule::new (парсер юзкейс-слоя)
 pub use cron::ScheduleKind;
 pub use pipeline::{
-    awaits, decide, gate, Action, Awaits, Gate, LoopOutcome, PeakWindow, SpawnLoop, SpawnPolicy,
-    UtcMinute,
+    awaits, can_preempt, decide, gate, Action, Awaits, Gate, LoopOutcome, PeakWindow, SpawnLoop,
+    SpawnPolicy, UtcMinute,
 };

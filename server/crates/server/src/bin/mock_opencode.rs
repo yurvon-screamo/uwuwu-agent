@@ -13,6 +13,9 @@
 //!            отдаёт 200 + text/html «Войти» на GET и 405 без тела на
 //!            POST (живая проба Caddy @nologin) — окно заглушки: скан
 //!            не «успешно пуст», а Err → слепой hold спавна
+//!   busy   — сессии не отвечают: ход «висит» (message_tail без finish →
+//!            busy по контракту сервера, #1231) — носитель busy-жертв
+//!            преемпшена CUP (#1259 e2e); abort снимает ход
 //!
 //! Env: MOCK_MODE (деф. plain), MOCK_PORT (8099), MOCK_STEP_MS (1500),
 //!      MOCK_MCP_URL (http://127.0.0.1:8090), MOCK_MCP_TOKEN («»),
@@ -294,6 +297,20 @@ async fn main() {
             }),
         )
         .route(
+            "/api/session/{id}/abort",
+            post({
+                let store = store.clone();
+                move |Path(id): Path<String>| abort_session(store, id)
+            }),
+        )
+        .route(
+            "/api/session/{id}/interrupt",
+            post({
+                let store = store.clone();
+                move |Path(id): Path<String>| abort_session(store, id)
+            }),
+        )
+        .route(
             "/api/session/{id}/prompt",
             post({
                 let store = store.clone();
@@ -514,6 +531,24 @@ async fn delete_session(store: Arc<Store>, id: String) -> Resp {
     }
 }
 
+/// Abort/interrupt (преемпшен #1259): мок принимает оба пути клиента.
+/// busy-режим: abort снимает ход — сессия получает финальный ответ
+/// («работа остановлена») и перестаёт держать busy-учёт сервера
+/// (message_tail с finish=stop → idle); после #1231 (мок несёт
+/// time.busy/time.idle) сюда ложится сброс busy.
+async fn abort_session(store: Arc<Store>, id: String) -> Resp {
+    tracing::info!(event = "mock.session_aborted", %id, "POST /session/{id}/abort");
+    let mut sessions = store.sessions.lock().expect("store");
+    match sessions.get_mut(&id) {
+        Some(s) => {
+            s.busy = false;
+            s.reply = Some((now_ms(), "ход остановлен (abort)".into()));
+            (StatusCode::OK, Json(json!({ "interrupted": true })))
+        }
+        None => (StatusCode::NOT_FOUND, Json(json!({ "status": "404" }))),
+    }
+}
+
 async fn prompt(
     store: Arc<Store>,
     mode: String,
@@ -533,6 +568,10 @@ async fn prompt(
         s.updated_ms = now_ms();
         s.busy_ms = now_ms(); // Started: ход в полёте (CUP-учёт, #1231)
 
+        if mode == "busy" {
+            // ход «висит»: busy-носитель жертв преемпшена (#1259 e2e)
+            s.busy = true;
+        }
         // Маркер turn probe (#1209): сессия отвечает многосообщным ходом —
         // мгновенный реплай не ставится, message_tail строит фазы пробы
         if text.contains("turn probe") {
@@ -544,8 +583,9 @@ async fn prompt(
         // ровно один ход, иначе следующие сообщения сессии молчат
         // (вскрыто media-сценарием #1171)
         s.turn_ms = None;
-        // реплай бота готов сразу (storm — исключение: прерывание без ответа)
-        if mode != "storm" {
+        // реплай бота готов сразу (storm/busy — исключения: storm прерывает
+        // без ответа, busy держит ход «висящим» — #1259 e2e)
+        if mode != "storm" && mode != "busy" {
             let tail = text
                 .lines()
                 .rev()

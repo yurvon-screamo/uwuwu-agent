@@ -77,6 +77,22 @@ impl AgentSessionGateway for BudgetedSessions {
         self.inner.delete_session(session).await
     }
 
+    async fn abort_session(&self, session: &str) -> UsecaseResult<()> {
+        self.inner.abort_session(session).await
+    }
+
+    fn spawn_allowed(&self) -> bool {
+        // Проба без мутаций окна (SpawnBudget::peek): преемпшен #1259
+        // проверяет готовность кандидата ДО гашения жертвы
+        matches!(
+            self.budget
+                .lock()
+                .expect("budget lock")
+                .peek(self.clock.now_ms()),
+            BudgetVerdict::Allowed
+        )
+    }
+
     async fn last_activity_ms(&self, session: &str) -> UsecaseResult<Option<u64>> {
         self.inner.last_activity_ms(session).await
     }
@@ -176,5 +192,36 @@ mod tests {
             "кап 2 исчерпан"
         );
         budgeted.create_session(&spec(true)).await.unwrap(); // bootstrap по-прежнему ок
+    }
+
+    #[tokio::test]
+    async fn spawn_allowed_peek_does_not_spend_budget() {
+        // Проба преемпшена (#1259): готовность кандидата проверяется до
+        // гашения жертвы — peek без мутаций окна, kill-switch = false
+        let budgeted = BudgetedSessions::with_shared(
+            Arc::new(Counting(Arc::new(AtomicUsize::new(1)))),
+            Arc::new(Mutex::new(SpawnBudget::new(2))),
+            Arc::new(ConstClock),
+        );
+        assert!(budgeted.spawn_allowed(), "свежее окно — проба true");
+        // исчерпание часа: два рабочих спавна
+        budgeted.create_session(&spec(false)).await.unwrap();
+        budgeted.create_session(&spec(false)).await.unwrap();
+        assert!(
+            !budgeted.spawn_allowed(),
+            "кап исчерпан — преемпшен не начинается"
+        );
+        // peek не тратил бюджет повторно: в окне те же две метки
+        assert!(
+            !budgeted.spawn_allowed(),
+            "проба идемпотентна (не мутирует окно)"
+        );
+        // kill-switch
+        let killed = BudgetedSessions::with_shared(
+            Arc::new(Counting(Arc::new(AtomicUsize::new(1)))),
+            Arc::new(Mutex::new(SpawnBudget::new(0))),
+            Arc::new(ConstClock),
+        );
+        assert!(!killed.spawn_allowed(), "kill-switch — пробы нет");
     }
 }
