@@ -13,8 +13,12 @@ mod executor;
 mod gherr;
 #[cfg(test)]
 mod gherr_tests;
+mod gitea;
+#[cfg(test)]
+mod gitea_tests;
 mod github;
 mod mockhub;
+mod prgate;
 mod search;
 mod state;
 mod tg;
@@ -220,7 +224,11 @@ async fn run(
     // Исполнители и роутер «проект → executor» (#1203); боты — raw-дефолт
     let clock = Arc::new(clock::SystemClock);
     let (raw_default, sessions) = build_sessions(&cfg, &secrets, clock.clone())?;
-    let prs = Arc::new(github::GhPrGateway::new(secrets.gh_token.clone()));
+    // PR-гейт: диспетчер по хосту PR-URL — GitHub + Gitea (#1269)
+    let prs = Arc::new(prgate::RoutedPrGateway::new(
+        github::GhPrGateway::new(secrets.gh_token.clone()),
+        gitea::GiteaPrGateway::new(secrets.gitea_tokens.clone()),
+    ));
     let state_path = cfg.state_path(&config_path);
     let state = Arc::new(state::JsonStateStore::load(state_path, clock.clone()));
     let spawn_models = Arc::new(match cfg.executor.models.as_ref() {
