@@ -34,7 +34,7 @@ pub use pipeline::{
     TickOutcome, TickPlan, TickUseCase,
 };
 pub use ports::{
-    AgentSessionGateway, AssistantReply, Clock, CommentRef, FmMutator, IssueDigest,
+    AgentSessionGateway, AssistantReply, Clock, CommentRef, DreamerMark, FmMutator, IssueDigest,
     IssueFieldStore, IssueIndexSource, IssueView, Liveness, PrGateway, PrState, SessionInfo,
     SessionSpec, TaskBoardRepo, TickStateStore, WikiRepo,
 };

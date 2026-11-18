@@ -285,6 +285,19 @@ pub trait IssueIndexSource: Send + Sync {
     async fn recent_issues(&self, limit: usize) -> UsecaseResult<Vec<IssueDigest>>;
 }
 
+/// Метка дример-обработки сессии (#1306, инвариант 1:1 — ADR-005):
+/// watermark вместо вечного маркера — revival (активность выше позиции)
+/// снова делает сессию кандидатом.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DreamerMark {
+    /// Прогон дримера покрывал активность сессии до этой метки
+    /// (ms последнего обновления источника на момент прогона).
+    UpTo(u64),
+    /// Не источник опыта (боты): никогда не дримить.
+    Forever,
+}
+
 /// Персистентное состояние тика (wakeup-дедуп, дример-инвариант).
 pub trait TickStateStore: Send + Sync {
     fn last_comment_id(&self, board: &str, number: u64) -> Option<String>;
@@ -293,9 +306,15 @@ pub trait TickStateStore: Send + Sync {
     fn last_seen_status(&self, board: &str, number: u64) -> Option<Status>;
     fn set_last_seen_status(&self, board: &str, number: u64, status: Status);
     fn set_last_comment_id(&self, board: &str, number: u64, id: &str);
-    /// Дример уже отработал сессию (1 рабочая = 1 дример).
-    fn dreamer_done(&self, session: &str) -> bool;
-    fn mark_dreamer_done(&self, session: &str);
+    /// Метка дример-обработки: None — сессия ещё не дримлена.
+    fn dreamer_mark(&self, session: &str) -> Option<DreamerMark>;
+    fn mark_dreamer(&self, session: &str, mark: DreamerMark);
+    /// Связка «исходная → её дример-сессия» (инвариант 1:1 — ADR-005).
+    fn dreamer_session(&self, source: &str) -> Option<String>;
+    fn link_dreamer_session(&self, source: &str, dreamer: &str);
+    /// Гигиена: метки и линки сессий, которых нет в живом union-скане,
+    /// сносятся (рост state ограничен живыми сессиями, #1306).
+    fn prune_dreamer(&self, live: &std::collections::HashSet<String>);
     /// Дример: спавнов за сутки (day_key = дата JST) — дневной кап.
     fn dreamer_day_spawns(&self, day_key: &str) -> u32;
     fn mark_dreamer_spawn(&self, day_key: &str);

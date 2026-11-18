@@ -12,7 +12,9 @@ use uwuwu_usecase::bots::{
     build_prompt, chunk_reply, classify_message, BotStateStore, Incoming, MediaKind,
     TelegramGateway, TgMedia, TgMessage, TgUpdate,
 };
-use uwuwu_usecase::{AgentSessionGateway, Liveness, SessionSpec, TickStateStore, UsecaseResult};
+use uwuwu_usecase::{
+    AgentSessionGateway, DreamerMark, Liveness, SessionSpec, TickStateStore, UsecaseResult,
+};
 
 pub(crate) const TG_POLL_SEC: u64 = 25;
 pub(crate) const RETRY_PAUSE_MS: u64 = 10_000;
@@ -48,7 +50,7 @@ pub(crate) struct BotDeps {
     pub state: Arc<dyn BotStateStore>,
     /// Приёмник ассетов бота (media-файлы → URL в hub, #1171).
     pub assets: Arc<dyn uwuwu_usecase::bots::BotAssetStore>,
-    /// dreamer_done-маркировка бот-сессий (не источники опыта).
+    /// dreamer-метка Forever бот-сессий (не источники опыта).
     pub tick_state: Arc<dyn TickStateStore>,
     /// Потолок ожидания реплая и шаг опроса (константы — поля ради тестов).
     pub reply_cap_ms: u64,
@@ -232,7 +234,7 @@ async fn run_turn(deps: &BotDeps, chat_id: i64, text: &str) -> UsecaseResult<()>
 
 /// Вечная сессия бота: живая из state — переиспользуется; иначе создаётся
 /// (workspace+model биндятся при создании; bootstrap — вне спавн-бюджета).
-/// Бот-сессии маркируются dreamer_done — дример их не подбирает.
+/// Бот-сессии маркируются DreamerMark::Forever — дример их не подбирает.
 async fn ensure_session(deps: &BotDeps) -> UsecaseResult<String> {
     if let Some(s) = deps.state.bot_session(&deps.slug) {
         match deps.sessions.liveness(&s).await {
@@ -258,7 +260,7 @@ async fn ensure_session(deps: &BotDeps) -> UsecaseResult<String> {
     let id = deps.sessions.create_session(&spec).await?;
     deps.state.set_bot_session(&deps.slug, Some(&id));
     deps.state.save()?;
-    deps.tick_state.mark_dreamer_done(&id);
+    deps.tick_state.mark_dreamer(&id, DreamerMark::Forever);
     tracing::info!(event = "bot.session_created", slug = %deps.slug, session = %id,
         model_provider = %m.provider, model_id = %m.id, "Сессия бота создана");
     Ok(id)
