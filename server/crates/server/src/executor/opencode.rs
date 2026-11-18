@@ -103,16 +103,36 @@ pub fn liveness_of_status(status: reqwest::StatusCode) -> Liveness {
 }
 
 /// HTML-ответ = без-cookie заглушка гейта (Caddy @nologin рерайтит любой
-/// путь в страницу «Войти», #1160): content-type text/html ИЛИ
-/// doctype-снифф тела. Детектор вызывается в call() — единственной точке
-/// парсинга — поэтому накрывает всех потребителей трейта; HTML-ответ =
-/// отказ пробы (Err), не «факт» о сессиях.
+/// путь в страницу «Войти», #1160): content-type text/html; при
+/// отсутствии классифицирующего заголовка — doctype-снифф начала тела.
+/// Детектор вызывается в call() — единственной точке парсинга — поэтому
+/// накрывает всех потребителей трейта; HTML-ответ = отказ пробы (Err),
+/// не «факт» о сессиях.
 fn html_gate_response(content_type: Option<&str>, body: &str) -> bool {
     if content_type.is_some_and(|ct| ct.to_ascii_lowercase().contains("text/html")) {
         return true;
     }
-    let lower = body.trim_start().to_ascii_lowercase();
-    lower.starts_with("<!doctype html") || lower.starts_with("<html")
+    // снифф — только когда заголовок не классифицировал ответ (middlebox
+    // без content-type): иначе false positive на легитимный plain-text,
+    // начинающийся с HTML-документа (Low ревью #1160; заглушка гейта
+    // всегда несёт text/html — живая проба 18.11)
+    if content_type.is_some() {
+        return false;
+    }
+    let trimmed = body.trim_start();
+    starts_with_ci(trimmed, b"<!doctype html") || starts_with_ci(trimmed, b"<html")
+}
+
+/// Регистронезависимый префикс первых байтов — без копии тела целиком
+/// (Low ревью #1160: to_ascii_lowercase на каждом ответе — лишняя
+/// аллокация больших страниц списка на каждом тике).
+fn starts_with_ci(haystack: &str, needle: &[u8]) -> bool {
+    let bytes = haystack.as_bytes();
+    bytes.len() >= needle.len()
+        && bytes[..needle.len()]
+            .iter()
+            .zip(needle)
+            .all(|(b, n)| b.to_ascii_lowercase() == *n)
 }
 
 impl OpencodeClient {
@@ -473,6 +493,12 @@ mod tests {
         assert!(!html_gate_response(Some("application/json"), "{\"a\":1}"));
         assert!(!html_gate_response(None, ""));
         assert!(!html_gate_response(None, "502 Bad Gateway"));
+        // Low дельты #1160: классифицирующий заголовок отключает снифф —
+        // plain-text (экспорт), начинающийся с HTML-документа, не Err
+        assert!(!html_gate_response(
+            Some("text/plain"),
+            "<!doctype html><html><body>экспорт</body></html>"
+        ));
     }
 
     fn page_item(id: &str, directory: &str) -> serde_json::Value {
