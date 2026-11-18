@@ -162,6 +162,11 @@ impl TaskWriteUseCase {
         number: u64,
         patch: &TaskPatch,
     ) -> UsecaseResult<()> {
+        // патч несёт оба значения — носитель не читается: результат гейта
+        // уже известен, GitHub round-trip не нужен (Low ревью #1280)
+        if patch.priority.is_some() && patch.automerge.is_some() {
+            return Ok(());
+        }
         let carrier = self.fields.load(number).await?;
         let priority = match patch.priority.as_deref() {
             Some(raw) => naming::parse_priority(raw),

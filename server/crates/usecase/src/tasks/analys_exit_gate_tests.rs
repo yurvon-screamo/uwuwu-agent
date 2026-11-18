@@ -1,10 +1,14 @@
 //! Гейт полноты обязательных полей на выходе из Analys (#1280): волна
 //! аналитики обязана выпускать строки с явными Приоритетом и Automerge —
-//! решение разбора, не пустота носителя. Матрица: пустое поле → отказ
-//! с перечнем; оба заполнены или перекрыты патчем → пропуск; не-Analys
-//! и Deleted → без проверки; идемпотентный Analys → Analys под гейтом
-//! (can_transition пропускает from == to); мусорный приоритет = пустота;
-//! отказ атомарен — set_status не вызывается.
+//! решение разбора, не пустота носителя. Носитель в кейсах — живого вида:
+//! физическое имя автомержа legacy «Autodone» (живой каталог «Automerge»
+//! не содержит), load фейка нормализует ключ на границе — контракт
+//! fields.rs после фикса (класс расхождения «мок vs живой carrier» —
+//! High-находка ревью #1280 — здесь же и ловится). Матрица: пустое поле →
+//! отказ с перечнем; оба заполнены или перекрыты патчем → пропуск;
+//! не-Analys и Deleted → без проверки; идемпотентный Analys → Analys под
+//! гейтом (can_transition пропускает from == to); мусорный приоритет =
+//! пустота; отказ атомарен — set_status не вызывается.
 
 use crate::error::UsecaseResult;
 use crate::ports::{CommentRef, FmMutator, IssueFieldStore, IssueView, TaskBoardRepo};
@@ -107,7 +111,9 @@ impl TaskBoardRepo for GateBoard {
     }
 }
 
-/// Поля issue на носителе: карта непустых значений (load = снятый клон).
+/// Поля issue на носителе живого вида: физическое имя автомержа —
+/// legacy «Autodone» (живой каталог «Automerge» не содержит, #1280 ревью);
+/// load нормализует ключ на границе — контракт fields.rs после фикса.
 #[derive(Default)]
 struct GateFields {
     stored: Mutex<HashMap<String, String>>,
@@ -124,12 +130,28 @@ impl GateFields {
             ),
         }
     }
+
+    /// Нормализация ключа на границе носителя: «Autodone» → «Automerge».
+    fn normalize(key: String) -> String {
+        if key == "Autodone" {
+            crate::naming::F_AUTOMERGE.to_string()
+        } else {
+            key
+        }
+    }
 }
 
 #[async_trait]
 impl IssueFieldStore for GateFields {
     async fn load(&self, _n: u64) -> UsecaseResult<HashMap<String, String>> {
-        Ok(self.stored.lock().expect("gate fields").clone())
+        Ok(self
+            .stored
+            .lock()
+            .expect("gate fields")
+            .clone()
+            .into_iter()
+            .map(|(k, v)| (Self::normalize(k), v))
+            .collect())
     }
 
     async fn store(&self, _n: u64, patch: &[(&str, Option<String>)]) -> UsecaseResult<()> {
@@ -173,10 +195,10 @@ fn status_patch(status: Status) -> TaskPatch {
 }
 
 /// Пустой Приоритет на носителе → отказ, перечень называет поле,
-/// заполненный Automerge в перечне не звать.
+/// заполненный (legacy «Autodone») Automerge в перечне не звать.
 #[tokio::test]
 async fn analys_exit_requires_priority() {
-    let (u, _, _) = case(Status::Analys, &[("Automerge", "on")]);
+    let (u, _, _) = case(Status::Analys, &[("Autodone", "on")]);
     let err = u
         .edit("uwuwu", 1, status_patch(Status::ReviewAnalys))
         .await
@@ -223,12 +245,27 @@ async fn analys_exit_lists_both_empty_fields() {
     );
 }
 
+/// Оба поля на носителе живого вида (legacy «Autodone») → переход
+/// проходит, статус записан: гейт не требует нового имени носителя.
+#[tokio::test]
+async fn legacy_autodone_carrier_passes_gate() {
+    let (u, board, _) = case(Status::Analys, &[("Приоритет", "high"), ("Autodone", "on")]);
+    u.edit("uwuwu", 1, status_patch(Status::ReviewAnalys))
+        .await
+        .expect("legacy-носитель полон — переход легален");
+    assert_eq!(
+        board.writes(),
+        vec![(1, Status::ReviewAnalys)],
+        "статус не записан"
+    );
+}
+
 /// Оба поля на носителе → переход проходит, статус записан.
 #[tokio::test]
 async fn analys_exit_passes_with_carrier_values() {
     let (u, board, _) = case(
         Status::Analys,
-        &[("Приоритет", "medium"), ("Automerge", "on")],
+        &[("Приоритет", "medium"), ("Autodone", "on")],
     );
     u.edit("uwuwu", 1, status_patch(Status::ReviewAnalys))
         .await
@@ -289,7 +326,7 @@ async fn analys_idempotent_transition_is_gated() {
 async fn garbage_priority_is_rejected() {
     let (u, _, _) = case(
         Status::Analys,
-        &[("Приоритет", "urgent"), ("Automerge", "on")],
+        &[("Приоритет", "urgent"), ("Autodone", "on")],
     );
     let err = u
         .edit("uwuwu", 1, status_patch(Status::ReviewAnalys))

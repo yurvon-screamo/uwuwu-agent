@@ -435,7 +435,15 @@ impl IssueFieldStore for MemoryHub {
             }
             if let Some(raw) = state.raw_fields.get(&number) {
                 for (name, value) in raw {
-                    out.insert(name.clone(), value.clone());
+                    // живой каталог: физическое имя автомержа legacy
+                    // «Autodone» (#1280 ревью) — наружу нормализованное
+                    // «Automerge», как fields.rs на границе носителя
+                    let shown = if name == "Autodone" {
+                        uwuwu_usecase::F_AUTOMERGE
+                    } else {
+                        name.as_str()
+                    };
+                    out.insert(shown.to_string(), value.clone());
                 }
             }
             Ok(out)
@@ -473,9 +481,10 @@ impl IssueFieldStore for MemoryHub {
                             let _ = f.open_pr(p);
                         }
                     }
-                    // «Приоритет»/«Automerge» — вне доменной проекции,
-                    // но на носителе: гейт полноты #1280 читает их load'ом
-                    ("Приоритет", value) | ("Automerge", value) => match value {
+                    // «Приоритет» — как есть; «Automerge» — физическое имя
+                    // legacy «Autodone»: имитация resolve_field живого
+                    // носителя (каталог «Automerge» не содержит, #1280 ревью)
+                    ("Приоритет", value) => match value {
                         Some(v) => {
                             state
                                 .raw_fields
@@ -486,6 +495,20 @@ impl IssueFieldStore for MemoryHub {
                         None => {
                             if let Some(raw) = state.raw_fields.get_mut(&number) {
                                 raw.remove(*name);
+                            }
+                        }
+                    },
+                    ("Automerge", value) => match value {
+                        Some(v) => {
+                            state
+                                .raw_fields
+                                .entry(number)
+                                .or_default()
+                                .insert("Autodone".into(), v.clone());
+                        }
+                        None => {
+                            if let Some(raw) = state.raw_fields.get_mut(&number) {
+                                raw.remove("Autodone");
                             }
                         }
                     },

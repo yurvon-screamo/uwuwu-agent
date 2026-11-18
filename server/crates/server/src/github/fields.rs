@@ -244,16 +244,24 @@ pub fn parse_field_values(issue: &Value) -> Fields {
     let mut out = Fields::new();
     if let Some(list) = issue["issue_field_values"].as_array() {
         for f in list {
-            let name = f["issue_field_name"].as_str().unwrap_or_default();
+            let mut name = f["issue_field_name"].as_str().unwrap_or_default();
             if name.is_empty() {
                 continue;
+            }
+            // Legacy-нормализация на границе носителя (#1280): resolve_field
+            // пишет автомерж в legacy-поле «Autodone» (каталог «Automerge»
+            // не содержит), читатели получают новое имя — потребители
+            // fields.load не обязаны помнить алиас (док F_AUTOMERGE:
+            // «сервер читает/пишет оба имени» — резолв здесь, как в store).
+            if name == "Autodone" {
+                name = uwuwu_usecase::F_AUTOMERGE;
             }
             let value = f["single_select_option"]["name"]
                 .as_str()
                 .or(f["value"].as_str())
                 .unwrap_or_default();
             if !value.is_empty() {
-                out.insert(name.to_string(), value.to_string());
+                out.entry(name.to_string()).or_insert(value.to_string());
             }
         }
     }
@@ -290,6 +298,33 @@ mod tests {
         assert_eq!(f.get("Сессия dev").map(String::as_str), Some("ses_a"));
         assert_eq!(f.get("Приоритет").map(String::as_str), Some("high"));
         assert!(!f.contains_key("PR"), "пустые значения не в карте");
+    }
+
+    #[test]
+    fn parse_normalizes_legacy_autodone() {
+        // живой каталог: физическое имя legacy «Autodone» (#1280 ревью) —
+        // наружу нормализованное «Automerge», legacy-ключ не просачивается
+        let issue = json!({
+            "issue_field_values": [
+                { "issue_field_name": "Autodone", "single_select_option": { "name": "on" } },
+                { "issue_field_name": "Приоритет", "single_select_option": { "name": "high" } },
+            ]
+        });
+        let f = parse_field_values(&issue);
+        assert_eq!(f.get("Automerge").map(String::as_str), Some("on"));
+        assert!(!f.contains_key("Autodone"), "legacy-ключ в карте");
+    }
+
+    #[test]
+    fn parse_keeps_live_automerge_name() {
+        // если каталог пополнился новым именем — оно не перетирается
+        let issue = json!({
+            "issue_field_values": [
+                { "issue_field_name": "Automerge", "single_select_option": { "name": "off" } },
+            ]
+        });
+        let f = parse_field_values(&issue);
+        assert_eq!(f.get("Automerge").map(String::as_str), Some("off"));
     }
 
     #[test]
