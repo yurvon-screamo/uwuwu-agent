@@ -315,10 +315,11 @@ async fn patch_garbage_priority_is_rejected() {
 }
 
 /// Мусорный патч-приоритет без automerge — тот же отказ (форма вызова
-/// без automerge идёт через носитель-ветку): перечень называет поле.
+/// без automerge идёт через носитель-ветку): перечень называет поле,
+/// отказ не пишет (атомарность на carrier-load ветке).
 #[tokio::test]
 async fn patch_garbage_priority_without_automerge_is_rejected() {
-    let (u, _, _) = case(Status::Analys, &[]);
+    let (u, board, _) = case(Status::Analys, &[]);
     let mut p = status_patch(Status::ReviewAnalys);
     p.priority = Some("urgent".into());
     let err = u
@@ -328,6 +329,11 @@ async fn patch_garbage_priority_without_automerge_is_rejected() {
     assert!(
         err.to_string().contains("Приоритет"),
         "перечень без Приоритета: {err}"
+    );
+    assert!(
+        board.writes().is_empty(),
+        "отказ записал статус: {:?}",
+        board.writes()
     );
 }
 

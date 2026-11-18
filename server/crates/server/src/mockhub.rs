@@ -153,6 +153,22 @@ impl MemoryHub {
     }
 }
 
+fn automerge_cell(on: &str) -> bool {
+    on == "on" || on == "true"
+}
+
+/// Проекция автомержа из носителя стенда в Task (read_board/read_issue
+/// читают одну карту raw_fields — единый носитель #1155+#1280, без дублей).
+fn project_carrier_automerge(
+    task: &mut Task,
+    raw_fields: &HashMap<u64, HashMap<String, String>>,
+    number: u64,
+) {
+    if let Some(on) = raw_fields.get(&number).and_then(|raw| raw.get("Autodone")) {
+        task.set_automerge(automerge_cell(on));
+    }
+}
+
 #[async_trait]
 impl TaskBoardRepo for MemoryHub {
     async fn read_board(&self, board: &str) -> UsecaseResult<Vec<Task>> {
@@ -174,13 +190,7 @@ impl TaskBoardRepo for MemoryHub {
                 if let Some(f) = state.fields.get(&t.number()) {
                     t.apply_fields(f.clone());
                 }
-                if let Some(on) = state
-                    .raw_fields
-                    .get(&t.number())
-                    .and_then(|raw| raw.get("Autodone"))
-                {
-                    t.set_automerge(on == "on" || on == "true");
-                }
+                project_carrier_automerge(t, &state.raw_fields, t.number());
             }
             rows.sort_by_key(|t| t.number());
             Ok(rows)
@@ -289,13 +299,7 @@ impl TaskBoardRepo for MemoryHub {
             if let Some(f) = state.fields.get(&number) {
                 task.apply_fields(f.clone());
             }
-            if let Some(on) = state
-                .raw_fields
-                .get(&number)
-                .and_then(|raw| raw.get("Autodone"))
-            {
-                task.set_automerge(on == "on" || on == "true");
-            }
+            project_carrier_automerge(&mut task, &state.raw_fields, number);
             let body = state.bodies.get(&number).cloned().unwrap_or_default();
             let comments = state.comments.get(&number).cloned().unwrap_or_default();
             Ok(IssueView {
