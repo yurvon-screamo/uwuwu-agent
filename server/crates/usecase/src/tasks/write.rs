@@ -507,6 +507,9 @@ mod tests {
     #[derive(Default)]
     struct FakeBoard {
         cells: std::sync::Mutex<Vec<CellWrite>>,
+        /// Номера, которые issues_with_title «находит» в репо — вход
+        /// холодного ящика (#1293): create с таким тайтлом обязан падать.
+        cold_hits: Vec<u64>,
     }
 
     /// Запись ячеек снапшота: номер + приоритет + automerge (#1258).
@@ -588,7 +591,7 @@ mod tests {
             Ok(())
         }
         async fn issues_with_title(&self, _title: &str) -> UsecaseResult<Vec<u64>> {
-            Ok(Vec::new())
+            Ok(self.cold_hits.clone())
         }
         async fn replace_body(&self, _n: u64, _b: &str) -> UsecaseResult<()> {
             Ok(())
@@ -624,7 +627,19 @@ mod tests {
     }
 
     fn writecase(fields: Arc<FakeFields>) -> (TaskWriteUseCase, Arc<FakeBoard>) {
-        let board = Arc::new(FakeBoard::default());
+        writecase_with_cold(fields, Vec::new())
+    }
+
+    /// Вариант с «холодными» номерами репо (клин #1293): issues_with_title
+    /// фейка возвращает их для любого тайтла — create обязан отклонить.
+    fn writecase_with_cold(
+        fields: Arc<FakeFields>,
+        cold_hits: Vec<u64>,
+    ) -> (TaskWriteUseCase, Arc<FakeBoard>) {
+        let board = Arc::new(FakeBoard {
+            cells: std::sync::Mutex::default(),
+            cold_hits,
+        });
         let u = TaskWriteUseCase {
             board: board.clone(),
             fields,
@@ -633,6 +648,24 @@ mod tests {
             state: Arc::new(crate::pipeline::tick_tests::MemState::empty()),
         };
         (u, board)
+    }
+
+    /// Холодный ящик (#1293): create с тайтлом закрытой вне снапшота
+    /// строки — громкая ошибка дубля (issues_with_title, REST search).
+    /// Снапшот-гард (dup_check по read_board) слепнет к архивным тайтлам —
+    /// контрмера восстанавливает инвариант «тайтл уникален».
+    #[tokio::test]
+    async fn create_rejects_title_of_cold_row() {
+        let fields = Arc::new(FakeFields::default());
+        let (u, _) = writecase_with_cold(fields, vec![1243]);
+        let err = u
+            .create("uwuwu", spec("тайтл архивной задачи"))
+            .await
+            .expect_err("холодный дубль обязан отклоняться");
+        assert!(
+            err.to_string().contains("1243"),
+            "ошибка называет холодный номер: {err}"
+        );
     }
 
     /// Красный тест бага #1232 → контракт #1258: create маршрутизирует
