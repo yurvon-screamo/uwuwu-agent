@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use uwuwu_domain::{Slot, Status, Task, TaskFields};
+use uwuwu_domain::{Priority, Slot, Status, Task, TaskFields};
 use uwuwu_usecase::{CommentRef, IssueView};
 use uwuwu_usecase::{IssueFieldStore, TaskBoardRepo};
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
@@ -32,32 +32,41 @@ struct HubState {
     docs: HashMap<String, String>,
 }
 
-/// Seed-строка стенда: доска (опционально), номер, стартовый статус.
+/// Seed-строка стенда: доска (опционально), номер, стартовый статус,
+/// приоритет (опционально — дефолт Empty; носитель приоритета для
+/// преемпшена CUP #1259, чьё решение живёт в строке доски).
 struct SeedRow {
     board: Option<String>,
     number: u64,
     status: Status,
+    priority: Priority,
 }
 
 /// Парсинг UWUWU_MOCK_SEED: «;»-раздельные строки «board:number:status»
-/// или «number:status» (без тега — видна на всех досках стенда).
+/// или «number:status» (без тега — видна на всех досках стенда);
+/// хвост «:high|medium|low» задаёт приоритет (преемпшен #1259 e2e).
+/// Трёхчастные сиды дискриминируются первой частью: число →
+/// «number:status:priority», иначе — «board:number:status» (доска
+/// нечисловая; «In Progress» номером быть не может — парсер отсечёт).
 fn parse_seeds(raw: &str) -> Vec<SeedRow> {
     raw.split(';')
         .filter_map(|entry| {
             let parts: Vec<&str> = entry.split(':').collect();
-            match parts.as_slice() {
-                [board, n, s] => Some(SeedRow {
-                    board: Some(board.trim().to_string()),
-                    number: n.trim().parse().ok()?,
-                    status: uwuwu_usecase::parse_status(s.trim()),
-                }),
-                [n, s] => Some(SeedRow {
-                    board: None,
-                    number: n.trim().parse().ok()?,
-                    status: uwuwu_usecase::parse_status(s.trim()),
-                }),
-                _ => None,
-            }
+            let (board, number, status, prio) = match parts.as_slice() {
+                [board, n, s, p] => (Some((*board).trim().to_string()), n, s, *p),
+                [a, b, c] if a.trim().parse::<u64>().is_ok() => (None, a, b, *c),
+                // прочие трёхчастные — «board:number:status» (без тега с
+                // приоритетом — 4-частная форма «board:number:status:pr»)
+                [board, n, s] => (Some((*board).trim().to_string()), n, s, ""),
+                [n, s] => (None, n, s, ""),
+                _ => return None,
+            };
+            Some(SeedRow {
+                board,
+                number: number.trim().parse().ok()?,
+                status: uwuwu_usecase::parse_status(status.trim()),
+                priority: uwuwu_usecase::parse_priority(prio),
+            })
         })
         .collect()
 }
@@ -90,6 +99,7 @@ impl MemoryHub {
                 board: None,
                 number,
                 status,
+                priority: Priority::Empty,
             }],
             None => Vec::new(),
         })
@@ -128,10 +138,13 @@ impl MemoryHub {
             return;
         }
         for seed in &self.seeds {
-            state.tasks.insert(
-                seed.number,
-                Task::new(seed.number, "мок-цикл конвейера".into(), seed.status),
-            );
+            let mut task = Task::new(seed.number, "мок-цикл конвейера".into(), seed.status);
+            // приоритет — свойство строки (носитель решения преемпшена
+            // CUP #1259): сид задаёт стартовое значение
+            if seed.priority != Priority::Empty {
+                task.set_priority(seed.priority);
+            }
+            state.tasks.insert(seed.number, task);
             if let Some(board) = &seed.board {
                 state.board_tags.insert(seed.number, board.clone());
             }
@@ -485,6 +498,16 @@ impl IssueFieldStore for MemoryHub {
             if !state.tasks.contains_key(&number) {
                 return Err(UsecaseError::Board(format!("mockhub: #{number} нет")));
             }
+            // приоритет (#1259 e2e): задача task_edit пишет F_PRIORITY —
+            // на стенде значение живёт в самой строке (Task::set_priority)
+            if let Some(v) = patch
+                .iter()
+                .find(|(name, _)| matches!(*name, uwuwu_usecase::F_PRIORITY | "Priority"))
+                .and_then(|(_, v)| v.as_deref())
+            {
+                let task = state.tasks.get_mut(&number).expect("checked above");
+                task.set_priority(uwuwu_usecase::parse_priority(v));
+            }
             let f = state.fields.entry(number).or_default();
             for (name, value) in patch {
                 let slot = match *name {
@@ -558,6 +581,7 @@ mod tests {
             board: Some("Задачи uwuwu".into()),
             number: 11,
             status: Status::Analys,
+            priority: Priority::Empty,
         }]);
         let own = hub
             .row_status("Задачи uwuwu", 11)
@@ -678,5 +702,44 @@ mod tests {
             .expect("строка на доске");
         assert_eq!(t.priority(), uwuwu_domain::Priority::Low);
         assert!(!t.automerge());
+    #[tokio::test]
+    async fn seeded_priority_reaches_read_board() {
+        // Носитель приоритета на стенде (преемпшен CUP #1259): сид с
+        // хвостом «:priority» виден тику как приоритет строки доски
+        let hub = MemoryHub::with_seeds(parse_seeds(
+            "2046:In Progress:High;2048:In Progress:low;2049:Design",
+        ));
+        let rows = hub.read_board("Задачи uwuwu").await.expect("доска");
+        let prio = |n: u64| rows.iter().find(|t| t.number() == n).map(|t| t.priority());
+        assert_eq!(prio(2046), Some(Priority::High), "сид-приоритет High");
+        assert_eq!(prio(2048), Some(Priority::Low), "регистр не влияет");
+        assert_eq!(
+            prio(2049),
+            Some(Priority::Empty),
+            "сид без хвоста — дефолт Empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_edit_priority_updates_row() {
+        // Понижение приоритета активной строки (#1259 e2e): task_edit
+        // пишет F_PRIORITY через IssueFieldStore — строка меняет приоритет
+        // (can_preempt живёт в строке доски, не в полях-носителях)
+        let hub = MemoryHub::with_seeds(parse_seeds("2046:In Progress:High"));
+        // материализация сида (в проде edit() гардит row_status ДО store)
+        hub.read_board("Задачи uwuwu").await.expect("доска");
+        hub.store(2046, &[(uwuwu_usecase::F_PRIORITY, Some("low".into()))])
+            .await
+            .expect("запись приоритета");
+        let rows = hub.read_board("Задачи uwuwu").await.expect("доска");
+        let prio = rows
+            .iter()
+            .find(|t| t.number() == 2046)
+            .map(|t| t.priority());
+        assert_eq!(
+            prio,
+            Some(Priority::Low),
+            "task_edit-приоритет виден строке"
+        );
     }
 }
