@@ -85,7 +85,9 @@ mod tests {
         let mut l = ExecutorLoudness::new(3, 60 * MIN, 60 * MIN);
         l.register_failure("kisa", 0);
         l.register_failure("kisa", MIN);
-        let incident = l.register_failure("kisa", 2 * MIN).expect("порог достигнут");
+        let incident = l
+            .register_failure("kisa", 2 * MIN)
+            .expect("порог достигнут");
         assert_eq!(incident.executor, "kisa");
         assert_eq!(incident.failures_in_window, 3);
     }

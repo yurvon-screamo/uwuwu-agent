@@ -13,8 +13,4 @@ pub(crate) mod tick_tests;
 pub use analyst::{AnalystBoard, AnalystUseCase};
 pub use analyst_review::AnalystReviewUseCase;
 pub use dreamer::DreamerUseCase;
-pub use executor::{
-    ExecutorIncident, ExecutorLoudness, EXECUTOR_UNAVAILABLE_COOLDOWN_MS,
-    EXECUTOR_UNAVAILABLE_THRESHOLD, EXECUTOR_UNAVAILABLE_WINDOW_MS,
-};
 pub use tick::{BoardPlan, Mode, TickOutcome, TickPlan, TickUseCase};
