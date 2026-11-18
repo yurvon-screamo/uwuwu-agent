@@ -474,14 +474,14 @@ EOF
 rm -f "$STATE"
 LOG_SRV_PRE="$RUN_DIR/server-preempt.log"
 MOCK_MODE=busy MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=1500 \
-  "$BIN_DIR/mock_opencode" >"$LOG_MOCK" 2>&1 &
+  "$BIN_MOCK" >"$LOG_MOCK" 2>&1 &
 MOCK_PID=$!
 sleep 1
 UWUWU_SERVER_CONFIG=$CONFIG_PREEMPT UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
   UWUWU_SERVER_MODE=live \
   UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
   UWUWU_MOCK_SEED="2046:In Progress:High;2048:In Progress:High" \
-  RUST_LOG=info "$BIN_DIR/uwuwu-server" >"$LOG_SRV_PRE" 2>&1 &
+  RUST_LOG=info "$BIN_SRV" >"$LOG_SRV_PRE" 2>&1 &
 SRV_PID=$!
 # тики до HeldCup: жертва 2046 спавнится и busy (не отвечает), кандидат
 # 2048 held — high-жертва не гасится (can_preempt false) → cup.preempt.no_victim
@@ -555,7 +555,7 @@ EOF
 rm -f "$STATE"
 LOG_SRV_SWEEP="$RUN_DIR/server-sweep.log"
 MOCK_MODE=idle MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=100 \
-  "$BIN_DIR/mock_opencode" >"$LOG_MOCK" 2>&1 &
+  "$BIN_MOCK" >"$LOG_MOCK" 2>&1 &
 MOCK_PID=$!
 sleep 1
 # 9a: observe — внутренний гейт клина: кандидаты в логе, строка на доске
@@ -563,7 +563,7 @@ UWUWU_SERVER_CONFIG=$CONFIG_SWEEP UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
   UWUWU_SERVER_MODE=observe \
   UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
   UWUWU_MOCK_SEED="Задачи uwuwu:2049:Done:low:14;Задачи uwuwu:2050:Done:low:1" \
-  RUST_LOG=info "$BIN_DIR/uwuwu-server" >"$LOG_SRV_SWEEP" 2>&1 &
+  RUST_LOG=info "$BIN_SRV" >"$LOG_SRV_SWEEP" 2>&1 &
 SRV_PID=$!
 SEEN=0
 while [ $SEEN -lt 10 ]; do
@@ -584,7 +584,7 @@ UWUWU_SERVER_CONFIG=$CONFIG_SWEEP UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
   UWUWU_SERVER_MODE=live \
   UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
   UWUWU_MOCK_SEED="Задачи uwuwu:2049:Done:low:14;Задачи uwuwu:2050:Done:low:1" \
-  RUST_LOG=info "$BIN_DIR/uwuwu-server" >"$LOG_SRV_SWEEP" 2>&1 &
+  RUST_LOG=info "$BIN_SRV" >"$LOG_SRV_SWEEP" 2>&1 &
 SRV_PID=$!
 SEEN=0
 while [ $SEEN -lt 10 ]; do
