@@ -54,6 +54,11 @@ struct StateFile {
     /// attention-механика.
     #[serde(default)]
     spawn_loops: BTreeMap<String, (String, u32)>,
+    /// «board:number» → подряд request_changes ревью-контура без approve
+    /// (#1311): персистентный счётчик, смены статуса внутри цикла не
+    /// сбрасывают.
+    #[serde(default)]
+    review_rounds: BTreeMap<String, u32>,
     /// «board:number» → (статус цикла, кругов) — цикл-гвард аналитики (#1135).
     #[serde(default)]
     analys_loops: BTreeMap<String, (String, u32)>,
@@ -114,6 +119,13 @@ impl JsonStateStore {
                 let cut = guard.spawn_loops.len() - 5000;
                 for k in keys.into_iter().take(cut) {
                     guard.spawn_loops.remove(&k);
+                }
+            }
+            if guard.review_rounds.len() > 5000 {
+                let keys: Vec<String> = guard.review_rounds.keys().cloned().collect();
+                let cut = guard.review_rounds.len() - 5000;
+                for k in keys.into_iter().take(cut) {
+                    guard.review_rounds.remove(&k);
                 }
             }
             // legacy-ключи триажа (эпоха до #1135) — вечный мёртвый груз
@@ -195,6 +207,13 @@ impl TickStateStore for JsonStateStore {
             _ => 1,
         };
         row.stall = Some((naming::status_name(status).to_string(), at_ms, count));
+    }
+
+    fn clear_stall(&self, board: &str, number: u64) {
+        let mut guard = self.state.lock().expect("state lock");
+        if let Some(row) = guard.rows.get_mut(&Self::key(board, number)) {
+            row.stall = None;
+        }
     }
 
     fn set_last_comment_id(&self, board: &str, number: u64, id: &str) {
@@ -396,6 +415,26 @@ impl TickStateStore for JsonStateStore {
         for key in stale {
             guard.spawn_loops.remove(&key);
         }
+    }
+
+    fn review_rounds(&self, board: &str, number: u64) -> u32 {
+        let key = Self::key(board, number);
+        self.state
+            .lock()
+            .expect("state lock")
+            .review_rounds
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn set_review_rounds(&self, board: &str, number: u64, rounds: u32) {
+        let key = Self::key(board, number);
+        self.state
+            .lock()
+            .expect("state lock")
+            .review_rounds
+            .insert(key, rounds);
     }
 
     fn own_comment(&self, id: &str) -> bool {
@@ -619,5 +658,51 @@ mod tests {
         assert!(s.last_comment_id("b", 1).is_none());
         assert!(s.bot_session("slug").is_none());
         assert!(s.bot_offset("slug").is_none());
+    }
+
+    #[test]
+    fn review_rounds_persist_across_restart() {
+        // #1311: счётчик подряд request_changes переживает рестарт сервера —
+        // иначе любой рестарт обнулял бы стоп-кран ревью-цикла (урок ADR-107)
+        let dir = std::env::temp_dir().join(format!("uwuwu-state-rr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        {
+            let s = store(path.clone());
+            s.set_review_rounds("Задачи uwuwu", 901, 3);
+            s.set_review_rounds("Задачи uwuwu", 902, 0);
+            TickStateStore::save(&s).unwrap();
+        }
+        let s = store(path.clone());
+        assert_eq!(
+            s.review_rounds("Задачи uwuwu", 901),
+            3,
+            "счётчик переживает рестарт"
+        );
+        assert_eq!(
+            s.review_rounds("Задачи uwuwu", 902),
+            0,
+            "явный ноль (сброс) не превращается в отсутствие ключа"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn review_rounds_gc_caps_the_map() {
+        // #1311: GC-кап 5000 в save_now — карта счётчиков не растёт вечно
+        // (сиблинг-семантика spawn_loops/own_comments); срез — старейший
+        // ключ (BTreeMap-порядок)
+        let dir = std::env::temp_dir().join(format!("uwuwu-state-rr-gc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let s = store(path.clone());
+        for n in 1..=5001u64 {
+            s.set_review_rounds("B", n, 7);
+        }
+        TickStateStore::save(&s).unwrap();
+        let s = store(path);
+        assert_eq!(s.review_rounds("B", 5001), 7, "свежий ключ жив");
+        assert_eq!(s.review_rounds("B", 1), 0, "старейший ключ срезан капом");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

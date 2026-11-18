@@ -117,6 +117,7 @@ impl TickStateStore for NoopState {
         None
     }
     fn mark_stall_ping(&self, _b: &str, _n: u64, _s: Status, _at: u64) {}
+    fn clear_stall(&self, _b: &str, _n: u64) {}
     fn clear_spawn_ms(&self, _b: &str, _n: u64, _s: Slot) {}
     /// Аналитика: кулдауны волн/ревью и цикл-гварды (#1135).
     fn last_analys_ms(&self, _b: &str, _n: u64) -> Option<u64> {
@@ -143,6 +144,10 @@ impl TickStateStore for NoopState {
     }
     fn set_spawn_loop(&self, _b: &str, _n: u64, _s: Slot, _st: Status, _r: u32) {}
     fn reset_stale_spawn_loops(&self, _b: &str, _n: u64, _c: Status) {}
+    fn review_rounds(&self, _b: &str, _n: u64) -> u32 {
+        0
+    }
+    fn set_review_rounds(&self, _b: &str, _n: u64, _r: u32) {}
     fn own_comment(&self, _id: &str) -> bool {
         false
     }

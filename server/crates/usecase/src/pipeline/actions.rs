@@ -88,6 +88,9 @@ impl TickUseCase {
         self.board
             .set_branch(&board.board, task.number(), &branch)
             .await?;
+        // #1300: с пином агента дев-семья берёт модель из developer-ключа
+        // карты (раньше шла по default-ключу); переход пинен тестом
+        // dev_spawn_pins_the_developer_agent, ключи канонически одинаковы
         let work_model = match Agent::of_slot(slot) {
             Some(agent) => self.models.for_agent(agent),
             None => self.models.for_default(),
@@ -290,6 +293,13 @@ impl TickUseCase {
                     .map(|c| c.body.as_str())
                     .collect::<Vec<_>>()
                     .join("\n\n---\n\n");
+                // Пин агента слота перед ходом (#1300): именованным слотам —
+                // no-op (сессия уже носит агента), легаси-дев-сессии —
+                // фикс класса «wake перебросил кости» резолва исполнителя.
+                // Отказ — Err без seen: доставка повторится следующим тиком.
+                if let Some(agent) = Agent::of_slot(slot) {
+                    sessions.switch_agent(session, agent).await?;
+                }
                 sessions
                     .prompt(
                         session,

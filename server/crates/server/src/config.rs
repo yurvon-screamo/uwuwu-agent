@@ -66,6 +66,16 @@ pub struct PolicyCfg {
     pub peak: PeakCfg,
 }
 
+/// Инцидент-сигнализация сталл-детекта (#1281): массовость эскалаций за
+/// окно — один ТГ-сигнал владельцу. Секция отсутствует — off (safe default).
+#[derive(Debug, Clone, Deserialize)]
+pub struct NotifyCfg {
+    /// Имя env-переменной с токеном ТГ-бота (само значение — env, не конфиг).
+    pub tg_token_env: String,
+    /// Chat id получателя сигналов.
+    pub tg_chat_id: i64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProjectCfg {
     pub name: String,
@@ -95,6 +105,9 @@ pub struct Config {
     pub executors: Vec<NamedExecutorCfg>,
     pub policy: PolicyCfg,
     pub project: Vec<ProjectCfg>,
+    /// ТГ-сигнализация инцидентов сталл-детекта (#1281); нет секции — off.
+    #[serde(default)]
+    pub notify: Option<NotifyCfg>,
 }
 
 fn default_poll() -> u64 {
@@ -254,6 +267,22 @@ impl Config {
             opencode_gate_cookie,
             bearer,
         })
+    }
+
+    /// ТГ-сигнализация инцидентов конвейера: сталл-детект (#1281),
+    /// деградация executor'а (#1312). Секция не задана — off; задана,
+    /// а env пуст — честная ошибка старта (канон секретов).
+    pub fn tg_notify(&self) -> Result<Option<(String, i64)>, ConfigError> {
+        match &self.notify {
+            None => Ok(None),
+            Some(n) => match non_empty_env(&n.tg_token_env) {
+                Some(token) => Ok(Some((token, n.tg_chat_id))),
+                None => Err(ConfigError::Validation(format!(
+                    "{} обязателен (инцидент-сигнализация ТГ)",
+                    n.tg_token_env
+                ))),
+            },
+        }
     }
 
     /// Путь state-файла: env > рядом с конфигом.
@@ -475,6 +504,71 @@ mod tests {
         let cfg = toml::from_str::<Config>(&raw).expect("toml парсится");
         let err = cfg.validate().expect_err("не-http url должен падать");
         assert!(err.to_string().contains("не http(s)"), "{err}");
+    }
+
+    fn minimal() -> String {
+        // минимально валидный конфиг для notify-кейсов (tg_notify не ходит
+        // в проекты/исполнителей — каркас только под serde/validate)
+        r#"
+mode = "observe"
+[hub]
+repo = "a/b"
+[executor]
+name = "kisa"
+url = "http://127.0.0.1:1"
+[policy]
+cup = 7
+peak = { enabled = false, start_min = 0, end_min = 0 }
+[[project]]
+name = "p"
+board = "B"
+repo = "a/c"
+checkout = "/tmp/co"
+env_root = "/tmp/env"
+"#
+        .to_string()
+    }
+
+    /// Срез 5 #1281: секция [notify] не задана — сигнализация off.
+    #[test]
+    fn notify_absent_section_is_off() {
+        let cfg = toml::from_str::<Config>(&minimal()).expect("toml парсится");
+        let notify = cfg.tg_notify().expect("off-вариант не ошибка старта");
+        assert!(notify.is_none(), "нет [notify] — сигнализация off");
+    }
+
+    /// Секция задана, а env пуст — честная ошибка старта (канон секретов).
+    #[test]
+    fn notify_section_without_env_fails_startup() {
+        let raw = format!(
+            "{}\n[notify]\ntg_token_env = \"UWUWU_TEST_NOTIFY_ABSENT\"\ntg_chat_id = 42\n",
+            minimal()
+        );
+        let cfg = toml::from_str::<Config>(&raw).expect("toml парсится");
+        let err = cfg
+            .tg_notify()
+            .expect_err("секция без env должна валить старт");
+        assert!(
+            err.to_string().contains("UWUWU_TEST_NOTIFY_ABSENT"),
+            "имя env в тексте ошибки: {err}"
+        );
+        assert!(err.to_string().contains("конфиг:"), "каноничный префикс");
+    }
+
+    /// Секция + env — пара (токен, chat) для TelegramClient.
+    #[test]
+    fn notify_section_with_env_returns_token_and_chat() {
+        // env — глобал процесса: ключ уникален тестам модуля, чистим в конце
+        const KEY: &str = "UWUWU_TEST_NOTIFY_PRESENT";
+        std::env::set_var(KEY, "tok-123");
+        let raw = format!(
+            "{}\n[notify]\ntg_token_env = \"{KEY}\"\ntg_chat_id = 42\n",
+            minimal()
+        );
+        let cfg = toml::from_str::<Config>(&raw).expect("toml парсится");
+        let notify = cfg.tg_notify().expect("env задан — пара читается");
+        assert_eq!(notify, Some(("tok-123".to_string(), 42)));
+        std::env::remove_var(KEY);
     }
 
     #[test]

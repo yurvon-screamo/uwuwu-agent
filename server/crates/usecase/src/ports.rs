@@ -4,7 +4,9 @@
 
 use crate::error::UsecaseResult;
 use async_trait::async_trait;
-use uwuwu_domain::{AgentSlot, BranchName, ModelRef, Slot, Status, Task, TaskFields, UtcMinute};
+use uwuwu_domain::{
+    Agent, AgentSlot, BranchName, ModelRef, Slot, Status, Task, TaskFields, UtcMinute,
+};
 
 /// Мутатор fm-ячеек задачи (branch/pr/priority/…).
 pub type FmMutator =
@@ -181,6 +183,16 @@ pub struct AssistantReply {
 pub trait AgentSessionGateway: Send + Sync {
     async fn create_session(&self, spec: &SessionSpec) -> UsecaseResult<String>;
     async fn prompt(&self, session: &str, text: &str) -> UsecaseResult<()>;
+    /// Пин агента слота на живой сессии перед доставкой хода (#1300):
+    /// opencode `POST /session/:id/agent` (switchAgent). Живая проба
+    /// 2.3.2: session.agent персистится; prompt-эндпоинт агент-поле не
+    /// несёт (openapi additionalProperties:false — тихий discard), поэтому
+    /// пин живёт отдельным зовном. Дефолт no-op — гейтвеи без ручки
+    /// (фейки портов) не переопределяют; прод-клиент и бюджет-обёртка
+    /// несут настоящую механику (прецедент abort_session).
+    async fn switch_agent(&self, _session: &str, _agent: Agent) -> UsecaseResult<()> {
+        Ok(())
+    }
     /// Slash-команда сессии (детерминированные shell-блоки — env-подготовка).
     async fn run_command(&self, session: &str, name: &str, args: &str) -> UsecaseResult<()>;
     async fn liveness(&self, session: &str) -> Liveness;
@@ -310,6 +322,11 @@ pub trait TickStateStore: Send + Sync {
     /// Смена статуса строки = новый раунд (счётчик с нуля).
     fn stall_ping(&self, board: &str, number: u64) -> Option<(uwuwu_domain::Status, u64, u32)>;
     fn mark_stall_ping(&self, board: &str, number: u64, status: uwuwu_domain::Status, at_ms: u64);
+    /// Сброс раунда сталла на носителе: каунтер, переживший рестарт
+    /// процесса, объявляется недействительным — следующий пинг начинает
+    /// счёт с единицы (инцидент 18.11 #1281: локального сброса мало,
+    /// mark_stall_ping инкрементит stale-каунтер).
+    fn clear_stall(&self, board: &str, number: u64);
     /// Новый раунд слота (fresh-eyes): кулдаун прошлого раунда не переносится.
     fn clear_spawn_ms(&self, board: &str, number: u64, slot: Slot);
     /// Аналитика (#1135, замена триажа): кулдауны волн/ревью и цикл-гвард.
@@ -341,6 +358,12 @@ pub trait TickStateStore: Send + Sync {
     /// Инцидент #1046 (15.11): счётчик (In Progress, 2) пережил путь
     /// IP→Design→Ревью плана→IP и эскалировал первый же спавн.
     fn reset_stale_spawn_loops(&self, board: &str, number: u64, current: Status);
+    /// Цикл-гвард ревью-контура (#1311): счёт подряд request_changes
+    /// (переходы ReviewResult→InProgress / ReviewPlan→Design) без
+    /// approve. Персистентный, смены статуса внутри цикла не сбрасывают —
+    /// в отличие от spawn_loop (слепота attention-гварда к циклу ревью).
+    fn review_rounds(&self, board: &str, number: u64) -> u32;
+    fn set_review_rounds(&self, board: &str, number: u64, rounds: u32);
     /// Реестр серверных постов (self-эхо-фильтр #1204): коммент опубликован
     /// агентом через MCP task_comment (не юзером и не фабрикой).
     fn own_comment(&self, id: &str) -> bool;

@@ -118,11 +118,16 @@ impl TickStateStore for StubState {
         None
     }
     fn mark_stall_ping(&self, _: &str, _: u64, _: Status, _: u64) {}
+    fn clear_stall(&self, _: &str, _: u64) {}
     fn spawn_loop(&self, _: &str, _: u64, _: Slot) -> Option<(Status, u32)> {
         None
     }
     fn set_spawn_loop(&self, _: &str, _: u64, _: Slot, _: Status, _: u32) {}
     fn reset_stale_spawn_loops(&self, _: &str, _: u64, _: Status) {}
+    fn review_rounds(&self, _: &str, _: u64) -> u32 {
+        0
+    }
+    fn set_review_rounds(&self, _: &str, _: u64, _: u32) {}
     fn own_comment(&self, _: &str) -> bool {
         false
     }

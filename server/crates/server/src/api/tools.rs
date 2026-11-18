@@ -72,7 +72,7 @@ pub fn tool_descriptors() -> Value {
                 "title": string("тайтл (уникален на доске)"),
                 "project": string("проект; дефолт uwuwu"),
                 "body": string("markdown-тело (Постановка…)"),
-                "type": string("bug|spike|analys|docs|other|feature|refactoring|legacy|idea|qa|infrastructure"),
+                "type": string("bug|spike|docs|other|feature|refactoring|legacy|qa|infrastructure"),
                 "priority": string("high|medium|low; дефолт medium"),
                 "automerge": json!({"type":"boolean","description":"автомерж: мерж PR при входе в Review, строка остаётся в Review; дефолт true"})
             }))
@@ -625,5 +625,40 @@ mod tests {
             assert!(names.contains(&expected), "нет инструмента {expected}");
         }
         assert_eq!(names.len(), 19, "контракт поверхности: {names:?}");
+    }
+
+    #[test]
+    fn task_create_type_schema_matches_validation_canon() {
+        // Инвариант: перечень типов в дескрипторе task_create (description
+        // поля type, сплит по '|') — полный матч с каноном валидации:
+        // каждый токен парсится и ни один тип канона не потерян.
+        let list = tool_descriptors();
+        let schema_type = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "task_create")
+            .expect("task_create в дескрипторах")["inputSchema"]["properties"]["type"]
+            ["description"]
+            .as_str()
+            .expect("description поля type");
+
+        let mut schema_types: Vec<&str> = schema_type.split('|').map(str::trim).collect();
+        for token in &schema_types {
+            assert!(
+                uwuwu_usecase::parse_task_type(token).is_some(),
+                "схема обещает тип, отвергаемый валидацией: «{token}»"
+            );
+        }
+        let mut canon_types: Vec<&str> = uwuwu_usecase::TASK_TYPES
+            .iter()
+            .map(|t| uwuwu_usecase::task_type_name(*t))
+            .collect();
+        schema_types.sort_unstable();
+        canon_types.sort_unstable();
+        assert_eq!(
+            schema_types, canon_types,
+            "перечень task_create.type != канон валидации"
+        );
     }
 }

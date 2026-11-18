@@ -1,6 +1,7 @@
 //! mock-opencode: эмулятор исполнителя для безопасного дебага конвейера
 //! uwuwu-server (без LLM, без Railway, на лаптопе). Контракты — 1:1 с
-//! OpencodeClient (crates/server/src/opencode.rs, openapi 2.3.0).
+//! OpencodeClient (crates/server/src/opencode.rs, openapi 2.3.0 + пин
+//! агента слота из 2.3.2, #1300).
 //!
 //! Сценарии (MOCK_MODE):
 //!   plain  — сессии живут, промпты обновляют активность (wakeup-тесты)
@@ -355,6 +356,22 @@ async fn main() {
             }),
         )
         .route(
+            "/api/session/{id}/agent",
+            post({
+                let store = store.clone();
+                let mode = mode.clone();
+                move |Path(id): Path<String>, Json(body): Json<Value>| {
+                    let store = store.clone();
+                    async move {
+                        if mode == "gate" {
+                            return gate_post_reject();
+                        }
+                        switch_agent(store, id, body).await.into_response()
+                    }
+                }
+            }),
+        )
+        .route(
             "/api/session/{id}/message",
             get({
                 let store = store.clone();
@@ -403,6 +420,23 @@ fn gate_stub() -> Response {
 /// без content-type и тела; клиент падает статусным чеком, не сниффом
 fn gate_post_reject() -> Response {
     (StatusCode::METHOD_NOT_ALLOWED, [("allow", "GET, HEAD")]).into_response()
+}
+
+/// Пин агента слота (#1300, контракт opencode 2.3.2): 204, agent
+/// персистится в сессию — сталл-пинги сервера проходят на стенде как в
+/// живом opencode (404 = сессия умерла, честный Err на клиенте).
+async fn switch_agent(store: Arc<Store>, id: String, body: Value) -> StatusCode {
+    let agent = body["agent"].as_str().unwrap_or_default().to_string();
+    tracing::info!(event = "mock.agent_switched", %id, %agent, "POST /session/:id/agent");
+    let mut sessions = store.sessions.lock().expect("store");
+    match sessions.get_mut(&id) {
+        Some(s) => {
+            s.agent = agent;
+            s.updated_ms = now_ms();
+            StatusCode::NO_CONTENT
+        }
+        None => StatusCode::NOT_FOUND,
+    }
 }
 
 async fn create_session(
