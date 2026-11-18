@@ -143,6 +143,10 @@ impl TickStateStore for NoopState {
     }
     fn set_spawn_loop(&self, _b: &str, _n: u64, _s: Slot, _st: Status, _r: u32) {}
     fn reset_stale_spawn_loops(&self, _b: &str, _n: u64, _c: Status) {}
+    fn review_rounds(&self, _b: &str, _n: u64) -> u32 {
+        0
+    }
+    fn set_review_rounds(&self, _b: &str, _n: u64, _r: u32) {}
     fn own_comment(&self, _id: &str) -> bool {
         false
     }

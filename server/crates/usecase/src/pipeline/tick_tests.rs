@@ -878,7 +878,7 @@ fn routed_usecase(
         }),
         clock,
         state: Arc::new(MemState(Mutex::default())),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     }
 }
 
