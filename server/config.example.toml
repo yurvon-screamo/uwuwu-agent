@@ -23,11 +23,11 @@ url = "https://opencode.uwuwu.net"
 # Формат: "provider/id[#variant]". Ключ "default" — Dev/Design/bootstrap.
 # Отсутствие секции — канон владельца (SpawnModels::canonical).
 [executor.models]
-default = "zai-coding-plan/glm-5.3"
-developer = "zai-coding-plan/glm-5.3"
-plan-reviewer = "zai-coding-plan/glm-5.3"
-code-quality-reviewer = "zai-coding-plan/glm-5.3"
-tester = "zai-coding-plan/glm-5.3-flash#max"
+default = "zai-coding-plan/glm-5.3-flash#high"
+developer = "zai-coding-plan/glm-5.3-flash#high"
+plan-reviewer = "zai-coding-plan/glm-5.3#high"
+code-quality-reviewer = "zai-coding-plan/glm-5.3#high"
+tester = "zai-coding-plan/glm-5.3-flash#high"
 analyst = "zai-coding-plan/glm-5.3-flash#high"
 analyst-reviewer = "zai-coding-plan/glm-5.3#high"
 dreamer = "zai-coding-plan/glm-5.3-flash#high"
