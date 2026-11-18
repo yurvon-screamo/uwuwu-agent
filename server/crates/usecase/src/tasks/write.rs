@@ -150,6 +150,56 @@ impl TaskWriteUseCase {
         }
         Ok(())
     }
+
+    /// Гейт полноты обязательных полей на выходе из Analys (#1280).
+    /// Эффективное значение = патч, иначе носитель (одно-вызовное
+    /// «заполни и перейди» легально); мусорный приоритет (не
+    /// high/medium/low) = пустота — не явное решение. Отказ с перечнем
+    /// возвращает строку на дозаполнение: не стоп-кран, владельца
+    /// не спрашивает (ADR-074).
+    async fn ensure_analys_exit_complete(
+        &self,
+        number: u64,
+        patch: &TaskPatch,
+    ) -> UsecaseResult<()> {
+        // патч несёт оба значения и приоритет распознан — носитель не
+        // читается: результат гейта известен, GitHub round-trip не нужен
+        // (Low ревью #1280). Мусорный патч-приоритет ранний выход не
+        // получает — идёт через общую ветку и отклоняется как пустота
+        // (Common ревью-раунда 2: семантика гейта не зависит от формы
+        // вызова; иначе «urgent» с automerge просачивался бы на носитель,
+        // CUP ранжировал бы его ниже low)
+        if let (Some(raw), Some(_)) = (patch.priority.as_deref(), patch.automerge) {
+            if naming::parse_priority(raw) != uwuwu_domain::Priority::Empty {
+                return Ok(());
+            }
+        }
+        let carrier = self.fields.load(number).await?;
+        let priority = match patch.priority.as_deref() {
+            Some(raw) => naming::parse_priority(raw),
+            None => carrier
+                .get(naming::F_PRIORITY)
+                .map(|raw| naming::parse_priority(raw))
+                .unwrap_or(uwuwu_domain::Priority::Empty),
+        };
+        let mut empty: Vec<&str> = Vec::new();
+        if priority == uwuwu_domain::Priority::Empty {
+            empty.push(naming::F_PRIORITY);
+        }
+        let automerge_explicit =
+            patch.automerge.is_some() || carrier.contains_key(naming::F_AUTOMERGE);
+        if !automerge_explicit {
+            empty.push(naming::F_AUTOMERGE);
+        }
+        if empty.is_empty() {
+            return Ok(());
+        }
+        Err(UsecaseError::Board(format!(
+            "переход из Analys #{number}: не заполнены обязательные поля — {}; \
+             заполни (task_edit priority / automerge) и повтори переход",
+            empty.join(", ")
+        )))
+    }
 }
 
 #[async_trait]
@@ -175,20 +225,26 @@ impl TaskWriter for TaskWriteUseCase {
                 &render_create_body(&spec),
             )
             .await?;
-        // приоритет/тип — нативные поля issue (fm снесён)
+        // тип — нативное поле issue (fm снесён); Тип в снапшоте не живёт
         let kind = spec.kind.unwrap_or(uwuwu_domain::TaskType::Feature);
-        let mut field_patch: Vec<(&str, Option<String>)> =
-            vec![("Тип", Some(naming::task_type_name(kind).to_string()))];
-        if !spec.priority.is_empty() {
-            field_patch.push((naming::F_PRIORITY, Some(spec.priority.clone())));
-        }
-        // автомерж пишется всегда — состояние на носителе явно, не умолчание
-        // чтения (баг #1232: create терял флаг, тик молчал)
-        field_patch.push((
-            crate::naming::F_AUTOMERGE,
-            Some(if spec.automerge { "on" } else { "off" }.to_string()),
-        ));
-        self.fields.store(number, &field_patch).await?;
+        self.fields
+            .store(
+                number,
+                &[("Тип", Some(naming::task_type_name(kind).to_string()))],
+            )
+            .await?;
+        // Приоритет/Automerge — ячейки снапшота доски: единая точка записи
+        // board-адаптера с кеш-гигиеной (#1258; add_to_board инвалидирует
+        // ДО записи полей — окно кеша без полей закрывается адаптером).
+        // Автомерж пишется всегда — состояние на носителе явно (канон #1232)
+        let priority = if spec.priority.is_empty() {
+            None
+        } else {
+            Some(spec.priority.as_str())
+        };
+        self.board
+            .set_board_cells(&board, number, priority, Some(spec.automerge))
+            .await?;
         Ok(number)
     }
 
@@ -239,6 +295,15 @@ impl TaskWriter for TaskWriteUseCase {
                     current, status
                 )));
             }
+            // Гейт полноты полей на выходе из Analys (#1280): волна
+            // аналитики обязана выпускать строки с явными Приоритетом
+            // и Automerge — решение разбора, не пустота носителя.
+            // Идемпотентная переустановка (current == status) — тоже выход
+            // из Analys под гейтом; снос (Deleted) мимо — task_close
+            // дубликатов полей не требует.
+            if current == Status::Analys && status != Status::Deleted {
+                self.ensure_analys_exit_complete(number, &patch).await?;
+            }
             tracing::info!(
                 event = "board.status_transition",
                 number,
@@ -259,7 +324,7 @@ impl TaskWriter for TaskWriteUseCase {
             }
             self.board.rename_issue(number, title).await?;
         }
-        // ветка/PR/приоритет — нативные поля issue (value-объекты валидируют)
+        // ветка/PR — нативные поля issue (в снапшоте не живут)
         let mut field_patch: Vec<(&str, Option<String>)> = Vec::new();
         if let Some(b) = &patch.branch {
             let name = uwuwu_domain::BranchName::parse(b).ok_or_else(|| {
@@ -272,17 +337,16 @@ impl TaskWriter for TaskWriteUseCase {
                 .ok_or_else(|| UsecaseError::Board(format!("PR «{p}» не http(s)-URL")))?;
             field_patch.push(("PR", Some(url.as_str().to_string())));
         }
-        if let Some(pr) = &patch.priority {
-            field_patch.push((naming::F_PRIORITY, Some(pr.clone())));
-        }
-        if let Some(on) = patch.automerge {
-            field_patch.push((
-                crate::naming::F_AUTOMERGE,
-                Some(if on { "on" } else { "off" }.to_string()),
-            ));
-        }
         if !field_patch.is_empty() {
             self.fields.store(number, &field_patch).await?;
+        }
+        // Приоритет/Automerge — ячейки снапшота доски: единая точка записи
+        // board-адаптера с кеш-гигиеной (read-your-writes #1258); мимо неё
+        // значения протухали в снапшоте до TTL (проба на проде 18.11)
+        if patch.priority.is_some() || patch.automerge.is_some() {
+            self.board
+                .set_board_cells(&board, number, patch.priority.as_deref(), patch.automerge)
+                .await?;
         }
         Ok(())
     }
@@ -424,17 +488,39 @@ mod tests {
         }
     }
 
-    /// Мок доски: доска пуста, issue создаётся с номером 1.
-    struct FakeBoard;
+    /// Мок доски: доска пуста, issue создаётся с номером 1; вызовы
+    /// set_board_cells логируются — юзкейс обязан маршрутизировать
+    /// Приоритет/Automerge в board-порт (read-your-writes #1258),
+    /// а не в fields.store (там эти ячейки снапшота протухали).
+    #[derive(Default)]
+    struct FakeBoard {
+        cells: std::sync::Mutex<Vec<CellWrite>>,
+    }
+
+    /// Запись ячеек снапшота: номер + приоритет + automerge (#1258).
+    type CellWrite = (u64, Option<String>, Option<bool>);
 
     #[async_trait]
     impl TaskBoardRepo for FakeBoard {
+        async fn row_status(&self, _board: &str, _number: u64) -> UsecaseResult<Option<Status>> {
+            Ok(None)
+        }
+
         async fn read_board(&self, _board: &str) -> UsecaseResult<Vec<Task>> {
             Ok(Vec::new())
         }
-        async fn row_status(&self, _b: &str, _n: u64) -> UsecaseResult<Option<Status>> {
-            // create-тесты: доска пуста, гард канона видит отсутствие строки
-            Ok(None)
+        async fn set_board_cells(
+            &self,
+            _b: &str,
+            n: u64,
+            p: Option<&str>,
+            a: Option<bool>,
+        ) -> UsecaseResult<()> {
+            self.cells
+                .lock()
+                .expect("fake board")
+                .push((n, p.map(str::to_string), a));
+            Ok(())
         }
         async fn set_status(&self, _b: &str, _n: u64, _s: Status) -> UsecaseResult<()> {
             Ok(())
@@ -519,61 +605,76 @@ mod tests {
         }
     }
 
-    fn writecase(fields: Arc<FakeFields>) -> TaskWriteUseCase {
-        TaskWriteUseCase {
-            board: Arc::new(FakeBoard),
+    fn writecase(fields: Arc<FakeFields>) -> (TaskWriteUseCase, Arc<FakeBoard>) {
+        let board = Arc::new(FakeBoard::default());
+        let u = TaskWriteUseCase {
+            board: board.clone(),
             fields,
             boards: vec![("uwuwu".into(), "Задачи uwuwu".into())],
             clock: Arc::new(crate::pipeline::tick_tests::FixedClock),
             state: Arc::new(crate::pipeline::tick_tests::MemState::empty()),
-        }
+        };
+        (u, board)
     }
 
-    /// Красный тест бага #1232: create с automerge обязан записать значение
-    /// на носитель (field_patch → store) и приземлить его (load видит on).
-    /// До фикса create терял spec.automerge — параметр был мёртвый.
+    /// Красный тест бага #1232 → контракт #1258: create маршрутизирует
+    /// automerge в board-порт (ячейки снапшота доски), не в fields.store —
+    /// там она протухала до TTL (проба #1258: «обновлена», task_list
+    /// показывает старое значение).
     #[tokio::test]
     async fn create_writes_automerge_value() {
         let fields = Arc::new(FakeFields::default());
-        let u = writecase(fields.clone());
+        let (u, board) = writecase(fields.clone());
         u.create("uwuwu", spec("тело")).await.unwrap();
-        let stored = fields
+        let cells = board.cells.lock().expect("fake board").clone();
+        assert_eq!(
+            cells,
+            vec![(1, None, Some(true))],
+            "create потерял automerge (мимо board-порта)"
+        );
+        // fields.store больше не несёт ячейку снапшота (Приоритет/Automerge —
+        // единая точка записи board-адаптера); Тип остаётся нативным полем
+        assert!(!fields
             .stored
             .lock()
             .expect("fake fields")
-            .get("Automerge")
-            .cloned();
-        assert_eq!(stored.as_deref(), Some("on"), "create потерял automerge");
-        // приземление: read-after-write видит значение
-        let landed = fields.load(1).await.unwrap();
-        assert_eq!(landed.get("Automerge").map(String::as_str), Some("on"));
+            .contains_key("Automerge"));
     }
 
     /// Выключенный automerge пишет off явно (состояние на носителе, не умолчание).
     #[tokio::test]
     async fn create_writes_automerge_off_when_disabled() {
         let fields = Arc::new(FakeFields::default());
-        let u = writecase(fields.clone());
+        let (u, board) = writecase(fields);
         let mut s = spec("тело");
         s.automerge = false;
         u.create("uwuwu", s).await.unwrap();
         assert_eq!(
-            fields
-                .stored
-                .lock()
-                .expect("fake fields")
-                .get("Automerge")
-                .cloned()
-                .as_deref(),
-            Some("off")
+            board.cells.lock().expect("fake board").clone(),
+            vec![(1, None, Some(false))],
         );
     }
 
-    /// task_edit(automerge) — инструмент до-пометки старых строк (#1232).
+    /// Приоритет create — тот же board-порт (#1258).
+    #[tokio::test]
+    async fn create_writes_priority_to_board_port() {
+        let fields = Arc::new(FakeFields::default());
+        let (u, board) = writecase(fields);
+        let mut s = spec("тело");
+        s.priority = "low".into();
+        u.create("uwuwu", s).await.unwrap();
+        assert_eq!(
+            board.cells.lock().expect("fake board").clone(),
+            vec![(1, Some("low".into()), Some(true))],
+        );
+    }
+
+    /// task_edit(automerge) — инструмент до-пометки старых строк (#1232):
+    /// маршрутизация в board-порт (#1258).
     #[tokio::test]
     async fn edit_patches_automerge() {
         let fields = Arc::new(FakeFields::default());
-        let u = writecase(fields.clone());
+        let (u, board) = writecase(fields);
         u.edit(
             "uwuwu",
             1,
@@ -585,14 +686,29 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            fields
-                .stored
-                .lock()
-                .expect("fake fields")
-                .get("Automerge")
-                .cloned()
-                .as_deref(),
-            Some("off")
+            board.cells.lock().expect("fake board").clone(),
+            vec![(1, None, Some(false))],
+        );
+    }
+
+    /// task_edit(priority) — тот же порт (#1258).
+    #[tokio::test]
+    async fn edit_patches_priority() {
+        let fields = Arc::new(FakeFields::default());
+        let (u, board) = writecase(fields);
+        u.edit(
+            "uwuwu",
+            1,
+            TaskPatch {
+                priority: Some("high".into()),
+                ..TaskPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            board.cells.lock().expect("fake board").clone(),
+            vec![(1, Some("high".into()), None)],
         );
     }
 

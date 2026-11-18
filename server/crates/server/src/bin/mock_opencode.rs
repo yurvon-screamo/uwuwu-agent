@@ -9,6 +9,10 @@
 //!   storm  — сессии мгновенно прерываются с 0 токенов (пустышки —
 //!            проверка SpawnLoop/attention/дример-фильтра)
 //!   dead   — созданные сессии сразу 404 (dead-respawn путь)
+//!   gate   — гейт-заглушка #1160: исполнитель жив, но без-cookie гейт
+//!            отдаёт 200 + text/html «Войти» на GET и 405 без тела на
+//!            POST (живая проба Caddy @nologin) — окно заглушки: скан
+//!            не «успешно пуст», а Err → слепой hold спавна
 //!
 //! Env: MOCK_MODE (деф. plain), MOCK_PORT (8099), MOCK_STEP_MS (1500),
 //!      MOCK_MCP_URL (http://127.0.0.1:8090), MOCK_MCP_TOKEN («»),
@@ -20,6 +24,7 @@
 use axum::{
     extract::{Path, Query},
     http::{HeaderMap, StatusCode},
+    response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -42,6 +47,10 @@ struct MockSession {
     tokens_out: u64,
     /// «работа» ещё идёт (agent-режим).
     busy: bool,
+    /// time.busy/time.idle API (Started/idle): busy ⟺ busy_ms > idle_ms
+    /// (нулевое значение = нет события) — семантика CUP-учёта (#1231).
+    busy_ms: u64,
+    idle_ms: u64,
     dead: bool,
     /// Реплай для message_tail: (created_ms, текст) — бот-контур (#1150)
     /// читает хвост как ответ сессии.
@@ -233,7 +242,14 @@ async fn main() {
                     let counter = counter.clone();
                     let salt = salt;
                     let mode = mode.clone();
-                    async move { create_session(store, counter, salt, mode, headers, body).await }
+                    async move {
+                        if mode == "gate" {
+                            return gate_post_reject();
+                        }
+                        create_session(store, counter, salt, mode, headers, body)
+                            .await
+                            .into_response()
+                    }
                 }
             }),
         )
@@ -241,21 +257,43 @@ async fn main() {
             "/api/session",
             get({
                 let store = store.clone();
-                move |q: Query<ListQuery>| list_sessions(store, q)
+                let mode = mode.clone();
+                move |q: Query<ListQuery>| {
+                    let store = store.clone();
+                    let mode = mode.clone();
+                    async move {
+                        if mode == "gate" {
+                            return gate_stub();
+                        }
+                        list_sessions(store, q).await.into_response()
+                    }
+                }
             }),
         )
         .route(
             "/api/session/{id}",
             get({
                 let store = store.clone();
-                move |Path(id): Path<String>| get_session(store, id)
+                let mode = mode.clone();
+                move |Path(id): Path<String>| {
+                    let store = store.clone();
+                    let mode = mode.clone();
+                    async move {
+                        if mode == "gate" {
+                            return gate_stub();
+                        }
+                        get_session(store, id).await.into_response()
+                    }
+                }
             }),
         )
         .route(
             "/api/session/{id}",
             delete({
                 let store = store.clone();
-                move |Path(id): Path<String>| delete_session(store, id)
+                move |Path(id): Path<String>| async move {
+                    delete_session(store, id).await.into_response()
+                }
             }),
         )
         .route(
@@ -271,23 +309,49 @@ async fn main() {
                     let mode = mode.clone();
                     let mcp_url = mcp_url.clone();
                     let mcp_token = mcp_token.clone();
-                    async move { prompt(store, mode, step, mcp_url, mcp_token, id, body).await }
+                    async move {
+                        if mode == "gate" {
+                            return gate_post_reject();
+                        }
+                        prompt(store, mode, step, mcp_url, mcp_token, id, body)
+                            .await
+                            .into_response()
+                    }
                 }
             }),
         )
         .route(
             "/api/session/{id}/command",
-            post(|Path(id): Path<String>| async move {
-                // bootstrap-команды детерминированы: принимаем, не эмулируя shell
-                tracing::info!(event = "mock.command", id = %id, "POST /command");
-                (StatusCode::OK, Json(json!({})))
+            post({
+                let mode = mode.clone();
+                move |Path(id): Path<String>| {
+                    let mode = mode.clone();
+                    async move {
+                        if mode == "gate" {
+                            return gate_post_reject();
+                        }
+                        // bootstrap-команды детерминированы: принимаем, не эмулируя shell
+                        tracing::info!(event = "mock.command", id = %id, "POST /command");
+                        (StatusCode::OK, Json(json!({}))).into_response()
+                    }
+                }
             }),
         )
         .route(
             "/api/session/{id}/message",
             get({
                 let store = store.clone();
-                move |Path(id): Path<String>| message_tail(store, id)
+                let mode = mode.clone();
+                move |Path(id): Path<String>| {
+                    let store = store.clone();
+                    let mode = mode.clone();
+                    async move {
+                        if mode == "gate" {
+                            return gate_stub();
+                        }
+                        message_tail(store, id).await.into_response()
+                    }
+                }
             }),
         )
         .route(
@@ -305,6 +369,24 @@ async fn main() {
 }
 
 type Resp = (StatusCode, Json<Value>);
+
+/// Страница «Войти» гейта — упрощённая копия прод-заглушки Caddy
+/// @nologin (живая проба #1160: 200 + text/html на любой GET-путь).
+const GATE_HTML: &str = "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">\
+<title>OpenCode — доступ</title></head><body><main><h1>OpenCode</h1>\
+<p>Приватный доступ. Нажми, чтобы войти.</p><a href=\"/gate-mock\">Войти</a></main></body></html>";
+
+/// gate-режим: GET-путь — 200 + text/html заглушка (клиент обязан дать
+/// Err сниффом, не «успешно пусто»)
+fn gate_stub() -> Response {
+    Html(GATE_HTML).into_response()
+}
+
+/// gate-режим: POST-путь — живой гейт отдаёт 405 (allow: GET, HEAD)
+/// без content-type и тела; клиент падает статусным чеком, не сниффом
+fn gate_post_reject() -> Response {
+    (StatusCode::METHOD_NOT_ALLOWED, [("allow", "GET, HEAD")]).into_response()
+}
 
 async fn create_session(
     store: Arc<Store>,
@@ -329,6 +411,8 @@ async fn create_session(
         tokens_in: 0,
         tokens_out: 0,
         busy: false,
+        busy_ms: 0,
+        idle_ms: 0,
         dead: mode == "dead",
         reply: None,
         turn_ms: None,
@@ -351,8 +435,9 @@ struct ListQuery {
 
 async fn list_sessions(store: Arc<Store>, q: Query<ListQuery>) -> Resp {
     let sessions = store.sessions.lock().expect("store");
-    // мёртвые вне списка: list и GET согласованы (сессии, которых serve
-    // не знает, 404-ят и в list не попадают) — контракт second source #1163
+    // мёртвые (удалённые) в списке не числятся — семантика реального
+    // опенкода, на неё опирается busy-учёт CUP (#1231); list и GET
+    // согласованы (контракт second source #1163)
     let mut list: Vec<Value> = sessions
         .values()
         .filter(|s| !s.dead)
@@ -403,7 +488,12 @@ fn session_json(s: &MockSession) -> Value {
         "agent": if s.agent.is_empty() { Value::Null } else { json!(s.agent) },
         "title": s.title,
         "location": { "directory": s.directory },
-        "time": { "created": s.updated_ms, "updated": s.updated_ms },
+        "time": {
+            "created": s.updated_ms,
+            "updated": s.updated_ms,
+            "busy": if s.busy_ms == 0 { Value::Null } else { json!(s.busy_ms) },
+            "idle": if s.idle_ms == 0 { Value::Null } else { json!(s.idle_ms) },
+        },
         "outcome": if s.outcome.is_empty() { Value::Null } else { json!(s.outcome) },
         "tokens": { "input": s.tokens_in, "output": s.tokens_out },
     })
@@ -444,6 +534,8 @@ async fn prompt(
     let mut sessions = store.sessions.lock().expect("store");
     if let Some(s) = sessions.get_mut(&id) {
         s.updated_ms = now_ms();
+        s.busy_ms = now_ms(); // Started: ход в полёте (CUP-учёт, #1231)
+
         // Маркер turn probe (#1209): сессия отвечает многосообщным ходом —
         // мгновенный реплай не ставится, message_tail строит фазы пробы
         if text.contains("turn probe") {
@@ -473,6 +565,7 @@ async fn prompt(
             let mut sessions = store.sessions.lock().expect("store");
             if let Some(s) = sessions.get_mut(&id) {
                 s.outcome = "interrupted".into();
+                s.idle_ms = now_ms(); // прерванный ход завершён (CUP-учёт)
             }
             tracing::warn!(event = "mock.storm_interrupted", %id, "шторм-сценарий");
         }
@@ -665,6 +758,7 @@ async fn work_like_agent(
     if let Some(s) = sessions.get_mut(&session.id) {
         s.busy = false;
         s.updated_ms = now_ms();
+        s.idle_ms = now_ms(); // idle: ход завершён — busy снимается (CUP-учёт, #1231)
         s.outcome = "succeeded".into();
         s.tokens_in = 900;
         s.tokens_out = 100;

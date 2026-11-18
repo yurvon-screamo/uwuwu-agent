@@ -162,9 +162,11 @@ impl GitHubHub {
                 .user_agent(concat!("uwuwu-server/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .expect("reqwest client"),
-            // 120 c ≤ тик (poll 180 c): снимок освежается раз в тик,
-            // мутации тика шарят один снимок
-            snap_cache: TtlCache::new(std::time::Duration::from_secs(120)),
+            // 240 c > тик (poll 180 c): снимок живёт через тик — полный
+            // рефреш раз в два тика (−50% GraphQL-трафика; доска 746 строк
+            // выжигала часовой бюджет, инцидент 18.11), мутации шарят
+            // снимок. Свежесть статусов для decide — ≤ двух тиков.
+            snap_cache: TtlCache::new(std::time::Duration::from_secs(240)),
             status_cache: TtlCache::new(std::time::Duration::from_secs(60)),
             gql_block: std::sync::RwLock::new(None),
             last_rate_limit: std::sync::RwLock::new(None),
@@ -502,6 +504,42 @@ impl GitHubHub {
         );
     }
 
+    /// Кеш-гигиена снапшота после записи нестатусных ячеек (#1258):
+    /// строка в кешированном снимке — write-through записанных значений
+    /// (read-your-writes, без рефетча и расхода GraphQL-бюджета);
+    /// снимка нет или строки в нём нет — инвалидация (окно create:
+    /// add_to_board инвалидирует до записи полей — свежий фетч мог
+    /// закешироваться без полей).
+    fn settle_board_cells(
+        &self,
+        board: &str,
+        number: u64,
+        priority: Option<&str>,
+        automerge: Option<bool>,
+    ) {
+        let now = std::time::Instant::now();
+        let Some(hit) = self.snap_cache.get(board, now) else {
+            return; // снимка нет — нечего гигиенить, фетч увидит поля
+        };
+        let (mut rows, meta) = hit.as_ref().clone();
+        let row_present = rows.iter_mut().any(|t| t.number() == number);
+        if !row_present {
+            // окно create: снимок мог закешироваться без полей — сброс,
+            // следующий фетч несёт записанные значения
+            self.invalidate_snapshot(board);
+            return;
+        }
+        for task in rows.iter_mut().filter(|t| t.number() == number) {
+            if let Some(p) = priority {
+                task.set_priority(uwuwu_usecase::parse_priority(p));
+            }
+            if let Some(a) = automerge {
+                task.set_automerge(a);
+            }
+        }
+        self.snap_cache.put(board, (rows, meta), now);
+    }
+
     /// Контрольное чтение после мутации статуса (семья #1213): до 3
     /// попыток с паузой 1 с. Rate limit — ретраи не продолжаются
     /// (мутация принята GitHub); сетевой сбой и рассогласование —
@@ -830,6 +868,36 @@ impl TaskBoardRepo for GitHubHub {
             )
             .await?;
         self.invalidate_snapshot(_board);
+        Ok(())
+    }
+
+    async fn set_board_cells(
+        &self,
+        board: &str,
+        number: u64,
+        priority: Option<&str>,
+        automerge: Option<bool>,
+    ) -> UsecaseResult<()> {
+        // поля — нативные issue (REST), как и у set_branch
+        let mut patch: Vec<(&str, Option<String>)> = Vec::new();
+        if let Some(p) = priority {
+            patch.push((
+                crate::github::fields::F_PRIORITY,
+                Some(p.trim().to_string()),
+            ));
+        }
+        if let Some(a) = automerge {
+            patch.push((
+                uwuwu_usecase::F_AUTOMERGE,
+                Some(if a { "on" } else { "off" }.to_string()),
+            ));
+        }
+        if !patch.is_empty() {
+            self.fields.store(number, &patch).await?;
+        }
+        // read-your-writes (#1258): кеш-гигиена снапшота — write-through
+        // записанных значений при живой строке, инвалидация при отсутствующей
+        self.settle_board_cells(board, number, priority, automerge);
         Ok(())
     }
 
@@ -1240,6 +1308,177 @@ mod tests {
                 .is_none(),
             "статусный кэш откатан"
         );
+    }
+
+    /// #1258: write-through нестатусных ячеек — записанные Приоритет/
+    /// Automerge видны кешированному снапшоту сразу (read-your-writes,
+    /// симметрия write_through_status).
+    #[test]
+    fn board_cells_write_through_updates_snapshot() {
+        let hub = GitHubHub::new("o/r".into(), "t".into());
+        hub.snap_cache.put(
+            "B",
+            (
+                vec![Task::new(7, "строка".into(), Status::Analys)],
+                BoardMeta::default(),
+            ),
+            std::time::Instant::now(),
+        );
+        hub.settle_board_cells("B", 7, Some("high"), Some(true));
+        let snap = hub
+            .snap_cache
+            .get("B", std::time::Instant::now())
+            .expect("снапшот жив");
+        let t = snap
+            .0
+            .iter()
+            .find(|t| t.number() == 7)
+            .expect("строка в снапшоте");
+        assert_eq!(t.priority(), Priority::High, "приоритет write-through'нут");
+        assert!(t.automerge(), "automerge write-through'нут");
+    }
+
+    /// #1258: строки нет в снимке (окно create) — снимок инвалидируется,
+    /// следующий фетч видит поля; кеш без строки не держится.
+    #[test]
+    fn board_cells_missing_row_invalidates_snapshot() {
+        let hub = GitHubHub::new("o/r".into(), "t".into());
+        hub.snap_cache.put(
+            "B",
+            (
+                vec![Task::new(8, "другая строка".into(), Status::Analys)],
+                BoardMeta::default(),
+            ),
+            std::time::Instant::now(),
+        );
+        hub.settle_board_cells("B", 7, Some("high"), None);
+        assert!(
+            hub.snap_cache.get("B", std::time::Instant::now()).is_none(),
+            "снимок без строки сброшен"
+        );
+    }
+
+    /// #1258: пустой кеш — чистый no-op (инвалидация мимо, без паники).
+    #[test]
+    fn board_cells_without_snapshot_is_clean_noop() {
+        let hub = GitHubHub::new("o/r".into(), "t".into());
+        hub.settle_board_cells("B", 7, Some("high"), None);
+        assert!(hub.snap_cache.get("B", std::time::Instant::now()).is_none());
+    }
+
+    /// #1258 живая проба (tester): read-your-writes нестатусных ячеек
+    /// против реального носителя. МУТАЦИОННАЯ — пишет и восстанавливает;
+    /// носитель — sandbox #1265 (носитель живых проб #1232/#1174).
+    /// До фикса: set_board_cells мимо snap_cache → немедленный read_board
+    /// горячего хаба показывал до-мутационное значение до TTL (проба
+    /// на проде 18.11). Контракт под проверку: запись → немедленное
+    /// чтение тем же хабом несёт записанное (write-through снапшота);
+    /// свежий хаб — раунд-трип REST-записи на носителе. Автомерж на
+    /// свежем чтении ассертится (Pv2-отражение стабильно, NB #1232);
+    /// приоритет — informational-принт: Pv2-отражение issue-backed
+    /// Приоритета под задокументированным дрейфом GitHub (#1232).
+    #[test]
+    #[ignore] // живой прогон: GH_TOKEN + сеть; MUTATION — пишет и восстанавливает
+    fn live_board_cells_write_through_on_real_carrier() {
+        let repo =
+            std::env::var("UWUWU_HUB_REPO").unwrap_or_else(|_| "yurvon-screamo/uwuwu-hub".into());
+        let token = std::env::var("GH_TOKEN").expect("GH_TOKEN");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let board = "Задачи sandbox";
+            let n = 1265u64;
+            // 1. базлайн: холодный хаб наполняет кеш живым фетчем
+            let hub = GitHubHub::new(repo.clone(), token.clone());
+            let base = hub.read_board(board).await.expect("read_board базлайн");
+            let row = base
+                .iter()
+                .find(|t| t.number() == n)
+                .expect("#1265 на доске sandbox");
+            let base_priority = row.priority();
+            let base_automerge = row.automerge();
+            // проба пишет значение, ОТЛИЧНОЕ от базлайна — ассерты значимы
+            // при любом состоянии носителя
+            let probe_priority: &str = match base_priority {
+                Priority::High | Priority::Medium => "low",
+                Priority::Low | Priority::Empty => "high",
+            };
+            let probe_automerge = !base_automerge;
+            // 2. контракт фикса: запись → СРАЗУ чтение тем же хабом
+            hub.set_board_cells(board, n, Some(probe_priority), Some(probe_automerge))
+                .await
+                .expect("set_board_cells");
+            let after = hub
+                .read_board(board)
+                .await
+                .expect("read_board сразу после записи");
+            let row2 = after
+                .iter()
+                .find(|t| t.number() == n)
+                .expect("#1265 жив после записи");
+            assert_eq!(
+                row2.priority(),
+                uwuwu_usecase::parse_priority(probe_priority),
+                "read-your-writes: приоритет виден сразу (write-through снапшота, #1258)"
+            );
+            assert_eq!(
+                row2.automerge(),
+                probe_automerge,
+                "read-your-writes: automerge виден сразу (write-through снапшота, #1258)"
+            );
+            // 3. свежий хаб (холодный кеш): раунд-трип записи на носителе;
+            // до 3 попыток с паузой (Pv2-отражение REST-записи — секундное)
+            let mut roundtrip = false;
+            for attempt in 0..3 {
+                let fresh = GitHubHub::new(repo.clone(), token.clone());
+                let rows = fresh.read_board(board).await.expect("read_board носителя");
+                let matched = rows.iter().find(|t| t.number() == n).map(|t| {
+                    println!(
+                        "инфо: свежий хаб, попытка {}: приоритет = {:?} (Pv2-отражение \
+                         issue-backed Приоритета под дрейфом #1232 — не ассерт)",
+                        attempt + 1,
+                        t.priority()
+                    );
+                    t.automerge() == probe_automerge
+                });
+                if matched == Some(true) {
+                    roundtrip = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            assert!(
+                roundtrip,
+                "носитель не отдал записанный automerge за 3 попытки (раунд-трип REST #1258)"
+            );
+            // 4. восстановление базлайна + контроль тем же хабом
+            let base_priority_arg: &str = match base_priority {
+                Priority::High => "high",
+                Priority::Medium => "medium",
+                Priority::Low => "low",
+                Priority::Empty => "", // очистка ячейки
+            };
+            hub.set_board_cells(board, n, Some(base_priority_arg), Some(base_automerge))
+                .await
+                .expect("восстановление базлайна");
+            let restored = hub
+                .read_board(board)
+                .await
+                .expect("read_board после отката");
+            let row4 = restored
+                .iter()
+                .find(|t| t.number() == n)
+                .expect("#1265 жив после отката");
+            assert_eq!(
+                row4.priority(),
+                base_priority,
+                "базлайн приоритета восстановлен"
+            );
+            assert_eq!(
+                row4.automerge(),
+                base_automerge,
+                "базлайн automerge восстановлен"
+            );
+        });
     }
 
     #[test]
