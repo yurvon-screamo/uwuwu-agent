@@ -433,6 +433,8 @@ impl Clock for FixedClock {
 struct MemStateInner {
     comments: Vec<String>,
     statuses: Vec<(u64, Status)>,
+    /// Сессии, отработанные дримером (dreamer-сценарии тиков).
+    dreamer_done: Vec<String>,
     /// (number, slot) → (status, repeats)
     loops: Vec<(u64, Slot, Status, u32)>,
     /// (number, status, rounds) — цикл-гвард аналитики (#1135)
@@ -480,10 +482,12 @@ impl TickStateStore for MemState {
     fn set_last_seen_status(&self, _b: &str, n: u64, status: Status) {
         self.0.lock().unwrap().statuses.push((n, status));
     }
-    fn dreamer_done(&self, _s: &str) -> bool {
-        false
+    fn dreamer_done(&self, s: &str) -> bool {
+        self.0.lock().unwrap().dreamer_done.iter().any(|id| id == s)
     }
-    fn mark_dreamer_done(&self, _s: &str) {}
+    fn mark_dreamer_done(&self, s: &str) {
+        self.0.lock().unwrap().dreamer_done.push(s.into());
+    }
     fn dreamer_day_spawns(&self, _day: &str) -> u32 {
         0
     }
@@ -3314,6 +3318,43 @@ async fn dreamer_held_when_cup_full() {
     let spawned = u.tick().await.unwrap();
     assert_eq!(spawned, 0, "дример-спавн при полном капе отложен");
     assert!(sessions.spawned.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn dreamer_revival_of_dreamed_session_reprompts() {
+    // #1306: отдрименная сессия получила новые сообщения (revival → финал
+    // хода → idle ≥ 30 мин) — дример обязан дообработать дополнение
+    // повторным прогоном (ADR-005: инвариант 1:1, wakeup-модель).
+    // Маркер «навсегда» молчит — тест красный до фикса.
+    struct DreamClock;
+    impl Clock for DreamClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            100_000_000
+        }
+    }
+    let state = Arc::new(MemState(Mutex::default()));
+    state.mark_dreamer_done("ses_target");
+    let sessions = Arc::new(FakeSessions::new());
+    sessions.extra.lock().unwrap().push(crate::ports::SessionInfo {
+        updated_ms: 100_000_000 - 31 * 60_000,
+        ..fake_session("ses_target", "developer", "succeeded", 700, false)
+    });
+    let u = DreamerUseCase {
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        state,
+        clock: Arc::new(DreamClock),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        checkout: "/tmp/checkout".into(),
+        cup: 7,
+    };
+    let spawned = u.tick().await.unwrap();
+    assert_eq!(spawned, 1, "revival отдрименной сессии — повторный прогон");
 }
 
 #[tokio::test]
