@@ -4954,6 +4954,7 @@ async fn review_and_test_spawns_carry_map_models_per_agent() {
         assert_eq!(work.model, want.model, "{agent_name}: модель из карты");
         assert_eq!(work.variant, want.variant, "{agent_name}: вариант из карты");
     }
+}
 
 // ---- преемпшен CUP: понижение приоритета отдаёт слот (#1259) ----
 

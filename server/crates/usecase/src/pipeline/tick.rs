@@ -11,8 +11,8 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use uwuwu_domain::{
-    decide, gate, spawn_guard, Action, Awaits, Gate, LoopOutcome, Priority, SessionSighting,
-    Slot, SpawnGuard, SpawnLoop, SpawnPolicy, Status, Task,
+    decide, gate, spawn_guard, Action, Awaits, Gate, LoopOutcome, Priority, SessionSighting, Slot,
+    SpawnGuard, SpawnLoop, SpawnPolicy, Status, Task,
 };
 
 /// Режим конвейера: observe — только решения в лог; live — исполнение.
