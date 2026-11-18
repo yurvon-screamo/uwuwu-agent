@@ -578,6 +578,9 @@ impl TickStateStore for MemState {
     fn mark_stall_ping(&self, _b: &str, n: u64, status: Status, at_ms: u64) {
         self.0.lock().unwrap().stalls.push((n, status, at_ms));
     }
+    fn clear_stall(&self, _b: &str, n: u64) {
+        self.0.lock().unwrap().stalls.retain(|(num, ..)| *num != n);
+    }
     fn analys_review_loop(&self, _b: &str, n: u64) -> Option<(Status, u32)> {
         self.0
             .lock()

@@ -103,6 +103,7 @@ impl TickStateStore for StubState {
         None
     }
     fn mark_stall_ping(&self, _: &str, _: u64, _: Status, _: u64) {}
+    fn clear_stall(&self, _: &str, _: u64) {}
     fn spawn_loop(&self, _: &str, _: u64, _: Slot) -> Option<(Status, u32)> {
         None
     }
