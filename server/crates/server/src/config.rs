@@ -354,6 +354,11 @@ fn parse_gitea_tokens(raw: &str) -> Result<HashMap<String, String>, ConfigError>
                 "{ENV_GITEA_TOKENS}: пустой host или token в паре {pair:?}"
             )));
         }
+        if tokens.contains_key(host) {
+            return Err(ConfigError::Validation(format!(
+                "{ENV_GITEA_TOKENS}: дубликат хоста {host:?} — последний токен молча перезатирал бы предыдущий"
+            )));
+        }
         tokens.insert(host.to_string(), token.to_string());
     }
     Ok(tokens)
@@ -388,6 +393,10 @@ mod tests {
         assert!(
             parse_gitea_tokens("=tok").is_err(),
             "пустой host — громкая ошибка старта"
+        );
+        assert!(
+            parse_gitea_tokens("git.l4a.ru=tok1,git.l4a.ru=tok2").is_err(),
+            "дубликат хоста — громкая ошибка старта, не молчаливый last-wins"
         );
     }
 
