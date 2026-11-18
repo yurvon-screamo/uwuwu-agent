@@ -68,6 +68,16 @@ pub struct PolicyCfg {
     pub peak: PeakCfg,
 }
 
+/// Инцидент-сигнализация сталл-детекта (#1281): массовость эскалаций за
+/// окно — один ТГ-сигнал владельцу. Секция отсутствует — off (safe default).
+#[derive(Debug, Clone, Deserialize)]
+pub struct NotifyCfg {
+    /// Имя env-переменной с токеном ТГ-бота (само значение — env, не конфиг).
+    pub tg_token_env: String,
+    /// Chat id получателя сигналов.
+    pub tg_chat_id: i64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProjectCfg {
     pub name: String,
@@ -97,6 +107,9 @@ pub struct Config {
     pub executors: Vec<NamedExecutorCfg>,
     pub policy: PolicyCfg,
     pub project: Vec<ProjectCfg>,
+    /// ТГ-сигнализация инцидентов сталл-детекта (#1281); нет секции — off.
+    #[serde(default)]
+    pub notify: Option<NotifyCfg>,
 }
 
 fn default_poll() -> u64 {
@@ -256,6 +269,21 @@ impl Config {
             opencode_gate_cookie,
             bearer,
         })
+    }
+
+    /// ТГ-сигнализация инцидентов сталл-детекта (#1281). Секция не задана —
+    /// off; задана, а env пуст — честная ошибка старта (канон секретов).
+    pub fn tg_notify(&self) -> Result<Option<(String, i64)>, ConfigError> {
+        match &self.notify {
+            None => Ok(None),
+            Some(n) => match non_empty_env(&n.tg_token_env) {
+                Some(token) => Ok(Some((token, n.tg_chat_id))),
+                None => Err(ConfigError::Validation(format!(
+                    "{} обязателен (инцидент-сигнализация ТГ)",
+                    n.tg_token_env
+                ))),
+            },
+        }
     }
 
     /// Путь state-файла: env > рядом с конфигом.

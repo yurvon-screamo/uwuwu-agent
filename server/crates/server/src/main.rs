@@ -24,7 +24,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
-use uwuwu_usecase::{Clock as _, TickOutcome, TickUseCase};
+use uwuwu_usecase::{
+    Clock as _, IncidentLoudness, TickOutcome, TickUseCase, STALL_INCIDENT_COOLDOWN_MS,
+    STALL_INCIDENT_THRESHOLD, STALL_INCIDENT_WINDOW_MS,
+};
 
 #[derive(Debug, thiserror::Error)]
 enum BootError {
@@ -536,12 +539,24 @@ async fn run(
     }
 
     let http_task = tokio::spawn(serve(cfg.port(), app));
+    let notify = cfg
+        .tg_notify()
+        .map_err(|e| e.to_string())?
+        .map(|(token, chat)| {
+            (
+                Arc::new(tg::TelegramClient::new(token))
+                    as Arc<dyn uwuwu_usecase::bots::TelegramGateway>,
+                chat,
+            )
+        });
     let tick_task = tokio::spawn(tick_loop(
         cfg.poll_sec,
         plan,
         usecase,
         shared,
         Arc::new(sidecars),
+        notify,
+        clock.clone(),
     ));
 
     tokio::select! {
@@ -623,11 +638,53 @@ async fn tick_loop(
     usecase: Arc<TickUseCase>,
     shared: Arc<std::sync::RwLock<TickOutcome>>,
     sidecars: Arc<Vec<Sidecar>>,
+    notify: Option<(Arc<dyn uwuwu_usecase::bots::TelegramGateway>, i64)>,
+    clock: Arc<dyn uwuwu_usecase::Clock>,
 ) {
+    // Инцидент-громкость (#1281): N+ сталл-эскалаций за скользящее окно —
+    // один ТГ-сигнал владельцу вместо N тихих парковок.
+    let mut loudness = IncidentLoudness::new(
+        STALL_INCIDENT_THRESHOLD,
+        STALL_INCIDENT_WINDOW_MS,
+        STALL_INCIDENT_COOLDOWN_MS,
+    );
     loop {
         let started = std::time::Instant::now();
         match usecase.run(&plan).await {
             Ok(outcome) => {
+                for _ in 0..outcome.stall_flagged {
+                    if !loudness.register(clock.now_ms()) {
+                        continue;
+                    }
+                    match &notify {
+                        Some((tg, chat)) => {
+                            let text = format!(
+                                "⚠︎ uwuwu: инцидент сталл-детекта — {} эскалаций за \
+                                 скользящее окно ({} мин): массовая парковка \
+                                 stage-сессий в Needs attention. Разбор — на доске.",
+                                loudness.escalations_in_window(),
+                                STALL_INCIDENT_WINDOW_MS / 60_000,
+                            );
+                            match tg.send_message(*chat, &text).await {
+                                Ok(()) => tracing::warn!(
+                                    event = "stall.incident_signal",
+                                    escalations = loudness.escalations_in_window(),
+                                    "Инцидент-сигнал владельцу отправлен"
+                                ),
+                                Err(e) => tracing::error!(
+                                    event = "stall.incident_signal_failed",
+                                    error = %e,
+                                    "Инцидент-сигнал не отправлен"
+                                ),
+                            }
+                        }
+                        None => tracing::warn!(
+                            event = "stall.incident_unnotified",
+                            escalations = loudness.escalations_in_window(),
+                            "Инцидент сталл-детекта: [notify] не настроен — сигнала нет"
+                        ),
+                    }
+                }
                 *shared.write().expect("tick lock") = outcome;
             }
             Err(e) => {
