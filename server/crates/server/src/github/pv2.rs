@@ -220,10 +220,15 @@ impl Pv2Rest {
                         meta.project_number
                     );
                 }
-                None => break,
+                // пагинация исчерпана — индекс полный
+                None => return Ok(map),
             }
         }
-        Ok(map)
+        // молчаливая обрезка хвоста = «строка не на доске» для живых строк
+        // (ревью 2 Common-1) — громкий гард, зеркально snapshot_fetch
+        Err(UsecaseError::Board(format!(
+            "доска «{board}»: item index превысил {ITEM_PAGES} страниц — гард"
+        )))
     }
 
     /// Чтение НОСИТЕЛЯ (GET item, мимо write-through — verify обязан
