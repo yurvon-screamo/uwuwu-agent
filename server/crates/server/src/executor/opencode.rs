@@ -36,9 +36,8 @@ fn session_busy(s: &serde_json::Value, now_ms: u64) -> bool {
     const ZOMBIE_BUSY_MS: u64 = 30 * 60_000;
     let busy_ms = s["time"]["busy"].as_u64();
     let idle_ms = s["time"]["idle"].as_u64();
-    busy_ms.is_some_and(|b| {
-        idle_ms.is_none_or(|i| b > i) && now_ms.saturating_sub(b) < ZOMBIE_BUSY_MS
-    })
+    busy_ms
+        .is_some_and(|b| idle_ms.is_none_or(|i| b > i) && now_ms.saturating_sub(b) < ZOMBIE_BUSY_MS)
 }
 
 /// Тело ответа message-эндпоинта opencode: голый массив ИЛИ обёртка
@@ -466,7 +465,10 @@ mod tests {
         });
         assert!(session_busy(&fresh, now), "свежий ход — busy");
         assert!(!session_busy(&stale, now), "зомби-флаг протух — не busy");
-        assert!(!session_busy(&idle_cleared, now), "idle новее busy — не busy");
+        assert!(
+            !session_busy(&idle_cleared, now),
+            "idle новее busy — не busy"
+        );
     }
 
     #[test]
@@ -575,26 +577,32 @@ mod tests {
         // #1231: busy ⟺ time.busy > time.idle — ход в полёте (Started
         // пишет time.busy, idle-финал пишет time.idle). outcome — атрибут
         // последнего завершённого хода, живость не выражает.
-        // ход в полёте: Started есть, idle ещё не ставился
+        // #1295: плюс зомби-гард — флаг busy свежее 30 мин (фикстуры
+        // динамические от now: статичные ms протухают по определению).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        // ход в полёте: Started есть (минуту назад), idle ещё не ставился
         assert!(parsed_with_time(
-            serde_json::json!(1000u64),
+            serde_json::json!(now - 60_000),
             serde_json::Value::Null
         ));
         // завершённый ход: idle позже Started — слот свободен
         assert!(!parsed_with_time(
-            serde_json::json!(1000u64),
-            serde_json::json!(2000u64)
+            serde_json::json!(now - 120_000),
+            serde_json::json!(now - 60_000)
         ));
         // корень бага #1231: второй ход поверх финала (outcome непуст) —
         // Started позже последнего idle, сессия держит кап
         assert!(parsed_with_time(
-            serde_json::json!(2000u64),
-            serde_json::json!(1000u64)
+            serde_json::json!(now - 60_000),
+            serde_json::json!(now - 3_600_000)
         ));
         // без события Started — не busy (ручная/легаси-сессия)
         assert!(!parsed_with_time(
             serde_json::Value::Null,
-            serde_json::json!(1000u64)
+            serde_json::json!(now - 60_000)
         ));
         // событий нет вовсе — не busy (page_item без time.busy/idle)
         assert!(!parsed_with_time(
