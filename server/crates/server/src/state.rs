@@ -197,6 +197,13 @@ impl TickStateStore for JsonStateStore {
         row.stall = Some((naming::status_name(status).to_string(), at_ms, count));
     }
 
+    fn clear_stall(&self, board: &str, number: u64) {
+        let mut guard = self.state.lock().expect("state lock");
+        if let Some(row) = guard.rows.get_mut(&Self::key(board, number)) {
+            row.stall = None;
+        }
+    }
+
     fn set_last_comment_id(&self, board: &str, number: u64, id: &str) {
         let mut guard = self.state.lock().expect("state lock");
         guard
