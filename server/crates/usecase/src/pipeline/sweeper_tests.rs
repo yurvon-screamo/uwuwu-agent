@@ -1,7 +1,16 @@
 //! Тесты клина холодного ящика (#1293): отбор, кап, бюджет-гайд,
 //! observe-гейт, отказ одной строки не роняет волну.
 
-use super::sweeper::{sweep_board, BUDGET_FLOOR, SWEEP_BATCH_CAP};
+use super::sweeper::{sweep_board, SweepPolicy, BUDGET_FLOOR, SWEEP_BATCH_CAP};
+
+/// Политика тест-прохода: NOW и порог из аргументов.
+fn policy(now_ms: u64, age_days: u32, observe: bool) -> SweepPolicy {
+    SweepPolicy {
+        now_ms,
+        age_days,
+        observe,
+    }
+}
 use crate::error::UsecaseResult;
 use crate::ports::TaskBoardRepo;
 use async_trait::async_trait;
@@ -120,7 +129,7 @@ async fn observe_logs_without_mutations() {
     // observe-гейт клина внутренний: кандидаты видны (счётчик), мутаций нет
     let board = SweepBoard::new(None);
     let tasks = vec![closed_done(1, 10), closed_done(2, 8), closed_done(3, 3)];
-    let out = sweep_board(&board, "B", &tasks, NOW, 7, true)
+    let out = sweep_board(&board, "B", &tasks, policy(NOW, 7, true))
         .await
         .expect("observe проход");
     assert_eq!(out.candidates, 2, "строки 1 и 2 старше 7 суток");
@@ -135,7 +144,7 @@ async fn live_archives_oldest_first_within_cap() {
     for i in 0..SWEEP_BATCH_CAP + 20 {
         tasks.push(closed_done(i as u64, 10 + i as u64 % 5));
     }
-    let out = sweep_board(&board, "B", &tasks, NOW, 7, false)
+    let out = sweep_board(&board, "B", &tasks, policy(NOW, 7, false))
         .await
         .expect("live проход");
     assert_eq!(out.candidates, SWEEP_BATCH_CAP + 20);
@@ -158,7 +167,7 @@ async fn live_archives_oldest_first_within_cap() {
 async fn budget_floor_defers_rest_of_wave() {
     let board = SweepBoard::new(Some(BUDGET_FLOOR - 1));
     let tasks = vec![closed_done(1, 10), closed_done(2, 12)];
-    let out = sweep_board(&board, "B", &tasks, NOW, 7, false)
+    let out = sweep_board(&board, "B", &tasks, policy(NOW, 7, false))
         .await
         .expect("проход с низким бюджетом");
     assert_eq!(out.archived, 0);
@@ -171,7 +180,7 @@ async fn budget_none_passes_gate() {
     // носитель не сообщает бюджет — гард пропускает
     let board = SweepBoard::new(None);
     let tasks = vec![closed_done(1, 10)];
-    let out = sweep_board(&board, "B", &tasks, NOW, 7, false)
+    let out = sweep_board(&board, "B", &tasks, policy(NOW, 7, false))
         .await
         .expect("проход без бюджета");
     assert_eq!(out.archived, 1);
@@ -182,7 +191,7 @@ async fn single_row_failure_does_not_break_wave() {
     let mut board = SweepBoard::new(None);
     board.fail_numbers = vec![1];
     let tasks = vec![closed_done(1, 10), closed_done(2, 12)];
-    let out = sweep_board(&board, "B", &tasks, NOW, 7, false)
+    let out = sweep_board(&board, "B", &tasks, policy(NOW, 7, false))
         .await
         .expect("отказ строки не роняет проход");
     assert_eq!(out.archived, 1);
@@ -197,7 +206,7 @@ async fn empty_when_no_candidates() {
         closed_done(1, 3),
         Task::new(2, "актив".into(), Status::InProgress),
     ];
-    let out = sweep_board(&board, "B", &tasks, NOW, 7, false)
+    let out = sweep_board(&board, "B", &tasks, policy(NOW, 7, false))
         .await
         .expect("пустой проход");
     assert_eq!(out, Default::default());

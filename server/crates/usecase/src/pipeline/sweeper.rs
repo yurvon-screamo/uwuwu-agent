@@ -31,6 +31,17 @@ pub struct SweepOutcome {
     pub failed: usize,
 }
 
+/// Политика прохода клина: часы и пороги одного тика.
+#[derive(Debug, Clone, Copy)]
+pub struct SweepPolicy {
+    /// Сейчас (unix ms) — возраст закрытия меряется от него.
+    pub now_ms: u64,
+    /// Порог «строго старше N суток» (конфиг sweep_days).
+    pub age_days: u32,
+    /// Внутренний observe-гейт: кандидаты логируются, мутаций нет.
+    pub observe: bool,
+}
+
 /// Проход клина по одной доске. `observe` — **внутренний** гейт клина:
 /// кандидаты логируются, мутаций нет (деплой наблюдаем, мутации после
 /// флипа live). Это не общий no-op-гейт сайдкаров main.rs — в observe
@@ -39,14 +50,12 @@ pub async fn sweep_board(
     board: &dyn TaskBoardRepo,
     board_name: &str,
     tasks: &[Task],
-    now_ms: u64,
-    age_days: u32,
-    observe: bool,
+    policy: SweepPolicy,
 ) -> UsecaseResult<SweepOutcome> {
     let mut out = SweepOutcome::default();
     let mut candidates: Vec<&Task> = tasks
         .iter()
-        .filter(|t| t.is_sweep_candidate(now_ms, age_days))
+        .filter(|t| t.is_sweep_candidate(policy.now_ms, policy.age_days))
         .collect();
     out.candidates = candidates.len();
     if candidates.is_empty() {
@@ -58,10 +67,10 @@ pub async fn sweep_board(
         event = "sweep.candidates",
         board = board_name,
         candidates = out.candidates,
-        observe,
+        observe = policy.observe,
         "Клин холодного ящика: кандидаты на архивацию"
     );
-    if observe {
+    if policy.observe {
         for t in &candidates {
             tracing::info!(
                 event = "sweep.observe",

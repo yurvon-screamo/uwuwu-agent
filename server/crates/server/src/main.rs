@@ -536,9 +536,11 @@ async fn run(
                             board.as_ref(),
                             &b.board,
                             &tasks,
-                            now_ms,
-                            cfg.sweep_days,
-                            is_observe,
+                            uwuwu_usecase::sweeper::SweepPolicy {
+                                now_ms,
+                                age_days: cfg.sweep_days,
+                                observe: is_observe,
+                            },
                         )
                         .await?;
                     }
