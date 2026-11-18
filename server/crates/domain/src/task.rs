@@ -343,9 +343,10 @@ impl PrUrl {
         let Some((head, tail)) = path.rsplit_once('/') else {
             return false;
         };
-        head.ends_with("/pull")
-            && !tail.is_empty()
-            && tail.chars().all(|c| c.is_ascii_digit())
+        if !head.ends_with("/pull") {
+            return false;
+        }
+        !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit())
     }
 }
 
@@ -594,7 +595,10 @@ mod tests {
         // #1286: грубая форма — хвост пути /pull/<n>, хост не важен
         let pull = |url: &str| PrUrl::parse(url).unwrap().is_pull();
         assert!(pull("https://github.com/o/r/pull/7"));
-        assert!(pull("https://github.com/o/r/pull/7/"), "трейлинг-слэш не рвёт форму");
+        assert!(
+            pull("https://github.com/o/r/pull/7/"),
+            "трейлинг-слэш не рвёт форму"
+        );
         assert!(pull("https://ghe.corp/o/r/pull/7"), "хост не важен");
         // артефакт-URL (wiki/issues/blob) — не PR-форма
         assert!(!pull("https://github.com/o/r/wiki/a"));
