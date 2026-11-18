@@ -607,4 +607,31 @@ wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
 SRV_PID=""; MOCK_PID=""
 say "фаза 9 ок: 2049 ушла в архив и из task_list, 2050 свежая осталась"
 
+say "фаза 9c: kill-switch — конфиг БЕЗ sweep_days (serde-дефолт 0): клина нет"
+CONFIG_NOSWEEP="$RUN_DIR/config.nosweep.toml"
+grep -v '^sweep_days' "$CONFIG_SWEEP" > "$CONFIG_NOSWEEP"
+rm -f "$STATE"
+LOG_SRV_NOSWEEP="$RUN_DIR/server-nosweep.log"
+MOCK_MODE=idle MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=100 \
+  "$BIN_MOCK" >"$LOG_MOCK" 2>&1 &
+MOCK_PID=$!
+sleep 1
+UWUWU_SERVER_CONFIG=$CONFIG_NOSWEEP UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
+  UWUWU_SERVER_MODE=live \
+  UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
+  UWUWU_MOCK_SEED="Задачи uwuwu:2051:Done:low:14" \
+  RUST_LOG=info "$BIN_SRV" >"$LOG_SRV_NOSWEEP" 2>&1 &
+SRV_PID=$!
+# 4 тика: sweep_days=0 обязан держать сайдкар выключенным структурно
+sleep 45
+grep -aq '"event":"sweep.' "$LOG_SRV_NOSWEEP" \
+  && fail "kill-switch сломан: sweep-события при sweep_days=0"
+NOSWEEP_LIST=$(mcp task_list '{"project":"uwuwu"}')
+echo "$NOSWEEP_LIST" | grep -q '2051' \
+  || fail "клин без конфига снёс строку 2051 (serde-дефолт 0 = агрессивный клин)"
+kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+SRV_PID=""; MOCK_PID=""
+say "фаза 9c ок: конфиг без sweep_days — sweeper структурно выключен, 2051 на доске"
+
 say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + мульти-экзекьютор + гард #1163 + self-эхо + слепой hold #1263 + преемпшен CUP #1259 + клин #1293); логи: $RUN_DIR"
