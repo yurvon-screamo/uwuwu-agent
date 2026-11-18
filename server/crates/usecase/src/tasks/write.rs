@@ -150,6 +150,44 @@ impl TaskWriteUseCase {
         }
         Ok(())
     }
+
+    /// Гейт полноты обязательных полей на выходе из Analys (#1280).
+    /// Эффективное значение = патч, иначе носитель (одно-вызовное
+    /// «заполни и перейди» легально); мусорный приоритет (не
+    /// high/medium/low) = пустота — не явное решение. Отказ с перечнем
+    /// возвращает строку на дозаполнение: не стоп-кран, владельца
+    /// не спрашивает (ADR-074).
+    async fn ensure_analys_exit_complete(
+        &self,
+        number: u64,
+        patch: &TaskPatch,
+    ) -> UsecaseResult<()> {
+        let carrier = self.fields.load(number).await?;
+        let priority = match patch.priority.as_deref() {
+            Some(raw) => naming::parse_priority(raw),
+            None => carrier
+                .get(naming::F_PRIORITY)
+                .map(|raw| naming::parse_priority(raw))
+                .unwrap_or(uwuwu_domain::Priority::Empty),
+        };
+        let mut empty: Vec<&str> = Vec::new();
+        if priority == uwuwu_domain::Priority::Empty {
+            empty.push(naming::F_PRIORITY);
+        }
+        let automerge_explicit =
+            patch.automerge.is_some() || carrier.contains_key(naming::F_AUTOMERGE);
+        if !automerge_explicit {
+            empty.push(naming::F_AUTOMERGE);
+        }
+        if empty.is_empty() {
+            return Ok(());
+        }
+        Err(UsecaseError::Board(format!(
+            "переход из Analys #{number}: не заполнены обязательные поля — {}; \
+             заполни (task_edit priority / automerge) и повтори переход",
+            empty.join(", ")
+        )))
+    }
 }
 
 #[async_trait]
@@ -238,6 +276,15 @@ impl TaskWriter for TaskWriteUseCase {
                     "переход {:?} → {:?} вне канона конвейера",
                     current, status
                 )));
+            }
+            // Гейт полноты полей на выходе из Analys (#1280): волна
+            // аналитики обязана выпускать строки с явными Приоритетом
+            // и Automerge — решение разбора, не пустота носителя.
+            // Идемпотентная переустановка (current == status) — тоже выход
+            // из Analys под гейтом; снос (Deleted) мимо — task_close
+            // дубликатов полей не требует.
+            if current == Status::Analys && status != Status::Deleted {
+                self.ensure_analys_exit_complete(number, &patch).await?;
             }
             tracing::info!(
                 event = "board.status_transition",
@@ -431,6 +478,9 @@ mod tests {
     impl TaskBoardRepo for FakeBoard {
         async fn read_board(&self, _board: &str) -> UsecaseResult<Vec<Task>> {
             Ok(Vec::new())
+        }
+        async fn row_status(&self, _b: &str, _n: u64) -> UsecaseResult<Option<Status>> {
+            Ok(None)
         }
         async fn set_status(&self, _b: &str, _n: u64, _s: Status) -> UsecaseResult<()> {
             Ok(())

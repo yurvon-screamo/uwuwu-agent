@@ -563,6 +563,15 @@ async fn analysis_pipeline_edges_on_mcp_surface() {
         .and_then(|s| s.split(' ').next())
         .and_then(|s| s.parse().ok())
         .unwrap();
+    // гейт полноты #1280: разбор заполняет поля явно до выхода из Analys
+    // (Automerge create пишет сам, Приоритет — решение аналитика)
+    call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": number, "priority": "medium" }),
+    )
+    .await
+    .expect("заполнение Приоритета решением разбора");
     // волна аналитика: Analys → Review Analys
     call(
         &tools,
@@ -604,6 +613,54 @@ async fn analysis_pipeline_edges_on_mcp_surface() {
     .await
     .expect_err("In Progress → Todo вне канона");
     assert!(err.contains("вне канона"), "{err}");
+}
+
+/// Гейт полноты полей на MCP-поверхности (#1280): выход из Analys с пустым
+/// Приоритетом — отказ с перечнем; дозаполнение → переход проходит.
+#[tokio::test]
+async fn analys_exit_gate_on_mcp_surface() {
+    let (tools, _memory) = hub();
+    let n = call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "гейт полноты" }),
+    )
+    .await
+    .unwrap();
+    let number: u64 = n
+        .trim()
+        .split('#')
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .and_then(|s| s.parse().ok())
+        .unwrap();
+    // create пишет Automerge сам — пуст только Приоритет: перечень
+    // называет его и не зовёт заполненное
+    let err = call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": number, "status": "Review Analys" }),
+    )
+    .await
+    .expect_err("пустой Приоритет не выпускает строку из Analys");
+    assert!(err.contains("Приоритет"), "перечень без Приоритета: {err}");
+    assert!(!err.contains("Automerge"), "заполненное поле в перечне: {err}");
+    // дозаполнение одним вызовом с переходом тоже легально —
+    // здесь раздельно: сначала решение, потом выход
+    call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": number, "priority": "high" }),
+    )
+    .await
+    .expect("дозаполнение Приоритета");
+    call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": number, "status": "Review Analys" }),
+    )
+    .await
+    .expect("после дозаполнения переход проходит");
 }
 
 #[tokio::test]

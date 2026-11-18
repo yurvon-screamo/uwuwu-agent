@@ -20,6 +20,10 @@ struct HubState {
     board_tags: HashMap<u64, String>,
     /// number → поля (сессии/ветка/PR)
     fields: HashMap<u64, TaskFields>,
+    /// number → значения issue-филдов вне доменной проекции
+    /// («Приоритет», «Automerge») — носитель для гейта полноты #1280
+    /// и read-path'а, читающего эти поля напрямую (fields.load).
+    raw_fields: HashMap<u64, HashMap<String, String>>,
     /// number → тело issue
     bodies: HashMap<u64, String>,
     /// number → комменты
@@ -429,6 +433,11 @@ impl IssueFieldStore for MemoryHub {
                     out.insert("PR".into(), p.as_str().to_string());
                 }
             }
+            if let Some(raw) = state.raw_fields.get(&number) {
+                for (name, value) in raw {
+                    out.insert(name.clone(), value.clone());
+                }
+            }
             Ok(out)
         })
     }
@@ -464,6 +473,22 @@ impl IssueFieldStore for MemoryHub {
                             let _ = f.open_pr(p);
                         }
                     }
+                    // «Приоритет»/«Automerge» — вне доменной проекции,
+                    // но на носителе: гейт полноты #1280 читает их load'ом
+                    ("Приоритет", value) | ("Automerge", value) => match value {
+                        Some(v) => {
+                            state
+                                .raw_fields
+                                .entry(number)
+                                .or_default()
+                                .insert((*name).into(), v.clone());
+                        }
+                        None => {
+                            if let Some(raw) = state.raw_fields.get_mut(&number) {
+                                raw.remove(*name);
+                            }
+                        }
+                    },
                     _ => {}
                 }
             }
