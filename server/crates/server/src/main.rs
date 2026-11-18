@@ -549,15 +549,15 @@ async fn run(
                 chat,
             )
         });
-    let tick_task = tokio::spawn(tick_loop(
-        cfg.poll_sec,
+    let tick_task = tokio::spawn(tick_loop(TickLoopArgs {
+        poll_sec: cfg.poll_sec,
         plan,
         usecase,
         shared,
-        Arc::new(sidecars),
+        sidecars: Arc::new(sidecars),
         notify,
-        clock.clone(),
-    ));
+        clock,
+    }));
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {},
@@ -632,15 +632,67 @@ async fn sidecar_ticks(sidecars: &[Sidecar]) -> Result<(), uwuwu_usecase::Usecas
     Ok(())
 }
 
-async fn tick_loop(
+/// Аргументы тик-лупа: группировка (qlty function-parameters #1281).
+struct TickLoopArgs {
     poll_sec: u64,
     plan: Arc<uwuwu_usecase::TickPlan>,
     usecase: Arc<TickUseCase>,
     shared: Arc<std::sync::RwLock<TickOutcome>>,
     sidecars: Arc<Vec<Sidecar>>,
+    /// ТГ-сигнализация инцидентов сталл-детекта (#1281); None — off.
     notify: Option<(Arc<dyn uwuwu_usecase::bots::TelegramGateway>, i64)>,
     clock: Arc<dyn uwuwu_usecase::Clock>,
+}
+
+/// Один инцидент-сигнал (#1281): регистрирует эскалацию в скользящем окне;
+/// при превышении порога и истёкшем cooldown — один ТГ-сигнал владельцу
+/// (канон «строка сбоя + ТГ» UC-02). [notify] не настроен — громкий лог.
+async fn incident_signal(
+    notify: &Option<(Arc<dyn uwuwu_usecase::bots::TelegramGateway>, i64)>,
+    loudness: &mut IncidentLoudness,
+    now_ms: u64,
 ) {
+    if !loudness.register(now_ms) {
+        return;
+    }
+    let text = format!(
+        "⚠︎ uwuwu: инцидент сталл-детекта — {} эскалаций за скользящее окно \
+         ({} мин): массовая парковка stage-сессий в Needs attention. \
+         Разбор — на доске.",
+        loudness.escalations_in_window(),
+        STALL_INCIDENT_WINDOW_MS / 60_000,
+    );
+    match notify {
+        Some((tg, chat)) => match tg.send_message(*chat, &text).await {
+            Ok(()) => tracing::warn!(
+                event = "stall.incident_signal",
+                escalations = loudness.escalations_in_window(),
+                "Инцидент-сигнал владельцу отправлен"
+            ),
+            Err(e) => tracing::error!(
+                event = "stall.incident_signal_failed",
+                error = %e,
+                "Инцидент-сигнал не отправлен"
+            ),
+        },
+        None => tracing::warn!(
+            event = "stall.incident_unnotified",
+            escalations = loudness.escalations_in_window(),
+            "Инцидент сталл-детекта: [notify] не настроен — сигнала нет"
+        ),
+    }
+}
+
+async fn tick_loop(args: TickLoopArgs) {
+    let TickLoopArgs {
+        poll_sec,
+        plan,
+        usecase,
+        shared,
+        sidecars,
+        notify,
+        clock,
+    } = args;
     // Инцидент-громкость (#1281): N+ сталл-эскалаций за скользящее окно —
     // один ТГ-сигнал владельцу вместо N тихих парковок.
     let mut loudness = IncidentLoudness::new(
@@ -653,37 +705,7 @@ async fn tick_loop(
         match usecase.run(&plan).await {
             Ok(outcome) => {
                 for _ in 0..outcome.stall_flagged {
-                    if !loudness.register(clock.now_ms()) {
-                        continue;
-                    }
-                    match &notify {
-                        Some((tg, chat)) => {
-                            let text = format!(
-                                "⚠︎ uwuwu: инцидент сталл-детекта — {} эскалаций за \
-                                 скользящее окно ({} мин): массовая парковка \
-                                 stage-сессий в Needs attention. Разбор — на доске.",
-                                loudness.escalations_in_window(),
-                                STALL_INCIDENT_WINDOW_MS / 60_000,
-                            );
-                            match tg.send_message(*chat, &text).await {
-                                Ok(()) => tracing::warn!(
-                                    event = "stall.incident_signal",
-                                    escalations = loudness.escalations_in_window(),
-                                    "Инцидент-сигнал владельцу отправлен"
-                                ),
-                                Err(e) => tracing::error!(
-                                    event = "stall.incident_signal_failed",
-                                    error = %e,
-                                    "Инцидент-сигнал не отправлен"
-                                ),
-                            }
-                        }
-                        None => tracing::warn!(
-                            event = "stall.incident_unnotified",
-                            escalations = loudness.escalations_in_window(),
-                            "Инцидент сталл-детекта: [notify] не настроен — сигнала нет"
-                        ),
-                    }
+                    incident_signal(&notify, &mut loudness, clock.now_ms()).await;
                 }
                 *shared.write().expect("tick lock") = outcome;
             }
