@@ -541,7 +541,9 @@ async fn run(
     let http_task = tokio::spawn(serve(cfg.port(), app));
     let notify = cfg
         .tg_notify()
-        .map_err(|e| e.to_string())?
+        // run() возвращает String; префикс «конфиг:» сохраняем из Display
+        // ConfigError (BootError-конверсия — вне скоупа #1281)
+        .map_err(|e| format!("конфиг: {e}"))?
         .map(|(token, chat)| {
             (
                 Arc::new(tg::TelegramClient::new(token))
@@ -694,7 +696,10 @@ async fn tick_loop(args: TickLoopArgs) {
         clock,
     } = args;
     // Инцидент-громкость (#1281): N+ сталл-эскалаций за скользящее окно —
-    // один ТГ-сигнал владельцу вместо N тихих парковок.
+    // один ТГ-сигнал владельцу вместо N тихих парковок. Окно неперсистентно
+    // осознанно: волна эскалаций, разнесённая через рестарт, одного сигнала
+    // не даст — «рестарт = свежее окно» (философия ADR-107), персистентность
+    // планом не требовалась.
     let mut loudness = IncidentLoudness::new(
         STALL_INCIDENT_THRESHOLD,
         STALL_INCIDENT_WINDOW_MS,

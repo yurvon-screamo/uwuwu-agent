@@ -2,7 +2,7 @@
 //! юзкейсы — с фейками, без сети/досок).
 
 use crate::error::{UsecaseError, UsecaseResult};
-use crate::pipeline::tick::{BoardPlan, Mode, TickPlan, TickUseCase};
+use crate::pipeline::tick::{BoardPlan, Mode, TickPlan, TickUseCase, PROBE_DEGRADE_MIN_ROWS};
 use crate::ports::{
     AgentSessionGateway, Clock, CommentRef, Liveness, PrGateway, PrState, SessionSpec,
     TaskBoardRepo, TickStateStore,
@@ -2962,9 +2962,9 @@ async fn probe_failure_records_outcome_without_escalation_or_counters() {
     );
 }
 
-/// Изоляция построчная (#1281): массовый отказ пробы (класс гейт-окна
-/// #1160) не глушит обработку остальных строк — строка с живой пробой
-/// получает свой сталл-вердикт, отказные считаются в outcome.
+/// Изоляция построчная (#1281): массовый отказ пробы не глушит обработку
+/// остальных строк — четыре строки слепы, пятая с достоверной пробой
+/// получает свой сталл-вердикт; отказные считаются в outcome.
 #[tokio::test]
 async fn probe_failure_isolated_per_row_other_rows_processed() {
     const NOW: u64 = 100_000_000;
@@ -2994,7 +2994,7 @@ async fn probe_failure_isolated_per_row_other_rows_processed() {
     let sess = Arc::new(FakeSessions {
         activity_ms: Some(NOW - 16 * 60_000),
         idle_reply: true,
-        // полоса отказов выше порога деградации: четыре строки слепы
+        // четыре строки слепы — ниже порога деградации (5), изоляция чистая
         activity_fails_sessions: Mutex::new(vec![
             "ses_dev_61".into(),
             "ses_dev_62".into(),
@@ -3033,6 +3033,77 @@ async fn probe_failure_isolated_per_row_other_rows_processed() {
             .iter()
             .any(|l| l.contains("NeedsAttention")),
         "массовый отказ пробы не паркует строки"
+    );
+}
+
+/// Полоса отказов пробы достигает порога деградации (#1281): пять слепых
+/// строк — probe_failed на уровне PROBE_DEGRADE_MIN_ROWS, run() сигнализирует
+/// деградацию одним громким событием stall.probe_degraded; эскалаций и
+/// пингов по недостоверным вердиктам нет.
+#[tokio::test]
+async fn probe_degradation_strip_reaches_threshold_signal() {
+    const NOW: u64 = 100_000_000;
+    struct BigClock;
+    impl Clock for BigClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            NOW
+        }
+    }
+    let mut rows = Vec::new();
+    for n in 71..76u64 {
+        rows.push(dev_task(n, &format!("ses_dev_{n}")));
+    }
+    let board = Arc::new(FakeBoard {
+        rows,
+        log: Mutex::default(),
+        comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
+    });
+    let sess = Arc::new(FakeSessions {
+        activity_fails_sessions: Mutex::new(vec![
+            "ses_dev_71".into(),
+            "ses_dev_72".into(),
+            "ses_dev_73".into(),
+            "ses_dev_74".into(),
+            "ses_dev_75".into(),
+        ]),
+        ..Default::default()
+    });
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sess.clone())),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+            probes: Mutex::default(),
+        }),
+        clock: Arc::new(BigClock),
+        state: Arc::new(MemState(Mutex::default())),
+        spawn_model: None,
+        boot_ms: 0,
+    };
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.probe_failed, PROBE_DEGRADE_MIN_ROWS,
+        "полоса отказов = порогу деградации: громкое событие stall.probe_degraded"
+    );
+    assert_eq!(out.stall_flagged, 0, "эскалаций по слепым пробам нет");
+    assert_eq!(out.soft_pings, 0);
+    assert!(
+        !board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("NeedsAttention")),
+        "деградация пробы не паркует строки"
     );
 }
 
