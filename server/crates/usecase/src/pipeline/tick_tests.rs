@@ -1634,6 +1634,36 @@ async fn branchless_real_pull_url_also_waits_for_owner() {
 }
 
 #[tokio::test]
+async fn artifact_url_with_branch_waits_for_owner() {
+    // #1286: docs-only с фабричной веткой и артефакт-URL (wiki — инстанс
+    // #1159) в PR-ячейке — гейт не пускает строку в automerge-пробу:
+    // probe не зовётся, bounce «ветка есть, PR не найден» не случается,
+    // строка ждёт владельца в Review. Интеграционный провод доменного
+    // гейта (decide → Observe) до мок-hubа: на master тест был красным
+    // (Automerge → probe → bounce).
+    let mut t = task(21, Status::UserReview);
+    t.set_automerge(true);
+    let mut f = TaskFields::default();
+    f.set_branch(BranchName::parse("work/task-1159").unwrap());
+    f.open_pr(PrUrl::parse("https://github.com/a/c/wiki/Runbook").unwrap())
+        .unwrap();
+    t.apply_fields(f);
+    let (u, board, _, prs) = usecase(vec![t], PrState::Missing);
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert!(
+        prs.probes.lock().unwrap().is_empty(),
+        "URL не PR-формы — проба не зовётся вовсе"
+    );
+    let log = board.log.lock().unwrap();
+    assert!(
+        !log.iter()
+            .any(|l| l.contains("status#21") || l.contains("comment#21")),
+        "docs-only с веткой не бончится: {log:?}"
+    );
+    assert!(!log.iter().any(|l| l.contains("close#21")));
+}
+
+#[tokio::test]
 async fn observe_does_not_charge_spawn_loops() {
     // Инцидент #1046 (15.11): observe-тики заряжали счётчик спавн-петли
     // (set_spawn_loop звался до Live-гейта) — live эскалировал строку
@@ -5104,10 +5134,10 @@ async fn stage_spawn_carries_model_from_server_map() {
     assert_eq!(out.spawns_done, 1, "спавн стадии состоялся");
     let specs = sessions.specs.lock().unwrap();
     assert_eq!(specs.len(), 2, "bootstrap + work");
-    let want = uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.3").unwrap();
+    let want = uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.3-flash#high").unwrap();
     for spec in specs.iter() {
         assert_eq!(spec.model, want.model, "модель спавна = default карты");
-        assert_eq!(spec.variant, None, "default — без варианта");
+        assert_eq!(spec.variant, want.variant, "default — вариант карты");
     }
 }
 
@@ -5120,17 +5150,17 @@ async fn review_and_test_spawns_carry_map_models_per_agent() {
         (
             Status::ReviewPlan,
             "plan-reviewer",
-            "zai-coding-plan/glm-5.3",
+            "zai-coding-plan/glm-5.3#high",
         ),
         (
             Status::ReviewResult,
             "code-quality-reviewer",
-            "zai-coding-plan/glm-5.3",
+            "zai-coding-plan/glm-5.3#high",
         ),
         (
             Status::Testing,
             "tester",
-            "zai-coding-plan/glm-5.3-flash#max",
+            "zai-coding-plan/glm-5.3-flash#high",
         ),
     ];
     for (status, agent_name, raw) in cases {
