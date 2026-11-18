@@ -386,6 +386,10 @@ async fn cron_run_carries_model_from_server_map() {
 
     // Assert
     assert_eq!(fired.len(), 1, "крон-файр состоялся");
-    // мастер без fm agent — Default-слот → default-модель карты
-    assert_model(sessions.spec_of(), "крон-спавн", "zai-coding-plan/glm-5.3");
+    // мастер без fm agent — Default-слот → default-модель карты (канон #417)
+    assert_model(
+        sessions.spec_of(),
+        "крон-спавн",
+        "zai-coding-plan/glm-5.3-flash#high",
+    );
 }

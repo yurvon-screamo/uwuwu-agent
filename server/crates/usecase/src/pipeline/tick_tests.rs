@@ -5165,10 +5165,10 @@ async fn stage_spawn_carries_model_from_server_map() {
     assert_eq!(out.spawns_done, 1, "спавн стадии состоялся");
     let specs = sessions.specs.lock().unwrap();
     assert_eq!(specs.len(), 2, "bootstrap + work");
-    let want = uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.3").unwrap();
+    let want = uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.3-flash#high").unwrap();
     for spec in specs.iter() {
-        assert_eq!(spec.model, want.model, "модель спавна = default карты");
-        assert_eq!(spec.variant, None, "default — без варианта");
+        assert_eq!(spec.model, want.model, "модель спавна = карта (#417)");
+        assert_eq!(spec.variant, want.variant, "вариант из карты");
     }
 }
 
@@ -5181,17 +5181,17 @@ async fn review_and_test_spawns_carry_map_models_per_agent() {
         (
             Status::ReviewPlan,
             "plan-reviewer",
-            "zai-coding-plan/glm-5.3",
+            "zai-coding-plan/glm-5.3#high",
         ),
         (
             Status::ReviewResult,
             "code-quality-reviewer",
-            "zai-coding-plan/glm-5.3",
+            "zai-coding-plan/glm-5.3#high",
         ),
         (
             Status::Testing,
             "tester",
-            "zai-coding-plan/glm-5.3-flash#max",
+            "zai-coding-plan/glm-5.3-flash#high",
         ),
     ];
     for (status, agent_name, raw) in cases {

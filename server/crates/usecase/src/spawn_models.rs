@@ -1,8 +1,9 @@
 //! Карта моделей спавнов (#1154, решение владельца 17.11): единый
 //! механизм конфигурации — модель кладётся сервером в тело спавна
 //! (`SessionSpec.model`), деф-файлы агентов моделей не несут. Канон
-//! владельца (11.11 «качественные контуры не режутся» + 1135 «Ревьювер —
-//! полный 5.3»): качественные — полный glm-5.3, рутинные — flash.
+//! владельца (18.11, #417): везде flash#high, ревьюверы — полный
+//! glm-5.3#high; canonical() следует config.example дословно
+//! (кросс-гвард spawn_models_config_sync_test).
 //! Ключи карты — имена агентов (naming::agent_name) + "default"
 //! (bootstrap-сессии подготовки env; до #1300 — также дев-семья, после
 //! пина агента Design/Dev берут ключ "developer").
@@ -30,11 +31,11 @@ impl SpawnModels {
                 SpawnModel::parse(raw).expect("канон-карта"),
             );
         };
-        put("default", "zai-coding-plan/glm-5.3");
-        put("developer", "zai-coding-plan/glm-5.3");
-        put("plan-reviewer", "zai-coding-plan/glm-5.3");
-        put("code-quality-reviewer", "zai-coding-plan/glm-5.3");
-        put("tester", "zai-coding-plan/glm-5.3-flash#max");
+        put("default", "zai-coding-plan/glm-5.3-flash#high");
+        put("developer", "zai-coding-plan/glm-5.3-flash#high");
+        put("plan-reviewer", "zai-coding-plan/glm-5.3#high");
+        put("code-quality-reviewer", "zai-coding-plan/glm-5.3#high");
+        put("tester", "zai-coding-plan/glm-5.3-flash#high");
         put("analyst", "zai-coding-plan/glm-5.3-flash#high");
         put("analyst-reviewer", "zai-coding-plan/glm-5.3#high");
         put("dreamer", "zai-coding-plan/glm-5.3-flash#high");
@@ -102,8 +103,8 @@ mod tests {
         let m = SpawnModels::canonical();
         assert_eq!(
             m.for_agent(Agent::PlanReviewer),
-            SpawnModel::parse("zai-coding-plan/glm-5.3").unwrap(),
-            "ревьюверы — полный 5.3 (канон 1135)"
+            SpawnModel::parse("zai-coding-plan/glm-5.3#high").unwrap(),
+            "ревьюверы — полный 5.3#high (слово владельца 18.11, #417)"
         );
         assert_eq!(
             m.for_agent(Agent::Dreamer),
@@ -111,7 +112,8 @@ mod tests {
         );
         assert_eq!(
             m.for_agent(Agent::Tester),
-            SpawnModel::parse("zai-coding-plan/glm-5.3-flash#max").unwrap()
+            SpawnModel::parse("zai-coding-plan/glm-5.3-flash#high").unwrap(),
+            "везде flash#high (слово владельца 18.11, #417)"
         );
         assert_eq!(m.for_default(), m.for_agent(Agent::Developer));
     }
