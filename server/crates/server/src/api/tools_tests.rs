@@ -476,6 +476,111 @@ async fn task_body_receipt_keeps_leading_hashes() {
     );
 }
 
+/// Проба #397 (16.11) дословно: полный task_body съедал титульную H1-секцию
+/// с контентом до следующего H1 (mangeling-trim диспетчера). Пин сценария:
+/// H1-старт — raw-тело на носителе ≡ отправленному (все секции и хвост).
+#[tokio::test]
+async fn full_body_replace_keeps_h1_title_section_verbatim() {
+    let (tools, memory) = hub();
+    let (number, _) = create_task(&tools, "t: h1", "## Постановка\n\nЧерновик.\n").await;
+    let sent = "# Заголовок задачи\n\nТитульная секция с контентом до следующего H1.\n\n## Постановка\n\nТело после H1-тайтла.\n\n## Хвост\n\nХвостовая секция.\n";
+    call(
+        &tools,
+        "task_body",
+        json!({ "number": number, "body": sent }),
+    )
+    .await
+    .expect("full body");
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert_eq!(
+        stored, sent,
+        "raw-тело ≡ отправленному — H1-тайтл, секции и хвост на месте"
+    );
+}
+
+/// Проба #397 (16.11) дословно: секционная замена дублировала хвост тела
+/// после правимой секции (байт-повтор секций, две «Комменты» по несколько КБ).
+/// Пин BDD-сценария: замена на месте, каждая секция хвоста — ровно один раз.
+#[tokio::test]
+async fn section_edit_replaces_in_place_without_tail_duplication() {
+    let (tools, memory) = hub();
+    let (number, hash) = create_task(&tools, "t: tail", &big_body()).await;
+    call(
+        &tools,
+        "task_body_section",
+        json!({
+            "number": number,
+            "section": "План",
+            "content": "Замена секции на месте; хвост не дублируется.\n",
+            "base_hash": hash,
+        }),
+    )
+    .await
+    .expect("section edit");
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert!(
+        stored.contains("Замена секции на месте"),
+        "новый контент секции на месте: {stored}"
+    );
+    for marker in ["## Постановка", "## Отчёт инженера", "## Смежное"]
+    {
+        assert_eq!(
+            stored.matches(marker).count(),
+            1,
+            "«{marker}» встречается ровно один раз — хвост не задублирован"
+        );
+    }
+}
+
+/// Профилактика #1256 (класс «чтение врёт после записи», ADR-093): запись
+/// тела → немедленное чтение того же номера возвращает записанное целиком,
+/// fm body_hash сходится с квитанцией. Граница покрытия: пин — серверная
+/// сторона (MemoryHub-носитель); GitHub-консистентность REST-чтений
+/// закрывает живая проба против прода.
+#[tokio::test]
+async fn immediate_read_after_body_write_returns_written_body() {
+    let (tools, _) = hub();
+    let (number, _) = create_task(&tools, "t: rar", "## Постановка\n\nЧерновик.\n").await;
+    let sent =
+        "# Тайтл записи\n\nКонтент записи: immediate read-after-write.\n\n## Хвост\n\nодин раз\n";
+    let receipt = call(
+        &tools,
+        "task_body",
+        json!({ "number": number, "body": sent }),
+    )
+    .await
+    .expect("write");
+    let get = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("read");
+    assert!(
+        get.contains(sent),
+        "немедленное чтение возвращает записанное целиком: {get}"
+    );
+    let receipt_hash = receipt
+        .split("body_hash: ")
+        .nth(1)
+        .unwrap_or_default()
+        .trim();
+    assert!(
+        !receipt_hash.is_empty(),
+        "квитанция несёт body_hash: {receipt}"
+    );
+    assert_eq!(
+        fm_hash(&get),
+        receipt_hash,
+        "fm body_hash немедленного чтения ≡ квитанции записи"
+    );
+}
+
 #[tokio::test]
 async fn section_edit_requires_section_and_base_hash() {
     let (tools, _) = hub();
