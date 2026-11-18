@@ -4,7 +4,7 @@
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::pipeline::tick::{BoardPlan, Mode, TickPlan, TickUseCase};
 use crate::ports::{
-    AgentSessionGateway, Clock, CommentRef, Liveness, PrGateway, PrState, SessionSpec,
+    AgentSessionGateway, Clock, CommentRef, DreamerMark, Liveness, PrGateway, PrState, SessionSpec,
     TaskBoardRepo, TickStateStore,
 };
 use crate::router::SessionRouter;
@@ -433,8 +433,8 @@ impl Clock for FixedClock {
 struct MemStateInner {
     comments: Vec<String>,
     statuses: Vec<(u64, Status)>,
-    /// Сессии, отработанные дримером (dreamer-сценарии тиков).
-    dreamer_done: Vec<String>,
+    /// Метки дример-обработки (dreamer-сценарии тиков).
+    dreamer_marks: BTreeMap<String, DreamerMark>,
     /// (number, slot) → (status, repeats)
     loops: Vec<(u64, Slot, Status, u32)>,
     /// (number, status, rounds) — цикл-гвард аналитики (#1135)
@@ -482,12 +482,17 @@ impl TickStateStore for MemState {
     fn set_last_seen_status(&self, _b: &str, n: u64, status: Status) {
         self.0.lock().unwrap().statuses.push((n, status));
     }
-    fn dreamer_done(&self, s: &str) -> bool {
-        self.0.lock().unwrap().dreamer_done.iter().any(|id| id == s)
+    fn dreamer_mark(&self, s: &str) -> Option<DreamerMark> {
+        self.0.lock().unwrap().dreamer_marks.get(s).copied()
     }
-    fn mark_dreamer_done(&self, s: &str) {
-        self.0.lock().unwrap().dreamer_done.push(s.into());
+    fn mark_dreamer(&self, s: &str, mark: DreamerMark) {
+        self.0.lock().unwrap().dreamer_marks.insert(s.into(), mark);
     }
+    fn dreamer_session(&self, _s: &str) -> Option<String> {
+        None
+    }
+    fn link_dreamer_session(&self, _s: &str, _d: &str) {}
+    fn prune_dreamer(&self, _live: &std::collections::HashSet<String>) {}
     fn dreamer_day_spawns(&self, _day: &str) -> u32 {
         0
     }
@@ -3339,12 +3344,17 @@ async fn dreamer_revival_of_dreamed_session_reprompts() {
         }
     }
     let state = Arc::new(MemState(Mutex::default()));
-    state.mark_dreamer_done("ses_target");
+    // Дрим в T1; revival — активность T2 > T1 (дополнение после дрима).
+    state.mark_dreamer("ses_target", DreamerMark::UpTo(100_000_000 - 40 * 60_000));
     let sessions = Arc::new(FakeSessions::new());
-    sessions.extra.lock().unwrap().push(crate::ports::SessionInfo {
-        updated_ms: 100_000_000 - 31 * 60_000,
-        ..fake_session("ses_target", "developer", "succeeded", 700, false)
-    });
+    sessions
+        .extra
+        .lock()
+        .unwrap()
+        .push(crate::ports::SessionInfo {
+            updated_ms: 100_000_000 - 31 * 60_000,
+            ..fake_session("ses_target", "developer", "succeeded", 700, false)
+        });
     let u = DreamerUseCase {
         sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         state,

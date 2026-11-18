@@ -12,8 +12,8 @@ use uwuwu_usecase::bots::{
     BotAssetStore, BotStateStore, MediaKind, TelegramGateway, TgMedia, TgMessage, TgUpdate,
 };
 use uwuwu_usecase::{
-    AgentSessionGateway, AssistantReply, Clock, Liveness, SessionInfo, SessionSpec, TickStateStore,
-    UsecaseError, UsecaseResult, WikiRepo,
+    AgentSessionGateway, AssistantReply, Clock, DreamerMark, Liveness, SessionInfo, SessionSpec,
+    TickStateStore, UsecaseError, UsecaseResult, WikiRepo,
 };
 
 use super::runner::{process_message, spawn_bot_task, BotDeps, BotStructural};
@@ -412,7 +412,7 @@ impl BotStateStore for FakeState {
 /// раннер), остальное — no-op.
 #[derive(Default)]
 struct MemTickState {
-    dreamer_done: Mutex<Vec<String>>,
+    dreamer_marks: Mutex<std::collections::BTreeMap<String, DreamerMark>>,
 }
 
 impl TickStateStore for MemTickState {
@@ -424,19 +424,24 @@ impl TickStateStore for MemTickState {
     }
     fn set_last_seen_status(&self, _b: &str, _n: u64, _s: Status) {}
     fn set_last_comment_id(&self, _b: &str, _n: u64, _id: &str) {}
-    fn dreamer_done(&self, session: &str) -> bool {
-        self.dreamer_done
+    fn dreamer_mark(&self, session: &str) -> Option<DreamerMark> {
+        self.dreamer_marks
             .lock()
             .expect("lock")
-            .iter()
-            .any(|s| s == session)
+            .get(session)
+            .copied()
     }
-    fn mark_dreamer_done(&self, session: &str) {
-        self.dreamer_done
+    fn mark_dreamer(&self, session: &str, mark: DreamerMark) {
+        self.dreamer_marks
             .lock()
             .expect("lock")
-            .push(session.to_string());
+            .insert(session.to_string(), mark);
     }
+    fn dreamer_session(&self, _source: &str) -> Option<String> {
+        None
+    }
+    fn link_dreamer_session(&self, _source: &str, _dreamer: &str) {}
+    fn prune_dreamer(&self, _live: &std::collections::HashSet<String>) {}
     fn dreamer_day_spawns(&self, _day: &str) -> u32 {
         0
     }

@@ -9,6 +9,7 @@ use uwuwu_domain::{Slot, Status};
 use uwuwu_usecase as naming;
 use uwuwu_usecase::BotStateStore;
 use uwuwu_usecase::Clock;
+use uwuwu_usecase::DreamerMark;
 use uwuwu_usecase::TickStateStore;
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
@@ -44,9 +45,16 @@ struct StateFile {
     /// «board:number» → состояние строки.
     #[serde(default)]
     rows: BTreeMap<String, RowState>,
-    /// Сессии, отработанные дримером.
+    /// Метки дример-обработки: id сессии → watermark/вечный скип (#1306).
     #[serde(default)]
-    dreamer_done: Vec<String>,
+    dreamer: BTreeMap<String, DreamerMark>,
+    /// «исходная → дример-сессия» — инвариант 1:1 ADR-005 (#1306).
+    #[serde(default)]
+    dreamer_links: BTreeMap<String, String>,
+    /// Legacy вечных маркеров (эпоха до #1306): мигрирует при загрузке
+    /// в `UpTo(now)`, в новом файле не пишется.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    legacy_dreamer_done: Vec<String>,
     /// «board:number:slot» → ms последнего спавна (анти-шторм).
     #[serde(default)]
     spawns: BTreeMap<String, u64>,
@@ -78,10 +86,19 @@ pub struct JsonStateStore {
 
 impl JsonStateStore {
     pub fn load(path: PathBuf, clock: Arc<dyn Clock>) -> Self {
-        let state = std::fs::read_to_string(&path)
+        let mut state: StateFile = std::fs::read_to_string(&path)
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok())
             .unwrap_or_default();
+        // Миграция legacy вечных маркеров (#1306): позиция = момент
+        // загрузки — revival'ы после деплоя дообрабатываются, старые
+        // сессии молчат (шторм повторных дримов исключён).
+        if !state.legacy_dreamer_done.is_empty() {
+            let boot = clock.now_ms();
+            for id in state.legacy_dreamer_done.drain(..) {
+                state.dreamer.entry(id).or_insert(DreamerMark::UpTo(boot));
+            }
+        }
         Self {
             path,
             state: std::sync::Mutex::new(state),
@@ -95,13 +112,8 @@ impl JsonStateStore {
 
     /// Атомарная запись файла (единая точка: оба трейта — делегаты).
     fn save_now(&self) -> UsecaseResult<()> {
-        // гигиена роста: dreamer_done — последние 500
         {
             let mut guard = self.state.lock().expect("state lock");
-            if guard.dreamer_done.len() > 500 {
-                let cut = guard.dreamer_done.len() - 500;
-                guard.dreamer_done.drain(0..cut);
-            }
             if guard.spawns.len() > 5000 {
                 let keys: Vec<String> = guard.spawns.keys().cloned().collect();
                 let cut = guard.spawns.len() - 5000;
@@ -206,21 +218,46 @@ impl TickStateStore for JsonStateStore {
             .last_comment_id = Some(id.to_string());
     }
 
-    fn dreamer_done(&self, session: &str) -> bool {
+    fn dreamer_mark(&self, session: &str) -> Option<DreamerMark> {
         self.state
             .lock()
             .expect("state lock")
-            .dreamer_done
-            .iter()
-            .any(|s| s == session)
+            .dreamer
+            .get(session)
+            .copied()
     }
 
-    fn mark_dreamer_done(&self, session: &str) {
+    fn mark_dreamer(&self, session: &str, mark: DreamerMark) {
         self.state
             .lock()
             .expect("state lock")
-            .dreamer_done
-            .push(session.to_string());
+            .dreamer
+            .insert(session.to_string(), mark);
+    }
+
+    fn dreamer_session(&self, source: &str) -> Option<String> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .dreamer_links
+            .get(source)
+            .cloned()
+    }
+
+    fn link_dreamer_session(&self, source: &str, dreamer: &str) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .dreamer_links
+            .insert(source.to_string(), dreamer.to_string());
+    }
+
+    fn prune_dreamer(&self, live: &std::collections::HashSet<String>) {
+        let mut guard = self.state.lock().expect("state lock");
+        guard.dreamer.retain(|id, _| live.contains(id));
+        guard
+            .dreamer_links
+            .retain(|source, _| live.contains(source));
     }
 
     fn dreamer_day_spawns(&self, day_key: &str) -> u32 {

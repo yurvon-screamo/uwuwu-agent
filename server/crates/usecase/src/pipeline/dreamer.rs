@@ -1,9 +1,10 @@
 //! Дример: пост-обработка уснувших сессий (REST-only, без opencode.db —
 //! решение #1133). Инвариант: 1 рабочая сессия = 1 дример-сессия;
-/// обработанные помечаются в состоянии тика.
+//! маркер обработки — watermark (revival ниже делает сессию кандидатом
+//! снова, #1306), вечный скип — только не-источники опыта (боты).
 use crate::error::UsecaseResult;
 use crate::naming;
-use crate::ports::{Clock, SessionSpec, TickStateStore};
+use crate::ports::{Clock, DreamerMark, SessionSpec, TickStateStore};
 use crate::router::SessionRouter;
 use crate::spawn_models::SpawnModels;
 use std::sync::Arc;
@@ -78,7 +79,11 @@ impl DreamerUseCase {
                 && naming::parse_agent(&s.agent)
                     .map(|a| !SKIP_AGENTS.contains(&a))
                     .unwrap_or(true)
-                && !self.state.dreamer_done(&s.id)
+                && match self.state.dreamer_mark(&s.id) {
+                    None => true,
+                    Some(DreamerMark::Forever) => false,
+                    Some(DreamerMark::UpTo(pos)) => s.updated_ms > pos,
+                }
         });
         let Some(target) = candidate else {
             return Ok(0);
@@ -101,7 +106,8 @@ impl DreamerUseCase {
         let session = sessions.create_session(&spec).await?;
         let prompt = dreamer_prompt(&target.id);
         sessions.prompt(&session, &prompt).await?;
-        self.state.mark_dreamer_done(&target.id);
+        self.state
+            .mark_dreamer(&target.id, DreamerMark::UpTo(target.updated_ms));
         self.state.mark_dreamer_spawn(&day_key);
         tracing::info!(event = "dreamer.spawned", target = %target.id, session = %session, "Dreamer spawned");
         Ok(1)
