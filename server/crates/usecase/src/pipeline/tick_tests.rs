@@ -2553,45 +2553,10 @@ async fn failed_spawn_does_not_charge_loop_or_cooldown() {
     // 15.11, #1151 (high): временный отказ спавна (бюджет 10/ч) не должен
     // заряжать луп-счётчик (3 отказа = ложная эскалация) и кулдаун слота —
     // заряжаем только состоявшийся спавн
-    struct FailingSessions;
-    #[async_trait::async_trait]
-    impl AgentSessionGateway for FailingSessions {
-        async fn create_session(&self, _s: &SessionSpec) -> UsecaseResult<String> {
-            Err(crate::error::UsecaseError::Session(
-                "бюджет исчерпан (мок)".into(),
-            ))
-        }
-        async fn prompt(&self, _s: &str, _t: &str) -> UsecaseResult<()> {
-            Ok(())
-        }
-        async fn run_command(&self, _s: &str, _n: &str, _a: &str) -> UsecaseResult<()> {
-            Ok(())
-        }
-        async fn delete_session(&self, _s: &str) -> UsecaseResult<()> {
-            Ok(())
-        }
-        async fn liveness(&self, _s: &str) -> Liveness {
-            Liveness::Alive
-        }
-        async fn last_activity_ms(&self, _s: &str) -> UsecaseResult<Option<u64>> {
-            Ok(None)
-        }
-        async fn last_assistant_reply(
-            &self,
-            _s: &str,
-        ) -> UsecaseResult<Option<crate::ports::AssistantReply>> {
-            Ok(None)
-        }
-        async fn list_sessions(&self) -> UsecaseResult<Vec<crate::ports::SessionInfo>> {
-            Ok(vec![])
-        }
-        async fn export_session(&self, _s: &str) -> UsecaseResult<String> {
-            Ok(String::new())
-        }
-    }
+    let sessions = Arc::new(FailingCreate);
     let state = Arc::new(MemState(Mutex::default()));
     let (mut u, _, _, _) = usecase(vec![task(40, Status::InProgress)], PrState::Missing);
-    u.sessions = Arc::new(SessionRouter::uniform(Arc::new(FailingSessions)));
+    u.sessions = Arc::new(SessionRouter::uniform(sessions.clone()));
     u.state = state.clone();
     for round in 0..4 {
         let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
@@ -2627,60 +2592,12 @@ fn analyst_uc(
     analyst_uc_with_cup(rows, state, sessions, 7)
 }
 
-fn analyst_uc_with_cup(
-    rows: Vec<Task>,
-    state: Arc<MemState>,
-    sessions: Arc<dyn AgentSessionGateway>,
-    cup: usize,
-) -> (AnalystUseCase, Arc<FakeBoard>) {
-    let board = Arc::new(FakeBoard {
-        rows,
-        log: Mutex::default(),
-        comments: vec![],
-        fields_fails: false,
-        set_session_fails: false,
-    });
-    let u = AnalystUseCase {
-        board: board.clone(),
-        boards: vec![analyst_board()],
-        sessions: Arc::new(SessionRouter::uniform(sessions)),
-        state,
-        clock: Arc::new(FixedClock),
-        cup,
-    };
-    (u, board)
-}
-
 fn review_uc(
     rows: Vec<Task>,
     state: Arc<MemState>,
     sessions: Arc<dyn AgentSessionGateway>,
 ) -> (AnalystReviewUseCase, Arc<FakeBoard>) {
     review_uc_with_cup(rows, state, sessions, 7)
-}
-
-fn review_uc_with_cup(
-    rows: Vec<Task>,
-    state: Arc<MemState>,
-    sessions: Arc<dyn AgentSessionGateway>,
-    cup: usize,
-) -> (AnalystReviewUseCase, Arc<FakeBoard>) {
-    let board = Arc::new(FakeBoard {
-        rows,
-        log: Mutex::default(),
-        comments: vec![],
-        fields_fails: false,
-        set_session_fails: false,
-    });
-    let u = AnalystReviewUseCase {
-        board: board.clone(),
-        boards: vec![analyst_board()],
-        sessions: Arc::new(SessionRouter::uniform(sessions)),
-        state,
-        clock: Arc::new(FixedClock),
-        cup,
-    };
-    (u, board)
 }
 
 #[tokio::test]
@@ -2729,6 +2646,48 @@ async fn analyst_multiboard_no_oversell_within_tick() {
     let specs = sessions.specs.lock().unwrap();
     assert_eq!(specs.len(), 1, "спавн только первой доски");
     assert_eq!(specs[0].directory, "/checkout-1");
+}
+
+/// Билдер юзкейса сайдкара аналитики: доска + роутер + кап (общая
+/// механика для аналитика и ревьювера, ревью #1231 similar-code).
+macro_rules! sidecar_uc_with_cup {
+    ($fn_name:ident, $ty:ident) => {
+        fn $fn_name(
+            rows: Vec<Task>,
+            state: Arc<MemState>,
+            sessions: Arc<dyn AgentSessionGateway>,
+            cup: usize,
+        ) -> ($ty, Arc<FakeBoard>) {
+            let board = Arc::new(FakeBoard {
+                rows,
+                log: Mutex::default(),
+                comments: vec![],
+                fields_fails: false,
+                set_session_fails: false,
+            });
+            let u = $ty {
+                board: board.clone(),
+                boards: vec![analyst_board()],
+                sessions: Arc::new(SessionRouter::uniform(sessions)),
+                state,
+                clock: Arc::new(FixedClock),
+                cup,
+            };
+            (u, board.clone())
+        }
+    };
+}
+sidecar_uc_with_cup!(analyst_uc_with_cup, AnalystUseCase);
+sidecar_uc_with_cup!(review_uc_with_cup, AnalystReviewUseCase);
+
+/// Прогон тика аналитики с предзаряженным стейтом: возвращает стейт
+/// после тика (сценарии сброса/чистки гвардов).
+async fn analyst_tick_precharged(inner: MemStateInner, rows: Vec<Task>) -> Arc<MemState> {
+    let state = Arc::new(MemState(Mutex::new(inner)));
+    let sessions = Arc::new(FakeSessions::new());
+    let (u, _) = analyst_uc(rows, state.clone(), sessions);
+    u.tick().await.unwrap();
+    state
 }
 
 fn titled(n: u64, title: &str, status: Status) -> Task {
@@ -3036,18 +2995,14 @@ async fn analyst_escalates_after_three_cycles() {
 #[tokio::test]
 async fn analyst_resets_stale_cycle_counter() {
     // строка уехала из цикла (Todo) — счётчик кругов устарел
-    let inner = MemStateInner {
-        analys_loops: vec![(2, Status::Analys, 2)],
-        ..Default::default()
-    };
-    let state = Arc::new(MemState(Mutex::new(inner)));
-    let sessions = Arc::new(FakeSessions::new());
-    let (u, _) = analyst_uc(
+    let state = analyst_tick_precharged(
+        MemStateInner {
+            analys_loops: vec![(2, Status::Analys, 2)],
+            ..Default::default()
+        },
         vec![titled(2, "в пайпе", Status::Todo)],
-        state.clone(),
-        sessions,
-    );
-    u.tick().await.unwrap();
+    )
+    .await;
     assert!(
         state.0.lock().unwrap().analys_loops.is_empty(),
         "вне цикла Analys↔Review Analys счётчик сбрасывается"
@@ -3726,18 +3681,14 @@ async fn reviewer_guard_survives_while_row_in_review_analys() {
 #[tokio::test]
 async fn analyst_prunes_review_loops_of_gone_rows() {
     // R2-L1: review-loop ключи ушедших строк вычищаются вместе с аналитическими
-    let inner = MemStateInner {
-        analys_review_loops: vec![(9, Status::ReviewAnalys, 1)],
-        ..Default::default()
-    };
-    let state = Arc::new(MemState(Mutex::new(inner)));
-    let sessions = Arc::new(FakeSessions::new());
-    let (u, _) = analyst_uc(
+    let state = analyst_tick_precharged(
+        MemStateInner {
+            analys_review_loops: vec![(9, Status::ReviewAnalys, 1)],
+            ..Default::default()
+        },
         vec![titled(1, "живая", Status::Analys)],
-        state.clone(),
-        sessions,
-    );
-    u.tick().await.unwrap();
+    )
+    .await;
     assert!(
         state.0.lock().unwrap().analys_review_loops.is_empty(),
         "мёртвый review-loop вычищен"
@@ -4000,46 +3951,41 @@ async fn task_close_missing_row_is_a_loud_error_without_mutations() {
 // роли несёт маркер таблицы Agent::emoji; если маппинг отломают — тест падает.
 
 #[tokio::test]
-async fn analyst_wave_title_carries_marker() {
-    // 🧠 в тайтле волновой сессии аналитика (свой юзкейс, вне конвейерного тика)
+async fn analyst_family_titles_carry_role_marker() {
+    // 🧠/⚖️ в тайтлах волновых сессий аналитика и ревью-аналитики
     let state = Arc::new(MemState(Mutex::default()));
     let sessions = Arc::new(FakeSessions::new());
     let (u, _) = analyst_uc(
         vec![titled(1, "заявка", Status::Analys)],
-        state,
+        state.clone(),
         sessions.clone(),
     );
     assert_eq!(u.tick().await.unwrap(), 1);
-    let specs = sessions.specs.lock().unwrap();
-    let spec = specs.last().expect("волновая сессия");
-    assert_eq!(
-        spec.title,
-        format!("{} аналитика волны", Agent::Analyst.emoji())
-    );
-    assert!(matches!(spec.agent, AgentSlot::Role(Agent::Analyst)));
-}
-
-#[tokio::test]
-async fn analyst_review_title_carries_marker() {
-    // ⚖️ в тайтле парной сессии ревью-аналитики
-    let state = Arc::new(MemState(Mutex::default()));
-    let sessions = Arc::new(FakeSessions::new());
     let (r, _) = review_uc(
-        vec![titled(1, "заявка", Status::ReviewAnalys)],
+        vec![titled(2, "заявка", Status::ReviewAnalys)],
         state,
         sessions.clone(),
     );
     assert_eq!(r.tick().await.unwrap(), 1);
     let specs = sessions.specs.lock().unwrap();
-    let spec = specs.last().expect("сессия ревью-аналитики");
+    let (a, rv) = (
+        specs
+            .iter()
+            .find(|s| matches!(s.agent, AgentSlot::Role(Agent::Analyst)))
+            .expect("волна"),
+        specs
+            .iter()
+            .find(|s| matches!(s.agent, AgentSlot::Role(Agent::AnalystReviewer)))
+            .expect("ревью-волна"),
+    );
     assert_eq!(
-        spec.title,
+        a.title,
+        format!("{} аналитика волны", Agent::Analyst.emoji())
+    );
+    assert_eq!(
+        rv.title,
         format!("{} ревью аналитики", Agent::AnalystReviewer.emoji())
     );
-    assert!(matches!(
-        spec.agent,
-        AgentSlot::Role(Agent::AnalystReviewer)
-    ));
 }
 
 #[tokio::test]
