@@ -6,4 +6,4 @@ mod prgate;
 
 pub use fields::{F_DEV_SESSION, F_REVIEW_SESSION, F_TEST_SESSION};
 pub use hub::GitHubHub;
-pub use prgate::GhPrGateway;
+pub use prgate::{parse_pr_url, GhPrGateway};

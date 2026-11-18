@@ -894,6 +894,101 @@ async fn task_get_renders_foreign_vendor_pull_url() {
 /// #1155 (поручение владельца): автомерж-ячейка живёт на mock-носителе —
 /// create пишет дефолт on, edit переключает, fm рендерит фактическое
 /// состояние (без хранения на носителе fm и тик стенда врали «false»).
+/// Приёмочный путь MCP-клиента (#1298): tools/list поверх протокола
+/// (POST /mcp) отдаёт схему task_create.type, совпадающую с валидацией —
+/// выпиленные #1135 idea/analys в списке не обещаются, а вызов с ними
+/// громко отвергается до мутаций доски.
+#[tokio::test]
+async fn mcp_tools_list_serves_canonical_task_types_only() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let (tools, _memory) = hub();
+    let state = Arc::new(super::McpState {
+        bearer: Arc::new("t-bearer".into()),
+        tools: tools.clone(),
+    });
+    let app = super::mcp_router(state);
+
+    let post = |body: Value| {
+        Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("authorization", "Bearer t-bearer")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    // tools/list: в схеме type только канон 9 типов.
+    let res = app
+        .clone()
+        .oneshot(post(
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    let schema_type = json["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "task_create")
+        .expect("task_create в tools/list")["inputSchema"]["properties"]["type"]["description"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        !schema_type.contains("idea") && !schema_type.contains("analys"),
+        "схема обещает выпиленное: {schema_type}"
+    );
+    for canonical in [
+        "bug",
+        "spike",
+        "docs",
+        "other",
+        "feature",
+        "refactoring",
+        "legacy",
+        "qa",
+        "infrastructure",
+    ] {
+        assert!(
+            schema_type.split('|').any(|t| t.trim() == canonical),
+            "«{canonical}» нет в схеме: {schema_type}"
+        );
+    }
+
+    // tools/call с выпиленным типом — громкий отказ, доска не мутируется.
+    let res = app
+        .oneshot(post(json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"task_create","arguments":{
+                "project":"uwuwu","title":"т: idea не по схеме","type":"idea"
+            }}
+        })))
+        .await
+        .unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["result"]["isError"], Value::Bool(true));
+    let text = json["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(text.contains("неизвестный тип"), "{text}");
+    let list = call(&tools, "task_list", json!({ "project": "uwuwu" }))
+        .await
+        .expect("list");
+    assert!(
+        !list.contains("т: idea не по схеме"),
+        "отказ валидации создал строку: {list}"
+    );
+}
+
 #[tokio::test]
 async fn automerge_cell_roundtrips_on_mock_carrier() {
     let (tools, _memory) = hub();

@@ -288,6 +288,21 @@ impl AgentSessionGateway for OpencodeClient {
         Self::check(status, &format!("prompt {session}"))
     }
 
+    /// Пин агента слота (#1300): `POST /session/:id/agent` — живая проба
+    /// 2.3.2 (throwaway serve): 204, session.agent персистится туда-обратно.
+    async fn switch_agent(&self, session: &str, agent: uwuwu_domain::Agent) -> UsecaseResult<()> {
+        let (status, _) = self
+            .call(
+                &format!("/session/{session}/agent"),
+                reqwest::Method::POST,
+                Some(json!({ "agent": uwuwu_usecase::agent_name(agent) })),
+            )
+            .await?;
+        // 404 = сессия умерла между liveness-пробой и пином — честный Err:
+        // seen не пишется, доставка повторится следующим тиком
+        Self::check(status, &format!("switch agent {session}"))
+    }
+
     async fn run_command(&self, session: &str, name: &str, args: &str) -> UsecaseResult<()> {
         let (status, _) = self
             .call(

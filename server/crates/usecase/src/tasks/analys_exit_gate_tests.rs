@@ -115,6 +115,12 @@ impl TaskBoardRepo for GateBoard {
     async fn close_issue_ext(&self, _: u64, _: bool) -> UsecaseResult<()> {
         Ok(())
     }
+    async fn archive_row(&self, _: &str, _: u64) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn issues_with_title(&self, _: &str) -> UsecaseResult<Vec<u64>> {
+        Ok(Vec::new())
+    }
 
     async fn replace_body(&self, _: u64, _: &str) -> UsecaseResult<()> {
         Ok(())

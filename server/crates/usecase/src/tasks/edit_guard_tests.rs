@@ -112,6 +112,12 @@ impl TaskBoardRepo for StaleBoard {
     async fn close_issue_ext(&self, _: u64, _: bool) -> UsecaseResult<()> {
         Ok(())
     }
+    async fn archive_row(&self, _: &str, _: u64) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn issues_with_title(&self, _: &str) -> UsecaseResult<Vec<u64>> {
+        Ok(Vec::new())
+    }
 
     async fn replace_body(&self, _: u64, _: &str) -> UsecaseResult<()> {
         Ok(())
@@ -199,6 +205,7 @@ impl TickStateStore for NopState {
     }
 
     fn mark_stall_ping(&self, _: &str, _: u64, _: Status, _: u64) {}
+    fn clear_stall(&self, _: &str, _: u64) {}
 
     fn clear_spawn_ms(&self, _: &str, _: u64, _: Slot) {}
 
@@ -239,6 +246,12 @@ impl TickStateStore for NopState {
     fn set_spawn_loop(&self, _: &str, _: u64, _: Slot, _: Status, _: u32) {}
 
     fn reset_stale_spawn_loops(&self, _: &str, _: u64, _: Status) {}
+
+    fn review_rounds(&self, _: &str, _: u64) -> u32 {
+        0
+    }
+
+    fn set_review_rounds(&self, _: &str, _: u64, _: u32) {}
 
     fn own_comment(&self, _: &str) -> bool {
         false

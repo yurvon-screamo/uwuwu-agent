@@ -29,9 +29,14 @@ pub use naming::{
     agent_name, parse_agent, parse_priority, parse_status, parse_task_type, priority_name,
     schedule_label, slot_key, status_name, task_type_name, F_AUTOMERGE, F_PRIORITY, TASK_TYPES,
 };
+pub use pipeline::sweeper;
 pub use pipeline::{
-    AnalystBoard, AnalystReviewUseCase, AnalystUseCase, BoardPlan, DreamerUseCase, Mode,
-    TickOutcome, TickPlan, TickUseCase,
+    executor::ExecutorLoudness, executor::EXECUTOR_UNAVAILABLE_COOLDOWN_MS,
+    executor::EXECUTOR_UNAVAILABLE_THRESHOLD, executor::EXECUTOR_UNAVAILABLE_WINDOW_MS,
+    incident::IncidentLoudness, incident::STALL_INCIDENT_COOLDOWN_MS,
+    incident::STALL_INCIDENT_THRESHOLD, incident::STALL_INCIDENT_WINDOW_MS, AnalystBoard,
+    AnalystReviewUseCase, AnalystUseCase, BoardPlan, DreamerUseCase, Mode, TickOutcome, TickPlan,
+    TickUseCase,
 };
 pub use ports::{
     AgentSessionGateway, AssistantReply, Clock, CommentRef, DreamerMark, FmMutator, IssueDigest,

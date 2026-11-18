@@ -14,6 +14,9 @@ pub const ENV_BEARER: &str = "UWUWU_SERVER_BEARER";
 pub const ENV_STATE_PATH: &str = "UWUWU_SERVER_STATE";
 pub const ENV_MODE: &str = "UWUWU_SERVER_MODE";
 pub const ENV_OPENCODE_GATE: &str = "UWUWU_OPENCODE_GATE";
+/// Gitea-инстансы PR-гейта: «host=token,host=token» (#1269); нет/пусто —
+/// Gitea-PR ждут владельца в Review (Foreign), деплой не ломается.
+pub const ENV_GITEA_TOKENS: &str = "GITEA_TOKENS";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -66,6 +69,16 @@ pub struct PolicyCfg {
     pub peak: PeakCfg,
 }
 
+/// Инцидент-сигнализация сталл-детекта (#1281): массовость эскалаций за
+/// окно — один ТГ-сигнал владельцу. Секция отсутствует — off (safe default).
+#[derive(Debug, Clone, Deserialize)]
+pub struct NotifyCfg {
+    /// Имя env-переменной с токеном ТГ-бота (само значение — env, не конфиг).
+    pub tg_token_env: String,
+    /// Chat id получателя сигналов.
+    pub tg_chat_id: i64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProjectCfg {
     pub name: String,
@@ -85,6 +98,12 @@ pub struct Config {
     pub mode: ModeCfg,
     #[serde(default = "default_poll")]
     pub poll_sec: u64,
+    /// Клин холодного ящика (#1293): терминальные строки, закрытые
+    /// строго старше этого числа суток, архивируются sidecar-тиком.
+    /// 0 = клин выключен (дефолт кода; боевой конфиг — санкция владельца
+    /// «старше недели»).
+    #[serde(default)]
+    pub sweep_days: u32,
     #[serde(default = "default_port")]
     port_cfg: u16,
     pub hub: HubCfg,
@@ -95,6 +114,9 @@ pub struct Config {
     pub executors: Vec<NamedExecutorCfg>,
     pub policy: PolicyCfg,
     pub project: Vec<ProjectCfg>,
+    /// ТГ-сигнализация инцидентов сталл-детекта (#1281); нет секции — off.
+    #[serde(default)]
+    pub notify: Option<NotifyCfg>,
 }
 
 fn default_poll() -> u64 {
@@ -113,6 +135,8 @@ pub struct Secrets {
     /// Гейт публичного опенкода: значение Cookie-хедера целиком
     /// (oc_gate=<hash>) — эндпоинт за Caddy-заглушкой.
     pub opencode_gate_cookie: Option<String>,
+    /// Gitea-токены PR-гейта: host → token (#1269).
+    pub gitea_tokens: HashMap<String, String>,
     pub bearer: String,
 }
 
@@ -243,6 +267,10 @@ impl Config {
         })?;
         let opencode_password = non_empty_env(ENV_OPENCODE_PASSWORD);
         let opencode_gate_cookie = non_empty_env(ENV_OPENCODE_GATE);
+        let gitea_tokens = match non_empty_env(ENV_GITEA_TOKENS) {
+            Some(raw) => parse_gitea_tokens(&raw)?,
+            None => HashMap::new(),
+        };
         if self.mode() == ModeCfg::Live && opencode_password.is_none() {
             return Err(ConfigError::Validation(format!(
                 "{ENV_OPENCODE_PASSWORD} обязателен в live-режиме (спавны)"
@@ -252,8 +280,25 @@ impl Config {
             gh_token,
             opencode_password,
             opencode_gate_cookie,
+            gitea_tokens,
             bearer,
         })
+    }
+
+    /// ТГ-сигнализация инцидентов конвейера: сталл-детект (#1281),
+    /// деградация executor'а (#1312). Секция не задана — off; задана,
+    /// а env пуст — честная ошибка старта (канон секретов).
+    pub fn tg_notify(&self) -> Result<Option<(String, i64)>, ConfigError> {
+        match &self.notify {
+            None => Ok(None),
+            Some(n) => match non_empty_env(&n.tg_token_env) {
+                Some(token) => Ok(Some((token, n.tg_chat_id))),
+                None => Err(ConfigError::Validation(format!(
+                    "{} обязателен (инцидент-сигнализация ТГ)",
+                    n.tg_token_env
+                ))),
+            },
+        }
     }
 
     /// Путь state-файла: env > рядом с конфигом.
@@ -323,12 +368,71 @@ fn non_empty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
+/// GITEA_TOKENS → мапа host → token: пары через запятую, разделитель `=`
+/// (#1269). Битая пара (без `=`, пустой host/token) — громкая ошибка
+/// старта: тихий пропуск пары прятал бы неработающий инстанс.
+fn parse_gitea_tokens(raw: &str) -> Result<HashMap<String, String>, ConfigError> {
+    let mut tokens = HashMap::new();
+    for pair in raw.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let Some((host, token)) = pair.split_once('=') else {
+            return Err(ConfigError::Validation(format!(
+                "{ENV_GITEA_TOKENS}: пара без '=' (host=token): {pair:?}"
+            )));
+        };
+        let (host, token) = (host.trim(), token.trim());
+        if host.is_empty() || token.is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "{ENV_GITEA_TOKENS}: пустой host или token в паре {pair:?}"
+            )));
+        }
+        if tokens.contains_key(host) {
+            return Err(ConfigError::Validation(format!(
+                "{ENV_GITEA_TOKENS}: дубликат хоста {host:?} — последний токен молча перезатирал бы предыдущий"
+            )));
+        }
+        tokens.insert(host.to_string(), token.to_string());
+    }
+    Ok(tokens)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn example() -> &'static str {
         include_str!("../../../config.example.toml")
+    }
+
+    #[test]
+    fn parses_gitea_tokens_env() {
+        // #1269: мапа host=token через запятую; пробелы и пустые пары терпимы
+        let tokens = parse_gitea_tokens(" git.l4a.ru = tok1 , git.true-wash.com=tok2 ,, ").unwrap();
+        assert_eq!(tokens.get("git.l4a.ru").map(String::as_str), Some("tok1"));
+        assert_eq!(
+            tokens.get("git.true-wash.com").map(String::as_str),
+            Some("tok2")
+        );
+        assert_eq!(parse_gitea_tokens("").unwrap().len(), 0);
+        assert!(
+            parse_gitea_tokens("host-without-token").is_err(),
+            "пара без '=' — громкая ошибка старта"
+        );
+        assert!(
+            parse_gitea_tokens("host=").is_err(),
+            "пустой token — громкая ошибка старта"
+        );
+        assert!(
+            parse_gitea_tokens("=tok").is_err(),
+            "пустой host — громкая ошибка старта"
+        );
+        assert!(
+            parse_gitea_tokens("git.l4a.ru=tok1,git.l4a.ru=tok2").is_err(),
+            "дубликат хоста — громкая ошибка старта, не молчаливый last-wins"
+        );
     }
 
     #[test]
@@ -475,6 +579,71 @@ mod tests {
         let cfg = toml::from_str::<Config>(&raw).expect("toml парсится");
         let err = cfg.validate().expect_err("не-http url должен падать");
         assert!(err.to_string().contains("не http(s)"), "{err}");
+    }
+
+    fn minimal() -> String {
+        // минимально валидный конфиг для notify-кейсов (tg_notify не ходит
+        // в проекты/исполнителей — каркас только под serde/validate)
+        r#"
+mode = "observe"
+[hub]
+repo = "a/b"
+[executor]
+name = "kisa"
+url = "http://127.0.0.1:1"
+[policy]
+cup = 7
+peak = { enabled = false, start_min = 0, end_min = 0 }
+[[project]]
+name = "p"
+board = "B"
+repo = "a/c"
+checkout = "/tmp/co"
+env_root = "/tmp/env"
+"#
+        .to_string()
+    }
+
+    /// Срез 5 #1281: секция [notify] не задана — сигнализация off.
+    #[test]
+    fn notify_absent_section_is_off() {
+        let cfg = toml::from_str::<Config>(&minimal()).expect("toml парсится");
+        let notify = cfg.tg_notify().expect("off-вариант не ошибка старта");
+        assert!(notify.is_none(), "нет [notify] — сигнализация off");
+    }
+
+    /// Секция задана, а env пуст — честная ошибка старта (канон секретов).
+    #[test]
+    fn notify_section_without_env_fails_startup() {
+        let raw = format!(
+            "{}\n[notify]\ntg_token_env = \"UWUWU_TEST_NOTIFY_ABSENT\"\ntg_chat_id = 42\n",
+            minimal()
+        );
+        let cfg = toml::from_str::<Config>(&raw).expect("toml парсится");
+        let err = cfg
+            .tg_notify()
+            .expect_err("секция без env должна валить старт");
+        assert!(
+            err.to_string().contains("UWUWU_TEST_NOTIFY_ABSENT"),
+            "имя env в тексте ошибки: {err}"
+        );
+        assert!(err.to_string().contains("конфиг:"), "каноничный префикс");
+    }
+
+    /// Секция + env — пара (токен, chat) для TelegramClient.
+    #[test]
+    fn notify_section_with_env_returns_token_and_chat() {
+        // env — глобал процесса: ключ уникален тестам модуля, чистим в конце
+        const KEY: &str = "UWUWU_TEST_NOTIFY_PRESENT";
+        std::env::set_var(KEY, "tok-123");
+        let raw = format!(
+            "{}\n[notify]\ntg_token_env = \"{KEY}\"\ntg_chat_id = 42\n",
+            minimal()
+        );
+        let cfg = toml::from_str::<Config>(&raw).expect("toml парсится");
+        let notify = cfg.tg_notify().expect("env задан — пара читается");
+        assert_eq!(notify, Some(("tok-123".to_string(), 42)));
+        std::env::remove_var(KEY);
     }
 
     #[test]

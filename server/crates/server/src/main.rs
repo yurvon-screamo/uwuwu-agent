@@ -10,11 +10,17 @@ mod clock;
 mod config;
 mod diag;
 mod executor;
+#[cfg(test)]
+mod executor_signal_tests;
 mod gherr;
 #[cfg(test)]
 mod gherr_tests;
+mod gitea;
+#[cfg(test)]
+mod gitea_tests;
 mod github;
 mod mockhub;
+mod prgate;
 mod search;
 mod state;
 mod tg;
@@ -25,7 +31,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
-use uwuwu_usecase::{Clock as _, TickOutcome, TickUseCase};
+use uwuwu_usecase::{
+    Clock as _, ExecutorLoudness, IncidentLoudness, TickOutcome, TickUseCase,
+    EXECUTOR_UNAVAILABLE_COOLDOWN_MS, EXECUTOR_UNAVAILABLE_THRESHOLD,
+    EXECUTOR_UNAVAILABLE_WINDOW_MS, STALL_INCIDENT_COOLDOWN_MS, STALL_INCIDENT_THRESHOLD,
+    STALL_INCIDENT_WINDOW_MS,
+};
 
 #[derive(Debug, thiserror::Error)]
 enum BootError {
@@ -220,7 +231,11 @@ async fn run(
     // Исполнители и роутер «проект → executor» (#1203); боты — raw-дефолт
     let clock = Arc::new(clock::SystemClock);
     let (raw_default, sessions) = build_sessions(&cfg, &secrets, clock.clone())?;
-    let prs = Arc::new(github::GhPrGateway::new(secrets.gh_token.clone()));
+    // PR-гейт: диспетчер по хосту PR-URL — GitHub + Gitea (#1269)
+    let prs = Arc::new(prgate::RoutedPrGateway::new(
+        github::GhPrGateway::new(secrets.gh_token.clone()),
+        gitea::GiteaPrGateway::new(secrets.gitea_tokens.clone()),
+    ));
     let state_path = cfg.state_path(&config_path);
     let state = Arc::new(state::JsonStateStore::load(state_path, clock.clone()));
     let spawn_models = Arc::new(match cfg.executor.models.as_ref() {
@@ -244,6 +259,7 @@ async fn run(
         clock: clock.clone(),
         state: state.clone(),
         models: spawn_models.clone(),
+        boot_ms: clock.now_ms(),
     });
 
     let shared: Arc<std::sync::RwLock<TickOutcome>> = Arc::default();
@@ -517,6 +533,57 @@ async fn run(
         });
     }
 
+    {
+        // клин холодного ящика (#1293): терминальные строки старше
+        // sweep_days суток уходят в архив Projects v2 — снапшот несёт
+        // активный контур. sweep_days = 0 — kill-switch: sidecar вообще
+        // не создаётся (дефолт serde 0 = выкл; боевой конфиг — 7).
+        // Обратите внимание: observe-гейт здесь **внутренний**
+        // (sweep_board логирует кандидатов и не мутирует), не общий
+        // no-op `if is_observe { return }` — observe-фаза обязана
+        // показывать кандидатов
+        if cfg.sweep_days > 0 {
+            let sweep_board_repo = board.clone();
+            let sweep_boards = plan.boards.clone();
+            let sweep_clock = clock.clone();
+            sidecars.push(Sidecar {
+                name: "sweeper".into(),
+                tick: Box::new(move || {
+                    let board = sweep_board_repo.clone();
+                    let boards = sweep_boards.clone();
+                    let clock = sweep_clock.clone();
+                    Box::pin(async move {
+                        let now_ms = clock.now_ms();
+                        // Дебаг-гейт одной строки (как у тика): UWUWU_ONLY_TASK
+                        // — клин действует только по ней; живая проба против
+                        // реального репо не запускает сотенную первую волну
+                        let only = std::env::var("UWUWU_ONLY_TASK")
+                            .ok()
+                            .and_then(|v| v.trim().parse::<u64>().ok());
+                        for b in &boards {
+                            let mut tasks = board.read_board(&b.board).await?;
+                            if let Some(n) = only {
+                                tasks.retain(|t| t.number() == n);
+                            }
+                            uwuwu_usecase::sweeper::sweep_board(
+                                board.as_ref(),
+                                &b.board,
+                                &tasks,
+                                uwuwu_usecase::sweeper::SweepPolicy {
+                                    now_ms,
+                                    age_days: cfg.sweep_days,
+                                    observe: is_observe,
+                                },
+                            )
+                            .await?;
+                        }
+                        Ok(())
+                    })
+                }),
+            });
+        }
+    }
+
     if let Some(backend) = semantic_backend.clone() {
         let clock2 = clock.clone();
 
@@ -560,13 +627,27 @@ async fn run(
     }
 
     let http_task = tokio::spawn(serve(cfg.port(), app));
-    let tick_task = tokio::spawn(tick_loop(
-        cfg.poll_sec,
+    let notify = cfg
+        .tg_notify()
+        // run() возвращает String; префикс «конфиг:» сохраняем из Display
+        // ConfigError (BootError-конверсия — вне скоупа #1281)
+        .map_err(|e| format!("конфиг: {e}"))?
+        .map(|(token, chat)| {
+            (
+                Arc::new(tg::TelegramClient::new(token))
+                    as Arc<dyn uwuwu_usecase::bots::TelegramGateway>,
+                chat,
+            )
+        });
+    let tick_task = tokio::spawn(tick_loop(TickLoopArgs {
+        poll_sec: cfg.poll_sec,
         plan,
         usecase,
         shared,
-        Arc::new(sidecars),
-    ));
+        sidecars: Arc::new(sidecars),
+        notify,
+        clock,
+    }));
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {},
@@ -641,17 +722,144 @@ async fn sidecar_ticks(sidecars: &[Sidecar]) -> Result<(), uwuwu_usecase::Usecas
     Ok(())
 }
 
-async fn tick_loop(
+/// Аргументы тик-лупа: группировка (qlty function-parameters #1281).
+struct TickLoopArgs {
     poll_sec: u64,
     plan: Arc<uwuwu_usecase::TickPlan>,
     usecase: Arc<TickUseCase>,
     shared: Arc<std::sync::RwLock<TickOutcome>>,
     sidecars: Arc<Vec<Sidecar>>,
+    /// ТГ-сигнализация инцидентов сталл-детекта (#1281); None — off.
+    notify: Option<(Arc<dyn uwuwu_usecase::bots::TelegramGateway>, i64)>,
+    clock: Arc<dyn uwuwu_usecase::Clock>,
+}
+
+/// Один инцидент-сигнал (#1281): регистрирует эскалацию в скользящем окне;
+/// при превышении порога и истёкшем cooldown — один ТГ-сигнал владельцу
+/// (канон «строка сбоя + ТГ» UC-02). [notify] не настроен — громкий лог.
+async fn incident_signal(
+    notify: &Option<(Arc<dyn uwuwu_usecase::bots::TelegramGateway>, i64)>,
+    loudness: &mut IncidentLoudness,
+    now_ms: u64,
 ) {
+    if !loudness.register(now_ms) {
+        return;
+    }
+    let text = format!(
+        "⚠︎ uwuwu: инцидент сталл-детекта — {} эскалаций за скользящее окно \
+         ({} мин): массовая парковка stage-сессий в Needs attention. \
+         Разбор — на доске.",
+        loudness.escalations_in_window(),
+        STALL_INCIDENT_WINDOW_MS / 60_000,
+    );
+    match notify {
+        Some((tg, chat)) => match tg.send_message(*chat, &text).await {
+            Ok(()) => tracing::warn!(
+                event = "stall.incident_signal",
+                escalations = loudness.escalations_in_window(),
+                "Инцидент-сигнал владельцу отправлен"
+            ),
+            Err(e) => tracing::error!(
+                event = "stall.incident_signal_failed",
+                error = %e,
+                "Инцидент-сигнал не отправлен"
+            ),
+        },
+        None => tracing::warn!(
+            event = "stall.incident_unnotified",
+            escalations = loudness.escalations_in_window(),
+            "Инцидент сталл-детекта: [notify] не настроен — сигнала нет"
+        ),
+    }
+}
+
+/// Транспортная деградация executor'а (#1312): отказы union-скана за
+/// скользящее окно — один ТГ-сигнал владельцу per-executor через тот же
+/// инцидент-контур #1281. [notify] не настроен — громкий лог.
+async fn executor_unavailable_signal(
+    notify: &Option<(Arc<dyn uwuwu_usecase::bots::TelegramGateway>, i64)>,
+    incidents: &mut ExecutorLoudness,
+    executor: &str,
+    now_ms: u64,
+) {
+    let Some(incident) = incidents.register_failure(executor, now_ms) else {
+        return;
+    };
+    let text = format!(
+        "⚠︎ uwuwu: executor «{}» недоступен — {} транспортных отказов за {} мин: \
+         дример/CUP деградированы, спавны в hold. Лечение: рестарт rathole-клиента на ноде.",
+        incident.executor,
+        incident.failures_in_window,
+        EXECUTOR_UNAVAILABLE_WINDOW_MS / 60_000,
+    );
+    match notify {
+        Some((tg, chat)) => match tg.send_message(*chat, &text).await {
+            Ok(()) => tracing::warn!(
+                event = "executor.unavailable",
+                executor = %incident.executor,
+                failures = incident.failures_in_window,
+                "Executor-сигнал владельцу отправлен"
+            ),
+            Err(e) => tracing::error!(
+                event = "executor.unavailable_failed",
+                executor = %incident.executor,
+                error = %e,
+                "Executor-сигнал не отправлен"
+            ),
+        },
+        None => tracing::warn!(
+            event = "executor.unavailable_unnotified",
+            executor = %incident.executor,
+            failures = incident.failures_in_window,
+            "Executor недоступен: [notify] не настроен — сигнала нет"
+        ),
+    }
+}
+
+async fn tick_loop(args: TickLoopArgs) {
+    let TickLoopArgs {
+        poll_sec,
+        plan,
+        usecase,
+        shared,
+        sidecars,
+        notify,
+        clock,
+    } = args;
+    // Инцидент-громкость (#1281): N+ сталл-эскалаций за скользящее окно —
+    // один ТГ-сигнал владельцу вместо N тихих парковок. Окно неперсистентно
+    // осознанно: волна эскалаций, разнесённая через рестарт, одного сигнала
+    // не даст — «рестарт = свежее окно» (философия ADR-107), персистентность
+    // планом не требовалась.
+    let mut loudness = IncidentLoudness::new(
+        STALL_INCIDENT_THRESHOLD,
+        STALL_INCIDENT_WINDOW_MS,
+        STALL_INCIDENT_COOLDOWN_MS,
+    );
+    // Громкость деградации executor'ов (#1312): per-executor инциденты —
+    // те же параметры окна, что у сталла; окно неперсистентно осознанно
+    // («рестарт = свежее окно», философия ADR-107).
+    let mut executor_incidents = ExecutorLoudness::new(
+        EXECUTOR_UNAVAILABLE_THRESHOLD,
+        EXECUTOR_UNAVAILABLE_WINDOW_MS,
+        EXECUTOR_UNAVAILABLE_COOLDOWN_MS,
+    );
     loop {
         let started = std::time::Instant::now();
         match usecase.run(&plan).await {
             Ok(outcome) => {
+                for _ in 0..outcome.stall_flagged {
+                    incident_signal(&notify, &mut loudness, clock.now_ms()).await;
+                }
+                for executor in &outcome.executors_failed {
+                    executor_unavailable_signal(
+                        &notify,
+                        &mut executor_incidents,
+                        executor,
+                        clock.now_ms(),
+                    )
+                    .await;
+                }
                 *shared.write().expect("tick lock") = outcome;
             }
             Err(e) => {

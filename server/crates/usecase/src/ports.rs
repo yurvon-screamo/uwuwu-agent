@@ -4,7 +4,9 @@
 
 use crate::error::UsecaseResult;
 use async_trait::async_trait;
-use uwuwu_domain::{AgentSlot, BranchName, ModelRef, Slot, Status, Task, TaskFields, UtcMinute};
+use uwuwu_domain::{
+    Agent, AgentSlot, BranchName, ModelRef, Slot, Status, Task, TaskFields, UtcMinute,
+};
 
 /// Мутатор fm-ячеек задачи (branch/pr/priority/…).
 pub type FmMutator =
@@ -83,6 +85,27 @@ pub trait TaskBoardRepo: Send + Sync {
     async fn patch_cells(&self, number: u64, mutate: FmMutator) -> UsecaseResult<()>;
     /// Закрытие с причиной (completed|not_planned).
     async fn close_issue_ext(&self, number: u64, not_planned: bool) -> UsecaseResult<()>;
+    /// Архивировать строку доски (терминальную — клин холодного ящика
+    /// #1293): Projects v2 убирает её из items (снапшот сжимается),
+    /// строка остаётся доступной через unarchive. Реализация НЕ обязана
+    /// инвалидинировать снапшот на каждую строку — волна архиваций
+    /// держит кеш живым (построчный ре-фетч полного снимка выжег бы
+    /// бюджет первой волной); свежий срез даёт invalidate_snapshot.
+    async fn archive_row(&self, board: &str, number: u64) -> UsecaseResult<()>;
+    /// Сброс снапшота доски: реализация с кешем забывает срез —
+    /// следующий read_board читает носитель. Клин зовёт один раз на
+    /// волну (финал), не на каждую строку. Дефолт — no-op (носители
+    /// без кеша).
+    fn invalidate_snapshot(&self, _board: &str) {}
+    /// Остаток GraphQL-бюджета носителя (точек): None — носитель не
+    /// сообщает, бюджет-гайд клина пропускает.
+    fn gql_budget_remaining(&self) -> Option<u64> {
+        None
+    }
+    /// Номера issues репо с точно этим тайтлом (включая закрытые):
+    /// dup_check create против холодного ящика (#1293) — тайтл уникален
+    /// на доске и после архивации старых строк.
+    async fn issues_with_title(&self, title: &str) -> UsecaseResult<Vec<u64>>;
     /// Полная замена тела issue (как записано; fm-шапка стрипается на
     /// границе юзкейса — тела без fm, поля нативные).
     async fn replace_body(&self, number: u64, body_md: &str) -> UsecaseResult<()>;
@@ -177,6 +200,16 @@ pub struct AssistantReply {
 pub trait AgentSessionGateway: Send + Sync {
     async fn create_session(&self, spec: &SessionSpec) -> UsecaseResult<String>;
     async fn prompt(&self, session: &str, text: &str) -> UsecaseResult<()>;
+    /// Пин агента слота на живой сессии перед доставкой хода (#1300):
+    /// opencode `POST /session/:id/agent` (switchAgent). Живая проба
+    /// 2.3.2: session.agent персистится; prompt-эндпоинт агент-поле не
+    /// несёт (openapi additionalProperties:false — тихий discard), поэтому
+    /// пин живёт отдельным зовном. Дефолт no-op — гейтвеи без ручки
+    /// (фейки портов) не переопределяют; прод-клиент и бюджет-обёртка
+    /// несут настоящую механику (прецедент abort_session).
+    async fn switch_agent(&self, _session: &str, _agent: Agent) -> UsecaseResult<()> {
+        Ok(())
+    }
     /// Slash-команда сессии (детерминированные shell-блоки — env-подготовка).
     async fn run_command(&self, session: &str, name: &str, args: &str) -> UsecaseResult<()>;
     async fn liveness(&self, session: &str) -> Liveness;
@@ -231,6 +264,10 @@ pub struct SessionInfo {
 pub enum PrState {
     /// PR не найден ни по ячейке, ни по ветке.
     Missing,
+    /// PR-URL задан в PR-форме, но вендор хоста гейтвеем не управляется
+    /// (чужой GHE-хост, Gitea-инстанс без токена, API-отказ инстанса):
+    /// строка ждёт владельца в Review — не bounce (#1269).
+    Foreign,
     /// GitHub считает (mergeable=null / чеки бегут): вердикт следующего тика.
     Pending,
     Open {
@@ -325,6 +362,11 @@ pub trait TickStateStore: Send + Sync {
     /// Смена статуса строки = новый раунд (счётчик с нуля).
     fn stall_ping(&self, board: &str, number: u64) -> Option<(uwuwu_domain::Status, u64, u32)>;
     fn mark_stall_ping(&self, board: &str, number: u64, status: uwuwu_domain::Status, at_ms: u64);
+    /// Сброс раунда сталла на носителе: каунтер, переживший рестарт
+    /// процесса, объявляется недействительным — следующий пинг начинает
+    /// счёт с единицы (инцидент 18.11 #1281: локального сброса мало,
+    /// mark_stall_ping инкрементит stale-каунтер).
+    fn clear_stall(&self, board: &str, number: u64);
     /// Новый раунд слота (fresh-eyes): кулдаун прошлого раунда не переносится.
     fn clear_spawn_ms(&self, board: &str, number: u64, slot: Slot);
     /// Аналитика (#1135, замена триажа): кулдауны волн/ревью и цикл-гвард.
@@ -356,6 +398,12 @@ pub trait TickStateStore: Send + Sync {
     /// Инцидент #1046 (15.11): счётчик (In Progress, 2) пережил путь
     /// IP→Design→Ревью плана→IP и эскалировал первый же спавн.
     fn reset_stale_spawn_loops(&self, board: &str, number: u64, current: Status);
+    /// Цикл-гвард ревью-контура (#1311): счёт подряд request_changes
+    /// (переходы ReviewResult→InProgress / ReviewPlan→Design) без
+    /// approve. Персистентный, смены статуса внутри цикла не сбрасывают —
+    /// в отличие от spawn_loop (слепота attention-гварда к циклу ревью).
+    fn review_rounds(&self, board: &str, number: u64) -> u32;
+    fn set_review_rounds(&self, board: &str, number: u64, rounds: u32);
     /// Реестр серверных постов (self-эхо-фильтр #1204): коммент опубликован
     /// агентом через MCP task_comment (не юзером и не фабрикой).
     fn own_comment(&self, id: &str) -> bool;
