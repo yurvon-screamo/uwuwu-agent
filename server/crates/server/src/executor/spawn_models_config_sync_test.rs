@@ -25,8 +25,31 @@ fn canonical_matches_config_example_verbatim() {
         map.insert(key.clone(), SpawnModel::parse(raw).expect("парсится"));
     }
 
-    // Assert: множества и значения совпадают в обе стороны
-    let example = SpawnModels::new(map);
+    // Assert: множества ключей совпадают — без фоллбэка for_agent
+    // rogue-ключ в example и отсутствующий ключ в example ловятся здесь,
+    // а не маскируются канон-дефолтом
+    let canonical_keys = canonical.keys();
+    let mut example_keys_raw: Vec<&String> = map.keys().collect();
+    example_keys_raw.sort();
+    let example_keys: Vec<&str> = example_keys_raw.iter().map(|k| k.as_str()).collect();
+    assert_eq!(
+        example_keys, canonical_keys,
+        "config.example [executor.models] ≠ canonical: ключи разошлись"
+    );
+
+    // значения по всем ключам — из example, не через for_agent (фоллбэк
+    // for_agent маскировал бы рассинхрон значения)
+    let example = SpawnModels::new(map.clone());
+    let _ = &example_keys_raw;
+    for key in &canonical_keys {
+        assert_eq!(
+            example.get(key),
+            canonical.get(key),
+            "config.example ↔ canonical: значение '{key}' разошлось"
+        );
+    }
+
+    // для_agent-пройд (суммарный контракт конвейера)
     for agent in [
         uwuwu_domain::Agent::Developer,
         uwuwu_domain::Agent::PlanReviewer,

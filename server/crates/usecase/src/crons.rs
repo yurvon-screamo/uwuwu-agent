@@ -472,7 +472,7 @@ mod tests {
             wiki,
             sessions: Arc::new(SessionRouter::uniform(sessions)),
             clock: Arc::new(TicksClock),
-            spawn_model: None,
+            models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
             checkout: "/tmp/checkout".into(),
             cup,
         }
@@ -556,7 +556,7 @@ mod tests {
             wiki,
             sessions: Arc::new(SessionRouter::uniform(sessions)),
             clock: Arc::new(TicksClock),
-            spawn_model: None,
+            models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
             checkout: "/tmp/checkout".into(),
             cup: 7,
         };

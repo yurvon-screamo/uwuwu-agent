@@ -6,6 +6,7 @@
 use crate::crons::CronUseCase;
 use crate::error::UsecaseResult;
 use crate::pipeline::analyst::{AnalystBoard, AnalystUseCase};
+use crate::pipeline::analyst_review::AnalystReviewUseCase;
 use crate::pipeline::dreamer::DreamerUseCase;
 use crate::ports::{
     AgentSessionGateway, AssistantReply, Clock, CommentRef, IssueView, Liveness, SessionInfo,
@@ -142,26 +143,41 @@ impl TickStateStore for NoopState {
     }
     fn set_spawn_loop(&self, _b: &str, _n: u64, _s: Slot, _st: Status, _r: u32) {}
     fn reset_stale_spawn_loops(&self, _b: &str, _n: u64, _c: Status) {}
+    fn own_comment(&self, _id: &str) -> bool {
+        false
+    }
+    fn mark_own_comment(&self, _id: &str, _posted_ms: u64) {}
     fn save(&self) -> UsecaseResult<()> {
         Ok(())
     }
 }
 
-/// Доска с одной строкой (триаж: Draft).
-struct DraftBoard;
+/// Доска с заданными строками (фантом спавн-контрактов).
+struct RowsBoard {
+    rows: Vec<Task>,
+}
 
 #[async_trait]
-impl TaskBoardRepo for DraftBoard {
+impl TaskBoardRepo for RowsBoard {
     async fn read_board(&self, _b: &str) -> UsecaseResult<Vec<Task>> {
-        Ok(vec![
-            Task::new(7, "первая".into(), Status::Analys),
-            Task::new(8, "вторая".into(), Status::Analys),
-        ])
+        Ok(self.rows.clone())
     }
     async fn set_status(&self, _b: &str, _n: u64, _s: Status) -> UsecaseResult<()> {
         Ok(())
     }
+    async fn row_status(&self, _b: &str, _n: u64) -> UsecaseResult<Option<Status>> {
+        Ok(None)
+    }
     async fn set_session(&self, _b: &str, _n: u64, _s: Slot, _sess: &str) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn set_board_cells(
+        &self,
+        _b: &str,
+        _n: u64,
+        _priority: Option<&str>,
+        _automerge: Option<bool>,
+    ) -> UsecaseResult<()> {
         Ok(())
     }
     async fn set_branch(
@@ -175,8 +191,8 @@ impl TaskBoardRepo for DraftBoard {
     async fn clear_session(&self, _b: &str, _n: u64, _s: Slot) -> UsecaseResult<()> {
         Ok(())
     }
-    async fn post_comment(&self, _n: u64, _body: &str) -> UsecaseResult<()> {
-        Ok(())
+    async fn post_comment(&self, _n: u64, _body: &str) -> UsecaseResult<String> {
+        Ok("posted-1".into())
     }
     async fn close_issue(&self, _n: u64) -> UsecaseResult<()> {
         Ok(())
@@ -253,11 +269,13 @@ fn assert_model(spec: Option<SessionSpec>, what: &str, raw: &str) {
 }
 
 #[tokio::test]
-async fn analyst_spawn_carries_model_from_server_map() {
-    // Arrange: волна — две строки Analys
+async fn analyst_review_spawn_carries_model_from_server_map() {
+    // Arrange: строка Review Analys — спавн парного ревьювера волны
     let sessions = CaptureSessions::new(vec![]);
-    let u = AnalystUseCase {
-        board: Arc::new(DraftBoard),
+    let u = AnalystReviewUseCase {
+        board: Arc::new(RowsBoard {
+            rows: vec![Task::new(9, "проработанная".into(), Status::ReviewAnalys)],
+        }),
         boards: vec![AnalystBoard {
             project: "uwuwu".into(),
             board: "Задачи uwuwu".into(),
@@ -267,6 +285,42 @@ async fn analyst_spawn_carries_model_from_server_map() {
         state: Arc::new(NoopState),
         clock: Arc::new(TestClock),
         models: models(),
+        cup: 7,
+    };
+
+    // Act
+    let spawned = u.tick().await.unwrap();
+
+    // Assert
+    assert!(spawned >= 1, "ревью-спавн состоялся");
+    assert_model(
+        sessions.spec_of(),
+        "ревью-спавн аналитики",
+        "zai-coding-plan/glm-5.3#high",
+    );
+}
+
+#[tokio::test]
+async fn analyst_spawn_carries_model_from_server_map() {
+    // Arrange: волна — две строки Analys
+    let sessions = CaptureSessions::new(vec![]);
+    let u = AnalystUseCase {
+        board: Arc::new(RowsBoard {
+            rows: vec![
+                Task::new(7, "первая".into(), Status::Analys),
+                Task::new(8, "вторая".into(), Status::Analys),
+            ],
+        }),
+        boards: vec![AnalystBoard {
+            project: "uwuwu".into(),
+            board: "Задачи uwuwu".into(),
+            checkout: "/tmp".into(),
+        }],
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        state: Arc::new(NoopState),
+        clock: Arc::new(TestClock),
+        models: models(),
+        cup: 7,
     };
 
     // Act
@@ -291,6 +345,7 @@ async fn dreamer_spawn_carries_model_from_server_map() {
         updated_ms: 0,
         outcome: "stop".into(),
         total_tokens: 42_000,
+        busy: false,
     }]);
     let u = DreamerUseCase {
         sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
@@ -298,6 +353,7 @@ async fn dreamer_spawn_carries_model_from_server_map() {
         clock: Arc::new(TestClock),
         models: models(),
         checkout: "/tmp".into(),
+        cup: 7,
     };
 
     // Act
@@ -322,6 +378,7 @@ async fn cron_run_carries_model_from_server_map() {
         clock: Arc::new(TestClock),
         models: models(),
         checkout: "/tmp".into(),
+        cup: 7,
     };
 
     // Act

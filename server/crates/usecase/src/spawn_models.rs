@@ -40,11 +40,23 @@ impl SpawnModels {
         Self { map }
     }
 
+    /// Множество ключей карты (агенты + default) — кросс-гвард с конфигом.
+    pub fn keys(&self) -> Vec<&str> {
+        let mut keys: Vec<&str> = self.map.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        keys
+    }
+
     /// Модель агента конвейера (по имени из naming::agent_name).
     pub fn for_agent(&self, agent: Agent) -> SpawnModel {
         self.by_key(naming::agent_name(agent))
             .cloned()
             .unwrap_or_else(|| self.fallback(agent))
+    }
+
+    /// Значение карты по ключу (кросс-гварды конфига и тесты).
+    pub fn get(&self, key: &str) -> Option<&SpawnModel> {
+        self.map.get(key)
     }
 
     /// Модель default-слота: Dev/Design (default_agent опенкода —
