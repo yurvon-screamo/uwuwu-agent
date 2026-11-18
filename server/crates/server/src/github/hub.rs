@@ -162,9 +162,11 @@ impl GitHubHub {
                 .user_agent(concat!("uwuwu-server/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .expect("reqwest client"),
-            // 120 c ≤ тик (poll 180 c): снимок освежается раз в тик,
-            // мутации тика шарят один снимок
-            snap_cache: TtlCache::new(std::time::Duration::from_secs(120)),
+            // 240 c > тик (poll 180 c): снимок живёт через тик — полный
+            // рефреш раз в два тика (−50% GraphQL-трафика; доска 746 строк
+            // выжигала часовой бюджет, инцидент 18.11), мутации шарят
+            // снимок. Свежесть статусов для decide — ≤ двух тиков.
+            snap_cache: TtlCache::new(std::time::Duration::from_secs(240)),
             status_cache: TtlCache::new(std::time::Duration::from_secs(60)),
             gql_block: std::sync::RwLock::new(None),
             last_rate_limit: std::sync::RwLock::new(None),
