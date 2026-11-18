@@ -45,7 +45,7 @@ sed "s|http://127.0.0.1:8099|http://127.0.0.1:$PORT_MOCK|" \
 MOCK_PID=""; SRV_PID=""; MOCK2_PID=""
 
 say()  { printf '\033[1;34m[e2e]\033[0m %s\n' "$*"; }
-fail() { printf '\033[1;31m[e2e FAIL]\033[0m %s\n' "$*"; exit 1; }
+fail() { printf '\033[1;31m[e2e FAIL]\033[0m %s\n' "$*"; KEEP=1; exit 1; }
 
 cleanup() { # только СВОИ процессы (pid-scoped): параллельные стенды не трогаем
   for pid in "$SRV_PID" "$MOCK_PID" "$MOCK2_PID"; do
@@ -308,12 +308,6 @@ wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
 SRV_PID=""; MOCK_PID=""
 sleep 1
 say "фаза 4 ок: гард держит спавн при живой сессии env и отпускает после её смерти"
-
-# после глобальных чисток фаз #1203/#1163 трекинг pid-ов протух — сброс:
-# фаза 5 стартует свои процессы с чистого листа, trap добьёт живые
-SRV_PID=""; MOCK_PID=""
-sleep 1
-rm -f "$STATE"
 
 say "фаза 5: self-эхо — свой MCP-коммент не будит держащую сессию (#1204)"
 # Гасим СВОИ остатки (pid-scoped: параллельные стенды соседних сессий
