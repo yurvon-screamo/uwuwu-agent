@@ -359,6 +359,8 @@ type BotRow = (Option<String>, Option<u64>, Option<u64>);
 #[derive(Default)]
 struct FakeState {
     rows: Mutex<HashMap<String, BotRow>>,
+    /// Сбой персиста (#1275): save() → Err — красные тесты наблюдаемости.
+    fail_save: AtomicBool,
 }
 
 impl BotStateStore for FakeState {
@@ -399,6 +401,9 @@ impl BotStateStore for FakeState {
         e.2 = Some(hash);
     }
     fn save(&self) -> UsecaseResult<()> {
+        if self.fail_save.load(Ordering::SeqCst) {
+            return Err(UsecaseError::State("fake state: save refused".into()));
+        }
         Ok(())
     }
 }
@@ -506,6 +511,60 @@ impl Clock for FakeClock {
 // ---------- хелперы ----------
 
 const SLUG: &str = "Projects/uwuwu/Боты/проба";
+
+// ---------- ловушка tracing-событий (#1275) ----------
+
+/// Ловушка событий: наблюдаемость деградаций state (#1275) — сбой персиста
+/// обязан оставлять event-строку. Thread-local dispatcher: #[tokio::test] —
+/// current-thread рантайм, спавнутые задачи поллятся тем же потоком,
+/// guard жив до конца теста.
+struct EventTrap {
+    records: Arc<Mutex<Vec<String>>>,
+}
+
+struct TrapFields(Arc<Mutex<Vec<String>>>);
+
+impl tracing::field::Visit for TrapFields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0
+            .lock()
+            .expect("trap lock")
+            .push(format!("{}={:?}", field.name(), value));
+    }
+}
+
+impl tracing::Subscriber for EventTrap {
+    fn enabled(&self, _meta: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        event.record(&mut TrapFields(Arc::clone(&self.records)));
+    }
+    fn enter(&self, _span: &tracing::span::Id) {}
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// Включить ловушку на время теста: guard держит dispatcher, records —
+/// накопленные поля событий («event=…», «slug=…», «error=…», «message=…»).
+fn trap_events() -> (tracing::dispatcher::DefaultGuard, Arc<Mutex<Vec<String>>>) {
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(EventTrap {
+        records: Arc::clone(&records),
+    }));
+    (guard, records)
+}
+
+fn assert_event_logged(records: &[String], needle: &str) {
+    assert!(
+        records.iter().any(|r| r.contains(needle)),
+        "tracing-событие без «{needle}»: {records:?}"
+    );
+}
 
 fn doc_md(model: &str, token_env: &str, manual: &str) -> String {
     format!(
@@ -1507,6 +1566,67 @@ async fn agent_mode_prompt_is_raw_text() {
         ps.iter().any(|(_, p)| p == "чистый вопрос"),
         "agent-режим: промпт без методички, только текст: {ps:?}"
     );
+}
+
+/// Сбой персиста manual-hash (#1275, сценарий 2): save() → Err не глотается —
+/// warn-событие с причиной (раньше `.ok()` терял сбой молча: факт «ручной
+/// режим» жил только в памяти до рестарта, manual уезжал повторно).
+#[tokio::test]
+async fn manual_hash_save_failure_is_logged() {
+    let tg = FakeTg::new(vec![private_update(30, "yurvon", "вопрос")]);
+    let sessions = FakeSessions::new();
+    let state = Arc::new(FakeState::default());
+    // живая сессия в state — ensure_session идёт коротким путём без save:
+    // единственный save хода — персист manual-hash после промпта
+    state.set_bot_session(SLUG, Some("ses_live"));
+    state.fail_save.store(true, Ordering::SeqCst);
+    let (_guard, records) = trap_events();
+    let deps0 = deps(
+        tg,
+        sessions.clone(),
+        state,
+        1_000,
+        10,
+        BotLive::new(Some("yurvon".into()), None, "м".into()),
+    );
+    let u = private_update(30, "yurvon", "вопрос");
+    process_message(&deps0, u.message.as_ref().unwrap())
+        .await
+        .expect("сбой персиста не рвёт обработку сообщения");
+    let rec = records.lock().expect("trap lock");
+    assert_event_logged(&rec, "bot.state_save_failed");
+    assert_event_logged(&rec, "save refused");
+    assert_event_logged(&rec, SLUG);
+}
+
+/// Сбой персиста после сброса сессии (#1275, сценарий 3): RecreateSession
+/// при save() → Err не глотается — warn-событие (раньше `let _ =` терял
+/// сбой: на диске оставалась старая сессия, рестарт сервера реанимировал
+/// бы её, и смена model/workspace к ней не применялась бы).
+#[tokio::test]
+async fn recreate_session_save_failure_is_logged() {
+    let wiki = FakeWiki::with_doc(SLUG, &doc_md("p/m1", "UWUWU_BOT_TOKEN_T9", "м"));
+    let sessions = FakeSessions::new();
+    let state = Arc::new(FakeState::default());
+    let clock = FakeClock::at(10_000);
+    let tg = FakeTg::new(vec![]); // очередь пуста: раннер-задачи молчат — save ровно один, у RecreateSession
+    let sup = Arc::new(supervisor(
+        wiki.clone(),
+        sessions.clone(),
+        state.clone(),
+        clock.clone(),
+        tg.clone(),
+        vec![("UWUWU_BOT_TOKEN_T9", "tok")],
+    ));
+    sup.tick().await.unwrap(); // спавн бота (сессия ленивая — state не пишет)
+    state.fail_save.store(true, Ordering::SeqCst);
+    wiki.set_doc(SLUG, &doc_md("p/m2", "UWUWU_BOT_TOKEN_T9", "м"));
+    let (_guard, records) = trap_events();
+    sup.tick().await.unwrap(); // RecreateSession: set_bot_session(None) + save() → Err
+    let rec = records.lock().expect("trap lock");
+    assert_event_logged(&rec, "bot.state_save_failed");
+    assert_event_logged(&rec, "save refused");
+    assert_event_logged(&rec, SLUG);
 }
 
 // ---------- media (#1171) ----------

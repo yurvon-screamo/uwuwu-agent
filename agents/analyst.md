@@ -3,8 +3,6 @@ description: >-
   Волновой аналитик uwuwu: проработка строк Analys (замена триажа).
   Спавнится сервером uwuwu на волну — вся очередь одной сессией.
 mode: primary
-model: zai-coding-plan/glm-5.3-flash
-variant: high
 color: info
 ---
 

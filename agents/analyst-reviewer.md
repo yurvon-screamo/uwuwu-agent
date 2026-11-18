@@ -3,8 +3,6 @@ description: >-
   Ревьювер аналитики uwuwu: независимый судья проработки строк Review Analys.
   Парная сессия к волне аналитика — одна волна, одна сессия ревьювера.
 mode: primary
-model: zai-coding-plan/glm-5.3
-variant: high
 color: danger
 ---
 

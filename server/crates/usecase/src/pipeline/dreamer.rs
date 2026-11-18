@@ -5,8 +5,9 @@ use crate::error::UsecaseResult;
 use crate::naming;
 use crate::ports::{Clock, SessionSpec, TickStateStore};
 use crate::router::SessionRouter;
+use crate::spawn_models::SpawnModels;
 use std::sync::Arc;
-use uwuwu_domain::{Agent, AgentSlot, ModelRef};
+use uwuwu_domain::{Agent, AgentSlot};
 
 /// Idle-порог: уснувшая = нет активности 30 минут и есть финал.
 const IDLE_MS: u64 = 30 * 60_000;
@@ -23,7 +24,7 @@ pub struct DreamerUseCase {
     pub sessions: Arc<SessionRouter>,
     pub state: Arc<dyn TickStateStore>,
     pub clock: Arc<dyn Clock>,
-    pub spawn_model: Option<ModelRef>,
+    pub models: Arc<SpawnModels>,
     pub checkout: String,
     /// Единый кап активных ходов исполнителя (policy.cup): дример-спавн
     /// откладывается при полном капе (#1231).
@@ -82,6 +83,7 @@ impl DreamerUseCase {
         let Some(target) = candidate else {
             return Ok(0);
         };
+        let sm = self.models.for_agent(Agent::Dreamer);
         let spec = SessionSpec {
             directory: self.checkout.clone(),
             title: format!(
@@ -91,8 +93,8 @@ impl DreamerUseCase {
             ),
             custom_agent: None,
             agent: AgentSlot::Role(Agent::Dreamer),
-            model: self.spawn_model.clone(),
-            variant: None,
+            model: sm.model,
+            variant: sm.variant,
             bootstrap: false,
         };
         let sessions = self.sessions.default();

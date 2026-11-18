@@ -8,10 +8,11 @@ use crate::error::UsecaseResult;
 use crate::naming;
 use crate::ports::{Clock, SessionSpec, WikiRepo};
 use crate::router::SessionRouter;
+use crate::spawn_models::SpawnModels;
 use std::sync::Arc;
 use uwuwu_domain::{
     civil_from_days, AgentSlot, CronField, CronMaster, CronSchedule, IntervalMinutes, JstDate,
-    JstTime, ModelRef, Schedule, ScheduleKind,
+    JstTime, Schedule, ScheduleKind,
 };
 
 /// Слэг папки кронов проекта.
@@ -24,7 +25,7 @@ pub struct CronUseCase {
     /// Роутер «проект → executor»: крон-ран — гейтвей своего проекта.
     pub sessions: Arc<SessionRouter>,
     pub clock: Arc<dyn Clock>,
-    pub spawn_model: Option<ModelRef>,
+    pub models: Arc<SpawnModels>,
     pub checkout: String,
     /// Единый кап активных ходов исполнителя (policy.cup): файр при
     /// полном капе откладывается до свободного тика — журнальная строка
@@ -118,13 +119,17 @@ impl CronUseCase {
                 )
                 .await?;
             let prompt = run_prompt(project, &master, &journal_md);
+            let sm = match master.agent {
+                AgentSlot::Role(agent) => self.models.for_agent(agent),
+                AgentSlot::Default => self.models.for_default(),
+            };
             let spec = SessionSpec {
                 custom_agent: None,
                 directory: self.checkout.clone(),
                 title: format!("⏰ {} · {}", master.title, stamp),
                 agent: master.agent,
-                model: self.spawn_model.clone(),
-                variant: None,
+                model: sm.model,
+                variant: sm.variant,
                 bootstrap: false,
             };
             let sessions = self.sessions.project(project);
@@ -467,7 +472,7 @@ mod tests {
             wiki,
             sessions: Arc::new(SessionRouter::uniform(sessions)),
             clock: Arc::new(TicksClock),
-            spawn_model: None,
+            models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
             checkout: "/tmp/checkout".into(),
             cup,
         }
@@ -551,7 +556,7 @@ mod tests {
             wiki,
             sessions: Arc::new(SessionRouter::uniform(sessions)),
             clock: Arc::new(TicksClock),
-            spawn_model: None,
+            models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
             checkout: "/tmp/checkout".into(),
             cup: 7,
         };
