@@ -4032,6 +4032,73 @@ async fn blind_scan_respawn_holds_for_every_stage_slot() {
     }
 }
 
+#[tokio::test]
+async fn blind_hold_charges_no_state_recovery_respawn_passes() {
+    // Пин тестировщика #1263 (клейм плана фикса: «луп-гвард и кулдаун на
+    // hold не заряжаются — персистенция только при реальном спавне»).
+    // Три слепых тика не пишут ни петлю, ни кулдаун; тик возврата
+    // исполнителя респавнит строку без эскалации в Needs attention.
+    // e2e-фаза 6 доказывает возврат только на plain-пути, этот пин
+    // закрывает respawn-путь.
+    let mk = || {
+        let mut t = task(79, Status::Testing);
+        let mut f = TaskFields::default();
+        f.set_session(
+            Slot::Test,
+            uwuwu_domain::SessionRef::parse("ses_dead_79").unwrap(),
+        );
+        t.apply_fields(f);
+        t
+    };
+    let state = Arc::new(MemState(Mutex::default()));
+    state.0.lock().unwrap().statuses.push((79, Status::Testing));
+
+    // Фаза слепоты: список-отказ — hold на каждом тике
+    let mut blind = FakeSessions::new();
+    blind.list_fails = true;
+    let (u, _, blind, _) =
+        usecase_with_sessions(vec![mk()], PrState::Missing, blind, state.clone());
+    blind
+        .dead_sessions
+        .lock()
+        .unwrap()
+        .push("ses_dead_79".into());
+    for i in 0..3 {
+        let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+        assert_eq!(out.held_blind, 1, "тик {i}: слепой hold");
+        assert_eq!(out.spawns_done, 0, "тик {i}: слепой спавн невозможен");
+    }
+    {
+        let st = state.0.lock().unwrap();
+        assert!(
+            st.loops.iter().all(|(n, _, _, _)| *n != 79),
+            "слепые hold'ы не заряжают луп-гвард"
+        );
+        assert!(
+            st.spawn_ms.iter().all(|(n, _, _)| *n != 79),
+            "слепые hold'ы не заряжают кулдаун"
+        );
+    }
+
+    // Тик возврата: список жив, мёртвая сессия вне списка (second source
+    // молчит), сестры нет — респавн проходит, эскалации нет
+    let healthy = FakeSessions::new();
+    let (u2, _, healthy, _) =
+        usecase_with_sessions(vec![mk()], PrState::Missing, healthy, state.clone());
+    healthy
+        .dead_sessions
+        .lock()
+        .unwrap()
+        .push("ses_dead_79".into());
+    let out = u2.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert!(
+        !healthy.spawned.lock().unwrap().is_empty(),
+        "после слепых hold'ов респавн на возврате исполнителя проходит (#1263)"
+    );
+    assert_eq!(out.attention_flagged, 0, "hold'ы не эскалировали петлю");
+    assert_eq!(out.held_blind, 0);
+}
+
 #[test]
 fn env_repo_dir_formula_is_pinned() {
     // ревью Low: формула env-директории одна — спавн и гард строят путь
