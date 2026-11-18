@@ -25,6 +25,9 @@ struct FakeBoard {
     fields_fails: bool,
     /// Отказ set_session (записи ячейки) — сирота-зачистка (#1163).
     set_session_fails: bool,
+    /// Отказ set_status (эскалационный ретрай: счётчик стоит на капе —
+    /// #1311, ревью L2).
+    status_fails: AtomicBool,
 }
 
 #[async_trait]
@@ -33,6 +36,9 @@ impl TaskBoardRepo for FakeBoard {
         Ok(self.rows.clone())
     }
     async fn set_status(&self, _b: &str, n: u64, s: Status) -> UsecaseResult<()> {
+        if self.status_fails.load(Ordering::Relaxed) {
+            return Err(UsecaseError::Session("set_status недоступен (мок)".into()));
+        }
         self.log.lock().unwrap().push(format!("status#{n}={s:?}"));
         Ok(())
     }
@@ -715,6 +721,7 @@ fn usecase_with_state(
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
     });
     let sessions = Arc::new(FakeSessions::new());
     let prs = Arc::new(FakePrs {
@@ -761,6 +768,7 @@ fn peak_usecase(
         comments,
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
     });
     let sessions = Arc::new(FakeSessions {
         prompts: Mutex::default(),
@@ -808,6 +816,7 @@ fn usecase_with_sessions(
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
     });
     let sessions = Arc::new(sessions);
     let prs = Arc::new(FakePrs {
@@ -861,6 +870,7 @@ fn routed_usecase(
             comments,
             fields_fails: false,
             set_session_fails: false,
+            status_fails: AtomicBool::new(false),
         }),
         sessions: Arc::new(SessionRouter::new(
             "kisa",
@@ -1064,6 +1074,7 @@ fn wake_usecase(
         comments,
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
     });
     let sessions = Arc::new(FakeSessions {
         prompts: Mutex::default(),
@@ -1314,6 +1325,7 @@ async fn mcp_comment_marks_registry_with_node_id() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
     });
     let state = Arc::new(MemState(Mutex::default()));
     let writer = crate::tasks::write::TaskWriteUseCase {
@@ -1921,6 +1933,83 @@ async fn review_rounds_observe_mode_does_not_write() {
 }
 
 #[tokio::test]
+async fn escalation_set_status_failure_retries_next_transition() {
+    // #1311 (ревью L2): единственная ветка деградации гварда — отказ
+    // set_status на эскалации. Счётчик остаётся на капе (никаких сбросов),
+    // N+1-й count-переход эскалирует снова; случайный сброс при отказе
+    // потерял бы стоп-кран навсегда.
+    let state = Arc::new(MemState(Mutex::default()));
+    for round in 0..6u32 {
+        state.0.lock().unwrap().spawn_ms.clear();
+        let (u, board, _, _) = usecase_with_state(
+            vec![task(47, Status::InProgress)],
+            PrState::Missing,
+            state.clone(),
+        );
+        if round == 4 {
+            board.status_fails.store(true, Ordering::Relaxed);
+        }
+        let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+        if round < 4 {
+            assert_eq!(
+                out.spawns_done, 1,
+                "раунд {round}: кап не достигнут, дев работает"
+            );
+        } else if round == 4 {
+            // кап достигнут, но set_status отказал: эскалации нет —
+            // раунд 5 проходит (деградация), счётчик остаётся на капе
+            let log = board.log.lock().unwrap();
+            assert!(
+                !log.iter()
+                    .any(|l| l.starts_with("status#47=NeedsAttention")),
+                "отказ set_status — статус не переведён: {log:?}"
+            );
+            assert!(
+                !log.iter().any(|l| l.starts_with("comment#47=")),
+                "дайджест при отказе set_status не уходит: {log:?}"
+            );
+            assert_eq!(out.spawns_done, 1, "раунд 5 проходит при деградации");
+            assert_eq!(
+                state.review_rounds("B", 47),
+                4,
+                "счётчик стоит на капе — ретрай на следующем переходе"
+            );
+            board.status_fails.store(false, Ordering::Relaxed);
+        } else {
+            // N+1-й count-переход: эскалация повторяется успешно
+            let log = board.log.lock().unwrap();
+            assert!(
+                log.iter()
+                    .any(|l| l.starts_with("status#47=NeedsAttention")),
+                "ретрай эскалации — строка в Needs attention: {log:?}"
+            );
+            assert!(
+                log.iter()
+                    .any(|l| l.starts_with("comment#47=⚠︎ Кап ревью-раундов")),
+                "дайджест уходит при успешном ретрае: {log:?}"
+            );
+            assert_eq!(out.spawns_done, 0, "6-й раунд не назначается");
+            assert_eq!(
+                state.review_rounds("B", 47),
+                0,
+                "после успешной эскалации — свежий бюджет"
+            );
+            break;
+        }
+        // строка уезжает на ревью и возвращается: очередной request_changes
+        let mut t = task(47, Status::ReviewResult);
+        let mut f = TaskFields::default();
+        f.set_session(
+            Slot::Dev,
+            uwuwu_domain::SessionRef::parse(&format!("ses_fix{round}")).unwrap(),
+        );
+        t.apply_fields(f);
+        let (u2, _, _, _) = usecase_with_state(vec![t], PrState::Missing, state.clone());
+        let _ = u2.run(&plan(Mode::Live, 7)).await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn plan_review_loop_escalates_by_same_cap() {
     // #1311 (план-контур): цикл Design ↔ Ревью плана дыряв так же —
     // 4-й подряд request_changes плана (ReviewPlan → Design) эскалирует
@@ -2178,6 +2267,7 @@ async fn mixed_health_candidate_decided_by_status_fallback_at_cup_gate() {
             comments: Vec::default(),
             fields_fails: false,
             set_session_fails: false,
+            status_fails: AtomicBool::new(false),
         });
         // master-break #1155 x #1263: struct вырос probes, оба новых
         // теста #1263 не догнали (тесты мастера не компилировались);
@@ -2238,6 +2328,7 @@ async fn foreign_executor_failure_does_not_blind_project_guard() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
     });
     // master-break #1155×#1263 (см. соседний тест): probes не догнали
     let prs = Arc::new(FakePrs {
@@ -2351,6 +2442,7 @@ async fn wakeup_held_when_cup_full() {
         }],
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
     });
     let sessions = Arc::new(FakeSessions {
         activity_ms: Some(1000), // коммент свежее активности сессии → fresh
@@ -2422,6 +2514,7 @@ async fn wakeup_delivery_occupies_cup_slot() {
         }],
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
     });
     let sessions = Arc::new(FakeSessions {
         activity_ms: Some(1000),
@@ -2727,6 +2820,7 @@ async fn undelivered_comment_is_not_marked_seen() {
             log: Mutex::default(),
             fields_fails: false,
             set_session_fails: false,
+            status_fails: AtomicBool::new(false),
             comments: vec![CommentRef {
                 id: "verdict".into(),
                 created_ms: 3000,
@@ -2789,6 +2883,7 @@ async fn undelivered_comment_is_not_marked_seen() {
         log: Mutex::default(),
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
         comments: vec![CommentRef {
             id: "verdict".into(),
             created_ms: 3000,
@@ -2849,6 +2944,7 @@ async fn multi_comment_tail_delivered_together() {
         log: Mutex::default(),
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
         comments: vec![
             CommentRef {
                 id: "A".into(),
@@ -2931,6 +3027,7 @@ async fn inflight_comment_delivered_after_agent_reply() {
         log: Mutex::default(),
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
         comments: vec![CommentRef {
             id: "verdict".into(),
             created_ms: 3000,
@@ -2998,6 +3095,7 @@ async fn busy_session_not_pinged_early() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
     });
     let sess = Arc::new(FakeSessions {
         // молчание ~30 мин (tool-call висит), idle_reply = false
@@ -3061,6 +3159,7 @@ async fn soft_ping_wakes_idle_session_without_transaction() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
     });
     let sess = Arc::new(FakeSessions {
         // молчание 16 мин, ход завершён (idle)
@@ -3143,6 +3242,7 @@ async fn idle_sessions_do_not_hold_cup() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
     });
     // все спящие сессии — живые в API (spawned), но idle (ход завершён)
     let sessions = Arc::new(FakeSessions {
@@ -3300,6 +3400,7 @@ async fn analyst_multiboard_no_oversell_within_tick() {
         comments: vec![],
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
     });
     let u = AnalystUseCase {
         board: board.clone(),
@@ -3344,6 +3445,7 @@ macro_rules! sidecar_uc_with_cup {
                 comments: vec![],
                 fields_fails: false,
                 set_session_fails: false,
+                status_fails: AtomicBool::new(false),
             });
             let u = $ty {
                 board: board.clone(),
@@ -3724,6 +3826,7 @@ async fn analyst_verdictless_waves_do_not_burn_cycles() {
         comments: vec![],
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
     });
     let clock = Arc::new(AdvClock(AtomicU64::new(2000)));
     let u = AnalystUseCase {
@@ -3838,6 +3941,7 @@ async fn analyst_three_real_rounds_escalate_with_honest_message() {
             comments: vec![],
             fields_fails: false,
             set_session_fails: false,
+            status_fails: AtomicBool::new(false),
         })
     };
     let mut u = AnalystUseCase {
@@ -4770,6 +4874,7 @@ fn tick_with_clock(
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
     });
     let sessions = Arc::new(sessions);
     let prs = Arc::new(FakePrs {
@@ -4965,6 +5070,7 @@ async fn enrichment_failure_skips_row() {
         comments: Vec::default(),
         fields_fails: true,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
     });
     let sessions = Arc::new(FakeSessions::new());
     let u = TickUseCase {
@@ -5001,6 +5107,7 @@ async fn orphan_deleted_when_set_session_fails() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: true,
+        status_fails: AtomicBool::new(false),
     });
     let sessions = Arc::new(FakeSessions::new());
     let u = TickUseCase {
