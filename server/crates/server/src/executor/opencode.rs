@@ -694,4 +694,22 @@ mod tests {
         let c = OpencodeClient::new(base, "p".into(), None);
         assert_eq!(c.liveness("ses_gone").await, Liveness::Dead);
     }
+
+    #[tokio::test]
+    async fn last_activity_ms_gate_html_stub_is_error_stall_logic_not_blind() {
+        // #1160, пин тестировщика: GET /message на заглушке — сталл-логике
+        // нужен Err («проба не удалась»), а не Ok(None) «активности нет»:
+        // слепой сталл-детект — соседний класс «всё пусто/всё ок»
+        let base = stub_server(
+            "HTTP/1.1 200 OK",
+            "text/html; charset=utf-8",
+            GATE_STUB_BODY,
+        );
+        let c = OpencodeClient::new(base, "p".into(), None);
+        let res = c.last_activity_ms("ses_x").await;
+        assert!(
+            res.is_err(),
+            "HTML-заглушка не должна выглядеть как отсутствие активности: {res:?}"
+        );
+    }
 }
