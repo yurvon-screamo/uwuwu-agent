@@ -293,6 +293,13 @@ impl TickUseCase {
                     .map(|c| c.body.as_str())
                     .collect::<Vec<_>>()
                     .join("\n\n---\n\n");
+                // Пин агента слота перед ходом (#1300): именованным слотам —
+                // no-op (сессия уже носит агента), легаси-дев-сессии —
+                // фикс класса «wake перебросил кости» резолва исполнителя.
+                // Отказ — Err без seen: доставка повторится следующим тиком.
+                if let Some(agent) = Agent::of_slot(slot) {
+                    sessions.switch_agent(session, agent).await?;
+                }
                 sessions
                     .prompt(
                         session,

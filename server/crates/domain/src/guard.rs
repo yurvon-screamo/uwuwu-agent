@@ -163,6 +163,24 @@ mod tests {
     }
 
     #[test]
+    fn pinned_developer_session_holds_dev_spawn() {
+        // #1300: дев-сессия с пином (agent="developer") — та же дев-семья,
+        // что и легаси-пустая; спавн поверх живого пиненого дева держится
+        let pinned = sighting("s1", ENV, "developer", "", NOW - 60_000);
+        assert_eq!(
+            spawn_guard(&[pinned], ENV, Slot::Dev, NOW),
+            SpawnGuard::Hold,
+            "пиненый дев держит спавн своей семьи"
+        );
+        let analyst = sighting("s2", ENV, "analyst", "", NOW - 60_000);
+        assert_eq!(
+            spawn_guard(&[analyst], ENV, Slot::Dev, NOW),
+            SpawnGuard::Allow,
+            "чужая роль (аналитик) дев-спавн не держит"
+        );
+    }
+
+    #[test]
     fn reviewer_session_does_not_hold_dev_spawn() {
         let reviewer = sighting("s1", ENV, "code-quality-reviewer", "", NOW - 60_000);
         assert_eq!(

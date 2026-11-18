@@ -13,7 +13,8 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use uwuwu_domain::{
-    BranchName, PeakWindow, PrUrl, Priority, Slot, SpawnPolicy, Status, Task, TaskFields, UtcMinute,
+    Agent, BranchName, PeakWindow, PrUrl, Priority, Slot, SpawnPolicy, Status, Task, TaskFields,
+    UtcMinute,
 };
 
 struct FakeBoard {
@@ -203,6 +204,8 @@ struct FakeSessions {
     deleted: Mutex<Vec<String>>,
     /// Журнал абортов сессий (преемпшен #1259).
     aborted: Mutex<Vec<String>>,
+    /// Журнал пинов агента слота (#1300): `{session}|{agent}`.
+    switched: Mutex<Vec<String>>,
     /// Отказ abort_session (гашение не удалось — кандидат остаётся held).
     abort_fails: AtomicBool,
     /// Бюджетная проба spawn_allowed (false — преемпшен не начинается).
@@ -237,6 +240,7 @@ impl FakeSessions {
             prompt_fails: false,
             deleted: Mutex::default(),
             aborted: Mutex::default(),
+            switched: Mutex::default(),
             abort_fails: AtomicBool::new(false),
             spawn_probe: AtomicBool::new(true),
         }
@@ -327,6 +331,13 @@ impl AgentSessionGateway for FakeSessions {
             return Err(UsecaseError::Session("abort недоступен (мок)".into()));
         }
         self.aborted.lock().unwrap().push(s.into());
+        Ok(())
+    }
+    async fn switch_agent(&self, s: &str, agent: Agent) -> UsecaseResult<()> {
+        self.switched
+            .lock()
+            .unwrap()
+            .push(format!("{s}|{}", crate::agent_name(agent)));
         Ok(())
     }
     fn spawn_allowed(&self) -> bool {
@@ -742,6 +753,7 @@ fn peak_usecase(
         set_session_fails: false,
     });
     let sessions = Arc::new(FakeSessions {
+        switched: Mutex::default(),
         prompts: Mutex::default(),
         spawned: Mutex::default(),
         activity_ms: Some(1000),
@@ -1013,6 +1025,12 @@ async fn soft_ping_prompt_routes_to_project_executor() {
         named_prompts.iter().any(|p| p.contains("Мягкий пинг")),
         "soft-ping на гейтвее проекта: {named_prompts:?}"
     );
+    // пин агента слота и на мягком пинге (#1300)
+    let switched = named_gw.switched.lock().unwrap();
+    assert!(
+        switched.iter().any(|s| s == "ses_dev_idle|developer"),
+        "soft-ping пинит developer: {switched:?}"
+    );
     assert!(
         default_gw.prompts.lock().unwrap().is_empty(),
         "дефолтный гейтвей soft-ping НЕ получил"
@@ -1045,6 +1063,7 @@ fn wake_usecase(
         set_session_fails: false,
     });
     let sessions = Arc::new(FakeSessions {
+        switched: Mutex::default(),
         prompts: Mutex::default(),
         spawned: Mutex::default(),
         activity_ms,
@@ -1937,6 +1956,7 @@ async fn dead_stage_and_candidate_hold_blind_when_list_unavailable() {
     dead.apply_fields(f);
     let candidate = task(43, Status::InProgress);
     let sessions = FakeSessions {
+        switched: Mutex::default(),
         prompts: Mutex::default(),
         spawned: Mutex::default(),
         activity_ms: Some(1000),
@@ -2158,6 +2178,36 @@ async fn cup_busy_counts_non_pipeline_sessions() {
     assert_eq!(out.held_cup, 1);
 }
 
+/// Пин агента слота на будильнике (#1300): доставка хода дев-строке
+/// предваряется switch_agent — легаси-безымянная дев-сессия получает
+/// developer до промпта (инцидент #1044: wake перебросил кости резолва
+/// исполнителя, ход делал аналитик).
+#[tokio::test]
+async fn wake_pins_the_slot_agent() {
+    let (u, sessions, _) = wake_usecase(
+        vec![dev_task(1, "ses_dev")],
+        vec![CommentRef {
+            id: "c1".into(),
+            created_ms: 3000,
+            body: "владелец: продолжай".into(),
+        }],
+        Some(1000),
+        true, // ход завершён (idle) — доставка сразу
+        Arc::new(MemState(Mutex::default())),
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.wakeups, 1, "wakeup доставлен");
+    let switched = sessions.switched.lock().unwrap();
+    assert!(
+        switched.iter().any(|s| s == "ses_dev|developer"),
+        "wake пинит developer на дев-сессии до промпта: {switched:?}"
+    );
+}
+
+/// CUP-гвард будильника (#1231): доставка промпта в idle-сессию — новый
+/// ход, тот же LLM-слот. При полном капе будильник откладывается;
+/// seen-маркер не пишется — доставка повторится на свободном тике
+/// (комменты не теряются).
 #[tokio::test]
 async fn wakeup_held_when_cup_full() {
     // #1231: доставка промпта в idle-сессию — новый ход, тот же LLM-слот.
@@ -2564,6 +2614,7 @@ async fn undelivered_comment_is_not_marked_seen() {
             }],
         });
         let sess = Arc::new(FakeSessions {
+            switched: Mutex::default(),
             prompts: Mutex::default(),
             spawned: Mutex::default(),
             activity_ms: Some(5000),
@@ -2626,6 +2677,7 @@ async fn undelivered_comment_is_not_marked_seen() {
         }],
     });
     let sess2 = Arc::new(FakeSessions {
+        switched: Mutex::default(),
         prompts: Mutex::default(),
         spawned: Mutex::default(),
         activity_ms: Some(1000),
@@ -2698,6 +2750,7 @@ async fn multi_comment_tail_delivered_together() {
         ],
     });
     let sess = Arc::new(FakeSessions {
+        switched: Mutex::default(),
         prompts: Mutex::default(),
         spawned: Mutex::default(),
         activity_ms: Some(900),
@@ -3083,7 +3136,7 @@ async fn failed_spawn_does_not_charge_loop_or_cooldown() {
 use crate::pipeline::analyst::{AnalystBoard, AnalystUseCase};
 use crate::pipeline::analyst_review::AnalystReviewUseCase;
 use crate::pipeline::dreamer::DreamerUseCase;
-use uwuwu_domain::{Agent, AgentSlot};
+use uwuwu_domain::AgentSlot;
 
 fn analyst_board() -> AnalystBoard {
     AnalystBoard {
@@ -5154,7 +5207,8 @@ fn env_repo_dir_formula_is_pinned() {
 async fn stage_spawn_carries_model_from_server_map() {
     // #1154 (решение владельца 17.11): модель спавна — карта сервера
     // (SpawnModels), каждый спавн несёт её в теле сессии; деф-файлы
-    // агентов моделей не несут. Dev-стадия — default-ключ карты.
+    // агентов моделей не несут. Дев-семья с #1300 — developer-ключ,
+    // bootstrap — default-ключ (канон 18.11 #417: оба flash#high).
     // Arrange
     let (u, _, sessions, _) = usecase(vec![task(1, Status::InProgress)], PrState::Missing);
 

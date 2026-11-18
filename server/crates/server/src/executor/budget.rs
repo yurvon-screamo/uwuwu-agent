@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
-use uwuwu_domain::{BudgetVerdict, SpawnBudget};
+use uwuwu_domain::{Agent, BudgetVerdict, SpawnBudget};
 use uwuwu_usecase::{AgentSessionGateway, AssistantReply, Liveness, SessionInfo, SessionSpec};
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
@@ -63,6 +63,12 @@ impl AgentSessionGateway for BudgetedSessions {
 
     async fn prompt(&self, session: &str, text: &str) -> UsecaseResult<()> {
         self.inner.prompt(session, text).await
+    }
+
+    /// Пин агента слота мимо бюджета (#1300): не спавн — LLM-слот не
+    /// занимает, тарификации нет.
+    async fn switch_agent(&self, session: &str, agent: Agent) -> UsecaseResult<()> {
+        self.inner.switch_agent(session, agent).await
     }
 
     async fn run_command(&self, session: &str, name: &str, args: &str) -> UsecaseResult<()> {
