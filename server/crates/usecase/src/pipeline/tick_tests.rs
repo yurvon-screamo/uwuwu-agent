@@ -3362,6 +3362,7 @@ async fn restored_counters_from_previous_process_do_not_escalate_on_first_tick()
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
     });
     let sess = Arc::new(FakeSessions {
         // silence 25 мин (≥ soft gate 15), ход завершён (idle)
@@ -3435,6 +3436,7 @@ async fn counters_earned_by_current_process_still_escalate() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
     });
     let sess = Arc::new(FakeSessions {
         activity_ms: Some(NOW - 25 * 60_000),
@@ -3512,6 +3514,7 @@ async fn escalation_deferred_when_liveness_probe_unreliable() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
     });
     let sess = Arc::new(FakeSessions {
         activity_ms: Some(NOW - 25 * 60_000),
@@ -3582,6 +3585,7 @@ async fn probe_failure_records_outcome_without_escalation_or_counters() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
     });
     let sess = Arc::new(FakeSessions {
         activity_ms: Some(NOW - 25 * 60_000),
@@ -3653,6 +3657,7 @@ async fn probe_failure_isolated_per_row_other_rows_processed() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
     });
     let sess = Arc::new(FakeSessions {
         activity_ms: Some(NOW - 16 * 60_000),
@@ -3728,6 +3733,7 @@ async fn probe_degradation_strip_reaches_threshold_signal() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
     });
     let sess = Arc::new(FakeSessions {
         activity_fails_sessions: Mutex::new(vec![
@@ -6038,6 +6044,7 @@ async fn round_stale_reset_gives_true_fresh_round_two_pings_before_escalation() 
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
     });
     let sess = Arc::new(FakeSessions {
         // сессия молчит весь сценарий (25 мин до первого тика, дальше — тишина)
