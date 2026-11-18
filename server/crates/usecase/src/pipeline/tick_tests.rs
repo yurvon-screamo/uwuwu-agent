@@ -1878,6 +1878,67 @@ async fn review_rounds_approve_resets_counter() {
 }
 
 #[tokio::test]
+async fn escalation_digest_names_last_review_session() {
+    // #1311 (допокрытие тестировщика): дайджест эскалации несёт id последней
+    // ревью-сессии из слота строки — владелец видит, чей раунд сорвался
+    let state = Arc::new(MemState(Mutex::default()));
+    // баланс 3: три предыдущих request_changes; прошлый тик видел ревью
+    state.0.lock().unwrap().review_rounds.push((50, 3));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((50, Status::ReviewResult));
+    // ревью-сессия в слоте результата — её id попадает в дайджест
+    let mut t = task(50, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::ResultReview,
+        uwuwu_domain::SessionRef::parse("ses_rev_live").unwrap(),
+    );
+    t.apply_fields(f);
+    let (u, board, _, _) = usecase_with_state(vec![t], PrState::Missing, state.clone());
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    let log = board.log.lock().unwrap();
+    let digest = log
+        .iter()
+        .find(|l| l.starts_with("comment#50=⚠︎ Кап ревью-раундов"))
+        .expect("дайджест эскалации");
+    assert!(
+        digest.contains("последняя ревью-сессия: ses_rev_live"),
+        "id ревью-сессии в дайджесте: {digest}"
+    );
+    assert_eq!(state.review_rounds("B", 50), 0, "эскалация — свежий бюджет");
+}
+
+#[tokio::test]
+async fn escalation_digest_without_session_is_honest_dash() {
+    // пустой слот ревью (сессия не дожила до эскалации) — честное «—»,
+    // не выдуманный id
+    let state = Arc::new(MemState(Mutex::default()));
+    state.0.lock().unwrap().review_rounds.push((51, 3));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((51, Status::ReviewResult));
+    let (u, board, _, _) =
+        usecase_with_state(vec![task(51, Status::InProgress)], PrState::Missing, state);
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    let log = board.log.lock().unwrap();
+    let digest = log
+        .iter()
+        .find(|l| l.starts_with("comment#51=⚠︎ Кап ревью-раундов"))
+        .expect("дайджест эскалации");
+    assert!(
+        digest.contains("последняя ревью-сессия: —"),
+        "пустой слот — «—» в дайджесте: {digest}"
+    );
+}
+
+#[tokio::test]
 async fn review_rounds_retry_spawn_does_not_count() {
     // ретрай спавна ревьювера в том же статусе (мёртвая сессия того же
     // раунда) — не request_changes: счётчик не инкрементится
