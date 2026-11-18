@@ -1100,14 +1100,19 @@ impl TaskBoardRepo for GitHubHub {
                 archived
             )));
         }
-        // строка ушла из items: снапшот должен забыть её сразу (#1235,
-        // read-your-writes), иначе write-through тика вернёт призрак
-        self.invalidate_snapshot(board);
+        // Снапшот здесь НЕ инвалидируется: item id из кеша валиден всю
+        // волну, а построчный ре-фетч (полный снимок — сотни поинтов на
+        // каждую архивацию) выжег бы бюджет первой волной — High-1 ревью
+        // #1293. Свежий срез даёт invalidate_snapshot на финале волны.
         Ok(())
     }
 
     fn gql_budget_remaining(&self) -> Option<u64> {
         Some(self.last_rate_limit.read().expect("rl lock").as_ref()?.0)
+    }
+
+    fn invalidate_snapshot(&self, board: &str) {
+        self.invalidate_snapshot(board)
     }
 
     async fn issues_with_title(&self, title: &str) -> UsecaseResult<Vec<u64>> {

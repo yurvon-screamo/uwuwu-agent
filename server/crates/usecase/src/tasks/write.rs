@@ -219,8 +219,21 @@ impl TaskWriter for TaskWriteUseCase {
         // холодный ящик (#1293): закрытые строки покидают снапшот, и
         // снапшот-гард слепнет к старым тайтлам — точное равенство
         // добивается поиском issues (REST, вне GraphQL-бюджета):
-        // инвариант «тайтл уникален» не сужается вместе с доской
-        let cold = self.board.issues_with_title(spec.title.trim()).await?;
+        // инвариант «тайтл уникален» не сужается вместе с доской.
+        // Транзиентный сбой поиска (Low-2 ревью) — fail-open с warn:
+        // снапшот-гард остаётся первичным рубежом, create не валим
+        let cold = match self.board.issues_with_title(spec.title.trim()).await {
+            Ok(found) => found,
+            Err(e) => {
+                tracing::warn!(
+                    event = "dup_check.search_failed",
+                    title = %spec.title.trim(),
+                    error = %e,
+                    "REST-поиск тайтлов недоступен — холодный гард пропущен (первичный снапшот-гард отработал)"
+                );
+                Vec::new()
+            }
+        };
         if !cold.is_empty() {
             return Err(UsecaseError::Board(format!(
                 "тайтл «{}» уже занят issue #{} — дубль запрещён (строка вне снапшота: холодный ящик)",
@@ -510,6 +523,8 @@ mod tests {
         /// Номера, которые issues_with_title «находит» в репо — вход
         /// холодного ящика (#1293): create с таким тайтлом обязан падать.
         cold_hits: Vec<u64>,
+        /// Транзиентный сбой REST-поиска (Low-2 ревью): create fail-open.
+        search_err: bool,
     }
 
     /// Запись ячеек снапшота: номер + приоритет + automerge (#1258).
@@ -591,6 +606,9 @@ mod tests {
             Ok(())
         }
         async fn issues_with_title(&self, _title: &str) -> UsecaseResult<Vec<u64>> {
+            if self.search_err {
+                return Err(UsecaseError::Board("search 503 (мок)".into()));
+            }
             Ok(self.cold_hits.clone())
         }
         async fn replace_body(&self, _n: u64, _b: &str) -> UsecaseResult<()> {
@@ -639,6 +657,7 @@ mod tests {
         let board = Arc::new(FakeBoard {
             cells: std::sync::Mutex::default(),
             cold_hits,
+            search_err: false,
         });
         let u = TaskWriteUseCase {
             board: board.clone(),
@@ -666,6 +685,30 @@ mod tests {
             err.to_string().contains("1243"),
             "ошибка называет холодный номер: {err}"
         );
+    }
+
+    /// Сбой REST-поиска (Low-2 ревью #1293) — fail-open: create живёт
+    /// (первичный снапшот-гард отработал), warn в логе.
+    #[tokio::test]
+    async fn create_cold_search_failure_fails_open() {
+        let fields = Arc::new(FakeFields::default());
+        let board = Arc::new(FakeBoard {
+            cells: std::sync::Mutex::default(),
+            cold_hits: Vec::new(),
+            search_err: true,
+        });
+        let u = TaskWriteUseCase {
+            board: board.clone(),
+            fields,
+            boards: vec![("uwuwu".into(), "Задачи uwuwu".into())],
+            clock: Arc::new(crate::pipeline::tick_tests::FixedClock),
+            state: Arc::new(crate::pipeline::tick_tests::MemState::empty()),
+        };
+        let number = u
+            .create("uwuwu", spec("тело против упавшего поиска"))
+            .await
+            .expect("сбой поиска не валит create");
+        assert_eq!(number, 1, "issue создан — гард fail-open");
     }
 
     /// Красный тест бага #1232 → контракт #1258: create маршрутизирует

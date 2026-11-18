@@ -27,6 +27,8 @@ pub struct SweepOutcome {
     pub archived: usize,
     /// Отложено бюджет-гайдом (переедут следующими тиками).
     pub deferred_budget: usize,
+    /// Не влезло в батч-кап прохода (переедут следующими тиками).
+    pub deferred_cap: usize,
     /// Не удалось архивировать (строка переедет следующим тиком).
     pub failed: usize,
 }
@@ -109,6 +111,13 @@ pub async fn sweep_board(
             }
         }
     }
+    // Свежий срез — один на волну, не на строку (High-1 ревью #1293):
+    // построчный ре-фетч полного снимка выжег бы бюджет первой волной
+    if out.archived > 0 {
+        board.invalidate_snapshot(board_name);
+    }
+    // остаток за батч-капом: не отобран бюджетом и не упал — ждёт тика
+    out.deferred_cap = out.candidates - out.archived - out.failed - out.deferred_budget;
     tracing::info!(
         event = "sweep.completed",
         board = board_name,

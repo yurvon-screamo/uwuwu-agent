@@ -25,6 +25,7 @@ struct SweepBoard {
     archived: Mutex<Vec<u64>>,
     budget: Mutex<Option<u64>>,
     fail_numbers: Vec<u64>,
+    invalidations: Mutex<usize>,
 }
 
 impl SweepBoard {
@@ -33,11 +34,16 @@ impl SweepBoard {
             archived: Mutex::new(Vec::new()),
             budget: Mutex::new(budget),
             fail_numbers: Vec::new(),
+            invalidations: Mutex::new(0),
         }
     }
 
     fn archived(&self) -> Vec<u64> {
         self.archived.lock().unwrap().clone()
+    }
+
+    fn invalidations(&self) -> usize {
+        *self.invalidations.lock().unwrap()
     }
 }
 
@@ -115,6 +121,9 @@ impl TaskBoardRepo for SweepBoard {
     async fn replace_body(&self, _n: u64, _body: &str) -> UsecaseResult<()> {
         Ok(())
     }
+    fn invalidate_snapshot(&self, _b: &str) {
+        *self.invalidations.lock().unwrap() += 1;
+    }
 }
 
 /// Строка-фабрика: терминальная Done, закрытая `days_ago` суток назад.
@@ -161,6 +170,30 @@ async fn live_archives_oldest_first_within_cap() {
         !archived.contains(&0),
         "самая молодая из кандидатов — в конце"
     );
+    // High-1 ревью #1293: свежий срез — ровно один на волну, не на строку
+    assert_eq!(board.invalidations(), 1);
+    assert_eq!(out.deferred_cap, 20, "не влезшие в кап учтены отдельно");
+}
+
+#[tokio::test]
+async fn observe_does_not_invalidate_snapshot() {
+    let board = SweepBoard::new(None);
+    let tasks = vec![closed_done(1, 10)];
+    sweep_board(&board, "B", &tasks, policy(NOW, 7, true))
+        .await
+        .expect("observe проход");
+    assert_eq!(board.invalidations(), 0, "observe не мутирует кеш");
+}
+
+#[tokio::test]
+async fn wave_without_archived_does_not_invalidate() {
+    // бюджет-гайд сработал до первой мутации: кеш никто не портил
+    let board = SweepBoard::new(Some(BUDGET_FLOOR - 1));
+    let tasks = vec![closed_done(1, 10)];
+    sweep_board(&board, "B", &tasks, policy(NOW, 7, false))
+        .await
+        .expect("проход");
+    assert_eq!(board.invalidations(), 0);
 }
 
 #[tokio::test]

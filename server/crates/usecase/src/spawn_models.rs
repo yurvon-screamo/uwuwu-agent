@@ -105,7 +105,7 @@ mod tests {
         assert_eq!(
             m.for_agent(Agent::PlanReviewer),
             SpawnModel::parse("zai-coding-plan/glm-5.3#high").unwrap(),
-            "ревьюверы — полный 5.3#high (канон #417)
+            "ревьюверы — полный 5.3#high (канон #417)"
         );
         assert_eq!(
             m.for_agent(Agent::Dreamer),
