@@ -40,7 +40,6 @@ fn canonical_matches_config_example_verbatim() {
     // значения по всем ключам — из example, не через for_agent (фоллбэк
     // for_agent маскировал бы рассинхрон значения)
     let example = SpawnModels::new(map.clone());
-    let _ = &example_keys_raw;
     for key in &canonical_keys {
         assert_eq!(
             example.get(key),
