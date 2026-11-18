@@ -1364,6 +1364,121 @@ mod tests {
         assert!(hub.snap_cache.get("B", std::time::Instant::now()).is_none());
     }
 
+    /// #1258 живая проба (tester): read-your-writes нестатусных ячеек
+    /// против реального носителя. МУТАЦИОННАЯ — пишет и восстанавливает;
+    /// носитель — sandbox #1265 (носитель живых проб #1232/#1174).
+    /// До фикса: set_board_cells мимо snap_cache → немедленный read_board
+    /// горячего хаба показывал до-мутационное значение до TTL (проба
+    /// на проде 18.11). Контракт под проверку: запись → немедленное
+    /// чтение тем же хабом несёт записанное (write-through снапшота);
+    /// свежий хаб — раунд-трип REST-записи на носителе. Автомерж на
+    /// свежем чтении ассертится (Pv2-отражение стабильно, NB #1232);
+    /// приоритет — informational-принт: Pv2-отражение issue-backed
+    /// Приоритета под задокументированным дрейфом GitHub (#1232).
+    #[test]
+    #[ignore] // живой прогон: GH_TOKEN + сеть; MUTATION — пишет и восстанавливает
+    fn live_board_cells_write_through_on_real_carrier() {
+        let repo =
+            std::env::var("UWUWU_HUB_REPO").unwrap_or_else(|_| "yurvon-screamo/uwuwu-hub".into());
+        let token = std::env::var("GH_TOKEN").expect("GH_TOKEN");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let board = "Задачи sandbox";
+            let n = 1265u64;
+            // 1. базлайн: холодный хаб наполняет кеш живым фетчем
+            let hub = GitHubHub::new(repo.clone(), token.clone());
+            let base = hub.read_board(board).await.expect("read_board базлайн");
+            let row = base
+                .iter()
+                .find(|t| t.number() == n)
+                .expect("#1265 на доске sandbox");
+            let base_priority = row.priority();
+            let base_automerge = row.automerge();
+            // проба пишет значение, ОТЛИЧНОЕ от базлайна — ассерты значимы
+            // при любом состоянии носителя
+            let probe_priority: &str = match base_priority {
+                Priority::High | Priority::Medium => "low",
+                Priority::Low | Priority::Empty => "high",
+            };
+            let probe_automerge = !base_automerge;
+            // 2. контракт фикса: запись → СРАЗУ чтение тем же хабом
+            hub.set_board_cells(board, n, Some(probe_priority), Some(probe_automerge))
+                .await
+                .expect("set_board_cells");
+            let after = hub
+                .read_board(board)
+                .await
+                .expect("read_board сразу после записи");
+            let row2 = after
+                .iter()
+                .find(|t| t.number() == n)
+                .expect("#1265 жив после записи");
+            assert_eq!(
+                row2.priority(),
+                uwuwu_usecase::parse_priority(probe_priority),
+                "read-your-writes: приоритет виден сразу (write-through снапшота, #1258)"
+            );
+            assert_eq!(
+                row2.automerge(),
+                probe_automerge,
+                "read-your-writes: automerge виден сразу (write-through снапшота, #1258)"
+            );
+            // 3. свежий хаб (холодный кеш): раунд-трип записи на носителе;
+            // до 3 попыток с паузой (Pv2-отражение REST-записи — секундное)
+            let mut roundtrip = false;
+            for attempt in 0..3 {
+                let fresh = GitHubHub::new(repo.clone(), token.clone());
+                let rows = fresh.read_board(board).await.expect("read_board носителя");
+                let matched = rows.iter().find(|t| t.number() == n).map(|t| {
+                    println!(
+                        "инфо: свежий хаб, попытка {}: приоритет = {:?} (Pv2-отражение \
+                         issue-backed Приоритета под дрейфом #1232 — не ассерт)",
+                        attempt + 1,
+                        t.priority()
+                    );
+                    t.automerge() == probe_automerge
+                });
+                if matched == Some(true) {
+                    roundtrip = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            assert!(
+                roundtrip,
+                "носитель не отдал записанный automerge за 3 попытки (раунд-трип REST #1258)"
+            );
+            // 4. восстановление базлайна + контроль тем же хабом
+            let base_priority_arg: &str = match base_priority {
+                Priority::High => "high",
+                Priority::Medium => "medium",
+                Priority::Low => "low",
+                Priority::Empty => "", // очистка ячейки
+            };
+            hub.set_board_cells(board, n, Some(base_priority_arg), Some(base_automerge))
+                .await
+                .expect("восстановление базлайна");
+            let restored = hub
+                .read_board(board)
+                .await
+                .expect("read_board после отката");
+            let row4 = restored
+                .iter()
+                .find(|t| t.number() == n)
+                .expect("#1265 жив после отката");
+            assert_eq!(
+                row4.priority(),
+                base_priority,
+                "базлайн приоритета восстановлен"
+            );
+            assert_eq!(
+                row4.automerge(),
+                base_automerge,
+                "базлайн automerge восстановлен"
+            );
+        });
+    }
+
     #[test]
     fn is_rate_limited_matches_only_owned_tag_not_github_texts() {
         // Permission-отказ: Display содержит «не rate limit» — старый
