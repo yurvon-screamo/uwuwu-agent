@@ -805,4 +805,40 @@ mod tests {
             "task_edit-приоритет виден строке"
         );
     }
+
+    #[tokio::test]
+    async fn archived_row_leaves_board_but_stays_readable() {
+        // Холодный ящик (#1293, сценарий «Проверки»): архивная строка
+        // покидает read_board (снапшот сжат), но знание не теряется —
+        // issue-first чтение (task_get) и статус доступны. Регресс до
+        // archived-фильтра в read_issue/row_status краснит вторую половину.
+        let hub = MemoryHub::with_seeds(parse_seeds("Задачи uwuwu:2049:Done:low:14"));
+        let before = hub.read_board("Задачи uwuwu").await.expect("доска до");
+        assert!(
+            before.iter().any(|t| t.number() == 2049),
+            "свежий Done-сид на доске до архивации"
+        );
+        hub.archive_row("Задачи uwuwu", 2049)
+            .await
+            .expect("архивация терминальной строки");
+        let after = hub.read_board("Задачи uwuwu").await.expect("доска после");
+        assert!(
+            !after.iter().any(|t| t.number() == 2049),
+            "архивная строка покинула снапшот"
+        );
+        let view = hub
+            .read_issue("Задачи uwuwu", 2049)
+            .await
+            .expect("issue-first чтение архивной строки (task_get холодный путь)");
+        assert_eq!(
+            view.task.number(),
+            2049,
+            "тело/мета строки доступны после архива"
+        );
+        let status = hub
+            .row_status("Задачи uwuwu", 2049)
+            .await
+            .expect("статус архивной строки");
+        assert_eq!(status, Some(Status::Done), "статус не потерян");
+    }
 }
