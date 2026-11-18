@@ -453,6 +453,49 @@ mod tests {
         })
     }
 
+    fn parsed_with_time(busy: serde_json::Value, idle: serde_json::Value) -> bool {
+        let mut item = page_item("s", "/x");
+        item["time"]["busy"] = busy;
+        item["time"]["idle"] = idle;
+        parse_session_page(&serde_json::json!({ "data": [item] }), 1)
+            .0
+            .remove(0)
+            .busy
+    }
+
+    #[test]
+    fn session_page_busy_semantics() {
+        // #1231: busy ⟺ time.busy > time.idle — ход в полёте (Started
+        // пишет time.busy, idle-финал пишет time.idle). outcome — атрибут
+        // последнего завершённого хода, живость не выражает.
+        // ход в полёте: Started есть, idle ещё не ставился
+        assert!(parsed_with_time(
+            serde_json::json!(1000u64),
+            serde_json::Value::Null
+        ));
+        // завершённый ход: idle позже Started — слот свободен
+        assert!(!parsed_with_time(
+            serde_json::json!(1000u64),
+            serde_json::json!(2000u64)
+        ));
+        // корень бага #1231: второй ход поверх финала (outcome непуст) —
+        // Started позже последнего idle, сессия держит кап
+        assert!(parsed_with_time(
+            serde_json::json!(2000u64),
+            serde_json::json!(1000u64)
+        ));
+        // без события Started — не busy (ручная/легаси-сессия)
+        assert!(!parsed_with_time(
+            serde_json::Value::Null,
+            serde_json::json!(1000u64)
+        ));
+        // событий нет вовсе — не busy (page_item без time.busy/idle)
+        assert!(!parsed_with_time(
+            serde_json::Value::Null,
+            serde_json::Value::Null
+        ));
+    }
+
     #[test]
     fn session_page_full_page_yields_next_cursor() {
         // полная страница + непустой cursor.next → продолжение пагинации
