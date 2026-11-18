@@ -13,6 +13,7 @@ pub type Gateway = Arc<dyn AgentSessionGateway>;
 
 pub struct SessionRouter {
     default: Gateway,
+    default_name: String,
     /// Все исполнители (дефолт первым) с именами: union-сканы и warn-логи.
     all: Vec<(String, Gateway)>,
     by_project: HashMap<String, Gateway>,
@@ -35,6 +36,7 @@ impl SessionRouter {
         }
         Self {
             default,
+            default_name: default_name.to_string(),
             all,
             by_project,
         }
@@ -49,6 +51,32 @@ impl SessionRouter {
     /// (конфиг валидируется на старте, фолбэк — на всякий случай).
     pub fn project(&self, name: &str) -> &Gateway {
         self.by_project.get(name).unwrap_or(&self.default)
+    }
+
+    /// Имя исполнителя проекта — ключ пер-проектного зрения тика (#1263):
+    /// гард спавна строки читает список СВОЕГО исполнителя, отказ чужого
+    /// зрение не гасит. Неизвестный проект — дефолтный исполнитель.
+    pub fn project_executor_name(&self, project: &str) -> &str {
+        let gateway = self.project(project);
+        for (name, g) in &self.all {
+            if Arc::ptr_eq(g, gateway) {
+                return name;
+            }
+        }
+        &self.default_name
+    }
+
+    /// Per-executor list: результат каждого исполнителя поимённо (#1263).
+    /// Потребитель с пер-проектным зрением берёт результат своего
+    /// исполнителя; агрегаты (CUP) сами решают union/fallback по набору.
+    pub async fn list_sessions_per_executor(
+        &self,
+    ) -> Vec<(String, UsecaseResult<Vec<SessionInfo>>)> {
+        let mut out = Vec::with_capacity(self.all.len());
+        for (name, gateway) in &self.all {
+            out.push((name.clone(), gateway.list_sessions().await));
+        }
+        out
     }
 
     /// Дефолтный исполнитель (дример-спавн и прочие внепроектные спавны).
