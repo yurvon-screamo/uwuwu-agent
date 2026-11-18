@@ -14,6 +14,9 @@ pub const ENV_BEARER: &str = "UWUWU_SERVER_BEARER";
 pub const ENV_STATE_PATH: &str = "UWUWU_SERVER_STATE";
 pub const ENV_MODE: &str = "UWUWU_SERVER_MODE";
 pub const ENV_OPENCODE_GATE: &str = "UWUWU_OPENCODE_GATE";
+/// Gitea-инстансы PR-гейта: «host=token,host=token» (#1269); нет/пусто —
+/// Gitea-PR ждут владельца в Review (Foreign), деплой не ломается.
+pub const ENV_GITEA_TOKENS: &str = "GITEA_TOKENS";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -126,6 +129,8 @@ pub struct Secrets {
     /// Гейт публичного опенкода: значение Cookie-хедера целиком
     /// (oc_gate=<hash>) — эндпоинт за Caddy-заглушкой.
     pub opencode_gate_cookie: Option<String>,
+    /// Gitea-токены PR-гейта: host → token (#1269).
+    pub gitea_tokens: HashMap<String, String>,
     pub bearer: String,
 }
 
@@ -256,6 +261,10 @@ impl Config {
         })?;
         let opencode_password = non_empty_env(ENV_OPENCODE_PASSWORD);
         let opencode_gate_cookie = non_empty_env(ENV_OPENCODE_GATE);
+        let gitea_tokens = match non_empty_env(ENV_GITEA_TOKENS) {
+            Some(raw) => parse_gitea_tokens(&raw)?,
+            None => HashMap::new(),
+        };
         if self.mode() == ModeCfg::Live && opencode_password.is_none() {
             return Err(ConfigError::Validation(format!(
                 "{ENV_OPENCODE_PASSWORD} обязателен в live-режиме (спавны)"
@@ -265,6 +274,7 @@ impl Config {
             gh_token,
             opencode_password,
             opencode_gate_cookie,
+            gitea_tokens,
             bearer,
         })
     }
@@ -352,12 +362,71 @@ fn non_empty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
+/// GITEA_TOKENS → мапа host → token: пары через запятую, разделитель `=`
+/// (#1269). Битая пара (без `=`, пустой host/token) — громкая ошибка
+/// старта: тихий пропуск пары прятал бы неработающий инстанс.
+fn parse_gitea_tokens(raw: &str) -> Result<HashMap<String, String>, ConfigError> {
+    let mut tokens = HashMap::new();
+    for pair in raw.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let Some((host, token)) = pair.split_once('=') else {
+            return Err(ConfigError::Validation(format!(
+                "{ENV_GITEA_TOKENS}: пара без '=' (host=token): {pair:?}"
+            )));
+        };
+        let (host, token) = (host.trim(), token.trim());
+        if host.is_empty() || token.is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "{ENV_GITEA_TOKENS}: пустой host или token в паре {pair:?}"
+            )));
+        }
+        if tokens.contains_key(host) {
+            return Err(ConfigError::Validation(format!(
+                "{ENV_GITEA_TOKENS}: дубликат хоста {host:?} — последний токен молча перезатирал бы предыдущий"
+            )));
+        }
+        tokens.insert(host.to_string(), token.to_string());
+    }
+    Ok(tokens)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn example() -> &'static str {
         include_str!("../../../config.example.toml")
+    }
+
+    #[test]
+    fn parses_gitea_tokens_env() {
+        // #1269: мапа host=token через запятую; пробелы и пустые пары терпимы
+        let tokens = parse_gitea_tokens(" git.l4a.ru = tok1 , git.true-wash.com=tok2 ,, ").unwrap();
+        assert_eq!(tokens.get("git.l4a.ru").map(String::as_str), Some("tok1"));
+        assert_eq!(
+            tokens.get("git.true-wash.com").map(String::as_str),
+            Some("tok2")
+        );
+        assert_eq!(parse_gitea_tokens("").unwrap().len(), 0);
+        assert!(
+            parse_gitea_tokens("host-without-token").is_err(),
+            "пара без '=' — громкая ошибка старта"
+        );
+        assert!(
+            parse_gitea_tokens("host=").is_err(),
+            "пустой token — громкая ошибка старта"
+        );
+        assert!(
+            parse_gitea_tokens("=tok").is_err(),
+            "пустой host — громкая ошибка старта"
+        );
+        assert!(
+            parse_gitea_tokens("git.l4a.ru=tok1,git.l4a.ru=tok2").is_err(),
+            "дубликат хоста — громкая ошибка старта, не молчаливый last-wins"
+        );
     }
 
     #[test]

@@ -1713,6 +1713,25 @@ async fn automerge_pending_is_quiet() {
 }
 
 #[tokio::test]
+async fn automerge_foreign_url_is_quiet_row_stays_review() {
+    // #1269: PR-URL неуправляемого вендора (GHE-форма на чужом хосте,
+    // Gitea без токена, API-отказ инстанса) — Foreign: PR есть, bounce
+    // «PR не найден» ложен; строка ждёт владельца в Review
+    let mut t = task(11, Status::UserReview);
+    carrier(&mut t, 11, true);
+    let (u, board, _, prs) = usecase(vec![t], PrState::Foreign);
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(prs.merges.lock().unwrap().len(), 0, "merge не зовётся");
+    assert_eq!(out.automerged, 0);
+    let log = board.log.lock().unwrap();
+    assert!(
+        !log.iter()
+            .any(|l| l.contains("status#11") || l.contains("comment#11")),
+        "foreign тих: строка ждёт владельца — {log:?}"
+    );
+}
+
+#[tokio::test]
 async fn automerge_docs_only_is_not_probed() {
     // docs-only (нет PR и ветки) — домен не решает Automerge: тик не
     // прощупывает PR, строка ждёт владельца в Review (#1232)

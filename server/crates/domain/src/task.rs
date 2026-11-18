@@ -329,7 +329,8 @@ impl PrUrl {
         &self.0
     }
 
-    /// Грубая PR-форма URL: хвост пути `/pull/<n>`, хвостовой `/` допустим,
+    /// Грубая PR-форма URL: хвост пути `/pull/<n>` или `/pulls/<n>`
+    /// (GitHub/GHE и Gitea/Forgejo семейства), хвостовой `/` допустим,
     /// хост не важен. Домен отвечает только «это вообще PR-форма?»; вендор
     /// и строгость (literal github.com, чужие сущности по числовым
     /// сегментам) — адаптер в своём parse_pr_url (#1155). Query/fragment и
@@ -343,7 +344,7 @@ impl PrUrl {
         let Some((head, tail)) = path.rsplit_once('/') else {
             return false;
         };
-        if !head.ends_with("/pull") {
+        if !head.ends_with("/pull") && !head.ends_with("/pulls") {
             return false;
         }
         !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit())
@@ -604,8 +605,9 @@ mod tests {
         assert!(!pull("https://github.com/o/r/wiki/a"));
         assert!(!pull("https://github.com/o/r/issues/1279"));
         assert!(!pull("https://github.com/o/r/blob/main/docs/x.md"));
-        // чужой вендор: Gitea /pulls/ — не форма (#1269 — его вендор-парс)
-        assert!(!pull("https://git.l4a.ru/o/r/pulls/7"));
+        // #1269: Gitea /pulls/<n> — вторая грубая форма (Gitea/Forgejo
+        // семейство): гейт пускает, вендор-разбор — в адаптере
+        assert!(pull("https://git.l4a.ru/o/r/pulls/7"), "#1269: Gitea-форма");
         // мусорные хвосты: строгий слой их отвергнет — гейт не пускает
         assert!(!pull("https://github.com/o/r/pull/"), "пустой номер");
         assert!(!pull("https://github.com/o/r/pull/abc"), "нецифровой номер");
