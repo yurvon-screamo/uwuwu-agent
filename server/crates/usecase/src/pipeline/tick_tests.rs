@@ -1752,6 +1752,9 @@ async fn mixed_health_candidate_decided_by_status_fallback_at_cup_gate() {
             fields_fails: false,
             set_session_fails: false,
         });
+        // master-break #1155 x #1263: struct вырос probes, оба новых
+        // теста #1263 не догнали (тесты мастера не компилировались);
+        // починено попутно в #1259, факт — в отчёте задачи
         let prs = Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
@@ -1809,6 +1812,7 @@ async fn foreign_executor_failure_does_not_blind_project_guard() {
         fields_fails: false,
         set_session_fails: false,
     });
+    // master-break #1155×#1263 (см. соседний тест): probes не догнали
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
         merges: Mutex::default(),
