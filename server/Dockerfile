@@ -2,7 +2,7 @@
 # Workspace: crates/{domain,usecase,server}; protoc — свежий бинаррь для lance-стека
 FROM rust:slim AS build
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl unzip ca-certificates \
+    && apt-get install -y --no-install-recommends curl unzip ca-certificates gcc libc6-dev \
     && curl -sSL "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-x86_64.zip" -o /tmp/protoc.zip \
     && unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*' \
     && chmod +x /usr/local/bin/protoc \
@@ -11,6 +11,7 @@ RUN apt-get update \
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY ops/thp_off.c ops/thp_off.c
 # BuildKit cache mounts: registry + target переживают билды — инкрементальная
 # сборка вместо полной пересборки lance/arrow/tokio на каждую правку
 # (было ~20 мин, с тёплым кешем точечные правки — минуты).
@@ -22,13 +23,15 @@ COPY crates ./crates
 RUN --mount=type=cache,id=s/a340b061-1816-4db5-a915-0444ec0084fe-/usr/local/cargo/registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=s/a340b061-1816-4db5-a915-0444ec0084fe-/build/target,target=/build/target \
     cargo build --release --bin uwuwu-server \
-    && cp /build/target/release/uwuwu-server /build/uwuwu-server
+    && cp /build/target/release/uwuwu-server /build/uwuwu-server \
+    && cc -O2 -o /build/thp_off ops/thp_off.c
 
 FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /build/uwuwu-server /usr/local/bin/uwuwu-server
+COPY --from=build /build/thp_off /usr/local/bin/thp_off
 COPY config.toml /app/config.toml
 WORKDIR /app
 ENV UWUWU_SERVER_CONFIG=/app/config.toml
@@ -37,4 +40,7 @@ EXPOSE 8090
 # платформенный HTTP-healthcheck не подошёл бы, проверяем TCP; bash /dev/tcp.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD bash -c 'exec 3<>/dev/tcp/127.0.0.1/8090' || exit 1
-CMD ["uwuwu-server"]
+# CMD через thp_off (срез A #1294): prctl PR_SET_THP_DISABLE переживает
+# execve — весь процесс без THP; Railway-метрика = cgroup, THP раздувает
+# cgroup-учёт (прецедент TrailBase, A/B −34%). Откат — revert коммита.
+CMD ["thp_off", "uwuwu-server"]
