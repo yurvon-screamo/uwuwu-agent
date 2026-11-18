@@ -212,7 +212,10 @@ async fn run_turn(deps: &BotDeps, chat_id: i64, text: &str) -> UsecaseResult<()>
     deps.sessions.prompt(&session, &prompt_text).await?;
     if need_manual && deps.structural.agent.is_none() {
         deps.state.set_bot_manual_hash(&deps.slug, manual_hash);
-        deps.state.save().ok();
+        if let Err(e) = deps.state.save() {
+            tracing::warn!(event = "bot.state_save_failed", slug = %deps.slug, error = %e,
+                "Manual-hash не персистится — методичка уедет повторно после рестарта");
+        }
     }
     match wait_reply(deps, &session, baseline).await {
         Some(reply) if !reply.trim().is_empty() => send(deps, chat_id, &reply).await?,

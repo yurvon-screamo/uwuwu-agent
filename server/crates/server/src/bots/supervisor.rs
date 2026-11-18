@@ -289,7 +289,10 @@ impl BotSupervisor {
                         Some(BotAction::RecreateSession) => {
                             entry.task.abort();
                             self.state.set_bot_session(slug, None);
-                            let _ = self.state.save();
+                            if let Err(e) = self.state.save() {
+                                tracing::warn!(event = "bot.state_save_failed", slug = %slug, error = %e,
+                                    "Сброс сессии не персистится — рестарт реанимирует старую сессию без новой model/workspace");
+                            }
                             tracing::info!(event = "bot.session_recreated", slug = %slug,
                                 reason = "structural",
                                 "Смена model/workspace — сессия пересоздаётся, память сброшена");
