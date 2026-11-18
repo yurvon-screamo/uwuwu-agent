@@ -888,6 +888,7 @@ fn routed_usecase(
         clock,
         state: Arc::new(MemState(Mutex::default())),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        boot_ms: 0,
     }
 }
 
@@ -2996,7 +2997,7 @@ async fn restored_counters_from_previous_process_do_not_escalate_on_first_tick()
         }),
         clock: Arc::new(BigClock),
         state: Arc::new(seeded),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: NOW,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
@@ -3067,7 +3068,7 @@ async fn counters_earned_by_current_process_still_escalate() {
         }),
         clock: Arc::new(BigClock),
         state: Arc::new(seeded),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: NOW - 50 * 60_000,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
@@ -3146,7 +3147,7 @@ async fn escalation_deferred_when_liveness_probe_unreliable() {
         }),
         clock: Arc::new(BigClock),
         state: Arc::new(seeded),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: NOW - 50 * 60_000,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
@@ -3208,7 +3209,7 @@ async fn probe_failure_records_outcome_without_escalation_or_counters() {
         }),
         clock: Arc::new(BigClock),
         state: state.clone(),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
@@ -3284,7 +3285,7 @@ async fn probe_failure_isolated_per_row_other_rows_processed() {
         }),
         clock: Arc::new(BigClock),
         state: Arc::new(MemState(Mutex::default())),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
@@ -3357,7 +3358,7 @@ async fn probe_degradation_strip_reaches_threshold_signal() {
         }),
         clock: Arc::new(BigClock),
         state: Arc::new(MemState(Mutex::default())),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
