@@ -502,6 +502,42 @@ impl GitHubHub {
         );
     }
 
+    /// Кеш-гигиена снапшота после записи нестатусных ячеек (#1258):
+    /// строка в кешированном снимке — write-through записанных значений
+    /// (read-your-writes, без рефетча и расхода GraphQL-бюджета);
+    /// снимка нет или строки в нём нет — инвалидация (окно create:
+    /// add_to_board инвалидирует до записи полей — свежий фетч мог
+    /// закешироваться без полей).
+    fn settle_board_cells(
+        &self,
+        board: &str,
+        number: u64,
+        priority: Option<&str>,
+        automerge: Option<bool>,
+    ) {
+        let now = std::time::Instant::now();
+        let Some(hit) = self.snap_cache.get(board, now) else {
+            return; // снимка нет — нечего гигиенить, фетч увидит поля
+        };
+        let (mut rows, meta) = hit.as_ref().clone();
+        let row_present = rows.iter_mut().any(|t| t.number() == number);
+        if !row_present {
+            // окно create: снимок мог закешироваться без полей — сброс,
+            // следующий фетч несёт записанные значения
+            self.invalidate_snapshot(board);
+            return;
+        }
+        for task in rows.iter_mut().filter(|t| t.number() == number) {
+            if let Some(p) = priority {
+                task.set_priority(uwuwu_usecase::parse_priority(p));
+            }
+            if let Some(a) = automerge {
+                task.set_automerge(a);
+            }
+        }
+        self.snap_cache.put(board, (rows, meta), now);
+    }
+
     /// Контрольное чтение после мутации статуса (семья #1213): до 3
     /// попыток с паузой 1 с. Rate limit — ретраи не продолжаются
     /// (мутация принята GitHub); сетевой сбой и рассогласование —
@@ -830,6 +866,36 @@ impl TaskBoardRepo for GitHubHub {
             )
             .await?;
         self.invalidate_snapshot(_board);
+        Ok(())
+    }
+
+    async fn set_board_cells(
+        &self,
+        board: &str,
+        number: u64,
+        priority: Option<&str>,
+        automerge: Option<bool>,
+    ) -> UsecaseResult<()> {
+        // поля — нативные issue (REST), как и у set_branch
+        let mut patch: Vec<(&str, Option<String>)> = Vec::new();
+        if let Some(p) = priority {
+            patch.push((
+                crate::github::fields::F_PRIORITY,
+                Some(p.trim().to_string()),
+            ));
+        }
+        if let Some(a) = automerge {
+            patch.push((
+                uwuwu_usecase::F_AUTOMERGE,
+                Some(if a { "on" } else { "off" }.to_string()),
+            ));
+        }
+        if !patch.is_empty() {
+            self.fields.store(number, &patch).await?;
+        }
+        // read-your-writes (#1258): кеш-гигиена снапшота — write-through
+        // записанных значений при живой строке, инвалидация при отсутствующей
+        self.settle_board_cells(board, number, priority, automerge);
         Ok(())
     }
 
@@ -1240,6 +1306,62 @@ mod tests {
                 .is_none(),
             "статусный кэш откатан"
         );
+    }
+
+    /// #1258: write-through нестатусных ячеек — записанные Приоритет/
+    /// Automerge видны кешированному снапшоту сразу (read-your-writes,
+    /// симметрия write_through_status).
+    #[test]
+    fn board_cells_write_through_updates_snapshot() {
+        let hub = GitHubHub::new("o/r".into(), "t".into());
+        hub.snap_cache.put(
+            "B",
+            (
+                vec![Task::new(7, "строка".into(), Status::Analys)],
+                BoardMeta::default(),
+            ),
+            std::time::Instant::now(),
+        );
+        hub.settle_board_cells("B", 7, Some("high"), Some(true));
+        let snap = hub
+            .snap_cache
+            .get("B", std::time::Instant::now())
+            .expect("снапшот жив");
+        let t = snap
+            .0
+            .iter()
+            .find(|t| t.number() == 7)
+            .expect("строка в снапшоте");
+        assert_eq!(t.priority(), Priority::High, "приоритет write-through'нут");
+        assert!(t.automerge(), "automerge write-through'нут");
+    }
+
+    /// #1258: строки нет в снимке (окно create) — снимок инвалидируется,
+    /// следующий фетч видит поля; кеш без строки не держится.
+    #[test]
+    fn board_cells_missing_row_invalidates_snapshot() {
+        let hub = GitHubHub::new("o/r".into(), "t".into());
+        hub.snap_cache.put(
+            "B",
+            (
+                vec![Task::new(8, "другая строка".into(), Status::Analys)],
+                BoardMeta::default(),
+            ),
+            std::time::Instant::now(),
+        );
+        hub.settle_board_cells("B", 7, Some("high"), None);
+        assert!(
+            hub.snap_cache.get("B", std::time::Instant::now()).is_none(),
+            "снимок без строки сброшен"
+        );
+    }
+
+    /// #1258: пустой кеш — чистый no-op (инвалидация мимо, без паники).
+    #[test]
+    fn board_cells_without_snapshot_is_clean_noop() {
+        let hub = GitHubHub::new("o/r".into(), "t".into());
+        hub.settle_board_cells("B", 7, Some("high"), None);
+        assert!(hub.snap_cache.get("B", std::time::Instant::now()).is_none());
     }
 
     #[test]

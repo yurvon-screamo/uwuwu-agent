@@ -61,6 +61,16 @@ impl TaskBoardRepo for FakeBoard {
             .push(format!("branch#{n}={}", branch.as_str()));
         Ok(())
     }
+    async fn set_board_cells(
+        &self,
+        _b: &str,
+        _n: u64,
+        _p: Option<&str>,
+        _a: Option<bool>,
+    ) -> UsecaseResult<()> {
+        Ok(())
+    }
+
     async fn clear_session(&self, _b: &str, n: u64, slot: Slot) -> UsecaseResult<()> {
         self.log
             .lock()
@@ -1693,6 +1703,7 @@ async fn mixed_health_candidate_decided_by_status_fallback_at_cup_gate() {
         let prs = Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            probes: Mutex::default(),
         });
         TickUseCase {
             board: board.clone(),
@@ -1749,6 +1760,7 @@ async fn foreign_executor_failure_does_not_blind_project_guard() {
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
         merges: Mutex::default(),
+        probes: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -3186,6 +3198,16 @@ impl TaskBoardRepo for FakeMultiBoard {
     async fn set_branch(&self, _: &str, _: u64, _: &uwuwu_domain::BranchName) -> UsecaseResult<()> {
         Ok(())
     }
+    async fn set_board_cells(
+        &self,
+        _b: &str,
+        _n: u64,
+        _p: Option<&str>,
+        _a: Option<bool>,
+    ) -> UsecaseResult<()> {
+        Ok(())
+    }
+
     async fn clear_session(&self, _b: &str, _n: u64, _s: Slot) -> UsecaseResult<()> {
         Ok(())
     }
@@ -3591,6 +3613,16 @@ impl TaskBoardRepo for CloseBoard {
     async fn set_branch(&self, _: &str, _: u64, _: &uwuwu_domain::BranchName) -> UsecaseResult<()> {
         Ok(())
     }
+    async fn set_board_cells(
+        &self,
+        _b: &str,
+        _n: u64,
+        _p: Option<&str>,
+        _a: Option<bool>,
+    ) -> UsecaseResult<()> {
+        Ok(())
+    }
+
     async fn clear_session(&self, _: &str, _: u64, _: Slot) -> UsecaseResult<()> {
         Ok(())
     }

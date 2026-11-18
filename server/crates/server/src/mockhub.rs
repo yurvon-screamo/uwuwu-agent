@@ -20,9 +20,6 @@ struct HubState {
     board_tags: HashMap<u64, String>,
     /// number → поля (сессии/ветка/PR)
     fields: HashMap<u64, TaskFields>,
-    /// number → автомерж (#1232: колонка «Automerge», legacy «Autodone» —
-    /// read-алиас; mock-носитель ячейки — мерж-гейт тика на стенде)
-    automerge: HashMap<u64, bool>,
     /// number → тело issue
     bodies: HashMap<u64, String>,
     /// number → комменты
@@ -172,9 +169,6 @@ impl TaskBoardRepo for MemoryHub {
                 if let Some(f) = state.fields.get(&t.number()) {
                     t.apply_fields(f.clone());
                 }
-                if let Some(on) = state.automerge.get(&t.number()) {
-                    t.set_automerge(*on);
-                }
             }
             rows.sort_by_key(|t| t.number());
             Ok(rows)
@@ -237,6 +231,32 @@ impl TaskBoardRepo for MemoryHub {
         })
     }
 
+    async fn set_board_cells(
+        &self,
+        _board: &str,
+        number: u64,
+        priority: Option<&str>,
+        automerge: Option<bool>,
+    ) -> UsecaseResult<()> {
+        self.with_state(|state| {
+            // сид материализуется лениво — симметрично row_status/set_status
+            self.ensure_seed(state);
+            let task = state
+                .tasks
+                .get_mut(&number)
+                .ok_or_else(|| UsecaseError::Board(format!("mockhub: #{number} нет")))?;
+            // ячейки снапшота — часть строки стенда; apply_fields при
+            // read_board Empty-приоритет не стирает (домен)
+            if let Some(p) = priority {
+                task.set_priority(uwuwu_usecase::parse_priority(p));
+            }
+            if let Some(a) = automerge {
+                task.set_automerge(a);
+            }
+            Ok(())
+        })
+    }
+
     async fn clear_session(&self, _board: &str, number: u64, slot: Slot) -> UsecaseResult<()> {
         self.with_state(|state| {
             state.fields.entry(number).or_default().clear_session(slot);
@@ -282,9 +302,6 @@ impl TaskBoardRepo for MemoryHub {
             // read_board (реальный hub несёт поля inline в GET issue)
             if let Some(f) = state.fields.get(&number) {
                 task.apply_fields(f.clone());
-            }
-            if let Some(on) = state.automerge.get(&number) {
-                task.set_automerge(*on);
             }
             let body = state.bodies.get(&number).cloned().unwrap_or_default();
             let comments = state.comments.get(&number).cloned().unwrap_or_default();
@@ -470,12 +487,19 @@ impl IssueFieldStore for MemoryHub {
                     }
                     ("Automerge" | "Autodone", Some(v)) => {
                         // автомерж-ячейка (#1232): canonical «Automerge»,
-                        // legacy «Autodone» — в одну клетку; on/true — вкл
-                        state.automerge.insert(number, v == "on" || v == "true");
+                        // legacy «Autodone» — в одну клетку; on/true — вкл.
+                        // Хранилище — поле строки (#1258: один механизм,
+                        // карта снесена; set_board_cells пишет туда же)
+                        if let Some(task) = state.tasks.get_mut(&number) {
+                            task.set_automerge(v == "on" || v == "true");
+                        }
                     }
                     ("Automerge" | "Autodone", None) => {
-                        // очистка по контракту store (None — снять)
-                        state.automerge.remove(&number);
+                        // очистка по контракту store (None — снять);
+                        // в поле строки два состояния — false как default
+                        if let Some(task) = state.tasks.get_mut(&number) {
+                            task.set_automerge(false);
+                        }
                     }
                     ("PR", Some(v)) => {
                         if let Some(p) = uwuwu_domain::PrUrl::parse(v) {
@@ -557,7 +581,8 @@ mod tests {
         // #1155 (поручение владельца): mock-носитель хранит автомерж-ячейку —
         // write-path («Automerge», legacy «Autodone» в одну клетку) →
         // снапшот-риды несут флаг; без этого тик стенда слеп к мерж-гейту
-        // (automerge_ready всегда false) и fm врёт «automerge: false»
+        // (automerge_ready всегда false) и fm врёт «automerge: false».
+        // Хранилище — поле строки (#1258: один механизм, карта снесена)
         let hub = MemoryHub::with_seed(Some((9, Status::UserReview)));
         use uwuwu_usecase::IssueFieldStore;
         // сид материализуется лениво (ensure_seed на ридах) — как в пине
@@ -586,5 +611,49 @@ mod tests {
             !hub.read_board("B").await.unwrap()[0].automerge(),
             "None — очистка по контракту store"
         );
+    }
+
+    /// Read-your-writes нестатусных ячеек снапшота (#1258): запись
+    /// Приоритета/Automerge видна read_board сразу. До фикса поля шли
+    /// мимо стейта (fields.store их терял) — task_list показывал
+    /// до-мутационные значения до TTL (проба на проде 18.11).
+    #[tokio::test]
+    async fn board_cells_are_visible_to_read_board_immediately() {
+        let hub = MemoryHub::with_seed(Some((7, Status::Analys)));
+        hub.set_board_cells("B", 7, Some("high"), Some(true))
+            .await
+            .expect("запись ячеек");
+        let rows = hub.read_board("B").await.expect("чтение доски");
+        let t = rows
+            .iter()
+            .find(|t| t.number() == 7)
+            .expect("строка на доске");
+        assert_eq!(
+            t.priority(),
+            uwuwu_domain::Priority::High,
+            "приоритет виден сразу"
+        );
+        assert!(t.automerge(), "automerge виден сразу");
+    }
+
+    /// Свежая строка (окно create: add_to_board инвалидирует снапшот ДО
+    /// записи полей) — записанные поля приземляются в read_board (#1258).
+    #[tokio::test]
+    async fn created_row_board_cells_landed_in_read_board() {
+        let hub = MemoryHub::with_seed(None);
+        let n = hub
+            .create_issue("B", "uwuwu", "строка", "тело")
+            .await
+            .expect("создание строки");
+        hub.set_board_cells("B", n, Some("low"), Some(false))
+            .await
+            .expect("запись ячеек свежей строки");
+        let rows = hub.read_board("B").await.expect("чтение доски");
+        let t = rows
+            .iter()
+            .find(|t| t.number() == n)
+            .expect("строка на доске");
+        assert_eq!(t.priority(), uwuwu_domain::Priority::Low);
+        assert!(!t.automerge());
     }
 }
