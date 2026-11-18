@@ -1693,6 +1693,7 @@ async fn mixed_health_candidate_decided_by_status_fallback_at_cup_gate() {
         let prs = Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            probes: Mutex::default(),
         });
         TickUseCase {
             board: board.clone(),
@@ -1749,6 +1750,7 @@ async fn foreign_executor_failure_does_not_blind_project_guard() {
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
         merges: Mutex::default(),
+        probes: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
