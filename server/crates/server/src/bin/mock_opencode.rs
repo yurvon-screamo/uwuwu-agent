@@ -454,8 +454,9 @@ async fn prompt(
     if let Some(s) = sessions.get_mut(&id) {
         s.updated_ms = now_ms();
         s.busy_ms = now_ms(); // Started: ход в полёте (CUP-учёт, #1231)
-                              // Маркер turn probe (#1209): сессия отвечает многосообщным ходом —
-                              // мгновенный реплай не ставится, message_tail строит фазы пробы
+
+        // Маркер turn probe (#1209): сессия отвечает многосообщным ходом —
+        // мгновенный реплай не ставится, message_tail строит фазы пробы
         if text.contains("turn probe") {
             s.turn_ms = Some(now_ms());
             s.reply = None;
