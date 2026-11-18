@@ -347,6 +347,28 @@ impl TaskWriter for TaskWriteUseCase {
                     "тайтл «{title}» уже занят другой строкой"
                 )));
             }
+            // холодный ящик (#1293, Low дельта-раунда 2): rename-гард
+            // сверяется и с закрытыми вне снапшота строками — инвариант
+            // «тайтл уникален» единый с create (issues_with_title, REST);
+            // сбой поиска — fail-open (первичный снапшот-гард отработал)
+            let cold = match self.board.issues_with_title(title).await {
+                Ok(found) => found,
+                Err(e) => {
+                    tracing::warn!(
+                        event = "dup_check.search_failed",
+                        title = %title,
+                        error = %e,
+                        "REST-поиск тайтлов недоступен при rename — холодный гард пропущен"
+                    );
+                    Vec::new()
+                }
+            };
+            if cold.iter().any(|n| *n != number) {
+                return Err(UsecaseError::Board(format!(
+                    "тайтл «{title}» уже занят issue #{} — дубль запрещён (строка вне снапшота: холодный ящик)",
+                    cold[0]
+                )));
+            }
             self.board.rename_issue(number, title).await?;
         }
         // ветка/PR — нативные поля issue (в снапшоте не живут)
@@ -689,6 +711,8 @@ mod tests {
 
     /// Сбой REST-поиска (Low-2 ревью #1293) — fail-open: create живёт
     /// (первичный снапшот-гард отработал), warn в логе.
+    /// Сбой REST-поиска (Low-2 ревью #1293) — fail-open: create живёт
+    /// (первичный снапшот-гард отработал), warn в логе.
     #[tokio::test]
     async fn create_cold_search_failure_fails_open() {
         let fields = Arc::new(FakeFields::default());
@@ -709,6 +733,37 @@ mod tests {
             .await
             .expect("сбой поиска не валит create");
         assert_eq!(number, 1, "issue создан — гард fail-open");
+    }
+
+    /// Холодный ящик (#1293, Low дельта-раунда 2): rename в тайтл закрытой
+    /// вне снапшота строки — громкая ошибка; свой тайтл (тот же номер)
+    /// холодным дублем не считается (идемпотентная правка легальна).
+    #[tokio::test]
+    async fn rename_rejects_title_of_cold_row_but_allows_own() {
+        let fields = Arc::new(FakeFields::default());
+        let board = Arc::new(FakeBoard {
+            cells: std::sync::Mutex::default(),
+            cold_hits: vec![1243],
+            search_err: false,
+        });
+        let u = TaskWriteUseCase {
+            board: board.clone(),
+            fields,
+            boards: vec![("uwuwu".into(), "Задачи uwuwu".into())],
+            clock: Arc::new(crate::pipeline::tick_tests::FixedClock),
+            state: Arc::new(crate::pipeline::tick_tests::MemState::empty()),
+        };
+        // строка 5 переименовывается в тайтл холодной #1243 — отказ
+        let mut p = TaskPatch::default();
+        p.title = Some("тайтл архивной задачи".into());
+        let err = u
+            .edit("uwuwu", 5, p)
+            .await
+            .expect_err("rename в холодный тайтл обязан отклоняться");
+        assert!(
+            err.to_string().contains("1243"),
+            "ошибка называет холодный номер: {err}"
+        );
     }
 
     /// Красный тест бага #1232 → контракт #1258: create маршрутизирует
