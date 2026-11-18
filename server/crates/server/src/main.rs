@@ -10,6 +10,8 @@ mod clock;
 mod config;
 mod diag;
 mod executor;
+#[cfg(test)]
+mod executor_signal_tests;
 mod gherr;
 #[cfg(test)]
 mod gherr_tests;
