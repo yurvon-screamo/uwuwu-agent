@@ -181,6 +181,19 @@ pub trait AgentSessionGateway: Send + Sync {
     async fn run_command(&self, session: &str, name: &str, args: &str) -> UsecaseResult<()>;
     async fn liveness(&self, session: &str) -> Liveness;
     async fn delete_session(&self, session: &str) -> UsecaseResult<()>;
+    /// Прервать активный ход сессии (преемпшен CUP #1259): opencode
+    /// `POST /session/:id/abort` — «stop any ongoing AI processing».
+    /// Дефолт Ok(()) — фейки портов не переопределяют; прод-гейтвеи
+    /// (opencode, budget-обёртка) несут настоящую ручку.
+    async fn abort_session(&self, _session: &str) -> UsecaseResult<()> {
+        Ok(())
+    }
+    /// Бюджетная проба без мутаций (преемпшен #1259: готовность
+    /// кандидата проверяется ДО гашения жертвы — жертва зря не гибнет).
+    /// Дефолт true — ограничение только у budget-обёртки.
+    fn spawn_allowed(&self) -> bool {
+        true
+    }
     /// ms последней активности сессии (последнее сообщение) или None.
     async fn last_activity_ms(&self, session: &str) -> UsecaseResult<Option<u64>>;
     /// Последний ассистентский ответ сессии (для ботов: ожидание реплая).

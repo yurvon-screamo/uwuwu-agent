@@ -396,4 +396,83 @@ SRV_PID=""; MOCK_PID=""
 sleep 1
 say "фаза 7 ок: окно gate-заглушки держит спавн и отпускает после снятия (#1160)"
 
-say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + мульти-экзекьютор + гард #1163 + self-эхо + слепой hold #1263 + gate-заглушка #1160); логи: $RUN_DIR"
+say "фаза 8: преемпшен CUP — понижение приоритета busy-актива отдаёт слот (#1259)"
+# свой стек (фаза 5 вычищена своим хвостом) и свой конфиг с капом 1:
+# один слот — жертва держит, кандидат ждёт; мок busy — жертва не отвечает
+CONFIG_PREEMPT="$RUN_DIR/config.preempt.toml"
+cat > "$CONFIG_PREEMPT" <<EOF
+mode = "live"
+poll_sec = 10
+port = $PORT_SRV
+
+[hub]
+repo = "yurvon-screamo/uwuwu-hub"
+driver = "memory"
+
+[executor]
+name = "local-mock"
+url = "http://127.0.0.1:$PORT_MOCK"
+
+[policy]
+cup = 1
+peak = { enabled = false, start_min = 0, end_min = 0 }
+
+[[project]]
+name = "uwuwu"
+board = "Задачи uwuwu"
+repo = "yurvon-screamo/uwuwu-agent"
+checkout = "/home/yurvon/uwuwu-agent"
+env_root = "/home/yurvon/agents-env"
+EOF
+rm -f "$STATE"
+LOG_SRV_PRE="$RUN_DIR/server-preempt.log"
+MOCK_MODE=busy MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=1500 \
+  "$BIN_DIR/mock_opencode" >"$LOG_MOCK" 2>&1 &
+MOCK_PID=$!
+sleep 1
+UWUWU_SERVER_CONFIG=$CONFIG_PREEMPT UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
+  UWUWU_SERVER_MODE=live \
+  UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
+  UWUWU_MOCK_SEED="2046:In Progress:High;2048:In Progress:High" \
+  RUST_LOG=info "$BIN_DIR/uwuwu-server" >"$LOG_SRV_PRE" 2>&1 &
+SRV_PID=$!
+# тики до HeldCup: жертва 2046 спавнится и busy (не отвечает), кандидат
+# 2048 held — high-жертва не гасится (can_preempt false) → cup.preempt.no_victim
+SEEN=0
+while [ $SEEN -lt 12 ]; do
+  SEEN=$((SEEN + 1))
+  sleep 5
+  grep -q '"event":"cup.preempt.no_victim"' "$LOG_SRV_PRE" && break
+done
+grep -q '"event":"cup.preempt.no_victim"' "$LOG_SRV_PRE" \
+  || fail "кандидат не достиг HeldCup (нет no_victim за минуту)"
+SPAWN2046=$(grep -oE '"event":"spawn.done","number":2046,"slot":"Dev"' "$LOG_SRV_PRE" | wc -l || true)
+[ "$SPAWN2046" -ge 1 ] || fail "жертва 2046 не заспавнена"
+say "held-фаза ок: high-жертва держит слот (no_victim), спавнов кандидата 0"
+# владелец понижает приоритет busy-актива: high → low
+mcp task_edit '{"number":2046,"project":"uwuwu","priority":"low"}' | grep -q '"isError":false' \
+  || fail "task_edit priority не применился (мок-hub не носит приоритет?)"
+# ближайший тик: cup.preempt (abort+delete жертвы) → слот кандидату
+SEEN=0
+while [ $SEEN -lt 12 ]; do
+  SEEN=$((SEEN + 1))
+  sleep 5
+  grep -q '"event":"cup.preempt"' "$LOG_SRV_PRE" && break
+done
+grep -q '"event":"cup.preempt","waiter":2048,"victim":2046' "$LOG_SRV_PRE" \
+  || fail "cup.preempt не случился (waiter 2048 / victim 2046)"
+grep -q '"event":"spawn.done","number":2048,"slot":"Dev"' "$LOG_SRV_PRE" \
+  || fail "кандидат 2048 не получил слот после преемпшена"
+grep -q 'mock.session_aborted' "$LOG_MOCK" \
+  || fail "abort-рута исполнителя не дёрнулась"
+LEFT=$(curl -s --max-time 5 "http://127.0.0.1:$PORT_MOCK/api/session" | grep -c '"title":"#2046 ' || true)
+[ "$LEFT" -eq 0 ] || fail "жертва 2046 не удалена с исполнителя (delete пропущен?)"
+grep -q '"preempts":1,' "$LOG_SRV_PRE" || fail "tick.completed не несёт preempts=1"
+grep -q 'loop_escalated' "$LOG_SRV_PRE" && fail "луп-гвард эскалировал"
+# pid-scoped зачистка (конвенция #1263): чужие стенды не трогаем
+kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+SRV_PID=""; MOCK_PID=""
+say "фаза 8 ок: понижение приоритета отдало слот (2046 abort+delete, 2048 заспавнен)"
+
+say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + мульти-экзекьютор + гард #1163 + self-эхо + слепой hold #1263 + преемпшен CUP #1259); логи: $RUN_DIR"

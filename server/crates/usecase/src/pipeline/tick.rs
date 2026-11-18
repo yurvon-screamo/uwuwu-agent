@@ -9,10 +9,10 @@ use crate::router::SessionRouter;
 use crate::spawn_models::SpawnModels;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use uwuwu_domain::{
-    decide, gate, spawn_guard, Action, Awaits, Gate, LoopOutcome, SessionSighting, Slot,
-    SpawnGuard, SpawnLoop, SpawnPolicy, Status, Task,
+    decide, gate, spawn_guard, Action, Awaits, Gate, LoopOutcome, Priority, SessionSighting,
+    Slot, SpawnGuard, SpawnLoop, SpawnPolicy, Status, Task,
 };
 
 /// Режим конвейера: observe — только решения в лог; live — исполнение.
@@ -98,6 +98,8 @@ pub struct TickOutcome {
     /// Спавнов, удержанных слепотой: список исполнителя проекта недоступен,
     /// спавн без зрения невозможен (#1263).
     pub held_blind: usize,
+    /// Гашений low/empty-активов при отдаче слота кандидату (#1259).
+    pub preempts: usize,
     /// Строк, пропущенных тиком при отказе enrichment (#1163): решение
     /// по невидимым ячейкам — источник дублей, ждём следующий тик.
     pub enrich_skipped: usize,
@@ -134,6 +136,57 @@ pub(crate) enum SpawnHold {
     Live,
 }
 
+/// Кандидат-жертва преемпшена (#1259): busy low/empty-строка доски, чей
+/// слот CUP может быть отдан кандидату строже нижнего ранга. Не-строки
+/// (кроны/боты/ручные сессии) в пул не попадают структурно — отбор идёт
+/// только по строкам досок.
+#[derive(Debug, Clone)]
+pub(crate) struct PreemptCandidate {
+    /// Проект-исполнитель жертвы (abort/delete — через её гейтвей).
+    pub project: String,
+    pub number: u64,
+    pub session: String,
+    pub priority: Priority,
+    /// ms спавна слота жертвы: детерминизм выбора (свежее — раньше).
+    pub spawned_ms: u64,
+}
+
+/// Пул жертв тика: собирается в run() из union-скана, расходуется
+/// HeldCup-ветками run_board (по одной жертве на отдачу слота).
+/// Mutex — не для параллелизма (доски обходятся последовательно):
+/// interior mutability для изъятия жертв между досками сквозь await
+/// и Send-ность будущего тика.
+#[derive(Default)]
+pub(crate) struct PreemptPool {
+    candidates: Mutex<Vec<PreemptCandidate>>,
+}
+
+impl PreemptPool {
+    fn push(&self, c: PreemptCandidate) {
+        self.candidates.lock().unwrap().push(c);
+    }
+
+    /// Взять жертву для кандидата: строго ниже рангом; среди подходящих —
+    /// минимальный ранг, при равенстве — свежее заспавненная (контекст
+    /// младше — дешевле потерять). Достаёт из пула (повторное гашение
+    /// одной жертвы в тике невозможно).
+    fn take(&self, waiter: &Task) -> Option<PreemptCandidate> {
+        let mut cands = self.candidates.lock().unwrap();
+        let idx = cands
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| uwuwu_domain::can_preempt(waiter.priority(), c.priority))
+            .min_by_key(|(_, c)| {
+                (
+                    std::cmp::Reverse(c.priority.rank()),
+                    std::cmp::Reverse(c.spawned_ms),
+                )
+            })
+            .map(|(i, _)| i)?;
+        Some(cands.remove(idx))
+    }
+}
+
 /// Контекст строки тика: данные union-скана и enrichment, общие для
 /// прохода доски (#1163). Не решение — вход решений.
 pub(crate) struct RowContext<'a> {
@@ -144,6 +197,8 @@ pub(crate) struct RowContext<'a> {
     pub(crate) sightings: Option<&'a [SessionSighting]>,
     /// Строки с отказом enrichment — тиком пропускаются.
     pub(crate) enrich_failed: &'a HashSet<u64>,
+    /// Кандидаты-жертвы преемпшена (#1259): busy low/empty-активы.
+    pub(crate) preempts: &'a PreemptPool,
 }
 
 impl TickUseCase {
@@ -271,6 +326,46 @@ impl TickUseCase {
                 }
             }
         }
+        // Пул жертв преемпшена (#1259) на #1231-базе: busy берётся из
+        // union-скана (SessionInfo.busy), не пер-сессионными пробами.
+        // Blind/fallback (scan None) пул не наполняет — гасить без зрения
+        // нельзя (#1263); idle-жертвы не попадают (капа не держат);
+        // high/medium не гасятся никогда. Не-строки (кроны/боты/ручные)
+        // вне пула структурно — отбор только по строкам досок.
+        let preempt_pool = PreemptPool::default();
+        if let Some(list) = &scan {
+            for (bp, tasks) in boards.iter() {
+                for t in tasks.iter() {
+                    if !t.status().is_active() {
+                        continue;
+                    }
+                    let Some(slot) = t.stage_slot() else { continue };
+                    let Some(session) = t.session_of(slot) else {
+                        continue;
+                    };
+                    let Some(info) = list.iter().find(|s| s.id == *session) else {
+                        continue; // мёртвая — гасить нечего
+                    };
+                    if !info.busy {
+                        continue; // idle не держит кап
+                    }
+                    if !matches!(t.priority(), Priority::Low | Priority::Empty) {
+                        continue;
+                    }
+                    let spawned_ms = self
+                        .state
+                        .last_spawn_ms(&bp.board, t.number(), slot)
+                        .unwrap_or(0);
+                    preempt_pool.push(PreemptCandidate {
+                        project: bp.project.clone(),
+                        number: t.number(),
+                        session: session.to_string(),
+                        priority: t.priority(),
+                        spawned_ms,
+                    });
+                }
+            }
+        }
         let global_active: usize = match &scan {
             Some(list) => list.iter().filter(|s| s.busy).count(),
             None => fallback_active,
@@ -294,6 +389,7 @@ impl TickUseCase {
                     &RowContext {
                         sightings,
                         enrich_failed: &enrich_failed,
+                        preempts: &preempt_pool,
                     },
                     out,
                 )
@@ -308,6 +404,7 @@ impl TickUseCase {
             spawns = out.spawns_done,
             held_cup = out.held_cup,
             sessions_busy = out.sessions_busy,
+            preempts = out.preempts,
             deferred_peak = out.deferred_peak,
             wakeups = out.wakeups,
             wakeups_deferred = out.wakeups_deferred,
@@ -465,7 +562,19 @@ impl TickUseCase {
                         }
                         None => {}
                     }
-                    let gated = gate(task, &action, plan.policy, *active_now, now);
+                    let mut gated = gate(task, &action, plan.policy, *active_now, now);
+                    if matches!(gated, Gate::HeldCup { .. }) && plan.mode == Mode::Live {
+                        // Отдача слота при понижении приоритета (#1259):
+                        // спавн кандидата держит кап, есть busy-жертва
+                        // строго ниже рангом → гасим её и отдаём слот на
+                        // этом же тике (детали — в try_preempt).
+                        if self
+                            .try_preempt(board, task, ctx, active_now, &mut out)
+                            .await
+                        {
+                            gated = gate(task, &action, plan.policy, *active_now, now);
+                        }
+                    }
                     match gated {
                         Gate::Allowed => {
                             out.spawns_allowed += 1;
@@ -575,6 +684,87 @@ impl TickUseCase {
             }
         }
         Ok(out)
+    }
+
+    /// Отдача слота при понижении приоритета (#1259): кандидат держится
+    /// капом, в пуле есть busy-жертва строго ниже рангом → гасим её
+    /// (abort+delete) и освобождаем слот на этом же тике. Возвращает
+    /// true, если слот освобождён (кандидату нужен повторный гейт).
+    /// Готовность кандидата ДО гашения: бюджетная проба (жертва зря не
+    /// гибнет); кулдаун/луп-гард/гард «одна живая» уже пройдены выше по
+    /// коду тика. Пик-окно сюда не доходит: DeferredPeak проверяется
+    /// гейтом раньше CUP — не-high кандидаты жертв не гасят.
+    /// Отказ гашения — громкий event, ретрай следующим тиком (тихого
+    /// no-op нет: abort-first с фоллбеком в гейтвее, см. opencode.rs).
+    async fn try_preempt(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        ctx: &RowContext<'_>,
+        active_now: &mut usize,
+        out: &mut TickOutcome,
+    ) -> bool {
+        if !self.sessions.project(&board.project).spawn_allowed() {
+            tracing::info!(
+                event = "cup.preempt.budget_held",
+                number = task.number(),
+                "CUP: спавн-бюджет исчерпан — гашения нет (жертва зря не гибнет)"
+            );
+            return false;
+        }
+        let Some(victim) = ctx.preempts.take(task) else {
+            // Причины пустого пула для разбора: fallback-режим (скана нет
+            // — пул структурно пуст), в скане нет busy low/empty-строк,
+            // либо ранги не строго ниже (жертвы-low заняты равным/
+            // высшим кандидатом или уже изъяты этим тиком).
+            tracing::info!(
+                event = "cup.preempt.no_victim",
+                number = task.number(),
+                active = *active_now,
+                "CUP: жертвы в пуле нет — слот не отдаётся"
+            );
+            return false;
+        };
+        let victim_gw = self.sessions.project(&victim.project);
+        let aborted = victim_gw.abort_session(&victim.session).await;
+        let deleted = if aborted.is_ok() {
+            victim_gw.delete_session(&victim.session).await
+        } else {
+            Err(UsecaseError::Session(
+                "abort не прошёл — delete не вызывается".into(),
+            ))
+        };
+        match (aborted, deleted) {
+            (Ok(()), Ok(())) => {
+                // Burn-down корректен: жертва попала в пул только из
+                // busy-учёта фазы 2 (idle не держат кап и в пул не
+                // попадают) — вычёт одного слота ровно соответствует
+                // погашенной трате; сатуратинг страховка от рассинхрона
+                // снапшота и счётчика (спавны тика поверх busy).
+                *active_now = active_now.saturating_sub(1);
+                out.preempts += 1;
+                tracing::info!(
+                    event = "cup.preempt",
+                    waiter = task.number(),
+                    victim = victim.number,
+                    victim_session = %victim.session,
+                    "CUP: слот отдан — low-актив погашен (abort+delete), возобновление штатным respawn'ом"
+                );
+                true
+            }
+            (abort_r, delete_r) => {
+                out.actions_failed += 1;
+                tracing::warn!(
+                    event = "cup.preempt.failed",
+                    waiter = task.number(),
+                    victim = victim.number,
+                    abort = ?abort_r.err(),
+                    delete = ?delete_r.err(),
+                    "CUP: гашение жертвы не удалось — кандидат остаётся held, ретрай следующим тиком"
+                );
+                false
+            }
+        }
     }
 
     /// Плечо Observe стадии: будильник/респавн под политикой запуска
