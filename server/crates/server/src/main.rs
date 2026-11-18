@@ -533,6 +533,57 @@ async fn run(
         });
     }
 
+    {
+        // клин холодного ящика (#1293): терминальные строки старше
+        // sweep_days суток уходят в архив Projects v2 — снапшот несёт
+        // активный контур. sweep_days = 0 — kill-switch: sidecar вообще
+        // не создаётся (дефолт serde 0 = выкл; боевой конфиг — 7).
+        // Обратите внимание: observe-гейт здесь **внутренний**
+        // (sweep_board логирует кандидатов и не мутирует), не общий
+        // no-op `if is_observe { return }` — observe-фаза обязана
+        // показывать кандидатов
+        if cfg.sweep_days > 0 {
+            let sweep_board_repo = board.clone();
+            let sweep_boards = plan.boards.clone();
+            let sweep_clock = clock.clone();
+            sidecars.push(Sidecar {
+                name: "sweeper".into(),
+                tick: Box::new(move || {
+                    let board = sweep_board_repo.clone();
+                    let boards = sweep_boards.clone();
+                    let clock = sweep_clock.clone();
+                    Box::pin(async move {
+                        let now_ms = clock.now_ms();
+                        // Дебаг-гейт одной строки (как у тика): UWUWU_ONLY_TASK
+                        // — клин действует только по ней; живая проба против
+                        // реального репо не запускает сотенную первую волну
+                        let only = std::env::var("UWUWU_ONLY_TASK")
+                            .ok()
+                            .and_then(|v| v.trim().parse::<u64>().ok());
+                        for b in &boards {
+                            let mut tasks = board.read_board(&b.board).await?;
+                            if let Some(n) = only {
+                                tasks.retain(|t| t.number() == n);
+                            }
+                            uwuwu_usecase::sweeper::sweep_board(
+                                board.as_ref(),
+                                &b.board,
+                                &tasks,
+                                uwuwu_usecase::sweeper::SweepPolicy {
+                                    now_ms,
+                                    age_days: cfg.sweep_days,
+                                    observe: is_observe,
+                                },
+                            )
+                            .await?;
+                        }
+                        Ok(())
+                    })
+                }),
+            });
+        }
+    }
+
     if let Some(backend) = semantic_backend.clone() {
         let clock2 = clock.clone();
 

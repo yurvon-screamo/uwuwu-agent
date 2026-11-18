@@ -27,6 +27,9 @@ struct HubState {
     comments: HashMap<u64, Vec<CommentRef>>,
     /// number → issue closed
     closed: HashMap<u64, bool>,
+    /// number → архивация строки (клин холодного ящика #1293):
+    /// архивная строка покидает read_board, но задачи/тела живут
+    archived: HashMap<u64, bool>,
     counter: u64,
     /// Слэг → markdown (вики стенда; seed UWUWU_MOCK_DOCS — JSON-карта).
     docs: HashMap<String, String>,
@@ -34,17 +37,20 @@ struct HubState {
 
 /// Seed-строка стенда: доска (опционально), номер, стартовый статус,
 /// приоритет (опционально — дефолт Empty; носитель приоритета для
-/// преемпшена CUP #1259, чьё решение живёт в строке доски).
+/// преемпшена CUP #1259, чьё решение живёт в строке доски), дни со
+/// дня закрытия issue (опционально — вход клина холодного ящика #1293).
 struct SeedRow {
     board: Option<String>,
     number: u64,
     status: Status,
     priority: Priority,
+    days_closed: u64,
 }
 
 /// Парсинг UWUWU_MOCK_SEED: «;»-раздельные строки «board:number:status»
 /// или «number:status» (без тега — видна на всех досках стенда);
-/// хвост «:high|medium|low» задаёт приоритет (преемпшен #1259 e2e).
+/// хвост «:high|medium|low» задаёт приоритет (преемпшен #1259 e2e);
+/// пятая часть «:days» — возраст закрытия issue (клин #1293 e2e).
 /// Трёхчастные сиды дискриминируются первой частью: число →
 /// «number:status:priority», иначе — «board:number:status» (доска
 /// нечисловая; «In Progress» номером быть не может — парсер отсечёт).
@@ -52,13 +58,20 @@ fn parse_seeds(raw: &str) -> Vec<SeedRow> {
     raw.split(';')
         .filter_map(|entry| {
             let parts: Vec<&str> = entry.split(':').collect();
-            let (board, number, status, prio) = match parts.as_slice() {
-                [board, n, s, p] => (Some((*board).trim().to_string()), n, s, *p),
-                [a, b, c] if a.trim().parse::<u64>().is_ok() => (None, a, b, *c),
+            let (board, number, status, prio, days) = match parts.as_slice() {
+                [board, n, s, p, d] => (
+                    Some((*board).trim().to_string()),
+                    n,
+                    s,
+                    *p,
+                    d.trim().parse::<u64>().unwrap_or(0),
+                ),
+                [board, n, s, p] => (Some((*board).trim().to_string()), n, s, *p, 0),
+                [a, b, c] if a.trim().parse::<u64>().is_ok() => (None, a, b, *c, 0),
                 // прочие трёхчастные — «board:number:status» (без тега с
                 // приоритетом — 4-частная форма «board:number:status:pr»)
-                [board, n, s] => (Some((*board).trim().to_string()), n, s, ""),
-                [n, s] => (None, n, s, ""),
+                [board, n, s] => (Some((*board).trim().to_string()), n, s, "", 0),
+                [n, s] => (None, n, s, "", 0),
                 _ => return None,
             };
             Some(SeedRow {
@@ -66,6 +79,7 @@ fn parse_seeds(raw: &str) -> Vec<SeedRow> {
                 number: number.trim().parse().ok()?,
                 status: uwuwu_usecase::parse_status(status.trim()),
                 priority: uwuwu_usecase::parse_priority(prio),
+                days_closed: days,
             })
         })
         .collect()
@@ -100,6 +114,7 @@ impl MemoryHub {
                 number,
                 status,
                 priority: Priority::Empty,
+                days_closed: 0,
             }],
             None => Vec::new(),
         })
@@ -144,6 +159,14 @@ impl MemoryHub {
             if seed.priority != Priority::Empty {
                 task.set_priority(seed.priority);
             }
+            // возраст закрытия — вход клина #1293 (сид «N:Done:low:14»)
+            if seed.days_closed > 0 {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock после эпохи")
+                    .as_millis() as u64;
+                task.set_closed_at(now_ms - seed.days_closed * 86_400_000);
+            }
             state.tasks.insert(seed.number, task);
             if let Some(board) = &seed.board {
                 state.board_tags.insert(seed.number, board.clone());
@@ -170,6 +193,9 @@ impl TaskBoardRepo for MemoryHub {
             let mut rows: Vec<Task> = state
                 .tasks
                 .values()
+                // архивная строка покидает снапшот (клин #1293) — как
+                // NOT_ARCHIVED-дефолт GitHub items
+                .filter(|t| !state.archived.contains_key(&t.number()))
                 .filter(|t| match state.board_tags.get(&t.number()) {
                     Some(tag) => tag == board,
                     None => true,
@@ -374,6 +400,40 @@ impl TaskBoardRepo for MemoryHub {
             let _ = task.transition(Status::Done);
             state.closed.insert(number, true);
             Ok(())
+        })
+    }
+
+    async fn archive_row(&self, board: &str, number: u64) -> UsecaseResult<()> {
+        self.with_state(|state| {
+            let on_board = state.tasks.contains_key(&number)
+                && state
+                    .board_tags
+                    .get(&number)
+                    .map(|t| t == board)
+                    .unwrap_or(true);
+            if !on_board {
+                return Err(UsecaseError::Board(format!(
+                    "строка #{number} не на доске «{board}»"
+                )));
+            }
+            state.archived.insert(number, true);
+            Ok(())
+        })
+    }
+
+    fn gql_budget_remaining(&self) -> Option<u64> {
+        // мок-хаб бюджета не имитирует: гард пропускает
+        None
+    }
+
+    async fn issues_with_title(&self, title: &str) -> UsecaseResult<Vec<u64>> {
+        self.with_state(|state| {
+            Ok(state
+                .tasks
+                .values()
+                .filter(|t| t.title() == title)
+                .map(|t| t.number())
+                .collect())
         })
     }
 
@@ -582,6 +642,7 @@ mod tests {
             number: 11,
             status: Status::Analys,
             priority: Priority::Empty,
+            days_closed: 0,
         }]);
         let own = hub
             .row_status("Задачи uwuwu", 11)
@@ -743,5 +804,41 @@ mod tests {
             Some(Priority::Low),
             "task_edit-приоритет виден строке"
         );
+    }
+
+    #[tokio::test]
+    async fn archived_row_leaves_board_but_stays_readable() {
+        // Холодный ящик (#1293, сценарий «Проверки»): архивная строка
+        // покидает read_board (снапшот сжат), но знание не теряется —
+        // issue-first чтение (task_get) и статус доступны. Регресс до
+        // archived-фильтра в read_issue/row_status краснит вторую половину.
+        let hub = MemoryHub::with_seeds(parse_seeds("Задачи uwuwu:2049:Done:low:14"));
+        let before = hub.read_board("Задачи uwuwu").await.expect("доска до");
+        assert!(
+            before.iter().any(|t| t.number() == 2049),
+            "свежий Done-сид на доске до архивации"
+        );
+        hub.archive_row("Задачи uwuwu", 2049)
+            .await
+            .expect("архивация терминальной строки");
+        let after = hub.read_board("Задачи uwuwu").await.expect("доска после");
+        assert!(
+            !after.iter().any(|t| t.number() == 2049),
+            "архивная строка покинула снапшот"
+        );
+        let view = hub
+            .read_issue("Задачи uwuwu", 2049)
+            .await
+            .expect("issue-first чтение архивной строки (task_get холодный путь)");
+        assert_eq!(
+            view.task.number(),
+            2049,
+            "тело/мета строки доступны после архива"
+        );
+        let status = hub
+            .row_status("Задачи uwuwu", 2049)
+            .await
+            .expect("статус архивной строки");
+        assert_eq!(status, Some(Status::Done), "статус не потерян");
     }
 }

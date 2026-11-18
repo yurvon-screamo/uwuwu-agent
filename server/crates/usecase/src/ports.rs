@@ -85,6 +85,27 @@ pub trait TaskBoardRepo: Send + Sync {
     async fn patch_cells(&self, number: u64, mutate: FmMutator) -> UsecaseResult<()>;
     /// Закрытие с причиной (completed|not_planned).
     async fn close_issue_ext(&self, number: u64, not_planned: bool) -> UsecaseResult<()>;
+    /// Архивировать строку доски (терминальную — клин холодного ящика
+    /// #1293): Projects v2 убирает её из items (снапшот сжимается),
+    /// строка остаётся доступной через unarchive. Реализация НЕ обязана
+    /// инвалидинировать снапшот на каждую строку — волна архиваций
+    /// держит кеш живым (построчный ре-фетч полного снимка выжег бы
+    /// бюджет первой волной); свежий срез даёт invalidate_snapshot.
+    async fn archive_row(&self, board: &str, number: u64) -> UsecaseResult<()>;
+    /// Сброс снапшота доски: реализация с кешем забывает срез —
+    /// следующий read_board читает носитель. Клин зовёт один раз на
+    /// волну (финал), не на каждую строку. Дефолт — no-op (носители
+    /// без кеша).
+    fn invalidate_snapshot(&self, _board: &str) {}
+    /// Остаток GraphQL-бюджета носителя (точек): None — носитель не
+    /// сообщает, бюджет-гайд клина пропускает.
+    fn gql_budget_remaining(&self) -> Option<u64> {
+        None
+    }
+    /// Номера issues репо с точно этим тайтлом (включая закрытые):
+    /// dup_check create против холодного ящика (#1293) — тайтл уникален
+    /// на доске и после архивации старых строк.
+    async fn issues_with_title(&self, title: &str) -> UsecaseResult<Vec<u64>>;
     /// Полная замена тела issue (как записано; fm-шапка стрипается на
     /// границе юзкейса — тела без fm, поля нативные).
     async fn replace_body(&self, number: u64, body_md: &str) -> UsecaseResult<()>;

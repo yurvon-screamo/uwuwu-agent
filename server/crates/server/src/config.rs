@@ -98,6 +98,12 @@ pub struct Config {
     pub mode: ModeCfg,
     #[serde(default = "default_poll")]
     pub poll_sec: u64,
+    /// Клин холодного ящика (#1293): терминальные строки, закрытые
+    /// строго старше этого числа суток, архивируются sidecar-тиком.
+    /// 0 = клин выключен (дефолт кода; боевой конфиг — санкция владельца
+    /// «старше недели»).
+    #[serde(default)]
+    pub sweep_days: u32,
     #[serde(default = "default_port")]
     port_cfg: u16,
     pub hub: HubCfg,

@@ -23,6 +23,8 @@ impl SpawnModels {
     }
 
     /// Канон владельца — дефолт карты при отсутствии секции в конфиге.
+    /// Синхрон с config.example (кросс-гвард): везде flash#high,
+    /// ревьюверы полный 5.3#high (поручение владельца 18.11, f1b9091c).
     pub fn canonical() -> Self {
         let mut map = HashMap::new();
         let mut put = |key: &str, raw: &str| {
