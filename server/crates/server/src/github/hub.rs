@@ -1087,12 +1087,13 @@ impl TaskBoardRepo for GitHubHub {
         let project_id = snap.1.project_id.clone();
         let mutation = r#"
           mutation($p:ID!,$i:ID!){
-            archiveProjectV2Item(input:{projectId:$p, itemId:$i}){ projectV2Item{ id isArchived } }
+            archiveProjectV2Item(input:{projectId:$p, itemId:$i}){ item{ id isArchived } }
           }"#;
         let data = self
             .gql(mutation, json!({ "p": project_id, "i": item }))
             .await?;
-        let archived = data["archiveProjectV2Item"]["projectV2Item"]["isArchived"].as_bool();
+        // payload-поле — item (не projectV2Item; живая проба #1293 поймала)
+        let archived = data["archiveProjectV2Item"]["item"]["isArchived"].as_bool();
         if archived != Some(true) {
             return Err(UsecaseError::Board(format!(
                 "archive #{number}: false-success (isArchived={:?})",
