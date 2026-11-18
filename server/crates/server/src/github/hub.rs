@@ -4,6 +4,7 @@
 //! (fields.rs). Тело задачи — чистый контент.
 
 use super::fields::{parse_field_values, Fields, IssueFields};
+use super::pv2::Pv2Rest;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -15,6 +16,10 @@ pub struct GitHubHub {
     repo: String,
     token: String,
     http: reqwest::Client,
+    /// Pv2 REST-мутации статусов и их пре-чтения (#1236): развод
+    /// независимых GraphQL/REST бакетов — вердикт-статус не зависит
+    /// от GraphQL-квоты (инстанс 16.11: task_edit падал при живом REST).
+    pv2: Pv2Rest,
     /// Нативные поля issue (сессии/ветка/PR/тип).
     pub fields: Arc<IssueFields>,
     /// TTL-кеш снапшотов досок (#1243): мутации одного тика шарят снимок —
@@ -69,20 +74,20 @@ const MAX_PAGES: usize = 10;
 /// TTL-кеш значений по ключу (#1243): цена обращения к GitHub GraphQL
 /// высока (полный снимок доски — сотни поинтов), а данные между тиками
 /// меняются редко. `now` прокидывается для тестируемости.
-struct TtlCache<T> {
+pub(crate) struct TtlCache<T> {
     ttl: std::time::Duration,
     cells: std::sync::RwLock<std::collections::HashMap<String, (std::time::Instant, Arc<T>)>>,
 }
 
 impl<T> TtlCache<T> {
-    fn new(ttl: std::time::Duration) -> Self {
+    pub(crate) fn new(ttl: std::time::Duration) -> Self {
         Self {
             ttl,
             cells: std::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
-    fn get(&self, key: &str, now: std::time::Instant) -> Option<Arc<T>> {
+    pub(crate) fn get(&self, key: &str, now: std::time::Instant) -> Option<Arc<T>> {
         let guard = self.cells.read().expect("ttl cache lock");
         match guard.get(key) {
             Some((at, v)) if now.duration_since(*at) < self.ttl => Some(v.clone()),
@@ -90,7 +95,7 @@ impl<T> TtlCache<T> {
         }
     }
 
-    fn put(&self, key: &str, value: T, now: std::time::Instant) -> Arc<T> {
+    pub(crate) fn put(&self, key: &str, value: T, now: std::time::Instant) -> Arc<T> {
         let arc = Arc::new(value);
         self.cells
             .write()
@@ -100,7 +105,7 @@ impl<T> TtlCache<T> {
     }
 
     /// Точечный сброс ключа: мутация доски — read-your-writes (#1235).
-    fn invalidate(&self, key: &str) {
+    pub(crate) fn invalidate(&self, key: &str) {
         self.cells.write().expect("ttl cache lock").remove(key);
     }
 
@@ -136,12 +141,11 @@ fn gh_tagged(fail: &crate::gherr::GhFail) -> UsecaseError {
     UsecaseError::Board(format!("gh graphql [{kind}]: {fail}"))
 }
 
-/// Rate-limit отказ транспорта: только собственный тег gql-точки,
+/// Rate-limit отказ транспорта: только собственные теги gql/pv2-точек,
 /// не строковые эвристики по текстам GitHub.
 fn is_rate_limited(e: &UsecaseError) -> bool {
-    e.to_string()
-        .to_lowercase()
-        .contains("gh graphql [rate_limited]")
+    let text = e.to_string().to_lowercase();
+    text.contains("gh graphql [rate_limited]") || text.contains("gh rest [rate_limited]")
 }
 
 #[derive(Default, Clone)]
@@ -154,8 +158,10 @@ struct BoardMeta {
 
 impl GitHubHub {
     pub fn new(repo: String, token: String) -> Self {
+        let pv2 = Pv2Rest::new(repo.clone(), token.clone());
         Self {
             fields: Arc::new(IssueFields::new(repo.clone(), token.clone())),
+            pv2,
             repo,
             token,
             http: reqwest::Client::builder()
@@ -424,56 +430,9 @@ impl GitHubHub {
         Ok(String::new())
     }
 
-    /// Статусный value строки КОНКРЕТНОЙ доски (project-фильтр по тайтлу):
-    /// None — строки нет на этой доске; Some("") — есть, но Status не задан.
-    /// Против board_status_fetch, который берёт Status первой попавшейся
-    /// привязки (#1235 Low-1).
-    async fn carrier_status(&self, board: &str, number: u64) -> UsecaseResult<Option<String>> {
-        let q = r#"
-          query($owner:String!,$name:String!,$n:Int!){
-            repository(owner:$owner,name:$name){
-              issue(number:$n){
-                projectItems(first:10){
-                  nodes{
-                    project{ title }
-                    fieldValues(first:20){ nodes{
-                      __typename ...on ProjectV2ItemFieldSingleSelectValue{
-                        name field{ ...on ProjectV2FieldCommon{ name } } } } }
-                  }
-                }
-              }
-            }
-          }"#;
-        let (owner, name) = self
-            .repo
-            .split_once('/')
-            .ok_or_else(|| UsecaseError::Board(format!("repo: {}", self.repo)))?;
-        let data = self
-            .gql(
-                q,
-                json!({ "owner": owner, "name": name, "n": number as i64 }),
-            )
-            .await?;
-        let Some(items) = data["repository"]["issue"]["projectItems"]["nodes"].as_array() else {
-            return Ok(None);
-        };
-        for item in items {
-            if item["project"]["title"].as_str() != Some(board) {
-                continue;
-            }
-            let Some(vals) = item["fieldValues"]["nodes"].as_array() else {
-                return Ok(Some(String::new()));
-            };
-            for v in vals {
-                if v["field"]["name"].as_str() == Some("Status") {
-                    return Ok(Some(v["name"].as_str().unwrap_or_default().to_string()));
-                }
-            }
-            return Ok(Some(String::new()));
-        }
-        Ok(None)
-    }
-
+    /// Статусный value строки КОНКРЕТНОЙ доски читает Pv2Rest
+    /// (pv2::read_status — гард-семантика с write-through); прежний
+    /// GraphQL carrier_status снён с переводом гард-пути на REST (#1236).
     /// Сброс снимка доски: мутация могла изменить строки/мету (#1235).
     fn invalidate_snapshot(&self, board: &str) {
         self.snap_cache.invalidate(board);
@@ -540,17 +499,28 @@ impl GitHubHub {
         self.snap_cache.put(board, (rows, meta), now);
     }
 
-    /// Контрольное чтение после мутации статуса (семья #1213): до 3
-    /// попыток с паузой 1 с. Rate limit — ретраи не продолжаются
-    /// (мутация принята GitHub); сетевой сбой и рассогласование —
-    /// полный цикл, дальше громкий отказ.
-    async fn verify_status(&self, number: u64, expected: Status) -> VerifyOutcome {
+    /// Контрольное чтение после мутации статуса (семья #1213): ответ
+    /// мутации с искомым значением — быстрый путь без доп. запросов;
+    /// иначе до 3 чтений НОСИТЕЛЯ (мимо write-through — иначе verify
+    /// самоподтверждался бы собственной записью) с паузой 1 с.
+    /// Rate limit — ретраи не продолжаются (мутация принята GitHub);
+    /// сетевой сбой и рассогласование — полный цикл, дальше громкий отказ.
+    async fn verify_status(
+        &self,
+        board: &str,
+        number: u64,
+        expected: Status,
+        confirmed: Option<String>,
+    ) -> VerifyOutcome {
+        if confirmed.as_deref() == Some(uwuwu_usecase::status_name(expected)) {
+            return VerifyOutcome::Ok;
+        }
         for attempt in 0..3 {
             if attempt > 0 {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
-            match self.board_status_fetch(number).await {
-                Ok(fetched) if uwuwu_usecase::parse_status(&fetched) == expected => {
+            match self.pv2.fetch_status(board, number).await {
+                Ok(Some(raw)) if uwuwu_usecase::parse_status(&raw) == expected => {
                     return VerifyOutcome::Ok;
                 }
                 Err(e) if is_rate_limited(&e) => return VerifyOutcome::SkippedRateLimited,
@@ -764,66 +734,44 @@ impl TaskBoardRepo for GitHubHub {
     }
 
     async fn set_status(&self, board: &str, number: u64, status: Status) -> UsecaseResult<()> {
-        let snap = self.snapshot(board).await?;
-        // last-known статус строки на момент мутации — для ребра в логах
-        // (Low-2 код-ревью #1235; значение со снапшота, может быть стэйл)
-        let from = snap
-            .0
-            .iter()
-            .find(|t| t.number() == number)
-            .map(|t| uwuwu_usecase::status_name(t.status()).to_string());
-        let option = snap
-            .1
-            .options
-            .get(uwuwu_usecase::status_name(status))
-            .cloned()
-            .ok_or_else(|| {
-                UsecaseError::Board(format!(
-                    "Status-опция «{}» не найдена",
-                    uwuwu_usecase::status_name(status)
-                ))
-            })?;
-        let item = snap.1.items.get(&number).cloned().ok_or_else(|| {
-            UsecaseError::Board(format!("строка #{number} не на доске «{board}»"))
-        })?;
-        let mutation = r#"
-          mutation($p:ID!,$i:ID!,$f:ID!,$o:String!){
-            updateProjectV2ItemFieldValue(input:{
-              projectId:$p, itemId:$i, fieldId:$f, value:{singleSelectOptionId:$o}
-            }){ projectV2Item{ id } }
-          }"#;
-        let (project_id, status_field_id) =
-            (snap.1.project_id.clone(), snap.1.status_field_id.clone());
-        self.gql(
-            mutation,
-            json!({ "p": project_id, "i": item, "f": status_field_id, "o": option }),
-        )
-        .await?;
-        // read-your-writes (#1235): собственная запись обслуживается кэшем,
-        // а не refetch'ем — read-лаг Projects v2 минутного масштаба не виден.
+        let name = uwuwu_usecase::status_name(status);
+        // last-known статус строки — для ребра в логах (Low-2 код-ревью
+        // #1235); источник — локальный статусный кеш, GraphQL не тратим
+        let from = self
+            .status_cache
+            .get(&number.to_string(), std::time::Instant::now())
+            .map(|raw| raw.as_str().to_string());
+        // мутация — REST ProjectsV2 (#1236); write-through Pv2Rest
+        // обслуживает повторный гард в окне read-лага носителя
+        let confirmed = self.pv2.set_status(board, number, name).await?;
+        // read-your-writes (#1235): собственная запись обслуживается кэшами,
+        // read-лаг Projects v2 минутного масштаба не виден.
         self.write_through_status(board, number, status);
         self.write_through_status_cache(number, status);
-        // verify-after-write (семья #1213): мутация либо подтверждена
-        // чтением, либо громкая ошибка с откатом write-through.
-        let outcome = self.verify_status(number, status).await;
+        // verify-after-write (семья #1213): ответ мутации — быстрый путь,
+        // иначе до 3 чтений носителя; rate limit — ретраи не продолжаются.
+        let outcome = self
+            .verify_status(board, number, status, confirmed)
+            .await;
         self.settle_write_through(board, number, outcome, status)?;
         tracing::info!(
             event = "board.set_status",
             board,
             number,
             from = from.as_deref().unwrap_or("—"),
-            to = %uwuwu_usecase::status_name(status),
-            "Статус строки обновлён и подтверждён чтением (from — last-known со снапшота)"
+            to = %name,
+            "Статус строки обновлён и подтверждён чтением (from — last-known из кеша)"
         );
         Ok(())
     }
 
     async fn row_status(&self, board: &str, number: u64) -> UsecaseResult<Option<Status>> {
-        // project-фильтр: номер на чужой доске — не наша строка (Low-1
-        // код-ревью #1235), а не «статус этой доски»
-        match self.carrier_status(board, number).await? {
+        // Pv2 REST (#1236): гард канона edit() больше не зависит от
+        // GraphQL-бакета; project-фильтр — индекс этой доски (прочая
+        // привязка строки — не наша строка, Low-1 код-ревью #1235)
+        match self.pv2.read_status(board, number).await? {
             // Status-значения на носителе нет (строка не на доске /
-            // поле не задано); непустое непарсящееся — Some(Empty)
+            // поле не задано / read-лаг); непустое непарсящееся — Some(Empty)
             None => Ok(None),
             Some(raw) if raw.trim().is_empty() => Ok(None),
             Some(raw) => Ok(Some(uwuwu_usecase::parse_status(&raw))),
@@ -1006,8 +954,7 @@ impl TaskBoardRepo for GitHubHub {
         if number == 0 {
             return Err(UsecaseError::Board("create issue: нет номера".into()));
         }
-        let node_id = resp["node_id"].as_str().unwrap_or_default().to_string();
-        self.add_to_board(board, number, &node_id).await?;
+        self.add_to_board(board, number).await?;
         Ok(number)
     }
 
@@ -1101,38 +1048,14 @@ impl GitHubHub {
         self.fields.load(number).await
     }
 
-    async fn add_to_board(&self, board: &str, number: u64, node_id: &str) -> UsecaseResult<()> {
-        let snap = self.snapshot(board).await?;
-        let (project_id, status_field_id, analys) = (
-            snap.1.project_id.clone(),
-            snap.1.status_field_id.clone(),
-            snap.1.options.get("Analys").cloned(),
-        );
-        let mutation = r#"
-          mutation($p:ID!,$c:ID!){ addProjectV2ItemById(input:{projectId:$p, contentId:$c}){
-            item{ id } } }"#;
-        let added = self
-            .gql(mutation, json!({ "p": project_id, "c": node_id }))
-            .await?;
-        let item = added["addProjectV2ItemById"]["item"]["id"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        if item.is_empty() {
-            return Err(UsecaseError::Board(format!("add #{number}: нет item id")));
-        }
-        // create-дефолт Analys (#1135): опция ставится по имени колонки;
-        // колонки нет — строка остаётся без статуса (rollout плана)
-        if let Some(analys) = analys {
-            let set = r#"
-              mutation($p:ID!,$i:ID!,$f:ID!,$o:String!){
-                updateProjectV2ItemFieldValue(input:{projectId:$p,itemId:$i,fieldId:$f,
-                  value:{singleSelectOptionId:$o}}){ projectV2Item{ id } } }"#;
-            self.gql(
-                set,
-                json!({ "p": project_id, "i": item, "f": status_field_id, "o": analys }),
-            )
-            .await?;
+    async fn add_to_board(&self, board: &str, number: u64) -> UsecaseResult<()> {
+        // add + дефолт Analys (#1135) — REST ProjectsV2 (#1236): POST
+        // принимает owner/repo/number, GraphQL node_id issue не нужен;
+        // опция ставится по имени колонки; колонки нет — строка остаётся
+        // без статуса (rollout плана)
+        self.pv2.add_item(board, number).await?;
+        if self.pv2.meta(board).await?.options.contains_key("Analys") {
+            self.pv2.set_status(board, number, "Analys").await?;
         }
         self.invalidate_snapshot(board);
         Ok(())
