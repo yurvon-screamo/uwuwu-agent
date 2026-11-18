@@ -5318,3 +5318,89 @@ fn env_repo_dir_formula_is_pinned() {
     assert_eq!(board_plan().env_repo_dir(50), "/tmp/env/50");
     assert_eq!(board_plan().env_repo_dir(1), "/tmp/env/1");
 }
+
+/// Регресс-пин #1281 (тестировщик): сброс раунда из-под рестарта должен
+/// давать НАСТОЯЩИЙ свежий раунд — до двух пингов текущего процесса до
+/// любой эскалации, и подпись эскалации считает доставленные пинги
+/// текущего процесса. Сценарий: persisted count=2 (до рестарта) → тик 1:
+/// round_stale + пинг; +30 мин тик 2: второй пинг (не эскалация);
+/// +30 мин тик 3: эскалация с «автопингов в раунде: 2».
+#[tokio::test]
+async fn round_stale_reset_gives_true_fresh_round_two_pings_before_escalation() {
+    const BOOT: u64 = 100_000_000;
+    struct SettableClock(Arc<Mutex<u64>>);
+    impl Clock for SettableClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            *self.0.lock().unwrap()
+        }
+    }
+    let now = Arc::new(Mutex::new(BOOT));
+    let board = Arc::new(FakeBoard {
+        rows: vec![dev_task(64, "ses_dev_64")],
+        log: Mutex::default(),
+        comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
+    });
+    let sess = Arc::new(FakeSessions {
+        // сессия молчит весь сценарий (25 мин до первого тика, дальше — тишина)
+        activity_ms: Some(BOOT - 25 * 60_000),
+        idle_reply: true,
+        ..Default::default()
+    });
+    // persisted стейт из-под рестарта: два пинга ДО старта процесса
+    let seeded = MemState(Mutex::new(MemStateInner {
+        stalls: vec![
+            (64, Status::InProgress, BOOT - 40 * 60_000),
+            (64, Status::InProgress, BOOT - 35 * 60_000),
+        ],
+        ..Default::default()
+    }));
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sess.clone())),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+            probes: Mutex::default(),
+        }),
+        clock: Arc::new(SettableClock(now.clone())),
+        state: Arc::new(seeded),
+        spawn_model: None,
+        boot_ms: BOOT,
+    };
+    // тик 1 (сразу после рестарта): раунд чужой — сброс + свежий пинг
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.stall_flagged, 0, "тик 1 не эскалирует");
+    assert_eq!(out.soft_pings, 1, "тик 1: свежий пинг раунда");
+    // тик 2 (+30 мин): раунд уже текущего процесса — второй пинг, не эскалация
+    *now.lock().unwrap() = BOOT + 30 * 60_000;
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.stall_flagged, 0,
+        "тик 2: в процессе доставлен только один пинг — эскалации нет"
+    );
+    assert_eq!(out.soft_pings, 1, "тик 2: второй пинг свежего раунда");
+    // тик 3 (+30 мин): два пинга доставлены, тишина продолжается — эскалация
+    *now.lock().unwrap() = BOOT + 60 * 60_000;
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.stall_flagged, 1,
+        "тик 3: два доставленных пинга исчерпаны — эскалация"
+    );
+    let log = board.log.lock().unwrap();
+    let comment = log
+        .iter()
+        .find(|l| l.starts_with("comment#64="))
+        .expect("эскалация постит коммент");
+    assert!(
+        comment.contains("автопингов в раунде: 2"),
+        "подпись считает пинги ТЕКУЩЕГО процесса (2), а не persisted-мусор: {comment}"
+    );
+}
