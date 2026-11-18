@@ -363,10 +363,9 @@ impl TaskWriter for TaskWriteUseCase {
                     Vec::new()
                 }
             };
-            if cold.iter().any(|n| *n != number) {
+            if let Some(other) = cold.iter().find(|n| **n != number) {
                 return Err(UsecaseError::Board(format!(
-                    "тайтл «{title}» уже занят issue #{} — дубль запрещён (строка вне снапшота: холодный ящик)",
-                    cold[0]
+                    "тайтл «{title}» уже занят issue #{other} — дубль запрещён (строка вне снапшота: холодный ящик)"
                 )));
             }
             self.board.rename_issue(number, title).await?;
@@ -711,8 +710,6 @@ mod tests {
 
     /// Сбой REST-поиска (Low-2 ревью #1293) — fail-open: create живёт
     /// (первичный снапшот-гард отработал), warn в логе.
-    /// Сбой REST-поиска (Low-2 ревью #1293) — fail-open: create живёт
-    /// (первичный снапшот-гард отработал), warn в логе.
     #[tokio::test]
     async fn create_cold_search_failure_fails_open() {
         let fields = Arc::new(FakeFields::default());
@@ -735,11 +732,13 @@ mod tests {
         assert_eq!(number, 1, "issue создан — гард fail-open");
     }
 
-    /// Холодный ящик (#1293, Low дельта-раунда 2): rename в тайтл закрытой
-    /// вне снапшота строки — громкая ошибка; свой тайтл (тот же номер)
-    /// холодным дублем не считается (идемпотентная правка легальна).
+    /// Холодный ящик (#1293, дельта-раунды 2–3): rename в тайтл закрытой
+    /// вне снапшота строки — громкая ошибка (чужой номер в тексте);
+    /// свой тайтл (тот же номер) холодным дублем не считается —
+    /// идемпотентная правка легальна (обе ветки контракта пинятся).
     #[tokio::test]
     async fn rename_rejects_title_of_cold_row_but_allows_own() {
+        // ветка отказа: чужой холодный номер — громкая ошибка с ним в тексте
         let fields = Arc::new(FakeFields::default());
         let board = Arc::new(FakeBoard {
             cells: std::sync::Mutex::default(),
@@ -753,7 +752,6 @@ mod tests {
             clock: Arc::new(crate::pipeline::tick_tests::FixedClock),
             state: Arc::new(crate::pipeline::tick_tests::MemState::empty()),
         };
-        // строка 5 переименовывается в тайтл холодной #1243 — отказ
         let p = TaskPatch {
             title: Some("тайтл архивной задачи".into()),
             ..Default::default()
@@ -766,6 +764,29 @@ mod tests {
             err.to_string().contains("1243"),
             "ошибка называет холодный номер: {err}"
         );
+
+        // ветка освобождения: cold содержит СОБСТВЕННЫЙ номер строки —
+        // ретрай edit-конверта с тем же тайтлом легален (регресс до
+        // !cold.is_empty() ломал бы идемпотентный rename — Low ревью)
+        let board = Arc::new(FakeBoard {
+            cells: std::sync::Mutex::default(),
+            cold_hits: vec![5],
+            search_err: false,
+        });
+        let u = TaskWriteUseCase {
+            board: board.clone(),
+            fields: Arc::new(FakeFields::default()),
+            boards: vec![("uwuwu".into(), "Задачи uwuwu".into())],
+            clock: Arc::new(crate::pipeline::tick_tests::FixedClock),
+            state: Arc::new(crate::pipeline::tick_tests::MemState::empty()),
+        };
+        let p = TaskPatch {
+            title: Some("тайтл архивной задачи".into()),
+            ..Default::default()
+        };
+        u.edit("uwuwu", 5, p)
+            .await
+            .expect("свой номер в cold — rename проходит");
     }
 
     /// Красный тест бага #1232 → контракт #1258: create маршрутизирует
