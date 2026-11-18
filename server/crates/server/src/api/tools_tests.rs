@@ -3,138 +3,16 @@
 //! happy-path, freshness-отказ, append, твин-гард, пин-h3 (кейс #1046),
 //! квитанция полного task_body. Мок-hub — в памяти, без GitHub.
 
+use super::test_support::{StubSessions, StubState, StubWiki};
 use super::tools::{tool_descriptors, ToolHub};
 use crate::clock::SystemClock;
 use crate::mockhub::MemoryHub;
-use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use uwuwu_domain::{Slot, Status};
 use uwuwu_usecase::{
-    AgentSessionGateway, DocsView, IssueFieldStore, Liveness, PersonView, SearchUseCase,
-    SessionInfo, SessionSpec, TaskBoardRepo, TaskView, TaskWriteUseCase, TickStateStore,
-    UsecaseResult, WikiRepo,
+    DocsView, IssueFieldStore, PersonView, SearchUseCase, TaskBoardRepo, TaskView,
+    TaskWriteUseCase, WikiRepo,
 };
-
-struct StubWiki;
-
-#[async_trait]
-impl WikiRepo for StubWiki {
-    async fn doc_shas(&self) -> UsecaseResult<Vec<(String, String)>> {
-        Ok(vec![])
-    }
-    async fn read_doc(&self, _slug: &str) -> UsecaseResult<Option<String>> {
-        Ok(None)
-    }
-    async fn list_docs(&self, _prefix: &str) -> UsecaseResult<Vec<String>> {
-        Ok(vec![])
-    }
-    async fn write_doc(&self, _: &str, _: &str, _: &str) -> UsecaseResult<()> {
-        Ok(())
-    }
-    async fn append_doc(&self, _: &str, _: &str, _: &str) -> UsecaseResult<()> {
-        Ok(())
-    }
-}
-
-struct StubSessions;
-
-#[async_trait]
-impl AgentSessionGateway for StubSessions {
-    async fn create_session(&self, _: &SessionSpec) -> UsecaseResult<String> {
-        Ok("ses_stub".into())
-    }
-    async fn prompt(&self, _: &str, _: &str) -> UsecaseResult<()> {
-        Ok(())
-    }
-    async fn run_command(&self, _: &str, _: &str, _: &str) -> UsecaseResult<()> {
-        Ok(())
-    }
-    async fn liveness(&self, _: &str) -> Liveness {
-        Liveness::Unknown
-    }
-    async fn delete_session(&self, _: &str) -> UsecaseResult<()> {
-        Ok(())
-    }
-    async fn last_activity_ms(&self, _: &str) -> UsecaseResult<Option<u64>> {
-        Ok(None)
-    }
-    async fn list_sessions(&self) -> UsecaseResult<Vec<SessionInfo>> {
-        Ok(vec![])
-    }
-    async fn export_session(&self, _: &str) -> UsecaseResult<String> {
-        Ok(String::new())
-    }
-    async fn last_assistant_reply(
-        &self,
-        _s: &str,
-    ) -> UsecaseResult<Option<uwuwu_usecase::AssistantReply>> {
-        Ok(None)
-    }
-}
-
-/// No-op TickStateStore: писателю нужен факт вызова mark_own_comment,
-/// состояние в пробе диспетчера не проверяется.
-struct StubState;
-
-impl TickStateStore for StubState {
-    fn last_comment_id(&self, _: &str, _: u64) -> Option<String> {
-        None
-    }
-    fn last_seen_status(&self, _: &str, _: u64) -> Option<Status> {
-        None
-    }
-    fn set_last_seen_status(&self, _: &str, _: u64, _: Status) {}
-    fn set_last_comment_id(&self, _: &str, _: u64, _: &str) {}
-    fn dreamer_done(&self, _: &str) -> bool {
-        false
-    }
-    fn mark_dreamer_done(&self, _: &str) {}
-    fn dreamer_day_spawns(&self, _: &str) -> u32 {
-        0
-    }
-    fn mark_dreamer_spawn(&self, _: &str) {}
-    fn last_spawn_ms(&self, _: &str, _: u64, _: Slot) -> Option<u64> {
-        None
-    }
-    fn mark_spawn(&self, _: &str, _: u64, _: Slot, _: u64) {}
-    fn clear_spawn_ms(&self, _: &str, _: u64, _: Slot) {}
-    fn last_analys_ms(&self, _: &str, _: u64) -> Option<u64> {
-        None
-    }
-    fn mark_analys_spawn(&self, _: &str, _: u64, _: u64) {}
-    fn last_analys_review_ms(&self, _: &str, _: u64) -> Option<u64> {
-        None
-    }
-    fn mark_analys_review_spawn(&self, _: &str, _: u64, _: u64) {}
-    fn analys_loop(&self, _: &str, _: u64) -> Option<(Status, u32)> {
-        None
-    }
-    fn set_analys_loop(&self, _: &str, _: u64, _: Status, _: u32) {}
-    fn clear_analys_loop(&self, _: &str, _: u64) {}
-    fn analys_review_loop(&self, _: &str, _: u64) -> Option<(Status, u32)> {
-        None
-    }
-    fn set_analys_review_loop(&self, _: &str, _: u64, _: Status, _: u32) {}
-    fn clear_analys_review_loop(&self, _: &str, _: u64) {}
-    fn prune_analys_guards(&self, _: &std::collections::HashSet<String>) {}
-    fn stall_ping(&self, _: &str, _: u64) -> Option<(Status, u64, u32)> {
-        None
-    }
-    fn mark_stall_ping(&self, _: &str, _: u64, _: Status, _: u64) {}
-    fn spawn_loop(&self, _: &str, _: u64, _: Slot) -> Option<(Status, u32)> {
-        None
-    }
-    fn set_spawn_loop(&self, _: &str, _: u64, _: Slot, _: Status, _: u32) {}
-    fn reset_stale_spawn_loops(&self, _: &str, _: u64, _: Status) {}
-    fn own_comment(&self, _: &str) -> bool {
-        false
-    }
-    fn mark_own_comment(&self, _: &str, _: u64) {}
-    fn save(&self) -> UsecaseResult<()> {
-        Ok(())
-    }
-}
 
 /// Фикстура поверхности: ToolHub целиком на MemoryHub + стабах вики/сессий.
 /// Возвращает тот же hub, что сидит в писателе — тело читается напрямую.
@@ -473,6 +351,119 @@ async fn task_body_receipt_keeps_leading_hashes() {
     assert!(
         stored.starts_with("## Постановка"),
         "хэши первого заголовка живы (fm-сборка с mangeling-trim снесена): {stored}"
+    );
+}
+
+/// Проба #397 (16.11) дословно: полный task_body съедал титульную H1-секцию
+/// с контентом до следующего H1 (mangeling-trim диспетчера). Пин сценария:
+/// H1-старт — raw-тело на носителе ≡ отправленному (все секции и хвост).
+#[tokio::test]
+async fn full_body_replace_keeps_h1_title_section_verbatim() {
+    let (tools, memory) = hub();
+    let (number, _) = create_task(&tools, "t: h1", "## Постановка\n\nЧерновик.\n").await;
+    let sent = "# Заголовок задачи\n\nТитульная секция с контентом до следующего H1.\n\n## Постановка\n\nТело после H1-тайтла.\n\n## Хвост\n\nХвостовая секция.\n";
+    call(
+        &tools,
+        "task_body",
+        json!({ "number": number, "body": sent }),
+    )
+    .await
+    .expect("full body");
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert_eq!(
+        stored, sent,
+        "raw-тело ≡ отправленному — H1-тайтл, секции и хвост на месте"
+    );
+}
+
+/// Проба #397 (16.11) дословно: секционная замена дублировала хвост тела
+/// после правимой секции (байт-повтор секций, две «Комменты» по несколько КБ).
+/// Пин BDD-сценария: замена на месте, каждая секция хвоста — ровно один раз.
+#[tokio::test]
+async fn section_edit_replaces_in_place_without_tail_duplication() {
+    let (tools, memory) = hub();
+    let (number, hash) = create_task(&tools, "t: tail", &big_body()).await;
+    call(
+        &tools,
+        "task_body_section",
+        json!({
+            "number": number,
+            "section": "План",
+            "content": "Замена секции на месте; хвост не дублируется.\n",
+            "base_hash": hash,
+        }),
+    )
+    .await
+    .expect("section edit");
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert!(
+        stored.contains("Замена секции на месте"),
+        "новый контент секции на месте: {stored}"
+    );
+    assert!(
+        !stored.contains("Контракт секционного пути"),
+        "старый контент секции «План» удалён, не дописан: {stored}"
+    );
+    for marker in [
+        "## План",
+        "## Постановка",
+        "## Отчёт инженера",
+        "## Смежное",
+    ] {
+        assert_eq!(
+            stored.matches(marker).count(),
+            1,
+            "«{marker}» встречается ровно один раз — заголовки и хвост не задублированы"
+        );
+    }
+}
+
+/// Профилактика #1256 (класс «чтение врёт после записи», ADR-093): запись
+/// тела → немедленное чтение того же номера возвращает записанное целиком,
+/// fm body_hash сходится с квитанцией. Граница покрытия: пин — серверная
+/// сторона (MemoryHub-носитель); GitHub-консистентность REST-чтений
+/// закрывает живая проба против прода.
+#[tokio::test]
+async fn immediate_read_after_body_write_returns_written_body() {
+    let (tools, _) = hub();
+    let (number, _) = create_task(&tools, "t: rar", "## Постановка\n\nЧерновик.\n").await;
+    let sent =
+        "# Тайтл записи\n\nКонтент записи: immediate read-after-write.\n\n## Хвост\n\nодин раз\n";
+    let receipt = call(
+        &tools,
+        "task_body",
+        json!({ "number": number, "body": sent }),
+    )
+    .await
+    .expect("write");
+    let get = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("read");
+    assert!(
+        get.contains(sent),
+        "немедленное чтение возвращает записанное целиком: {get}"
+    );
+    let receipt_hash = receipt
+        .split("body_hash: ")
+        .nth(1)
+        .unwrap_or_default()
+        .trim();
+    assert!(
+        !receipt_hash.is_empty(),
+        "квитанция несёт body_hash: {receipt}"
+    );
+    assert_eq!(
+        fm_hash(&get),
+        receipt_hash,
+        "fm body_hash немедленного чтения ≡ квитанции записи"
     );
 }
 
