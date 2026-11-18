@@ -8,6 +8,7 @@ mod api;
 mod bots;
 mod clock;
 mod config;
+mod diag;
 mod executor;
 mod gherr;
 #[cfg(test)]
@@ -24,7 +25,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
-use uwuwu_usecase::{Clock as _, TickOutcome, TickUseCase};
+use uwuwu_usecase::{
+    Clock as _, IncidentLoudness, TickOutcome, TickUseCase, STALL_INCIDENT_COOLDOWN_MS,
+    STALL_INCIDENT_THRESHOLD, STALL_INCIDENT_WINDOW_MS,
+};
 
 #[derive(Debug, thiserror::Error)]
 enum BootError {
@@ -63,6 +67,19 @@ fn main() -> Result<(), BootError> {
         poll_sec = cfg.poll_sec,
         config = %config_path.display(),
         "Server started"
+    );
+    // Срез A #1294: THP-контекст процесса — вердикт THP-пробы прямым
+    // наблюдением (Railway-метрика = cgroup, THP раздувает cgroup-учёт).
+    let thp = diag::snapshot();
+    tracing::info!(
+        event = "server.thp",
+        thp = thp.thp.as_deref().unwrap_or("n/a"),
+        anon_hugepages_kb = thp
+            .anon_hugepages_kb
+            .map(|v| v.to_string())
+            .as_deref()
+            .unwrap_or("n/a"),
+        "THP snapshot"
     );
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -230,6 +247,7 @@ async fn run(
         clock: clock.clone(),
         state: state.clone(),
         models: spawn_models.clone(),
+        boot_ms: clock.now_ms(),
     });
 
     let shared: Arc<std::sync::RwLock<TickOutcome>> = Arc::default();
@@ -593,13 +611,27 @@ async fn run(
     }
 
     let http_task = tokio::spawn(serve(cfg.port(), app));
-    let tick_task = tokio::spawn(tick_loop(
-        cfg.poll_sec,
+    let notify = cfg
+        .tg_notify()
+        // run() возвращает String; префикс «конфиг:» сохраняем из Display
+        // ConfigError (BootError-конверсия — вне скоупа #1281)
+        .map_err(|e| format!("конфиг: {e}"))?
+        .map(|(token, chat)| {
+            (
+                Arc::new(tg::TelegramClient::new(token))
+                    as Arc<dyn uwuwu_usecase::bots::TelegramGateway>,
+                chat,
+            )
+        });
+    let tick_task = tokio::spawn(tick_loop(TickLoopArgs {
+        poll_sec: cfg.poll_sec,
         plan,
         usecase,
         shared,
-        Arc::new(sidecars),
-    ));
+        sidecars: Arc::new(sidecars),
+        notify,
+        clock,
+    }));
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {},
@@ -674,17 +706,84 @@ async fn sidecar_ticks(sidecars: &[Sidecar]) -> Result<(), uwuwu_usecase::Usecas
     Ok(())
 }
 
-async fn tick_loop(
+/// Аргументы тик-лупа: группировка (qlty function-parameters #1281).
+struct TickLoopArgs {
     poll_sec: u64,
     plan: Arc<uwuwu_usecase::TickPlan>,
     usecase: Arc<TickUseCase>,
     shared: Arc<std::sync::RwLock<TickOutcome>>,
     sidecars: Arc<Vec<Sidecar>>,
+    /// ТГ-сигнализация инцидентов сталл-детекта (#1281); None — off.
+    notify: Option<(Arc<dyn uwuwu_usecase::bots::TelegramGateway>, i64)>,
+    clock: Arc<dyn uwuwu_usecase::Clock>,
+}
+
+/// Один инцидент-сигнал (#1281): регистрирует эскалацию в скользящем окне;
+/// при превышении порога и истёкшем cooldown — один ТГ-сигнал владельцу
+/// (канон «строка сбоя + ТГ» UC-02). [notify] не настроен — громкий лог.
+async fn incident_signal(
+    notify: &Option<(Arc<dyn uwuwu_usecase::bots::TelegramGateway>, i64)>,
+    loudness: &mut IncidentLoudness,
+    now_ms: u64,
 ) {
+    if !loudness.register(now_ms) {
+        return;
+    }
+    let text = format!(
+        "⚠︎ uwuwu: инцидент сталл-детекта — {} эскалаций за скользящее окно \
+         ({} мин): массовая парковка stage-сессий в Needs attention. \
+         Разбор — на доске.",
+        loudness.escalations_in_window(),
+        STALL_INCIDENT_WINDOW_MS / 60_000,
+    );
+    match notify {
+        Some((tg, chat)) => match tg.send_message(*chat, &text).await {
+            Ok(()) => tracing::warn!(
+                event = "stall.incident_signal",
+                escalations = loudness.escalations_in_window(),
+                "Инцидент-сигнал владельцу отправлен"
+            ),
+            Err(e) => tracing::error!(
+                event = "stall.incident_signal_failed",
+                error = %e,
+                "Инцидент-сигнал не отправлен"
+            ),
+        },
+        None => tracing::warn!(
+            event = "stall.incident_unnotified",
+            escalations = loudness.escalations_in_window(),
+            "Инцидент сталл-детекта: [notify] не настроен — сигнала нет"
+        ),
+    }
+}
+
+async fn tick_loop(args: TickLoopArgs) {
+    let TickLoopArgs {
+        poll_sec,
+        plan,
+        usecase,
+        shared,
+        sidecars,
+        notify,
+        clock,
+    } = args;
+    // Инцидент-громкость (#1281): N+ сталл-эскалаций за скользящее окно —
+    // один ТГ-сигнал владельцу вместо N тихих парковок. Окно неперсистентно
+    // осознанно: волна эскалаций, разнесённая через рестарт, одного сигнала
+    // не даст — «рестарт = свежее окно» (философия ADR-107), персистентность
+    // планом не требовалась.
+    let mut loudness = IncidentLoudness::new(
+        STALL_INCIDENT_THRESHOLD,
+        STALL_INCIDENT_WINDOW_MS,
+        STALL_INCIDENT_COOLDOWN_MS,
+    );
     loop {
         let started = std::time::Instant::now();
         match usecase.run(&plan).await {
             Ok(outcome) => {
+                for _ in 0..outcome.stall_flagged {
+                    incident_signal(&notify, &mut loudness, clock.now_ms()).await;
+                }
                 *shared.write().expect("tick lock") = outcome;
             }
             Err(e) => {

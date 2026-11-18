@@ -4,6 +4,7 @@ pub mod actions;
 pub mod analyst;
 pub mod analyst_review;
 pub mod dreamer;
+pub mod incident;
 pub mod sweeper;
 #[cfg(test)]
 mod sweeper_tests;

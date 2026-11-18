@@ -320,6 +320,11 @@ pub trait TickStateStore: Send + Sync {
     /// Смена статуса строки = новый раунд (счётчик с нуля).
     fn stall_ping(&self, board: &str, number: u64) -> Option<(uwuwu_domain::Status, u64, u32)>;
     fn mark_stall_ping(&self, board: &str, number: u64, status: uwuwu_domain::Status, at_ms: u64);
+    /// Сброс раунда сталла на носителе: каунтер, переживший рестарт
+    /// процесса, объявляется недействительным — следующий пинг начинает
+    /// счёт с единицы (инцидент 18.11 #1281: локального сброса мало,
+    /// mark_stall_ping инкрементит stale-каунтер).
+    fn clear_stall(&self, board: &str, number: u64);
     /// Новый раунд слота (fresh-eyes): кулдаун прошлого раунда не переносится.
     fn clear_spawn_ms(&self, board: &str, number: u64, slot: Slot);
     /// Аналитика (#1135, замена триажа): кулдауны волн/ревью и цикл-гвард.

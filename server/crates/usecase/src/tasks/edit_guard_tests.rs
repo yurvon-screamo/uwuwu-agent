@@ -196,6 +196,7 @@ impl TickStateStore for NopState {
     }
 
     fn mark_stall_ping(&self, _: &str, _: u64, _: Status, _: u64) {}
+    fn clear_stall(&self, _: &str, _: u64) {}
 
     fn clear_spawn_ms(&self, _: &str, _: u64, _: Slot) {}
 

@@ -328,6 +328,26 @@ impl PrUrl {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Грубая PR-форма URL: хвост пути `/pull/<n>`, хвостовой `/` допустим,
+    /// хост не важен. Домен отвечает только «это вообще PR-форма?»; вендор
+    /// и строгость (literal github.com, чужие сущности по числовым
+    /// сегментам) — адаптер в своём parse_pr_url (#1155). Query/fragment и
+    /// нецифровой хвост — false: гейт не пускает то, что строгий слой
+    /// отвергнет (#1286).
+    pub fn is_pull(&self) -> bool {
+        let Some((_, rest)) = self.0.split_once("://") else {
+            return false;
+        };
+        let path = rest.trim_end_matches('/');
+        let Some((head, tail)) = path.rsplit_once('/') else {
+            return false;
+        };
+        if !head.ends_with("/pull") {
+            return false;
+        }
+        !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit())
+    }
 }
 
 /// Агрегат: срез строки доски, достаточный конвейеру.
@@ -497,11 +517,16 @@ impl Task {
     /// Автомерж-кандидат (#1232): Review + automerge + кодовый носитель
     /// (ветка/PR). Безветочная ячейка (Local и Artifact — docs-only
     /// артефакт/чужой-вендор URL, #1155) мержить нечего — строка ждёт
-    /// владельца в Review, тик её не прощупывает.
+    /// владельца в Review, тик её не прощупывает. PR-ячейка с URL не
+    /// PR-формы (wiki/issues/blob — docs-only с фабричной веткой, #1286)
+    /// — тот же класс «нечего мержить»: гейт требует PR-формы, когда URL
+    /// есть; без URL (ветка одна) кандидат остаётся — веточная проба,
+    /// авторемонт UC-01 (PR ещё не создан).
     pub fn automerge_ready(&self) -> bool {
         self.status == Status::UserReview
             && self.automerge
             && matches!(self.fields.vcs(), Vcs::Branch(_) | Vcs::PullRequest { .. })
+            && self.fields.pr().map(PrUrl::is_pull).unwrap_or(true)
     }
 }
 
@@ -592,6 +617,29 @@ mod tests {
         assert!(BranchName::parse("work/task-1").is_some());
         assert!(PrUrl::parse("ftp://x").is_none());
         assert!(PrUrl::parse("https://github.com/x/pull/1").is_some());
+    }
+
+    #[test]
+    fn is_pull_coarse_form() {
+        // #1286: грубая форма — хвост пути /pull/<n>, хост не важен
+        let pull = |url: &str| PrUrl::parse(url).unwrap().is_pull();
+        assert!(pull("https://github.com/o/r/pull/7"));
+        assert!(
+            pull("https://github.com/o/r/pull/7/"),
+            "трейлинг-слэш не рвёт форму"
+        );
+        assert!(pull("https://ghe.corp/o/r/pull/7"), "хост не важен");
+        // артефакт-URL (wiki/issues/blob) — не PR-форма
+        assert!(!pull("https://github.com/o/r/wiki/a"));
+        assert!(!pull("https://github.com/o/r/issues/1279"));
+        assert!(!pull("https://github.com/o/r/blob/main/docs/x.md"));
+        // чужой вендор: Gitea /pulls/ — не форма (#1269 — его вендор-парс)
+        assert!(!pull("https://git.l4a.ru/o/r/pulls/7"));
+        // мусорные хвосты: строгий слой их отвергнет — гейт не пускает
+        assert!(!pull("https://github.com/o/r/pull/"), "пустой номер");
+        assert!(!pull("https://github.com/o/r/pull/abc"), "нецифровой номер");
+        assert!(!pull("https://github.com/o/r/pull/7#x"), "fragment");
+        assert!(!pull("https://github.com/o/r/pull"), "без номера");
     }
 
     #[test]
