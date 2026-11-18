@@ -42,7 +42,7 @@ fn hub() -> Arc<ToolHub> {
                 StubSessions,
             ))),
             clock: Arc::new(SystemClock),
-            spawn_model: None,
+            models: Arc::new(uwuwu_usecase::SpawnModels::canonical()),
             checkout: String::new(),
             cup: 7,
         }),

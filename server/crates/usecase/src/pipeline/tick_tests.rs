@@ -707,7 +707,7 @@ fn usecase_with_state(
         prs: prs.clone(),
         clock: Arc::new(FixedClock),
         state,
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     (u, board, sessions, prs)
 }
@@ -769,7 +769,7 @@ fn peak_usecase(
         prs: prs.clone(),
         clock: Arc::new(PeakClock),
         state,
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     (u, board, sessions, prs)
 }
@@ -800,7 +800,7 @@ fn usecase_with_sessions(
         prs: prs.clone(),
         clock: Arc::new(FixedClock),
         state,
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     (u, board, sessions, prs)
 }
@@ -1071,7 +1071,7 @@ fn wake_usecase(
         }),
         clock: Arc::new(FixedClock),
         state: state.clone(),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     (u, sessions, state)
 }
@@ -1962,7 +1962,7 @@ async fn mixed_health_candidate_decided_by_status_fallback_at_cup_gate() {
             prs: prs.clone(),
             clock: Arc::new(FixedClock),
             state: Arc::new(MemState(Mutex::default())),
-            spawn_model: None,
+            models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         }
     };
     let held = build().run(&plan(Mode::Live, 1)).await.unwrap();
@@ -2020,7 +2020,7 @@ async fn foreign_executor_failure_does_not_blind_project_guard() {
         prs: prs.clone(),
         clock: Arc::new(FixedClock),
         state,
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
@@ -2152,7 +2152,7 @@ async fn wakeup_held_when_cup_full() {
         prs: prs.clone(),
         clock: Arc::new(FixedClock),
         state: state.clone(),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
     assert!(
@@ -2220,7 +2220,7 @@ async fn wakeup_delivery_occupies_cup_slot() {
         prs: prs.clone(),
         clock: Arc::new(FixedClock),
         state: state.clone(),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
     assert_eq!(
@@ -2530,7 +2530,7 @@ async fn undelivered_comment_is_not_marked_seen() {
             prs: prs.clone(),
             clock: Arc::new(FixedClock),
             state: state.clone(),
-            spawn_model: None,
+            models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         };
         (uc, board, sess, prs)
     };
@@ -2591,7 +2591,7 @@ async fn undelivered_comment_is_not_marked_seen() {
         }),
         clock: Arc::new(FixedClock),
         state,
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     let out = u2.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.wakeups, 1, "коммент доставлен после завершения хода");
@@ -2663,7 +2663,7 @@ async fn multi_comment_tail_delivered_together() {
         }),
         clock: Arc::new(FixedClock),
         state: state.clone(),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.wakeups, 1);
@@ -2725,7 +2725,7 @@ async fn inflight_comment_delivered_after_agent_reply() {
         }),
         clock: Arc::new(FixedClock),
         state,
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.wakeups, 1, "in-flight коммент доставлен после ответа");
@@ -2790,7 +2790,7 @@ async fn busy_session_not_pinged_early() {
         }),
         clock: Arc::new(BigClock),
         state: Arc::new(MemState(Mutex::default())),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
@@ -2849,7 +2849,7 @@ async fn soft_ping_wakes_idle_session_without_transaction() {
         }),
         clock: Arc::new(BigClock),
         state: Arc::new(MemState(Mutex::default())),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.soft_pings, 1, "мягкий пинг ушёл в сессию");
@@ -2936,7 +2936,7 @@ async fn idle_sessions_do_not_hold_cup() {
         prs: prs.clone(),
         clock: Arc::new(FixedClock),
         state,
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
@@ -3087,6 +3087,7 @@ async fn analyst_multiboard_no_oversell_within_tick() {
         sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         state,
         clock: Arc::new(FixedClock),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         cup: 2,
     };
     let spawned = u.tick().await.unwrap();
@@ -3119,6 +3120,7 @@ macro_rules! sidecar_uc_with_cup {
                 sessions: Arc::new(SessionRouter::uniform(sessions)),
                 state,
                 clock: Arc::new(FixedClock),
+                models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
                 cup,
             };
             (u, board.clone())
@@ -3275,7 +3277,7 @@ async fn dreamer_held_when_cup_full() {
         sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         state: Arc::new(MemState(Mutex::default())),
         clock: Arc::new(BigClock),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         checkout: "/tmp/checkout".into(),
         cup: 1,
     };
@@ -3306,7 +3308,14 @@ async fn analyst_wave_one_session_for_all_rows() {
         specs[0].directory, "/tmp/checkout",
         "мастер-чекаут, без env"
     );
-    assert!(specs[0].model.is_none(), "модель несёт деф-файл");
+    assert_eq!(
+        specs[0].model,
+        uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.3-flash#high")
+            .unwrap()
+            .model,
+        "модель аналитика — карта сервера (#1154)"
+    );
+    assert_eq!(specs[0].variant.as_deref(), Some("high"));
     // Todo-строка мимо волны; обе Analys-строки в пачке, счётчик первой попытки
     let inner = state.0.lock().unwrap();
     assert_eq!(inner.analys_loops.len(), 2, "только строки волны");
@@ -3492,6 +3501,7 @@ async fn analyst_verdictless_waves_do_not_burn_cycles() {
         sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         state: state.clone(),
         clock: clock.clone(),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         cup: 7,
     };
     // четыре волны подряд (сессия аналитика гибнет без вердикта, строка
@@ -3605,6 +3615,7 @@ async fn analyst_three_real_rounds_escalate_with_honest_message() {
         sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         state: state.clone(),
         clock: clock.clone(),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         cup: 7,
     };
     let pair = |state: &Arc<MemState>| {
@@ -3702,7 +3713,14 @@ async fn reviewer_spawns_for_review_analys_wave() {
         specs[0].agent,
         AgentSlot::Role(Agent::AnalystReviewer)
     ));
-    assert!(specs[0].model.is_none(), "модель несёт деф-файл");
+    assert_eq!(
+        specs[0].model,
+        uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.3#high")
+            .unwrap()
+            .model,
+        "модель ревьювера аналитики — карта сервера (#1154)"
+    );
+    assert_eq!(specs[0].variant.as_deref(), Some("high"));
 }
 
 #[tokio::test]
@@ -4016,6 +4034,7 @@ async fn analyst_wave_per_board_own_checkout_and_project() {
         sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         state: Arc::new(MemState(Mutex::default())),
         clock: Arc::new(FixedClock),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         cup: 7,
     };
     assert_eq!(u.tick().await.unwrap(), 2, "по сессии на доску");
@@ -4193,6 +4212,7 @@ async fn prune_skipped_when_a_board_read_fails() {
         sessions: Arc::new(SessionRouter::uniform(sessions)),
         state: state.clone(),
         clock: Arc::new(FixedClock),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         cup: 7,
     };
     u.tick().await.unwrap();
@@ -4477,7 +4497,7 @@ async fn dreamer_title_carries_marker() {
         sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         state: Arc::new(MemState(Mutex::default())),
         clock: Arc::new(FarClock(AtomicU64::new(2_000_000))), // > idle-порога 30 мин
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         checkout: "/tmp/checkout".into(),
         cup: 7,
     };
@@ -4532,7 +4552,7 @@ fn tick_with_clock(
         prs: prs.clone(),
         clock,
         state,
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     (u, board, sessions, prs)
 }
@@ -4726,7 +4746,7 @@ async fn enrichment_failure_skips_row() {
         }),
         clock: Arc::new(FixedClock),
         state: Arc::new(MemState(Mutex::default())),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.enrich_skipped, 1, "строка пропущена, не решена");
@@ -4762,7 +4782,7 @@ async fn orphan_deleted_when_set_session_fails() {
         }),
         clock: Arc::new(FixedClock),
         state: Arc::new(MemState(Mutex::default())),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.actions_failed, 1, "отказ записи ячейки виден");
@@ -5067,6 +5087,69 @@ fn env_repo_dir_formula_is_pinned() {
     // одной функцией; формат пинится тестом (расхождение = тихая слепота)
     assert_eq!(board_plan().env_repo_dir(50), "/tmp/env/50");
     assert_eq!(board_plan().env_repo_dir(1), "/tmp/env/1");
+}
+
+#[tokio::test]
+async fn stage_spawn_carries_model_from_server_map() {
+    // #1154 (решение владельца 17.11): модель спавна — карта сервера
+    // (SpawnModels), каждый спавн несёт её в теле сессии; деф-файлы
+    // агентов моделей не несут. Dev-стадия — default-ключ карты.
+    // Arrange
+    let (u, _, sessions, _) = usecase(vec![task(1, Status::InProgress)], PrState::Missing);
+
+    // Act
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+
+    // Assert
+    assert_eq!(out.spawns_done, 1, "спавн стадии состоялся");
+    let specs = sessions.specs.lock().unwrap();
+    assert_eq!(specs.len(), 2, "bootstrap + work");
+    let want = uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.3").unwrap();
+    for spec in specs.iter() {
+        assert_eq!(spec.model, want.model, "модель спавна = default карты");
+        assert_eq!(spec.variant, None, "default — без варианта");
+    }
+}
+
+#[tokio::test]
+async fn review_and_test_spawns_carry_map_models_per_agent() {
+    // Low-пин ревью R5: for_agent-ветка spawn_stage_inner (PlanReview/
+    // ResultReview/Test) — модель каждой роли из карты, не дефолт.
+    // Arrange: по строке на стадию без сессии слота
+    let cases = [
+        (
+            Status::ReviewPlan,
+            "plan-reviewer",
+            "zai-coding-plan/glm-5.3",
+        ),
+        (
+            Status::ReviewResult,
+            "code-quality-reviewer",
+            "zai-coding-plan/glm-5.3",
+        ),
+        (
+            Status::Testing,
+            "tester",
+            "zai-coding-plan/glm-5.3-flash#max",
+        ),
+    ];
+    for (status, agent_name, raw) in cases {
+        let (u, _, sessions, _) = usecase(vec![task(5, status)], PrState::Missing);
+        let want = uwuwu_domain::SpawnModel::parse(raw).unwrap();
+
+        // Act
+        let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+
+        // Assert
+        assert_eq!(out.spawns_done, 1, "{agent_name}: спавн состоялся");
+        let specs = sessions.specs.lock().unwrap();
+        let work = specs
+            .iter()
+            .find(|s| !s.bootstrap)
+            .expect("рабочая сессия в спеках");
+        assert_eq!(work.model, want.model, "{agent_name}: модель из карты");
+        assert_eq!(work.variant, want.variant, "{agent_name}: вариант из карты");
+    }
 }
 
 // ---- преемпшен CUP: понижение приоритета отдаёт слот (#1259) ----

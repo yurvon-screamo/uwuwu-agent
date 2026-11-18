@@ -2,6 +2,7 @@
 //! Нативные ошибки загрузки. Порт из TOML-структур в TickPlan — внизу.
 
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use uwuwu_domain::{PeakWindow, SpawnPolicy};
 use uwuwu_usecase::{BoardPlan, Mode, TickPlan};
@@ -34,16 +35,13 @@ fn default_hub_driver() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct SpawnModelCfg {
-    pub provider: String,
-    pub id: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub struct ExecutorCfg {
     pub name: String,
     pub url: String,
-    pub spawn_model: Option<SpawnModelCfg>,
+    /// Карта моделей спавнов `provider/id[#variant]` по имени агента
+    /// (+ "default" для Dev/Design/bootstrap) — #1154. Отсутствует —
+    /// канон владельца (SpawnModels::canonical).
+    pub models: Option<HashMap<String, String>>,
 }
 
 /// Дополнительный именованный исполнитель ([[executors]]): подмножество
