@@ -823,6 +823,202 @@ fn task(n: u64, status: Status) -> Task {
     Task::new(n, format!("t{n}"), status)
 }
 
+/// Роутинг тика «проект → executor» (#1248): юзкейс на двух фейк-гейтвеях
+/// (дефолт kisa + named redmi), проект → named — как memory-multi конфиг.
+/// Возвращает юзкейс и оба гейтвея (default, named).
+fn routed_usecase(
+    rows: Vec<Task>,
+    comments: Vec<CommentRef>,
+    clock: Arc<dyn Clock>,
+    default_gw: Arc<FakeSessions>,
+    named_gw: Arc<FakeSessions>,
+) -> TickUseCase {
+    TickUseCase {
+        board: Arc::new(FakeBoard {
+            rows,
+            log: Mutex::default(),
+            comments,
+            fields_fails: false,
+            set_session_fails: false,
+        }),
+        sessions: Arc::new(SessionRouter::new(
+            "kisa",
+            default_gw.clone(),
+            Vec::new(),
+            std::collections::HashMap::from([(
+                "1xgames".to_string(),
+                named_gw.clone() as Arc<dyn AgentSessionGateway>,
+            )]),
+        )),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+            probes: Mutex::default(),
+        }),
+        clock,
+        state: Arc::new(MemState(Mutex::default())),
+        spawn_model: None,
+    }
+}
+
+/// План тика с routed-доской (проект 1xgames).
+fn routed_plan(mode: Mode) -> TickPlan {
+    TickPlan {
+        mode,
+        policy: SpawnPolicy {
+            cup: 7,
+            peak: PeakWindow {
+                enabled: false,
+                start_min: 0,
+                end_min: 0,
+            },
+        },
+        boards: vec![BoardPlan {
+            project: "1xgames".into(),
+            board: "B".into(),
+            repo: "a/c".into(),
+            checkout: "/tmp/checkout".into(),
+            env_root: "/tmp/env".into(),
+        }],
+    }
+}
+
+/// Пин lifecycle-роутинга (#1248): Design-спавн routed-проекта — create
+/// (bootstrap и рабочая) И начальный prompt уходят в один гейтвей —
+/// исполнителя проекта; дефолтный prompt не получил вовсе.
+#[tokio::test]
+async fn spawn_design_routes_create_and_initial_prompt_to_project_executor() {
+    let default_gw = Arc::new(FakeSessions::new());
+    let named_gw = Arc::new(FakeSessions::new());
+    let u = routed_usecase(
+        vec![task(438, Status::Design)],
+        Vec::new(),
+        Arc::new(FixedClock),
+        default_gw.clone(),
+        named_gw.clone(),
+    );
+    let out = u.run(&routed_plan(Mode::Live)).await.unwrap();
+    assert_eq!(out.spawns_done, 1, "Design-строка заспавнена");
+    // bootstrap + рабочая сессия — на исполнителе проекта
+    assert_eq!(
+        named_gw.specs.lock().unwrap().len(),
+        2,
+        "create_session на named-исполнителе (bootstrap + рабочая)"
+    );
+    assert!(
+        default_gw.specs.lock().unwrap().is_empty(),
+        "дефолт не создаёт сессии routed-проекта"
+    );
+    // начальный prompt рабочей сессии — на исполнителе проекта
+    let named_prompts = named_gw.prompts.lock().unwrap();
+    assert_eq!(
+        named_prompts.len(),
+        1,
+        "начальный prompt на named-исполнителе, получено: {named_prompts:?}"
+    );
+    let (session, _) = named_prompts[0].split_once('|').expect("session|text");
+    let named_ids = named_gw.spawned.lock().unwrap();
+    assert!(
+        named_ids.contains(&session.to_string()),
+        "промптится сессия, созданная на том же исполнителе"
+    );
+    assert!(
+        default_gw.prompts.lock().unwrap().is_empty(),
+        "дефолтный гейтвей начальный prompt НЕ получил"
+    );
+}
+
+/// Пин lifecycle-роутинга (#1248): будильник живой stage-сессии routed-проекта
+/// ходит в гейтвей проекта; дефолтный prompt не получил.
+#[tokio::test]
+async fn wakeup_prompt_routes_to_project_executor() {
+    let mut t = task(440, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dev_live").unwrap(),
+    );
+    t.apply_fields(f);
+    let default_gw = Arc::new(FakeSessions::new());
+    // активность сессии старше коммента — fresh-доставка
+    let named_gw = Arc::new(FakeSessions {
+        activity_ms: Some(1000),
+        ..FakeSessions::new()
+    });
+    let u = routed_usecase(
+        vec![t],
+        vec![CommentRef {
+            id: "c1".into(),
+            created_ms: 3000,
+            body: "свежий коммент".into(),
+        }],
+        Arc::new(FixedClock),
+        default_gw.clone(),
+        named_gw.clone(),
+    );
+    let out = u.run(&routed_plan(Mode::Live)).await.unwrap();
+    assert_eq!(out.wakeups, 1, "будильник доставлен");
+    let named_prompts = named_gw.prompts.lock().unwrap();
+    assert!(
+        named_prompts.iter().any(|p| p.contains("Wakeup")),
+        "wakeup-prompt на гейтвее проекта: {named_prompts:?}"
+    );
+    assert!(
+        default_gw.prompts.lock().unwrap().is_empty(),
+        "дефолтный гейтвей wakeup-prompt НЕ получил"
+    );
+}
+
+/// Пин lifecycle-роутинга (#1248): мягкий сталл-пинг (прямой промпт) уходит
+/// в гейтвей проекта; дефолтный prompt не получил.
+#[tokio::test]
+async fn soft_ping_prompt_routes_to_project_executor() {
+    struct BigClock;
+    impl Clock for BigClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            100_000_000
+        }
+    }
+    let mut t = task(441, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dev_idle").unwrap(),
+    );
+    t.apply_fields(f);
+    let default_gw = Arc::new(FakeSessions::new());
+    // молчание 16 мин, ход завершён (idle) — мягкий пинг прямым промптом
+    let named_gw = Arc::new(FakeSessions {
+        activity_ms: Some(100_000_000 - 16 * 60_000),
+        idle_reply: true,
+        ..FakeSessions::new()
+    });
+    let u = routed_usecase(
+        vec![t],
+        Vec::new(),
+        Arc::new(BigClock),
+        default_gw.clone(),
+        named_gw.clone(),
+    );
+    let out = u.run(&routed_plan(Mode::Live)).await.unwrap();
+    assert_eq!(out.soft_pings, 1, "мягкий пинг ушёл");
+    let named_prompts = named_gw.prompts.lock().unwrap();
+    assert!(
+        named_prompts.iter().any(|p| p.contains("Мягкий пинг")),
+        "soft-ping на гейтвее проекта: {named_prompts:?}"
+    );
+    assert!(
+        default_gw.prompts.lock().unwrap().is_empty(),
+        "дефолтный гейтвей soft-ping НЕ получил"
+    );
+}
+
 /// Задача In Progress с живой дев-сессией (wake-сценарии #1204).
 fn dev_task(n: u64, session: &str) -> Task {
     let mut t = task(n, Status::InProgress);
