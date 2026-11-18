@@ -203,6 +203,9 @@ struct FakeSessions {
     /// Сессии с недостоверной пробой активности (Err) — срез честности
     /// пробы #1281: изоляция построчная, вердикт тишины не выдаётся.
     activity_fails_sessions: Mutex<Vec<String>>,
+    /// Гейт недоступен целиком (окно заглушки/рестарт) — liveness Unknown
+    /// на все сессии (#1281 срез 4: эскалация по недостоверной пробе).
+    liveness_unknown: bool,
 }
 
 /// Слепок живой сессии в фейке: (id, agent, directory, outcome, updated).
@@ -233,6 +236,7 @@ impl FakeSessions {
             prompt_fails: false,
             deleted: Mutex::default(),
             activity_fails_sessions: Mutex::default(),
+            liveness_unknown: false,
         }
     }
     fn with_live(agent: &str) -> Self {
@@ -306,6 +310,9 @@ impl AgentSessionGateway for FakeSessions {
         Ok(())
     }
     async fn liveness(&self, s: &str) -> Liveness {
+        if self.liveness_unknown {
+            return Liveness::Unknown;
+        }
         if self.dead_sessions.lock().unwrap().iter().any(|d| d == s) {
             Liveness::Dead
         } else {
@@ -751,6 +758,7 @@ fn peak_usecase(
         prompt_fails: false,
         deleted: Mutex::default(),
         activity_fails_sessions: Mutex::default(),
+        liveness_unknown: false,
     });
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
@@ -858,6 +866,7 @@ fn wake_usecase(
         specs: Mutex::default(),
         live: Mutex::default(),
         activity_fails_sessions: Mutex::default(),
+        liveness_unknown: false,
     });
     let u = TickUseCase {
         board,
@@ -1688,6 +1697,7 @@ async fn dead_stage_and_candidate_hold_blind_when_list_unavailable() {
         prompt_fails: false,
         deleted: Mutex::default(),
         activity_fails_sessions: Mutex::default(),
+        liveness_unknown: false,
     };
     let (u, _, _, _) = usecase_with_sessions(
         vec![dead, candidate],
@@ -2313,6 +2323,7 @@ async fn undelivered_comment_is_not_marked_seen() {
             prompt_fails: false,
             deleted: Mutex::default(),
             activity_fails_sessions: Mutex::default(),
+            liveness_unknown: false,
         });
         let prs = Arc::new(FakePrs {
             state: PrState::Missing,
@@ -2374,6 +2385,7 @@ async fn undelivered_comment_is_not_marked_seen() {
         prompt_fails: false,
         deleted: Mutex::default(),
         activity_fails_sessions: Mutex::default(),
+        liveness_unknown: false,
     });
     let u2 = TickUseCase {
         board: board.clone(),
@@ -2445,6 +2457,7 @@ async fn multi_comment_tail_delivered_together() {
         prompt_fails: false,
         deleted: Mutex::default(),
         activity_fails_sessions: Mutex::default(),
+        liveness_unknown: false,
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -2790,6 +2803,95 @@ async fn counters_earned_by_current_process_still_escalate() {
     assert_eq!(
         out.stall_flagged, 1,
         "раунд, заработанный текущим процессом, эскалирует как раньше"
+    );
+    // Различение причин (#1281): подпись эскалации — действенный
+    // diagnose-сигнал, а не «после двух автопингов» без вердикта пробы
+    let log = board.log.lock().unwrap();
+    let comment = log
+        .iter()
+        .find(|l| l.starts_with("comment#64="))
+        .expect("эскалация постит коммент");
+    assert!(
+        comment.contains("при живой сессии"),
+        "подпись различает причину: агент молчит при живой сессии"
+    );
+    assert!(
+        comment.contains("проба исполнителя: жива"),
+        "вердикт пробы в подписи"
+    );
+    assert!(
+        comment.contains("автопингов в раунде: 2"),
+        "счётчик доставленных пингов раунда в подписи"
+    );
+}
+
+/// Срез 4 (#1281): недостоверная проба живости в момент эскалации —
+/// эскалация не выполняется, отказ фиксируется как probe_failed
+/// (повтор на следующем тике, когда проба вернётся к правде).
+#[tokio::test]
+async fn escalation_deferred_when_liveness_probe_unreliable() {
+    const NOW: u64 = 100_000_000;
+    struct BigClock;
+    impl Clock for BigClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            NOW
+        }
+    }
+    let board = Arc::new(FakeBoard {
+        rows: vec![dev_task(64, "ses_dev_64")],
+        log: Mutex::default(),
+        comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
+    });
+    let sess = Arc::new(FakeSessions {
+        activity_ms: Some(NOW - 25 * 60_000),
+        idle_reply: true,
+        liveness_unknown: true,
+        ..Default::default()
+    });
+    // раунд, заработанный текущим процессом (boot давно): обычная
+    // эскалация заблокирована только недостоверной пробой
+    let seeded = MemState(Mutex::new(MemStateInner {
+        stalls: vec![
+            (64, Status::InProgress, NOW - 40 * 60_000),
+            (64, Status::InProgress, NOW - 35 * 60_000),
+        ],
+        ..Default::default()
+    }));
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sess.clone())),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+            probes: Mutex::default(),
+        }),
+        clock: Arc::new(BigClock),
+        state: Arc::new(seeded),
+        spawn_model: None,
+        boot_ms: NOW - 50 * 60_000,
+    };
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.stall_flagged, 0,
+        "эскалация не выполняется по недостоверной пробе"
+    );
+    assert_eq!(out.probe_failed, 1, "отказ пробы виден в outcome");
+    assert!(
+        !board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("NeedsAttention")),
+        "строка не паркуется, пока проба недостоверна"
     );
 }
 

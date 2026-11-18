@@ -821,12 +821,43 @@ impl TickUseCase {
                 .stall_ping_round(board, task, slot, session, soft, silence, now)
                 .await;
         }
-        // два пинга исчерпаны, тишина продолжается — мяч владельцу
+        // Проба живости В МОМЕНТ эскалации (#1281, различение причин):
+        // вердикт должен быть достоверным, подпись — действенной.
+        // Unknown — проба недостоверна: отказ (повтор на следующем тике);
+        // Dead — сессия потеряна: парковка не выполняется, dead-детект
+        // wakeup-пути респавнит строку на следующем тике (ADR-107),
+        // класс «сессия потеряна» живёт в комменте респавн-петли.
+        match self
+            .sessions
+            .project(&board.project)
+            .liveness(session)
+            .await
+        {
+            Liveness::Alive => {}
+            Liveness::Unknown => {
+                tracing::warn!(
+                    event = "stall.escalation_probe_unknown",
+                    number = task.number(),
+                    "Эскалация отложена: проба живости недостоверна"
+                );
+                return Ok(StallAct::ProbeFailed);
+            }
+            Liveness::Dead => {
+                tracing::warn!(
+                    event = "stall.escalation_session_lost",
+                    number = task.number(),
+                    "Эскалация отменена: сессия потеряна — строку заберёт dead-детект"
+                );
+                return Ok(StallAct::None);
+            }
+        }
+        // пинги исчерпаны, сессия жива и молчит — мяч владельцу
         tracing::warn!(
             event = "stall.escalated",
             number = task.number(),
             silence_min = silence / 60_000,
-            "Сталл: сессия молчит после двух автопингов"
+            round_pings = count,
+            "Сталл: агент молчит при живой сессии после раунда автопингов"
         );
         self.board
             .set_status(&board.board, task.number(), Status::NeedsAttention)
@@ -835,8 +866,9 @@ impl TickUseCase {
             .post_comment(
                 task.number(),
                 &format!(
-                    "⚠︎ Сталл-детект: stage-сессия `{}` молчит {} мин после двух \
-                     автопингов — агент не завершает статусную транзакцию. Строка в \
+                    "⚠︎ Сталл-детект: stage-сессия `{}` молчит {} мин при живой \
+                     сессии — агент не завершает статусную транзакцию (проба \
+                     исполнителя: жива; автопингов в раунде: {count}). Строка в \
                      Needs attention, разбор владельца.",
                     naming::slot_key(slot),
                     silence / 60_000
