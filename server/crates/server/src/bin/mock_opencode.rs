@@ -462,6 +462,10 @@ async fn prompt(
             s.reply = None;
             return (StatusCode::OK, Json(json!({ "data": { "id": id } })));
         }
+        // любой не-turn ход гасит залипший turn-режим: фазы пробы —
+        // ровно один ход, иначе следующие сообщения сессии молчат
+        // (вскрыто media-сценарием #1171)
+        s.turn_ms = None;
         // реплай бота готов сразу (storm — исключение: прерывание без ответа)
         if mode != "storm" {
             let tail = text

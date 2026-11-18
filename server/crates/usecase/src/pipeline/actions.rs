@@ -3,7 +3,7 @@
 
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
-use crate::pipeline::tick::{BoardPlan, RowContext, TickUseCase};
+use crate::pipeline::tick::{BoardPlan, RowContext, SpawnHold, TickUseCase};
 use crate::ports::{CommentRef, Liveness, SessionSpec};
 use crate::router::Gateway;
 use uwuwu_domain::{
@@ -22,6 +22,8 @@ pub enum WakeAct {
     Deferred,
     /// Гард «живая сессия в env» держит запуск (#1163).
     Guarded,
+    /// Список исполнителя недоступен — респавн без зрения невозможен (#1263).
+    GuardedBlind,
     /// Нечего будить: тишина, коммент уже отработан или луп-эскалация.
     None,
 }
@@ -175,19 +177,31 @@ impl TickUseCase {
                         "Проба Dead при живой сессии в списке исполнителя — респавн отменён");
                     return Ok(WakeAct::None);
                 }
-                // Env-гард на респавне (ревью Common-2): сеанс ячейки мёртв
-                // по-настоящему, но в env строки может жить сирота из
-                // crash-окна (падение процесса между prompt и set_session
-                // до зачистки) — респавн поверх живого хода = тот же класс
-                // дубля, что и на plain-пути.
-                if self.spawn_held_by_live(ctx, board, task, slot, self.clock.now_ms()) {
-                    tracing::warn!(
-                        event = "respawn.held_live_session",
-                        number = task.number(),
-                        slot = naming::slot_key(slot),
-                        "Респавн держится: живая сессия в env строки (second source #1163)"
-                    );
-                    return Ok(WakeAct::Guarded);
+                // Env-гард на респавне (ревью Common-2 + зрение #1263):
+                // сеанс ячейки мёртв по-настоящему, но в env строки может
+                // жить сирота из crash-окна — респавн поверх живого хода =
+                // тот же класс дубля, что и на plain-пути. Слепой скан —
+                // респавн без зрения невозможен, hold до восстановления.
+                match self.spawn_hold(ctx, board, task, slot, self.clock.now_ms()) {
+                    Some(SpawnHold::BlindScan) => {
+                        tracing::info!(
+                            event = "respawn.held_blind_scan",
+                            number = task.number(),
+                            slot = naming::slot_key(slot),
+                            "Респавн держится: список исполнителя недоступен — спавн без зрения невозможен (#1263)"
+                        );
+                        return Ok(WakeAct::GuardedBlind);
+                    }
+                    Some(SpawnHold::Live) => {
+                        tracing::warn!(
+                            event = "respawn.held_live_session",
+                            number = task.number(),
+                            slot = naming::slot_key(slot),
+                            "Респавн держится: живая сессия в env строки (second source #1163)"
+                        );
+                        return Ok(WakeAct::Guarded);
+                    }
+                    None => {}
                 }
                 // респавн = фактический спавн — полный гейт (пик + CUP)
                 let spawn = Action::Spawn { slot };

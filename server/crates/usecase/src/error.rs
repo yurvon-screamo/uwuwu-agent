@@ -17,6 +17,9 @@ pub enum UsecaseError {
     State(String),
     /// Telegram Bot API (боты, #1150).
     Telegram(String),
+    /// Файл превышает потолок скачивания Bot API (20 MiB) — перманентный
+    /// отказ `getFile`, ретрай бессмысленен (#1171).
+    TelegramTooBig(String),
 }
 
 impl fmt::Display for UsecaseError {
@@ -27,6 +30,7 @@ impl fmt::Display for UsecaseError {
             Self::Pr(m) => write!(f, "pr: {m}"),
             Self::State(m) => write!(f, "состояние: {m}"),
             Self::Telegram(m) => write!(f, "telegram: {m}"),
+            Self::TelegramTooBig(m) => write!(f, "telegram too big: {m}"),
         }
     }
 }

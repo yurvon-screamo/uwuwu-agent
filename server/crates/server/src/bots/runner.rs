@@ -9,14 +9,23 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use uwuwu_domain::{AgentSlot, BotModel, ModelRef};
 use uwuwu_usecase::bots::{
-    build_prompt, chunk_reply, classify_message, BotStateStore, TelegramGateway, TgMessage,
-    TgUpdate,
+    build_prompt, chunk_reply, classify_message, BotStateStore, Incoming, MediaKind,
+    TelegramGateway, TgMedia, TgMessage, TgUpdate,
 };
 use uwuwu_usecase::{AgentSessionGateway, Liveness, SessionSpec, TickStateStore, UsecaseResult};
 
 pub(crate) const TG_POLL_SEC: u64 = 25;
 pub(crate) const RETRY_PAUSE_MS: u64 = 10_000;
 const FALLBACK: &str = "Не успел ответить — напиши ещё раз.";
+/// Потолок скачивания Bot API: документированные «20 MB» — двоичные,
+/// граница getFile ровно 20 971 520 B (план #1171).
+const TG_MAX_FILE_BYTES: i64 = 20 * 1024 * 1024;
+const REFUSE_KIND: &str = "Такой тип файлов не принимаю (видео/голос/стикер) — пришли фото \
+или файлом (как документ), либо кинь файл прямо в задачу на GitHub.";
+const REFUSE_OVERSIZE: &str = "Файл слишком большой (>20 МБ) — Telegram не даёт ботам его \
+скачать. Приложи файл прямо в задачу на GitHub.";
+const REFUSE_FAILED: &str = "Не смог забрать файл — пришли заново или кинь прямо в задачу \
+на GitHub.";
 
 /// Структурные поля спеки: фиксируются на жизнь задачи (смена = рестарт
 /// задачи супервизором, для recreate — ещё и пересоздание сессии).
@@ -37,6 +46,8 @@ pub(crate) struct BotDeps {
     pub tg: Arc<dyn TelegramGateway>,
     pub sessions: Arc<dyn AgentSessionGateway>,
     pub state: Arc<dyn BotStateStore>,
+    /// Приёмник ассетов бота (media-файлы → URL в hub, #1171).
+    pub assets: Arc<dyn uwuwu_usecase::bots::BotAssetStore>,
     /// dreamer_done-маркировка бот-сессий (не источники опыта).
     pub tick_state: Arc<dyn TickStateStore>,
     /// Потолок ожидания реплая и шаг опроса (константы — поля ради тестов).
@@ -100,16 +111,84 @@ async fn handle_update(deps: &BotDeps, u: &TgUpdate) -> bool {
 
 pub(crate) async fn process_message(deps: &BotDeps, m: &TgMessage) -> UsecaseResult<()> {
     let view = deps.live.view();
-    let Some(text) = classify_message(m, view.owner.as_deref()) else {
+    let Some(incoming) = classify_message(m, view.owner.as_deref()) else {
         tracing::info!(event = "bot.skipped", slug = %deps.slug, chat_id = m.chat_id,
             "Не private или не владелец — молча");
         return Ok(());
     };
-    if text == "/start" {
-        if let Some(greeting) = view.greeting {
-            return send(deps, m.chat_id, &greeting).await;
+    match incoming {
+        Incoming::Text(text) => {
+            if text == "/start" {
+                if let Some(greeting) = view.greeting {
+                    return send(deps, m.chat_id, &greeting).await;
+                }
+            }
+            run_turn(deps, m.chat_id, &text).await
         }
+        Incoming::Media { caption, media } => process_media(deps, m.chat_id, caption, media).await,
     }
+}
+
+/// Media-ветка (#1171): photo/document ≤ 20 MiB — скачать → asset store →
+/// промпт с URL (обычный ход сессии); oversize/чужой тип/сбой — явный
+/// ТГ-отказ. Ни одна ветка не проходит молча; отказ поглощает апдейт
+/// (Ok — не ретрай: перманентные ошибки залочили бы очередь бота).
+async fn process_media(
+    deps: &BotDeps,
+    chat_id: i64,
+    caption: Option<String>,
+    media: TgMedia,
+) -> UsecaseResult<()> {
+    if media.kind == MediaKind::Other {
+        tracing::info!(event = "bot.media_refused", slug = %deps.slug,
+            kind = "other", "Медиа-тип не поддержан — явный отказ");
+        return send(deps, chat_id, REFUSE_KIND).await;
+    }
+    if media.file_size.is_some_and(|s| s > TG_MAX_FILE_BYTES) {
+        tracing::info!(event = "bot.media_oversize", slug = %deps.slug,
+            kind = "pre_check", "Файл больше потолка Bot API — явный отказ");
+        return send(deps, chat_id, REFUSE_OVERSIZE).await;
+    }
+    let bytes = match deps.tg.download_file(&media.file_id).await {
+        Ok(b) => b,
+        Err(uwuwu_usecase::UsecaseError::TelegramTooBig(_)) => {
+            tracing::info!(event = "bot.media_oversize", slug = %deps.slug,
+                kind = "get_file_400", "getFile: file is too big — явный отказ");
+            return send(deps, chat_id, REFUSE_OVERSIZE).await;
+        }
+        Err(_) => {
+            tracing::warn!(event = "bot.media_refused", slug = %deps.slug,
+                kind = "download_failed", "Скачивание не удалось — явный отказ");
+            return send(deps, chat_id, REFUSE_FAILED).await;
+        }
+    };
+    let url = match deps
+        .assets
+        .put(&deps.slug, media.kind, media.file_name.as_deref(), &bytes)
+        .await
+    {
+        Ok(u) => u,
+        Err(_) => {
+            tracing::warn!(event = "bot.media_refused", slug = %deps.slug,
+                kind = "upload_failed", "Загрузка ассета не удалась — явный отказ");
+            return send(deps, chat_id, REFUSE_FAILED).await;
+        }
+    };
+    tracing::info!(event = "bot.media_delivered", slug = %deps.slug,
+        kind = ?media.kind, "Файл забран и приложен к контексту сессии");
+    let caption_line = caption.unwrap_or_else(|| "Подписи нет".into());
+    let media_text = format!(
+        "Владелец прислал файл: {url}\n{caption_line}\n\
+Если оформляешь заявку — вложи эту ссылку в тело задачи (markdown), \
+чтобы контент попал в разбор."
+    );
+    run_turn(deps, chat_id, &media_text).await
+}
+
+/// Ход сессии (общий для текста и media): методичка при устаревании,
+/// prompt вечной сессии, ожидание реплая, отправка владельцу.
+async fn run_turn(deps: &BotDeps, chat_id: i64, text: &str) -> UsecaseResult<()> {
+    let view = deps.live.view();
     let session = ensure_session(deps).await?;
     // Методичка НЕ префиксует каждое сообщение (владелец 16.11):
     // - agent-режим: методичка в agents/<name>.md, промпт — чистый текст;
@@ -118,11 +197,11 @@ pub(crate) async fn process_message(deps: &BotDeps, m: &TgMessage) -> UsecaseRes
     let manual_hash = view.manual.len() as u64 ^ view.manual.chars().count() as u64;
     let need_manual = deps.state.bot_manual_hash(&deps.slug) != Some(manual_hash);
     let prompt_text = if deps.structural.agent.is_some() {
-        text
+        text.to_string()
     } else if need_manual {
-        build_prompt(&view.manual, &text)
+        build_prompt(&view.manual, text)
     } else {
-        text
+        text.to_string()
     };
     let baseline = deps
         .sessions
@@ -136,14 +215,14 @@ pub(crate) async fn process_message(deps: &BotDeps, m: &TgMessage) -> UsecaseRes
         deps.state.save().ok();
     }
     match wait_reply(deps, &session, baseline).await {
-        Some(reply) if !reply.trim().is_empty() => send(deps, m.chat_id, &reply).await?,
+        Some(reply) if !reply.trim().is_empty() => send(deps, chat_id, &reply).await?,
         _ => {
             tracing::warn!(event = "bot.reply_timeout", slug = %deps.slug, session = %session,
                 cap_ms = deps.reply_cap_ms, "Ответ не дождались — фоллбек владельцу");
-            send(deps, m.chat_id, FALLBACK).await?;
+            send(deps, chat_id, FALLBACK).await?;
         }
     }
-    tracing::info!(event = "bot.replied", slug = %deps.slug, chat_id = m.chat_id,
+    tracing::info!(event = "bot.replied", slug = %deps.slug, chat_id = chat_id,
         "Ответ отправлен");
     Ok(())
 }

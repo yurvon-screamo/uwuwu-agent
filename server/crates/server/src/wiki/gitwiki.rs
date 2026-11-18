@@ -89,6 +89,18 @@ impl GitWikiWriter {
 
     /// Коммит файла с сообщением (ff-only на branch).
     pub async fn commit_file(&self, path: &str, content: &str, message: &str) -> UsecaseResult<()> {
+        self.commit_bytes(path, content.as_bytes(), message).await
+    }
+
+    /// Коммит бинарного файла (ассеты ботов, #1171): blob — base64
+    /// encoding (git-блоб нейтрален к способу загрузки, md-текст в UI
+    /// остаётся текстом), механика ref→tree→commit→ref ff — общая.
+    pub async fn commit_bytes(
+        &self,
+        path: &str,
+        content: &[u8],
+        message: &str,
+    ) -> UsecaseResult<()> {
         // ref → commit → base tree
         let (_, head) = self
             .call(
@@ -120,7 +132,10 @@ impl GitWikiWriter {
             .call(
                 reqwest::Method::POST,
                 &format!("/repos/{}/git/blobs", self.repo),
-                Some(json!({ "content": content, "encoding": "utf-8" })),
+                Some(json!({
+                    "content": base64_encode(content),
+                    "encoding": "base64"
+                })),
             )
             .await?;
         let blob_sha = blob["sha"].as_str().unwrap_or_default().to_string();
@@ -197,4 +212,52 @@ pub fn base64_std(input: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// Стандартный base64-энкодер с паддингом (blob API encoding=base64,
+/// #1171): 3 байта → 4 символа, хвост добивается '='.
+pub fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod base64_tests {
+    use super::*;
+
+    #[test]
+    fn encode_roundtrips_with_std_decoder() {
+        // round-trip энкодер ↔ существующий декодер (включая паддинги)
+        for sample in [
+            &b""[..],
+            b"a",
+            b"ab",
+            b"abc",
+            b"abcd",
+            &[0u8, 255, 7, 128, 64, 13][..],
+        ] {
+            assert_eq!(base64_std(&base64_encode(sample)).as_deref(), Some(sample));
+        }
+        assert_eq!(base64_encode(b"abc"), "YWJj");
+        assert_eq!(base64_encode(b"a"), "YQ==");
+    }
 }

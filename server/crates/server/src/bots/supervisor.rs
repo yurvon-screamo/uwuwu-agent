@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use uwuwu_domain::{BotAction, BotSpec};
-use uwuwu_usecase::bots::{parse_bot_doc, plan_action, BotStateStore, TelegramGateway};
+use uwuwu_usecase::bots::{
+    parse_bot_doc, plan_action, BotAssetStore, BotStateStore, TelegramGateway,
+};
 use uwuwu_usecase::{AgentSessionGateway, Clock, TickStateStore, UsecaseResult, WikiRepo};
 
 use super::runner::{spawn_bot_task, BotStructural, RETRY_PAUSE_MS};
@@ -66,6 +68,8 @@ pub struct BotSupervisor {
     /// жизнь сессии; шторм гасит собственный луп-гвард).
     sessions: Arc<dyn AgentSessionGateway>,
     state: Arc<dyn BotStateStore>,
+    /// Приёмник ассетов ботов: media-файлы владельца → URL в hub (#1171).
+    assets: Arc<dyn BotAssetStore>,
     /// dreamer_done-маркировка бот-сессий (дример их не подбирает).
     tick_state: Arc<dyn TickStateStore>,
     clock: Arc<dyn Clock>,
@@ -83,6 +87,7 @@ impl BotSupervisor {
         wiki: Arc<dyn WikiRepo>,
         sessions: Arc<dyn AgentSessionGateway>,
         state: Arc<dyn BotStateStore>,
+        assets: Arc<dyn BotAssetStore>,
         tick_state: Arc<dyn TickStateStore>,
         clock: Arc<dyn Clock>,
         make_tg: TgFactory,
@@ -91,6 +96,7 @@ impl BotSupervisor {
             wiki,
             sessions,
             state,
+            assets,
             tick_state,
             clock,
             make_tg,
@@ -375,6 +381,7 @@ impl BotSupervisor {
             tg: (self.make_tg)(&token),
             sessions: self.sessions.clone(),
             state: self.state.clone(),
+            assets: self.assets.clone(),
             tick_state: self.tick_state.clone(),
             reply_cap_ms: self.reply_cap_ms,
             reply_poll_ms: self.reply_poll_ms,

@@ -14,6 +14,9 @@
 #     удаления сироты спавн происходит;
 #   фаза 5 (self-эхо #1204): медленный мок (акт 11с при тике 10с) —
 #     собственные MCP-комменты срезаются живьём, эхо-доставок нет.
+#   фаза 6 (слепой hold #1263): исполнитель недоступен — спавн держится
+#     (spawn.held_blind_scan, спавнов 0), после возврата исполнителя
+#     спавн происходит.
 #
 # Запуск: server/ops/stand/e2e.sh   (из каталога server; cargo build сам)
 # Выход: 0 — ок; 1 — провал с диагнозом. Логи/state/config — mktemp-рандир
@@ -25,7 +28,14 @@ cd "$(dirname "$0")/../.."   # server/
 PORT_MOCK="${PORT_MOCK:-8099}"; PORT_SRV="${PORT_SRV:-8090}"
 BEARER="${UWUWU_SERVER_BEARER:-stand-e2e-bearer}"
 SEED_N=2046
-RUN_DIR="$(mktemp -d /tmp/uwuwu-stand-XXXXXX)"
+# Каталог бинарников: target/debug по умолчанию; UWUWU_STAND_BIN_DIR —
+# оверрайд (копии под другим именем пути = иммунитет к broad-pkill чужих
+# параллельных стендов, чистящих «target/debug/uwuwu-server» подстрокой)
+BIN_DIR="${UWUWU_STAND_BIN_DIR:-$PWD/target/debug}"
+# Рандир логов/state: /tmp по умолчанию; UWUWU_STAND_RUN_DIR — оверрайд
+# (параллельные прогоны и внешние чистки /tmp — изоляция в scratch канона)
+RUN_DIR="${UWUWU_STAND_RUN_DIR:-$(mktemp -d /tmp/uwuwu-stand-XXXXXX)}"
+mkdir -p "$RUN_DIR"
 LOG_MOCK="$RUN_DIR/mock.log"
 LOG_SRV_OBS="$RUN_DIR/server-observe.log"
 LOG_SRV_LIVE="$RUN_DIR/server-live.log"
@@ -36,14 +46,15 @@ STATE="$RUN_DIR/state.json"
 CONFIG="$RUN_DIR/config.memory.toml"
 sed "s|http://127.0.0.1:8099|http://127.0.0.1:$PORT_MOCK|" \
   ops/config.memory.toml > "$CONFIG"
-MOCK_PID=""; SRV_PID=""
+MOCK_PID=""; SRV_PID=""; MOCK2_PID=""
 
 say()  { printf '\033[1;34m[e2e]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[e2e FAIL]\033[0m %s\n' "$*"; exit 1; }
 
 cleanup() { # только СВОИ процессы (pid-scoped): параллельные стенды не трогаем
-  [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null || true
-  [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null || true
+  for pid in "$SRV_PID" "$MOCK_PID" "$MOCK2_PID"; do
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+  done
 }
 trap cleanup EXIT
 
@@ -64,8 +75,8 @@ cargo build -q --bin uwuwu-server --bin mock_opencode
 # пред-чистка стека: утечка сервера прошлого прогона (убитая сессия не
 # отвела trap) занимает 8090 — новый сервер молча exit(1) по bind_failed,
 # а цикл ведёт чужой процесс (инцидент прогона тестировщика 17.11)
-pkill -f 'target/debug/uwuwu-server' 2>/dev/null || true
-pkill -f 'target/debug/mock_opencode' 2>/dev/null || true
+pkill -f "$BIN_DIR/uwuwu-server" 2>/dev/null || true
+pkill -f "$BIN_DIR/mock_opencode" 2>/dev/null || true
 sleep 1
 rm -f "$STATE"
 
@@ -73,14 +84,14 @@ say "фаза 1: observe не заряжает счётчики петель"
 MOCK_MODE=agent MOCK_PORT=$PORT_MOCK MOCK_MCP_URL="http://127.0.0.1:$PORT_SRV" \
   MOCK_MCP_TOKEN="$BEARER" MOCK_STEP_MS=300 \
   MOCK_VERDICTS="result:request_changes+die" \
-  ./target/debug/mock_opencode >"$LOG_MOCK" 2>&1 &
+  "$BIN_DIR/mock_opencode" >"$LOG_MOCK" 2>&1 &
 MOCK_PID=$!
 sleep 1
 UWUWU_SERVER_CONFIG=$CONFIG UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
   UWUWU_SERVER_MODE=observe \
   UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
   UWUWU_MOCK_SEED="$SEED_N:In Progress" RUST_LOG=info \
-  ./target/debug/uwuwu-server >"$LOG_SRV_OBS" 2>&1 &
+  "$BIN_DIR/uwuwu-server" >"$LOG_SRV_OBS" 2>&1 &
 SRV_PID=$!
 sleep 25   # 2+ тика (poll 10с)
 kill "$SRV_PID" 2>/dev/null || true; wait "$SRV_PID" 2>/dev/null || true; SRV_PID=""
@@ -100,7 +111,7 @@ UWUWU_SERVER_CONFIG=$CONFIG UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
   UWUWU_SERVER_MODE=live \
   UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
   UWUWU_MOCK_SEED="$SEED_N:Design" \
-  RUST_LOG=info ./target/debug/uwuwu-server >"$LOG_SRV_LIVE" 2>&1 &
+  RUST_LOG=info "$BIN_DIR/uwuwu-server" >"$LOG_SRV_LIVE" 2>&1 &
 SRV_PID=$!
 # сценарий вердиктов: первое ревью результата — на доработку (с мёртвой
 # dev-ячейкой), дальше approve
@@ -125,24 +136,31 @@ say "фаза 2 ок: ре-энтри круг пройден (dev-спавно�
 
 say "фаза 3: мульти-экзекьютор — маршрутизация проект → executor + отказ исполнителя (#1203)"
 # фаза 2 оставила свой стек (сервер 8090 + мок 8099) — чистим перед стендом
-pkill -f 'target/debug/uwuwu-server' 2>/dev/null || true
-pkill -f 'target/debug/mock_opencode' 2>/dev/null || true
+pkill -f "$BIN_DIR/uwuwu-server" 2>/dev/null || true
+pkill -f "$BIN_DIR/mock_opencode" 2>/dev/null || true
 sleep 1
 rm -f "$STATE"
-MOCK2_PORT=8098
-LOG_MOCK2=/tmp/uwuwu-stand-mock2.log
-LOG_SRV_MULTI=/tmp/uwuwu-stand-server-multi.log
+MOCK2_PORT=$((PORT_MOCK + 1))   # сессионная изоляция: константа 8098
+                                # сталкивала параллельные стенды на фазе 3
+LOG_MOCK2="$RUN_DIR/mock2.log"
+LOG_SRV_MULTI="$RUN_DIR/server-multi.log"
+CONFIG_MULTI="$RUN_DIR/config.memory-multi.toml"
+# портируемый конфиг: статические порты 8099/8098 → прогонные
+sed -e "s|http://127.0.0.1:8099|http://127.0.0.1:$PORT_MOCK|" \
+    -e "s|http://127.0.0.1:8098|http://127.0.0.1:$MOCK2_PORT|" \
+    ops/config.memory-multi.toml > "$CONFIG_MULTI"
 # мок-1 (дефолтный executor): agent-режим — ведёт uwuwu-цикл до Review
 MOCK_MODE=agent MOCK_PORT=$PORT_MOCK MOCK_MCP_URL="http://127.0.0.1:$PORT_SRV" \
   MOCK_MCP_TOKEN="$BEARER" MOCK_STEP_MS=300 MOCK_VERDICTS="result:approve" \
-  ./target/debug/mock_opencode >"$LOG_MOCK" 2>&1 &
+  "$BIN_DIR/mock_opencode" >"$LOG_MOCK" 2>&1 &
+MOCK_PID=$!
 sleep 1
 # мок-2 (named executor «mock2»): dead-режим — спавн «успешен» (create/
 # command/prompt живут), но сессия сразу 404 на чтение: красный исполнитель
 # идёт по существующей семантике dead-respawn-петли (луп-гвард → Needs
 # attention), без тишины
 MOCK_MODE=dead MOCK_PORT=$MOCK2_PORT \
-  ./target/debug/mock_opencode >"$LOG_MOCK2" 2>&1 &
+  "$BIN_DIR/mock_opencode" >"$LOG_MOCK2" 2>&1 &
 MOCK2_PID=$!
 sleep 1
 # конфиг фазы 3 — в ран-дир (state.json пишется рядом с конфигом; конфиг
@@ -151,10 +169,11 @@ sleep 1
 CONFIG_MULTI="$RUN_DIR/config-memory-multi.toml"
 sed "s|http://127.0.0.1:8099|http://127.0.0.1:$PORT_MOCK|; s|http://127.0.0.1:8098|http://127.0.0.1:$MOCK2_PORT|" \
   ops/config.memory-multi.toml > "$CONFIG_MULTI"
-UWUWU_SERVER_CONFIG=$CONFIG_MULTI UWUWU_SERVER_MODE=live \
+UWUWU_SERVER_CONFIG=$CONFIG_MULTI UWUWU_SERVER_MODE=live PORT=$PORT_SRV \
   UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
   UWUWU_MOCK_SEED="Задачи uwuwu:$SEED_N:Design;Задачи 1xgames-mock:2047:Design" \
-  RUST_LOG=info ./target/debug/uwuwu-server >"$LOG_SRV_MULTI" 2>&1 &
+  RUST_LOG=info "$BIN_DIR/uwuwu-server" >"$LOG_SRV_MULTI" 2>&1 &
+SRV_PID=$!
 sleep 25   # 2+ тика: оба проекта спавнятся каждый на своём исполнителе
 # диагностика маршрутизации — по журналам моков (list endpoint честно
 # фильтрует мёртвые: #1163, dead-сессии mock-2 в list не попадают;
@@ -170,8 +189,15 @@ task_status_num() { mcp task_get "{\"number\":$1,\"project\":\"$2\"}" | python3 
 import json,sys
 t = json.load(sys.stdin)['result']['content'][0]['text']
 print(t.split(chr(10))[0].split('— ')[-1])" 2>/dev/null; }
-sleep 40   # dead-детект + респавны мёртвой сессии 2047 → луп-гвард
-grep -q 'loop_escalated' "$LOG_SRV_MULTI" || fail "нет loop_escalated (семантика респавн-петли красного исполнителя сломана)"
+# dead-детект + респавны мёртвой сессии 2047 → луп-гвард: поллинг вместо
+# маргинального фиксированного окна (петле нужно ~6 тиков; дрейф тиков и
+# параллельные стенды съедали фиксированные 40с)
+ESCALATED=0
+for _ in $(seq 1 18); do
+  sleep 5
+  if grep -q 'loop_escalated' "$LOG_SRV_MULTI" 2>/dev/null; then ESCALATED=1; break; fi
+done
+[ "$ESCALATED" -eq 1 ] || fail "нет loop_escalated за 90с (семантика респавн-петли красного исполнителя сломана)"
 S2047="$(task_status_num 2047 1xgames-mock)"
 case "$S2047" in
   *attention*|*Needs*) say "красный executor: 2047 → Needs attention (луп-гвард сработал)" ;;
@@ -190,8 +216,8 @@ grep -q 'cup.list_sessions_failed' "$LOG_SRV_MULTI" || fail "нет CUP-фолб
 grep -q '"sidecar":"dreamer"' "$LOG_SRV_MULTI" || fail "нет sidecar.tick_failed дримера (strict union не отработал)"
 curl -s --max-time 5 "http://127.0.0.1:$PORT_MOCK/api/session" >/dev/null || fail "мок-1 недоступен после отказа мок-2"
 say "отказ исполнителя: CUP-фолбэк + strict-остановка дримера, тик живёт ($BEFORE_TICKS → $AFTER_TICKS тиков)"
-pkill -f 'target/debug/uwuwu-server' 2>/dev/null || true
-pkill -f 'target/debug/mock_opencode' 2>/dev/null || true
+pkill -f "$BIN_DIR/uwuwu-server" 2>/dev/null || true
+pkill -f "$BIN_DIR/mock_opencode" 2>/dev/null || true
 sleep 1
 say "фаза 3 ок: маршрутизация по проектам, отказ исполнителя без паралича"
 
@@ -204,7 +230,8 @@ rm -f "$STATE"
 # гард обязан видеть сироту и в многостраничном списке
 ENV_DIR="/home/yurvon/agents-env/$SEED_N"
 MOCK_MODE=plain MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=1500 MOCK_PAGE_LIMIT=1 \
-  ./target/debug/mock_opencode >"$LOG_MOCK" 2>&1 &
+  "$BIN_DIR/mock_opencode" >"$LOG_MOCK" 2>&1 &
+MOCK_PID=$!
 sleep 1
 ORPHAN_RESP=$(curl -s --max-time 5 -X POST "http://127.0.0.1:$PORT_MOCK/api/session" \
   -H 'Content-Type: application/json' \
@@ -224,7 +251,8 @@ sed "s|http://127.0.0.1:8099|http://127.0.0.1:$PORT_MOCK|; s|http://127.0.0.1:80
 UWUWU_SERVER_CONFIG=$CONFIG_P4 PORT=$PORT_SRV UWUWU_SERVER_MODE=live \
   UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
   UWUWU_MOCK_SEED="$SEED_N:In Progress" RUST_LOG=info \
-  ./target/debug/uwuwu-server >"$LOG_SRV_LIVE" 2>&1 &
+  "$BIN_DIR/uwuwu-server" >"$LOG_SRV_LIVE" 2>&1 &
+SRV_PID=$!
 sleep 25   # 2+ тика: спавн держится гардом
 SPAWNS=$(grep -oE '"event":"spawn.done","number":'$SEED_N "$LOG_SRV_LIVE" | wc -l || true)
 [ "$SPAWNS" -eq 0 ] || fail "спавн случился поверх живой сессии env (гард молчит): $SPAWNS"
@@ -234,8 +262,8 @@ say "гард держит: сирота в env, спавнов 0"
 curl -s --max-time 5 -X DELETE "http://127.0.0.1:$PORT_MOCK/api/session/$ORPHAN_ID" >/dev/null
 sleep 25   # тик после релиза
 grep -q '"event":"spawn.done","number":'$SEED_N "$LOG_SRV_LIVE" || fail "спавна нет после удаления сироты (гард перегораживает)"
-pkill -f 'target/debug/uwuwu-server' 2>/dev/null || true
-pkill -f 'target/debug/mock_opencode' 2>/dev/null || true
+pkill -f "$BIN_DIR/uwuwu-server" 2>/dev/null || true
+pkill -f "$BIN_DIR/mock_opencode" 2>/dev/null || true
 sleep 1
 say "фаза 4 ок: гард держит спавн при живой сессии env и отпускает после её смерти"
 
@@ -258,14 +286,14 @@ sleep 1
 rm -f "$STATE"
 MOCK_MODE=agent MOCK_PORT=$PORT_MOCK MOCK_MCP_URL="http://127.0.0.1:$PORT_SRV" \
   MOCK_MCP_TOKEN="$BEARER" MOCK_STEP_MS=11000 \
-  ./target/debug/mock_opencode >"$LOG_MOCK" 2>&1 &
+  "$BIN_DIR/mock_opencode" >"$LOG_MOCK" 2>&1 &
 MOCK_PID=$!
 sleep 1
 UWUWU_SERVER_CONFIG=$CONFIG UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
   UWUWU_SERVER_MODE=live \
   UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
   UWUWU_MOCK_SEED="$SEED_N:Design" \
-  RUST_LOG=info ./target/debug/uwuwu-server >"$LOG_SRV_ECHO" 2>&1 &
+  RUST_LOG=info "$BIN_DIR/uwuwu-server" >"$LOG_SRV_ECHO" 2>&1 &
 SRV_PID=$!
 # Цикл Design → … → Review на дефолтных approve с лагом актов: спавны
 # стадий идут сменой статуса, собственные комменты каждой стадии срезаются
@@ -288,4 +316,39 @@ SLICED=$(grep -c '"event":"wakeup.self_echo_sliced"' "$LOG_SRV_ECHO" || true)
 [ "$DELIVERED" -eq 0 ] || fail "wake-доставок: $DELIVERED (ожидался 0 — эхо?)"
 say "фаза 5 ок: sliced=$SLICED, delivered=0 — свои комменты не будят"
 
-say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + мульти-экзекьютор + гард #1163 + self-эхо); логи: $RUN_DIR"
+say "фаза 6: слепой hold — список исполнителя недоступен, спавн без зрения невозможен (#1263)"
+# Гасим СВОИ остатки (pid-scoped); мок НЕ поднимаем — union-скан падает
+# на каждом тике, инверсия деградации держит спавн до восстановления
+kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+SRV_PID=""; MOCK_PID=""
+sleep 1
+rm -f "$STATE"
+LOG_SRV_BLIND="$RUN_DIR/server-blind.log"
+UWUWU_SERVER_CONFIG=$CONFIG UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
+  UWUWU_SERVER_MODE=live \
+  UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
+  UWUWU_MOCK_SEED="$SEED_N:In Progress" \
+  RUST_LOG=info "$BIN_DIR/uwuwu-server" >"$LOG_SRV_BLIND" 2>&1 &
+SRV_PID=$!
+sleep 25   # 2+ тика на слепоте: спавн держится
+SPAWNS=$(grep -oE '"event":"spawn.done"' "$LOG_SRV_BLIND" | wc -l || true)
+[ "$SPAWNS" -eq 0 ] || fail "спавн случился при недоступном исполнителе (слепой спавн): $SPAWNS"
+grep -q '"event":"spawn.held_blind_scan"' "$LOG_SRV_BLIND" \
+  || fail "нет spawn.held_blind_scan (слепой hold не сработал)"
+grep -q '"event":"tick.completed"' "$LOG_SRV_BLIND" || fail "тик умер на слепоте"
+say "слепой hold держит: исполнитель недоступен, спавнов 0, тик живёт"
+# восстановление: мок возвращаем — спавн происходит
+MOCK_MODE=plain MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=1500 \
+  "$BIN_DIR/mock_opencode" >"$LOG_MOCK" 2>&1 &
+MOCK_PID=$!
+sleep 25
+grep -q '"event":"spawn.done"' "$LOG_SRV_BLIND" \
+  || fail "спавна нет после возврата исполнителя (hold перегораживает)"
+kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+SRV_PID=""; MOCK_PID=""
+sleep 1
+say "фаза 6 ок: слепой hold держит спавн при мёртвом исполнителе и отпускает после возврата"
+
+say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + мульти-экзекьютор + гард #1163 + self-эхо + слепой hold #1263); логи: $RUN_DIR"

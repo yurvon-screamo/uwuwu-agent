@@ -4,11 +4,13 @@
 //! Контракт вечной сессии: смена model/workspace → пересоздание (память
 //! осознанно сбрасывается); token_env/enabled → stop/start, сессия живёт.
 
+mod asset_store;
 mod runner;
 #[cfg(test)]
 mod runner_tests;
 mod supervisor;
 
+pub use asset_store::{GitAssetStore, MemoryAssetStore};
 pub use supervisor::BotSupervisor;
 
 /// Живое (горячее) представление бота: метаданные и методичка читаются
