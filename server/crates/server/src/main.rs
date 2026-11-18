@@ -328,6 +328,7 @@ async fn run(
                 .first()
                 .map(|b| b.checkout.clone())
                 .unwrap_or_default(),
+            cup: plan.policy.cup,
         }),
     });
 
@@ -365,6 +366,7 @@ async fn run(
             clock: clock.clone(),
             spawn_model: spawn_model_cfg.clone(),
             checkout: checkout.clone(),
+            cup: plan.policy.cup,
         });
         let project = project.clone();
 
@@ -400,6 +402,7 @@ async fn run(
             sessions: sessions.clone(),
             state: state.clone(),
             clock: clock.clone(),
+            cup: plan.policy.cup,
         });
         let analyst_review = Arc::new(uwuwu_usecase::AnalystReviewUseCase {
             board: board.clone(),
@@ -407,6 +410,7 @@ async fn run(
             sessions: sessions.clone(),
             state: state.clone(),
             clock: clock.clone(),
+            cup: plan.policy.cup,
         });
         let dreamer = Arc::new(uwuwu_usecase::DreamerUseCase {
             sessions: sessions.clone(),
@@ -417,6 +421,7 @@ async fn run(
                 .first()
                 .map(|(_, _, checkout)| checkout.clone())
                 .unwrap_or_default(),
+            cup: plan.policy.cup,
         });
         sidecars.push(Sidecar {
             name: "analys".into(),

@@ -42,6 +42,10 @@ struct MockSession {
     tokens_out: u64,
     /// «работа» ещё идёт (agent-режим).
     busy: bool,
+    /// time.busy/time.idle API (Started/idle): busy ⟺ busy_ms > idle_ms
+    /// (нулевое значение = нет события) — семантика CUP-учёта (#1231).
+    busy_ms: u64,
+    idle_ms: u64,
     dead: bool,
     /// Реплай для message_tail: (created_ms, текст) — бот-контур (#1150)
     /// читает хвост как ответ сессии.
@@ -326,6 +330,8 @@ async fn create_session(
         tokens_in: 0,
         tokens_out: 0,
         busy: false,
+        busy_ms: 0,
+        idle_ms: 0,
         dead: mode == "dead",
         reply: None,
         turn_ms: None,
@@ -348,8 +354,9 @@ struct ListQuery {
 
 async fn list_sessions(store: Arc<Store>, q: Query<ListQuery>) -> Resp {
     let sessions = store.sessions.lock().expect("store");
-    // мёртвые вне списка: list и GET согласованы (сессии, которых serve
-    // не знает, 404-ят и в list не попадают) — контракт second source #1163
+    // мёртвые (удалённые) в списке не числятся — семантика реального
+    // опенкода, на неё опирается busy-учёт CUP (#1231); list и GET
+    // согласованы (контракт second source #1163)
     let mut list: Vec<Value> = sessions
         .values()
         .filter(|s| !s.dead)
@@ -400,7 +407,12 @@ fn session_json(s: &MockSession) -> Value {
         "agent": if s.agent.is_empty() { Value::Null } else { json!(s.agent) },
         "title": s.title,
         "location": { "directory": s.directory },
-        "time": { "created": s.updated_ms, "updated": s.updated_ms },
+        "time": {
+            "created": s.updated_ms,
+            "updated": s.updated_ms,
+            "busy": if s.busy_ms == 0 { Value::Null } else { json!(s.busy_ms) },
+            "idle": if s.idle_ms == 0 { Value::Null } else { json!(s.idle_ms) },
+        },
         "outcome": if s.outcome.is_empty() { Value::Null } else { json!(s.outcome) },
         "tokens": { "input": s.tokens_in, "output": s.tokens_out },
     })
@@ -441,6 +453,8 @@ async fn prompt(
     let mut sessions = store.sessions.lock().expect("store");
     if let Some(s) = sessions.get_mut(&id) {
         s.updated_ms = now_ms();
+        s.busy_ms = now_ms(); // Started: ход в полёте (CUP-учёт, #1231)
+
         // Маркер turn probe (#1209): сессия отвечает многосообщным ходом —
         // мгновенный реплай не ставится, message_tail строит фазы пробы
         if text.contains("turn probe") {
@@ -470,6 +484,7 @@ async fn prompt(
             let mut sessions = store.sessions.lock().expect("store");
             if let Some(s) = sessions.get_mut(&id) {
                 s.outcome = "interrupted".into();
+                s.idle_ms = now_ms(); // прерванный ход завершён (CUP-учёт)
             }
             tracing::warn!(event = "mock.storm_interrupted", %id, "шторм-сценарий");
         }
@@ -662,6 +677,7 @@ async fn work_like_agent(
     if let Some(s) = sessions.get_mut(&session.id) {
         s.busy = false;
         s.updated_ms = now_ms();
+        s.idle_ms = now_ms(); // idle: ход завершён — busy снимается (CUP-учёт, #1231)
         s.outcome = "succeeded".into();
         s.tokens_in = 900;
         s.tokens_out = 100;

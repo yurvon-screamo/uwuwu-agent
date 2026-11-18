@@ -57,6 +57,13 @@ fn parse_session_page(
         .map(|list| {
             list.iter()
                 .filter_map(|s| {
+                    // busy = ход в полёте (Started): time.busy пишется на
+                    // старте хода и не очищается, time.idle — на idle;
+                    // busy ⟺ busy > idle (сверено с бинарём 2.3.0, #1231).
+                    // При апгрейде opencode семантику перепроверить.
+                    let busy_ms = s["time"]["busy"].as_u64();
+                    let idle_ms = s["time"]["idle"].as_u64();
+                    let busy = busy_ms.is_some_and(|b| idle_ms.is_none_or(|i| b > i));
                     Some(SessionInfo {
                         id: s["id"].as_str()?.to_string(),
                         agent: s["agent"].as_str().unwrap_or_default().to_string(),
@@ -68,6 +75,7 @@ fn parse_session_page(
                         outcome: s["outcome"].as_str().unwrap_or_default().to_string(),
                         total_tokens: s["tokens"]["input"].as_u64().unwrap_or_default()
                             + s["tokens"]["output"].as_u64().unwrap_or_default(),
+                        busy,
                     })
                 })
                 .collect()
@@ -443,6 +451,49 @@ mod tests {
             "outcome": null,
             "tokens": { "input": 3, "output": 4 }
         })
+    }
+
+    fn parsed_with_time(busy: serde_json::Value, idle: serde_json::Value) -> bool {
+        let mut item = page_item("s", "/x");
+        item["time"]["busy"] = busy;
+        item["time"]["idle"] = idle;
+        parse_session_page(&serde_json::json!({ "data": [item] }), 1)
+            .0
+            .remove(0)
+            .busy
+    }
+
+    #[test]
+    fn session_page_busy_semantics() {
+        // #1231: busy ⟺ time.busy > time.idle — ход в полёте (Started
+        // пишет time.busy, idle-финал пишет time.idle). outcome — атрибут
+        // последнего завершённого хода, живость не выражает.
+        // ход в полёте: Started есть, idle ещё не ставился
+        assert!(parsed_with_time(
+            serde_json::json!(1000u64),
+            serde_json::Value::Null
+        ));
+        // завершённый ход: idle позже Started — слот свободен
+        assert!(!parsed_with_time(
+            serde_json::json!(1000u64),
+            serde_json::json!(2000u64)
+        ));
+        // корень бага #1231: второй ход поверх финала (outcome непуст) —
+        // Started позже последнего idle, сессия держит кап
+        assert!(parsed_with_time(
+            serde_json::json!(2000u64),
+            serde_json::json!(1000u64)
+        ));
+        // без события Started — не busy (ручная/легаси-сессия)
+        assert!(!parsed_with_time(
+            serde_json::Value::Null,
+            serde_json::json!(1000u64)
+        ));
+        // событий нет вовсе — не busy (page_item без time.busy/idle)
+        assert!(!parsed_with_time(
+            serde_json::Value::Null,
+            serde_json::Value::Null
+        ));
     }
 
     #[test]

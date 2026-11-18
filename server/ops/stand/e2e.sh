@@ -163,6 +163,12 @@ MOCK_MODE=dead MOCK_PORT=$MOCK2_PORT \
   "$BIN_DIR/mock_opencode" >"$LOG_MOCK2" 2>&1 &
 MOCK2_PID=$!
 sleep 1
+# конфиг фазы 3 — в ран-дир (state.json пишется рядом с конфигом; конфиг
+# в ops/ делал state общим между прогонами — луп-гварды персистили и
+# эскалировали свежие строки мгновенно, #1231 конфликт-kickoff)
+CONFIG_MULTI="$RUN_DIR/config-memory-multi.toml"
+sed "s|http://127.0.0.1:8099|http://127.0.0.1:$PORT_MOCK|; s|http://127.0.0.1:8098|http://127.0.0.1:$MOCK2_PORT|" \
+  ops/config.memory-multi.toml > "$CONFIG_MULTI"
 UWUWU_SERVER_CONFIG=$CONFIG_MULTI UWUWU_SERVER_MODE=live PORT=$PORT_SRV \
   UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
   UWUWU_MOCK_SEED="Задачи uwuwu:$SEED_N:Design;Задачи 1xgames-mock:2047:Design" \
@@ -199,16 +205,17 @@ case "$S2047" in
 esac
 
 # kill мок-2 (транспортная смерть): strict-union CUP → фолбэк на статусный
-# подсчёт, best-effort дример → warn, тик конвейера продолжает жить
+# подсчёт; дример/аналитика на strict — sidecar.tick_failed (решения по
+# агрегату честно останавливаются), тик конвейера продолжает жить
 BEFORE_TICKS=$(grep -c '"event":"tick.completed"' "$LOG_SRV_MULTI" || true)
 kill "$MOCK2_PID" 2>/dev/null || true
 sleep 25   # 2+ тика на отказе
 AFTER_TICKS=$(grep -c '"event":"tick.completed"' "$LOG_SRV_MULTI" || true)
 [ "$AFTER_TICKS" -gt "$BEFORE_TICKS" ] || fail "тик умер после отказа исполнителя (тик-луп встал)"
 grep -q 'cup.list_sessions_failed' "$LOG_SRV_MULTI" || fail "нет CUP-фолбэка (strict union не отработал)"
-grep -q 'router.list_partial' "$LOG_SRV_MULTI" || fail "нет warn union-скана дримера (best-effort не отработал)"
+grep -q '"sidecar":"dreamer"' "$LOG_SRV_MULTI" || fail "нет sidecar.tick_failed дримера (strict union не отработал)"
 curl -s --max-time 5 "http://127.0.0.1:$PORT_MOCK/api/session" >/dev/null || fail "мок-1 недоступен после отказа мок-2"
-say "отказ исполнителя: CUP-фолбэк + warn дримера, тик живёт ($BEFORE_TICKS → $AFTER_TICKS тиков)"
+say "отказ исполнителя: CUP-фолбэк + strict-остановка дримера, тик живёт ($BEFORE_TICKS → $AFTER_TICKS тиков)"
 pkill -f "$BIN_DIR/uwuwu-server" 2>/dev/null || true
 pkill -f "$BIN_DIR/mock_opencode" 2>/dev/null || true
 sleep 1
@@ -235,7 +242,13 @@ d = json.load(sys.stdin)
 row = d.get('data') or d
 print(row.get('id',''))")
 [ -n "$ORPHAN_ID" ] || fail "мок не создал сироту-сессию: [$ORPHAN_RESP]"
-UWUWU_SERVER_CONFIG=$CONFIG UWUWU_SERVER_MODE=live PORT=$PORT_SRV \
+# конфиг фазы 4 — в ран-дир: state пишется config-adjacent; конфиг из ops/
+# делал state общим между прогонами (server/ops/state.json ворктри,
+# ревью #1231 раунд 4 Common)
+CONFIG_P4="$RUN_DIR/config-memory-p4.toml"
+sed "s|http://127.0.0.1:8099|http://127.0.0.1:$PORT_MOCK|; s|http://127.0.0.1:8090|http://127.0.0.1:$PORT_SRV|" \
+  ops/config.memory.toml > "$CONFIG_P4"
+UWUWU_SERVER_CONFIG=$CONFIG_P4 PORT=$PORT_SRV UWUWU_SERVER_MODE=live \
   UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
   UWUWU_MOCK_SEED="$SEED_N:In Progress" RUST_LOG=info \
   "$BIN_DIR/uwuwu-server" >"$LOG_SRV_LIVE" 2>&1 &
