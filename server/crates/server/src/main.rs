@@ -208,7 +208,7 @@ async fn run(
     let (raw_default, sessions) = build_sessions(&cfg, &secrets, clock.clone())?;
     let prs = Arc::new(github::GhPrGateway::new(secrets.gh_token.clone()));
     let state_path = cfg.state_path(&config_path);
-    let state = Arc::new(state::JsonStateStore::load(state_path));
+    let state = Arc::new(state::JsonStateStore::load(state_path, clock.clone()));
     let spawn_models = Arc::new(match cfg.executor.models.as_ref() {
         Some(raw) => {
             let mut map = std::collections::HashMap::new();
@@ -260,6 +260,20 @@ async fn run(
             ))),
         )),
     };
+    // Ассеты ботов (#1171): прод — коммит в hub-репо (ff-only), e2e/
+    // memory — приёмник стенда (полный media-флоу без GitHub).
+    let asset_store: Arc<dyn uwuwu_usecase::bots::BotAssetStore> = match &memory_hub {
+        Some(_) => Arc::new(bots::MemoryAssetStore::default()),
+        None => Arc::new(bots::GitAssetStore::new(
+            Arc::new(wiki::GitWikiWriter::new(
+                cfg.hub.repo.clone(),
+                "main".to_string(),
+                secrets.gh_token.clone(),
+            )),
+            cfg.hub.repo.clone(),
+            "main".to_string(),
+        )),
+    };
     // Семантика: LanceDB embedded + Ollama-туннель (env UWUWU_EMBED_URL;
     // нет туннеля — поиск честно без индекса)
     let embed_url = std::env::var("UWUWU_EMBED_URL")
@@ -307,6 +321,8 @@ async fn run(
             board: board.clone(),
             fields: field_store,
             boards: boards_cfg.clone(),
+            clock: clock.clone(),
+            state: state.clone(),
         }),
         wiki: wiki.clone(),
         sessions: sessions.clone(),
@@ -321,6 +337,7 @@ async fn run(
                 .first()
                 .map(|b| b.checkout.clone())
                 .unwrap_or_default(),
+            cup: plan.policy.cup,
         }),
     });
 
@@ -358,6 +375,7 @@ async fn run(
             clock: clock.clone(),
             models: spawn_models.clone(),
             checkout: checkout.clone(),
+            cup: plan.policy.cup,
         });
         let project = project.clone();
 
@@ -394,6 +412,8 @@ async fn run(
             state: state.clone(),
             clock: clock.clone(),
             models: spawn_models.clone(),
+            cup: plan.policy.cup,
+>>>>>>> origin/master
         });
         let analyst_review = Arc::new(uwuwu_usecase::AnalystReviewUseCase {
             board: board.clone(),
@@ -402,6 +422,7 @@ async fn run(
             state: state.clone(),
             clock: clock.clone(),
             models: spawn_models.clone(),
+            cup: plan.policy.cup,
         });
         let dreamer = Arc::new(uwuwu_usecase::DreamerUseCase {
             sessions: sessions.clone(),
@@ -412,6 +433,7 @@ async fn run(
                 .first()
                 .map(|(_, _, checkout)| checkout.clone())
                 .unwrap_or_default(),
+            cup: plan.policy.cup,
         });
         sidecars.push(Sidecar {
             name: "analys".into(),
@@ -460,6 +482,7 @@ async fn run(
             wiki.clone(),
             bot_sessions,
             state.clone(),
+            asset_store.clone(),
             state.clone() as Arc<dyn uwuwu_usecase::TickStateStore>,
             clock.clone(),
             Arc::new(|token| {

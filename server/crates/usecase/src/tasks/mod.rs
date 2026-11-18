@@ -1,5 +1,9 @@
 //! Задачи: запись (write) и вьюхи (views).
 
+#[cfg(test)]
+mod analys_exit_gate_tests;
+#[cfg(test)]
+mod edit_guard_tests;
 mod md_section;
 #[cfg(test)]
 mod md_section_tests;

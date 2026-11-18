@@ -41,8 +41,8 @@ pub struct SpawnPolicy {
 pub enum Action {
     /// Спавн агента стадии (сессии нет).
     Spawn { slot: Slot },
-    /// Автодон: проба PR → мерж/Done/bounce.
-    Autodone,
+    /// Автомерж: проба PR → мерж (строка остаётся в Review) / bounce (#1232).
+    Automerge,
     /// Строка-наблюдение: чего она ждёт по канону.
     Observe { awaits: Awaits },
 }
@@ -67,7 +67,7 @@ pub enum Awaits {
     Untracked,
 }
 
-/// Чего ждёт строка вне спавна/автодона.
+/// Чего ждёт строка вне спавна/автомержа.
 pub fn awaits(status: Status) -> Awaits {
     match status {
         Status::Design
@@ -103,8 +103,8 @@ pub fn decide(task: &Task) -> Action {
     if let Some(slot) = task.stage_needs_spawn() {
         return Action::Spawn { slot };
     }
-    if task.autodone_ready() {
-        return Action::Autodone;
+    if task.automerge_ready() {
+        return Action::Automerge;
     }
     Action::Observe {
         awaits: awaits(task.status()),
@@ -266,11 +266,46 @@ mod tests {
     }
 
     #[test]
-    fn decide_autodone_only_with_flag() {
+    fn decide_automerge_only_with_flag() {
         let mut t = task(Status::UserReview);
+        let branch = crate::task::BranchName::parse("work/x").unwrap();
+        t.apply_fields(crate::task::TaskFields::new(
+            std::collections::BTreeMap::new(),
+            crate::task::Vcs::Branch(branch),
+            crate::task::Priority::Empty,
+        ));
         assert!(matches!(decide(&t), Action::Observe { .. }));
-        t.set_autodone(true);
-        assert_eq!(decide(&t), Action::Autodone);
+        t.set_automerge(true);
+        assert_eq!(decide(&t), Action::Automerge);
+    }
+
+    #[test]
+    fn decide_automerge_needs_mergeable_carrier() {
+        // docs-only (нет PR и ветки) мержить нечего: строка ждёт владельца,
+        // тик не прощупывает (#1232); безветочный артефакт-URL (#1155) —
+        // тот же класс «нечего мержить», не гейт мержа
+        let mut t = task(Status::UserReview);
+        t.set_automerge(true);
+        assert!(matches!(decide(&t), Action::Observe { .. }));
+        t.apply_fields(crate::task::TaskFields::new(
+            std::collections::BTreeMap::new(),
+            crate::task::Vcs::Artifact {
+                url: crate::task::PrUrl::parse("https://github.com/a/b/blob/main/docs/x.md")
+                    .unwrap(),
+            },
+            crate::task::Priority::Empty,
+        ));
+        assert!(
+            matches!(decide(&t), Action::Observe { .. }),
+            "Artifact — не мерж-гейт"
+        );
+        let branch = crate::task::BranchName::parse("work/x").unwrap();
+        t.apply_fields(crate::task::TaskFields::new(
+            std::collections::BTreeMap::new(),
+            crate::task::Vcs::Branch(branch),
+            crate::task::Priority::Empty,
+        ));
+        assert_eq!(decide(&t), Action::Automerge);
     }
 
     #[test]
@@ -330,7 +365,7 @@ mod tests {
             Gate::Allowed
         );
         assert_eq!(
-            gate(&t, &Action::Autodone, policy, 2, in_peak),
+            gate(&t, &Action::Automerge, policy, 2, in_peak),
             Gate::Allowed
         );
     }

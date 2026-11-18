@@ -23,6 +23,20 @@ pub const F_PRIORITY: &str = uwuwu_usecase::F_PRIORITY;
 /// Карта значений полей задачи (непустые).
 pub type Fields = HashMap<String, String>;
 
+/// Резолв имени в каталоге с legacy-алиасом автомержа (#1232): пишем
+/// «Automerge», при отсутствии в каталоге — legacy-поле «Autodone»
+/// (id 49841025, опции off/on); оба отсутствуют → None (ensure_field
+/// создаст «Automerge» single_select off/on).
+fn resolve_field(catalog: &HashMap<String, u64>, name: &str) -> Option<u64> {
+    if let Some(f) = catalog.get(name) {
+        return Some(*f);
+    }
+    if name == uwuwu_usecase::F_AUTOMERGE {
+        return catalog.get("Autodone").copied();
+    }
+    None
+}
+
 pub struct IssueFields {
     repo: String,
     token: String,
@@ -128,12 +142,12 @@ impl IssueFields {
         for (name, value) in patch {
             // self-heal: отсутствующее поле создаём (инцидент #1149 —
             // create задачи падал целиком из-за неготового «Тип»)
-            let fid = match catalog.get(*name) {
-                Some(f) => *f,
+            let fid = match resolve_field(&catalog, name) {
+                Some(f) => f,
                 None => {
                     self.ensure_field(name).await?;
                     catalog = self.catalog().await?;
-                    *catalog.get(*name).ok_or_else(|| {
+                    resolve_field(&catalog, name).ok_or_else(|| {
                         UsecaseError::Board(format!("глобальное поле «{name}» не найдено"))
                     })?
                 }
@@ -179,30 +193,38 @@ impl IssueFields {
     }
 
     /// Создать глобальное поле, если его нет (каталог дрогнуть).
-    #[allow(dead_code)] // применяется при заведении «Тип» первым create
     pub async fn ensure_field(&self, name: &str) -> UsecaseResult<()> {
         let catalog = self.catalog().await?;
-        if catalog.contains_key(name) {
+        if resolve_field(&catalog, name).is_some() {
             return Ok(());
         }
         // «Тип» — single-select канона (create без поля падал «глобальное
-        // поле не найдено», инцидент #1149); прочие имена — текст
-        let body = if name == "Тип" {
-            let colors = [
-                "red", "purple", "blue", "gray", "gray", "green", "yellow", "orange", "pink",
-                "green", "blue",
-            ];
-            let options: Vec<Value> = uwuwu_usecase::TASK_TYPES
-                .iter()
-                .enumerate()
-                .map(|(i, t)| {
-                    json!({ "name": uwuwu_usecase::task_type_name(*t), "color": colors[i],
-                            "priority": i + 1 })
-                })
-                .collect();
-            json!({ "name": name, "data_type": "single_select", "options": options })
-        } else {
-            json!({ "name": name, "data_type": "text" })
+        // поле не найдено», инцидент #1149); автомерж (#1232) —
+        // single_select off/on; прочие имена — текст
+        let body = match name {
+            "Тип" => {
+                let colors = [
+                    "red", "purple", "blue", "gray", "gray", "green", "yellow", "orange", "pink",
+                    "green", "blue",
+                ];
+                let options: Vec<Value> = uwuwu_usecase::TASK_TYPES
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        json!({ "name": uwuwu_usecase::task_type_name(*t), "color": colors[i],
+                                "priority": i + 1 })
+                    })
+                    .collect();
+                json!({ "name": name, "data_type": "single_select", "options": options })
+            }
+            "Automerge" | "Autodone" => json!({
+                "name": name, "data_type": "single_select",
+                "options": [
+                    { "name": "off", "color": "gray" },
+                    { "name": "on", "color": "green" },
+                ]
+            }),
+            _ => json!({ "name": name, "data_type": "text" }),
         };
         let (status, _resp) = self
             .rest(reqwest::Method::POST, "/user/issue-fields", Some(body))
@@ -222,16 +244,24 @@ pub fn parse_field_values(issue: &Value) -> Fields {
     let mut out = Fields::new();
     if let Some(list) = issue["issue_field_values"].as_array() {
         for f in list {
-            let name = f["issue_field_name"].as_str().unwrap_or_default();
+            let mut name = f["issue_field_name"].as_str().unwrap_or_default();
             if name.is_empty() {
                 continue;
+            }
+            // Legacy-нормализация на границе носителя (#1280): resolve_field
+            // пишет автомерж в legacy-поле «Autodone» (каталог «Automerge»
+            // не содержит), читатели получают новое имя — потребители
+            // fields.load не обязаны помнить алиас (док F_AUTOMERGE:
+            // «сервер читает/пишет оба имени» — резолв здесь, как в store).
+            if name == "Autodone" {
+                name = uwuwu_usecase::F_AUTOMERGE;
             }
             let value = f["single_select_option"]["name"]
                 .as_str()
                 .or(f["value"].as_str())
                 .unwrap_or_default();
             if !value.is_empty() {
-                out.insert(name.to_string(), value.to_string());
+                out.entry(name.to_string()).or_insert(value.to_string());
             }
         }
     }
@@ -268,5 +298,63 @@ mod tests {
         assert_eq!(f.get("Сессия dev").map(String::as_str), Some("ses_a"));
         assert_eq!(f.get("Приоритет").map(String::as_str), Some("high"));
         assert!(!f.contains_key("PR"), "пустые значения не в карте");
+    }
+
+    #[test]
+    fn parse_normalizes_legacy_autodone() {
+        // живой каталог: физическое имя legacy «Autodone» (#1280 ревью) —
+        // наружу нормализованное «Automerge», legacy-ключ не просачивается
+        let issue = json!({
+            "issue_field_values": [
+                { "issue_field_name": "Autodone", "single_select_option": { "name": "on" } },
+                { "issue_field_name": "Приоритет", "single_select_option": { "name": "high" } },
+            ]
+        });
+        let f = parse_field_values(&issue);
+        assert_eq!(f.get("Automerge").map(String::as_str), Some("on"));
+        assert!(!f.contains_key("Autodone"), "legacy-ключ в карте");
+    }
+
+    #[test]
+    fn parse_keeps_live_automerge_name() {
+        // если каталог пополнился новым именем — оно не перетирается
+        let issue = json!({
+            "issue_field_values": [
+                { "issue_field_name": "Automerge", "single_select_option": { "name": "off" } },
+            ]
+        });
+        let f = parse_field_values(&issue);
+        assert_eq!(f.get("Automerge").map(String::as_str), Some("off"));
+    }
+
+    #[test]
+    fn resolve_field_prefers_new_name() {
+        let mut catalog = HashMap::new();
+        catalog.insert("Automerge".to_string(), 1);
+        catalog.insert("Autodone".to_string(), 2);
+        assert_eq!(
+            resolve_field(&catalog, "Automerge"),
+            Some(1),
+            "новое имя бьёт legacy-алиас"
+        );
+    }
+
+    #[test]
+    fn resolve_field_falls_back_to_legacy_autodone() {
+        // живой каталог 17.11: Autodone id 49841025, опции off/on; поля
+        // Automerge в каталоге нет — значение приземляется в legacy-поле
+        let mut catalog = HashMap::new();
+        catalog.insert("Autodone".to_string(), 49841025);
+        assert_eq!(resolve_field(&catalog, "Automerge"), Some(49841025));
+    }
+
+    #[test]
+    fn resolve_field_misses_yield_none() {
+        let empty: HashMap<String, u64> = HashMap::new();
+        assert_eq!(resolve_field(&empty, "Automerge"), None, "ensure_field");
+        assert_eq!(resolve_field(&empty, "Приоритет"), None);
+        let mut no_legacy = HashMap::new();
+        no_legacy.insert("Приоритет".to_string(), 49841008);
+        assert_eq!(resolve_field(&no_legacy, "Automerge"), None);
     }
 }

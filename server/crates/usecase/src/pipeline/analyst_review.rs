@@ -22,6 +22,9 @@ pub struct AnalystReviewUseCase {
     pub state: Arc<dyn TickStateStore>,
     pub clock: Arc<dyn crate::ports::Clock>,
     pub models: Arc<SpawnModels>,
+    /// Единый кап активных ходов исполнителя (policy.cup): ревью-волна не
+    /// спавнится при полном капе (#1231).
+    pub cup: usize,
 }
 
 impl AnalystReviewUseCase {
@@ -31,16 +34,29 @@ impl AnalystReviewUseCase {
     /// владельца 16.11, >4) — систематически умирающий ревьювер не ретраится
     /// вечно, строка уходит в Needs attention.
     pub async fn tick(&self) -> UsecaseResult<usize> {
-        // парность: ≤1 живого ревьювера аналитики одновременно
-        // Strict union (#1203): как у аналитика — живой ревьювер волны на
-        // офлайн-исполнителе не порождает дубль-спавн на другом
-        if self.sessions.list_sessions_strict().await?.iter().any(|s| {
-            s.outcome.is_empty()
-                && crate::naming::parse_agent(&s.agent) == Some(Agent::AnalystReviewer)
-        }) {
+        // парность: ≤1 живого ревьювера аналитики — busy-признак (ход в
+        // полёте, #1231): outcome при новом ходе не очищается, дубль-волна
+        // на 2+ ходе ревьювера была незаметна. Strict union (#1203): как у
+        // аналитика — живой ревьювер волны на офлайн-исполнителе не
+        // порождает дубль-спавн на другом
+        let scan = self.sessions.list_sessions_strict().await?;
+        if crate::router::has_busy_agent(&scan, Agent::AnalystReviewer) {
             tracing::debug!(
                 event = "analys_review.alive_skip",
                 "Живой ревьювер — волна ждёт"
+            );
+            return Ok(0);
+        }
+        // CUP-гвард (#1231): ревью-волна — запуск хода, отложка при полном
+        // капе; гарды строк не заряжаются (отложка — не спавн). Счётчик на
+        // тик: спавны волн текущего тика занимают слоты (#1244-класс).
+        let mut busy = crate::router::busy_count(&scan);
+        if busy >= self.cup {
+            tracing::info!(
+                event = "analys_review.held_cup",
+                active = busy,
+                cap = self.cup,
+                "Ревью-волна отложена: CUP cap"
             );
             return Ok(0);
         }
@@ -97,12 +113,24 @@ impl AnalystReviewUseCase {
             if wave.is_empty() {
                 continue;
             }
+            // CUP-гвард на доску (#1231): волны предыдущих досок этого тика
+            // заняли слоты — при полном капе доска откладывается целиком
+            if busy >= self.cup {
+                tracing::info!(
+                    event = "analys_review.held_cup",
+                    board = %tb.board,
+                    active = busy,
+                    cap = self.cup,
+                    "Ревью-волна доски отложена: CUP cap"
+                );
+                continue;
+            }
             // Спавн ДО зарядки счётчиков (канон «failed spawn не заряжает»):
             // сбой гейтвея не тратит попытку ревью и не заряжает кулдаун.
             let sm = self.models.for_agent(Agent::AnalystReviewer);
             let spec = SessionSpec {
                 directory: tb.checkout.clone(),
-                title: "ревью аналитики".into(),
+                title: format!("{} ревью аналитики", Agent::AnalystReviewer.emoji()),
                 agent: AgentSlot::Role(Agent::AnalystReviewer),
                 custom_agent: None,
                 model: sm.model,
@@ -115,6 +143,7 @@ impl AnalystReviewUseCase {
             // построены в одном проходе) — здесь порядок не трогаем (L1)
             let prompt = analyst_review_prompt(&tb.project, &wave);
             sessions.prompt(&session, &prompt).await?;
+            busy += 1; // спавн этого тика занимает слот капа
             for (t, guard) in wave.iter().zip(guards.iter()) {
                 self.state.set_analys_review_loop(
                     &tb.board,

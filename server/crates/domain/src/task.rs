@@ -39,7 +39,7 @@ impl Status {
 
     /// Канон переходов (AGENTS.md «статусы кто ставит» + пайп конвейера):
     /// рёбра пайплайна + Needs attention из любой рабочей стадии; Done —
-    /// только через close/автодон (не task_edit); Done/Deleted/Empty —
+    /// только через close владельца (не task_edit); Done/Deleted/Empty —
     /// без исходящих рёбер (реопен/легаси — владелец в UI, мимо MCP).
     /// Fast-track (#1135, развилка 6): Draft/Analys/Todo → In Progress —
     /// владелец тащит простые задачи сразу в работу.
@@ -130,6 +130,20 @@ pub enum Slot {
     Test,
 }
 
+impl Slot {
+    /// Эмодзи-маркер стадии в тайтле спавн-сессии (задача #1212).
+    /// Design/Dev == 🔨 осознанно: оба слота — дефолтная сессия
+    /// исполнителя; равенство с Agent::Developer.emoji() связано тестом.
+    pub fn emoji(self) -> &'static str {
+        match self {
+            Self::Design | Self::Dev => "🔨",
+            Self::PlanReview => "🔍",
+            Self::ResultReview => "🔬",
+            Self::Test => "🧪",
+        }
+    }
+}
+
 /// Нативные поля issue, типизированные и инкапсулированные:
 /// домен владеет мутациями, инфра маппит имена → конструкторы.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,14 +159,23 @@ pub struct TaskFields {
     priority: Priority,
 }
 
-/// VCS-состояние задачи: без ветки → ветка → PR. Инвариант: PR не бывает
-/// раньше ветки (PR без ветки — кривые данные носителя, загрузчик их
-/// отбрасывает с warn).
+/// VCS-состояние задачи: без ветки → ветка → PR. Кодовый инвариант:
+/// PullRequest не бывает без ветки (мутаторы требуют Branch-ячейку).
+/// Безветочная PR-ячейка — Artifact: URL-артефакт по канону ADR-021
+/// (вики/issue/чужой-вендор PR) — рендерится в fm без Branch (#1155).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Vcs {
     Local,
     Branch(BranchName),
-    PullRequest { branch: BranchName, url: PrUrl },
+    PullRequest {
+        branch: BranchName,
+        url: PrUrl,
+    },
+    /// PR-ячейка несёт URL без ветки кода (docs-only артефакт, чужой
+    /// вендор) — fm рендерит pr, branch остаётся пустым.
+    Artifact {
+        url: PrUrl,
+    },
 }
 
 impl Default for TaskFields {
@@ -196,17 +219,17 @@ impl TaskFields {
     /// Ветка, если есть.
     pub fn branch(&self) -> Option<&BranchName> {
         match &self.vcs {
-            Vcs::Local => None,
+            Vcs::Local | Vcs::Artifact { .. } => None,
             Vcs::Branch(b) => Some(b),
             Vcs::PullRequest { branch, .. } => Some(branch),
         }
     }
 
-    /// PR, если есть.
+    /// PR, если есть (включая безветочный артефакт — fm рендерит оба вида).
     pub fn pr(&self) -> Option<&PrUrl> {
         match &self.vcs {
-            Vcs::PullRequest { url, .. } => Some(url),
-            _ => None,
+            Vcs::PullRequest { url, .. } | Vcs::Artifact { url } => Some(url),
+            Vcs::Local | Vcs::Branch(_) => None,
         }
     }
 
@@ -222,7 +245,7 @@ impl TaskFields {
     }
 
     /// Мутатор: заявка/смена ветки; открытый PR сохраняется (ветка задачи
-    /// одна — канон).
+    /// одна — канон); Artifact вытесняется веткой кода.
     pub fn set_branch(&mut self, name: BranchName) {
         self.vcs = match std::mem::replace(&mut self.vcs, Vcs::Local) {
             Vcs::PullRequest { url, .. } => Vcs::PullRequest { branch: name, url },
@@ -230,10 +253,16 @@ impl TaskFields {
         };
     }
 
+    /// Мутатор: безветочная PR-ячейка — URL-артефакт (канон ADR-021:
+    /// «PR-ячейка заполняется всегда, включая docs-only»).
+    pub fn set_artifact(&mut self, url: PrUrl) {
+        self.vcs = Vcs::Artifact { url };
+    }
+
     /// Мутатор: открытие PR (требуется ветка — канон: PR из ветки задачи).
     pub fn open_pr(&mut self, url: PrUrl) -> Result<(), &'static str> {
         match self.vcs.clone() {
-            Vcs::Local => Err("PR без ветки: сначала Branch-ячейка"),
+            Vcs::Local | Vcs::Artifact { .. } => Err("PR без ветки: сначала Branch-ячейка"),
             Vcs::Branch(branch) => {
                 self.vcs = Vcs::PullRequest { branch, url };
                 Ok(())
@@ -308,7 +337,7 @@ pub struct Task {
     title: String,
     status: Status,
     priority: Priority,
-    autodone: bool,
+    automerge: bool,
     fields: TaskFields,
 }
 
@@ -319,7 +348,7 @@ impl Task {
             title,
             status,
             priority: Priority::Empty,
-            autodone: false,
+            automerge: false,
             fields: TaskFields::default(),
         }
     }
@@ -335,6 +364,14 @@ impl Task {
         }
         self.status = to;
         Ok(())
+    }
+
+    /// Запись известного значения носителя мимо канона: write-through
+    /// кэша доски после успешной мутации (#1235). Канон-гард лежит в
+    /// usecase edit(); здесь значение только фиксируется — носитель
+    /// уже принял его.
+    pub fn override_status(&mut self, to: Status) {
+        self.status = to;
     }
 
     pub fn number(&self) -> u64 {
@@ -353,8 +390,8 @@ impl Task {
         self.priority
     }
 
-    pub fn autodone(&self) -> bool {
-        self.autodone
+    pub fn automerge(&self) -> bool {
+        self.automerge
     }
 
     pub fn branch(&self) -> Option<&BranchName> {
@@ -370,9 +407,9 @@ impl Task {
         self.priority = p;
     }
 
-    /// Управление автодоном (владелец/триаж).
-    pub fn set_autodone(&mut self, on: bool) {
-        self.autodone = on;
+    /// Управление автомержем (владелец/триаж).
+    pub fn set_automerge(&mut self, on: bool) {
+        self.automerge = on;
     }
 
     /// Заявка сессии (claim): терминальная строка не принимает заявок —
@@ -428,18 +465,51 @@ impl Task {
         self.fields = fields;
     }
 
-    /// Автодон-кандидат: Review + autodone.
-    pub fn autodone_ready(&self) -> bool {
-        self.status == Status::UserReview && self.autodone
+    /// Автомерж-кандидат (#1232): Review + automerge + кодовый носитель
+    /// (ветка/PR). Безветочная ячейка (Local и Artifact — docs-only
+    /// артефакт/чужой-вендор URL, #1155) мержить нечего — строка ждёт
+    /// владельца в Review, тик её не прощупывает.
+    pub fn automerge_ready(&self) -> bool {
+        self.status == Status::UserReview
+            && self.automerge
+            && matches!(self.fields.vcs(), Vcs::Branch(_) | Vcs::PullRequest { .. })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::Agent;
 
     fn task(status: Status) -> Task {
         Task::new(7, "t".into(), status)
+    }
+
+    /// Маркеры слотов попарно различимы, кроме осознанной пары
+    /// Design/Dev (оба 🔨); связка слотов с ролями — ассертом равенства
+    /// (критерий различимости #1212).
+    #[test]
+    fn slot_emojis_distinct_and_linked_to_agents() {
+        let emojis: [&str; 5] = [
+            Slot::Design.emoji(),
+            Slot::Dev.emoji(),
+            Slot::PlanReview.emoji(),
+            Slot::ResultReview.emoji(),
+            Slot::Test.emoji(),
+        ];
+        for i in 0..emojis.len() {
+            for j in i + 1..emojis.len() {
+                if i == 0 && j == 1 {
+                    continue; // Design/Dev — осознанное совпадение
+                }
+                assert_ne!(emojis[i], emojis[j]);
+            }
+        }
+        assert_eq!(emojis[0], emojis[1], "Design == Dev == 🔨");
+        assert_eq!(emojis[1], Agent::Developer.emoji());
+        assert_eq!(emojis[2], Agent::PlanReviewer.emoji());
+        assert_eq!(emojis[3], Agent::CodeQualityReviewer.emoji());
+        assert_eq!(emojis[4], Agent::Tester.emoji());
     }
 
     #[test]
@@ -519,6 +589,49 @@ mod tests {
     }
 
     #[test]
+    fn artifact_url_renders_pr_without_branch() {
+        // #1155: безветочная PR-ячейка — Artifact, fm рендерит pr, branch пуст
+        let mut f = TaskFields::default();
+        f.set_artifact(PrUrl::parse("https://github.com/x/y/blob/main/docs/a.md").unwrap());
+        assert!(matches!(f.vcs(), Vcs::Artifact { .. }));
+        assert_eq!(
+            f.pr().map(|u| u.as_str()),
+            Some("https://github.com/x/y/blob/main/docs/a.md")
+        );
+        assert!(f.branch().is_none());
+    }
+
+    #[test]
+    fn open_pr_from_artifact_requires_branch() {
+        // инвариант кодового цикла: PR без ветки — ошибка и из Artifact
+        let mut f = TaskFields::default();
+        f.set_artifact(PrUrl::parse("https://x/1").unwrap());
+        assert!(f.open_pr(PrUrl::parse("https://x/2").unwrap()).is_err());
+    }
+
+    #[test]
+    fn set_branch_displaces_artifact() {
+        let mut f = TaskFields::default();
+        f.set_artifact(PrUrl::parse("https://x/1").unwrap());
+        f.set_branch(BranchName::parse("work/task-1").unwrap());
+        assert!(
+            matches!(f.vcs(), Vcs::Branch(_)),
+            "ветка вытесняет артефакт"
+        );
+        assert!(f.pr().is_none());
+        f.open_pr(PrUrl::parse("https://x/2").unwrap()).unwrap();
+        assert!(matches!(f.vcs(), Vcs::PullRequest { .. }));
+    }
+
+    #[test]
+    fn set_artifact_replaces_url() {
+        let mut f = TaskFields::default();
+        f.set_artifact(PrUrl::parse("https://x/1").unwrap());
+        f.set_artifact(PrUrl::parse("https://x/2").unwrap());
+        assert_eq!(f.pr().map(|u| u.as_str()), Some("https://x/2"));
+    }
+
+    #[test]
     fn status_transitions_canon() {
         use Status as S;
         // рёбра пайпа
@@ -565,7 +678,7 @@ mod tests {
         assert!(!S::can_transition(S::Done, S::InProgress));
         assert!(
             !S::can_transition(S::UserReview, S::Done),
-            "Done — только close/автодон"
+            "Done — только close владельца"
         );
         assert!(!S::can_transition(S::InProgress, S::Todo));
         assert!(

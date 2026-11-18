@@ -28,6 +28,7 @@ impl FakeGw {
                         updated_ms: 0,
                         outcome: String::new(),
                         total_tokens: 0,
+                        busy: false,
                     })
                     .collect(),
             ),
@@ -147,37 +148,6 @@ async fn strict_union_fails_when_any_executor_down() {
     );
     let err = router.list_sessions_strict().await.expect_err("all-or-Err");
     assert!(err.to_string().contains("redmi"), "{err}");
-}
-
-#[tokio::test]
-async fn best_effort_merges_available_executors() {
-    let router = SessionRouter::new(
-        "kisa",
-        gw(FakeGw::serving("kisa", &["ses-a"])),
-        vec![("redmi".into(), gw(FakeGw::failing("redmi")))],
-        HashMap::new(),
-    );
-    let list = router
-        .list_sessions_best_effort()
-        .await
-        .expect("частичный список — Ok");
-    assert_eq!(list.len(), 1, "только сессии доступного исполнителя");
-    assert_eq!(list[0].id, "ses-a");
-}
-
-#[tokio::test]
-async fn best_effort_fails_when_all_executors_down() {
-    let router = SessionRouter::new(
-        "kisa",
-        gw(FakeGw::failing("kisa")),
-        vec![("redmi".into(), gw(FakeGw::failing("redmi")))],
-        HashMap::new(),
-    );
-    let err = router
-        .list_sessions_best_effort()
-        .await
-        .expect_err("все вниз — Err как при одном исполнителе");
-    assert!(err.to_string().contains("недоступен"), "{err}");
 }
 
 #[tokio::test]

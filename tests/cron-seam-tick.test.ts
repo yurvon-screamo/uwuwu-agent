@@ -30,11 +30,11 @@ interface FixtureIssue {
 const FIXTURES: FixtureIssue[] = [
   {
     number: 137, title: "Lead: ночной аудит uwuwu", state: "open",
-    body: "---\nstatus: Вейт\nschedule: 04:30\nautodone: true\n---\n## Инструкция\nпроверь hub и отчитайся",
+    body: "---\nstatus: Вейт\nschedule: 04:30\nautomerge: true\n---\n## Инструкция\nпроверь hub и отчитайся",
   },
   {
     number: 440, title: "Крон: суточный semantic sync", state: "open",
-    body: "---\nstatus: Вейт\nschedule: 0 5 * * *\nautodone: true\n---\n## Инструкция\nкрути индекс",
+    body: "---\nstatus: Вейт\nschedule: 0 5 * * *\nautomerge: true\n---\n## Инструкция\nкрути индекс",
   },
   {
     number: 114, title: "QA: ночной аудит кода uwuwu-agent", state: "open",

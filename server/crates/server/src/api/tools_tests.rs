@@ -9,9 +9,11 @@ use crate::mockhub::MemoryHub;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use uwuwu_domain::{Slot, Status};
 use uwuwu_usecase::{
     AgentSessionGateway, DocsView, IssueFieldStore, Liveness, PersonView, SearchUseCase,
-    SessionInfo, SessionSpec, TaskBoardRepo, TaskView, TaskWriteUseCase, UsecaseResult, WikiRepo,
+    SessionInfo, SessionSpec, TaskBoardRepo, TaskView, TaskWriteUseCase, TickStateStore,
+    UsecaseResult, WikiRepo,
 };
 
 struct StubWiki;
@@ -71,6 +73,69 @@ impl AgentSessionGateway for StubSessions {
     }
 }
 
+/// No-op TickStateStore: писателю нужен факт вызова mark_own_comment,
+/// состояние в пробе диспетчера не проверяется.
+struct StubState;
+
+impl TickStateStore for StubState {
+    fn last_comment_id(&self, _: &str, _: u64) -> Option<String> {
+        None
+    }
+    fn last_seen_status(&self, _: &str, _: u64) -> Option<Status> {
+        None
+    }
+    fn set_last_seen_status(&self, _: &str, _: u64, _: Status) {}
+    fn set_last_comment_id(&self, _: &str, _: u64, _: &str) {}
+    fn dreamer_done(&self, _: &str) -> bool {
+        false
+    }
+    fn mark_dreamer_done(&self, _: &str) {}
+    fn dreamer_day_spawns(&self, _: &str) -> u32 {
+        0
+    }
+    fn mark_dreamer_spawn(&self, _: &str) {}
+    fn last_spawn_ms(&self, _: &str, _: u64, _: Slot) -> Option<u64> {
+        None
+    }
+    fn mark_spawn(&self, _: &str, _: u64, _: Slot, _: u64) {}
+    fn clear_spawn_ms(&self, _: &str, _: u64, _: Slot) {}
+    fn last_analys_ms(&self, _: &str, _: u64) -> Option<u64> {
+        None
+    }
+    fn mark_analys_spawn(&self, _: &str, _: u64, _: u64) {}
+    fn last_analys_review_ms(&self, _: &str, _: u64) -> Option<u64> {
+        None
+    }
+    fn mark_analys_review_spawn(&self, _: &str, _: u64, _: u64) {}
+    fn analys_loop(&self, _: &str, _: u64) -> Option<(Status, u32)> {
+        None
+    }
+    fn set_analys_loop(&self, _: &str, _: u64, _: Status, _: u32) {}
+    fn clear_analys_loop(&self, _: &str, _: u64) {}
+    fn analys_review_loop(&self, _: &str, _: u64) -> Option<(Status, u32)> {
+        None
+    }
+    fn set_analys_review_loop(&self, _: &str, _: u64, _: Status, _: u32) {}
+    fn clear_analys_review_loop(&self, _: &str, _: u64) {}
+    fn prune_analys_guards(&self, _: &std::collections::HashSet<String>) {}
+    fn stall_ping(&self, _: &str, _: u64) -> Option<(Status, u64, u32)> {
+        None
+    }
+    fn mark_stall_ping(&self, _: &str, _: u64, _: Status, _: u64) {}
+    fn spawn_loop(&self, _: &str, _: u64, _: Slot) -> Option<(Status, u32)> {
+        None
+    }
+    fn set_spawn_loop(&self, _: &str, _: u64, _: Slot, _: Status, _: u32) {}
+    fn reset_stale_spawn_loops(&self, _: &str, _: u64, _: Status) {}
+    fn own_comment(&self, _: &str) -> bool {
+        false
+    }
+    fn mark_own_comment(&self, _: &str, _: u64) {}
+    fn save(&self) -> UsecaseResult<()> {
+        Ok(())
+    }
+}
+
 /// Фикстура поверхности: ToolHub целиком на MemoryHub + стабах вики/сессий.
 /// Возвращает тот же hub, что сидит в писателе — тело читается напрямую.
 fn hub() -> (Arc<ToolHub>, Arc<MemoryHub>) {
@@ -90,6 +155,8 @@ fn hub() -> (Arc<ToolHub>, Arc<MemoryHub>) {
             board: board.clone(),
             fields,
             boards,
+            clock: Arc::new(SystemClock),
+            state: Arc::new(StubState),
         }),
         wiki,
         sessions,
@@ -102,6 +169,7 @@ fn hub() -> (Arc<ToolHub>, Arc<MemoryHub>) {
             clock: Arc::new(SystemClock),
             models: Arc::new(uwuwu_usecase::SpawnModels::canonical()),
             checkout: String::new(),
+            cup: 7,
         }),
     });
     (tools, memory)
@@ -496,6 +564,15 @@ async fn analysis_pipeline_edges_on_mcp_surface() {
         .and_then(|s| s.split(' ').next())
         .and_then(|s| s.parse().ok())
         .unwrap();
+    // гейт полноты #1280: разбор заполняет поля явно до выхода из Analys
+    // (Automerge create пишет сам, Приоритет — решение аналитика)
+    call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": number, "priority": "medium" }),
+    )
+    .await
+    .expect("заполнение Приоритета решением разбора");
     // волна аналитика: Analys → Review Analys
     call(
         &tools,
@@ -539,6 +616,57 @@ async fn analysis_pipeline_edges_on_mcp_surface() {
     assert!(err.contains("вне канона"), "{err}");
 }
 
+/// Гейт полноты полей на MCP-поверхности (#1280): выход из Analys с пустым
+/// Приоритетом — отказ с перечнем; дозаполнение → переход проходит.
+#[tokio::test]
+async fn analys_exit_gate_on_mcp_surface() {
+    let (tools, _memory) = hub();
+    let n = call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "гейт полноты" }),
+    )
+    .await
+    .unwrap();
+    let number: u64 = n
+        .trim()
+        .split('#')
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .and_then(|s| s.parse().ok())
+        .unwrap();
+    // create пишет Automerge сам — пуст только Приоритет: перечень
+    // называет его и не зовёт заполненное
+    let err = call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": number, "status": "Review Analys" }),
+    )
+    .await
+    .expect_err("пустой Приоритет не выпускает строку из Analys");
+    assert!(err.contains("Приоритет"), "перечень без Приоритета: {err}");
+    assert!(
+        !err.contains("Automerge"),
+        "заполненное поле в перечне: {err}"
+    );
+    // дозаполнение одним вызовом с переходом тоже легально —
+    // здесь раздельно: сначала решение, потом выход
+    call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": number, "priority": "high" }),
+    )
+    .await
+    .expect("дозаполнение Приоритета");
+    call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": number, "status": "Review Analys" }),
+    )
+    .await
+    .expect("после дозаполнения переход проходит");
+}
+
 #[tokio::test]
 async fn fast_track_from_draft_and_todo() {
     // Draft (черновик владельца) → In Progress напрямую (создание через сид:
@@ -557,6 +685,8 @@ async fn fast_track_from_draft_and_todo() {
             board: board.clone(),
             fields,
             boards,
+            clock: Arc::new(SystemClock),
+            state: Arc::new(StubState),
         }),
         wiki,
         sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(sessions)),
@@ -569,6 +699,7 @@ async fn fast_track_from_draft_and_todo() {
             clock: Arc::new(SystemClock),
             models: Arc::new(uwuwu_usecase::SpawnModels::canonical()),
             checkout: String::new(),
+            cup: 7,
         }),
     });
     call(
@@ -590,6 +721,91 @@ async fn fast_track_from_draft_and_todo() {
     )
     .await
     .expect("fast-track Todo → In Progress");
+}
+
+// ===== Автомерж #1232: MCP-поверхность (schema, legacy-ключ, edit-патч) =====
+
+#[test]
+fn descriptors_expose_automerge() {
+    let list = tool_descriptors();
+    let find = |name: &str| {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("{name} на поверхности"))["inputSchema"]["properties"]
+            .clone()
+    };
+    let create = find("task_create");
+    assert!(
+        create.get("automerge").is_some(),
+        "create рекламит automerge: {create:?}"
+    );
+    assert!(
+        create.get("autodone").is_none(),
+        "legacy-ключ не рекламится (но читается)"
+    );
+    let edit = find("task_edit");
+    assert!(
+        edit.get("automerge").is_some(),
+        "edit рекламит automerge (до-пометка старых строк): {edit:?}"
+    );
+}
+
+/// Legacy-ключ `autodone` читается как automerge (back-compat MCP-клиентов
+/// 14.11); выключенный automerge создаёт строку без ошибок.
+#[tokio::test]
+async fn task_create_accepts_automerge_and_legacy_key() {
+    let (tools, _memory) = hub();
+    call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "auto on (новый ключ)", "body": "б", "automerge": true }),
+    )
+    .await
+    .expect("новый ключ accepted");
+    call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "auto on (legacy ключ)", "body": "б", "autodone": true }),
+    )
+    .await
+    .expect("legacy autodone читается как automerge");
+    call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "auto off", "body": "б", "automerge": false }),
+    )
+    .await
+    .expect("выключенный automerge accepted");
+}
+
+/// task_edit с одним automerge — непустой патч: до фикса edit не нёс
+/// automerge и патч падал «пустой патч» (инструмент до-пометки старых строк).
+#[tokio::test]
+async fn task_edit_automerge_patch_is_not_empty_at_surface() {
+    let (tools, _memory) = hub();
+    let created = call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "под automerge-патч", "body": "б" }),
+    )
+    .await
+    .expect("create ок");
+    let n: u64 = created
+        .trim()
+        .split('#')
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .and_then(|s| s.parse().ok())
+        .expect("номер в ответе");
+    call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": n, "automerge": true }),
+    )
+    .await
+    .expect("automerge-only патч не «пустой»");
 }
 
 /// #1166: фабрика записала Branch при спавне — `task edit --pr` без
@@ -621,4 +837,98 @@ async fn task_get_renders_pr_after_factory_branch_without_manual_branch_edit() {
         .expect("get");
     assert!(card.contains("branch: work/task-8"), "{card}");
     assert!(card.contains("pr: https://github.com/o/r/pull/9"), "{card}");
+}
+
+/// #1155: docs-only ячейка (вики-артефакт без ветки кода) рендерится в fm —
+/// `pr: <URL>`, `branch: —` (инцидент #1153: два раунда ревью на «pr: —»
+/// при живом в носителе значении).
+#[tokio::test]
+async fn task_get_renders_branchless_pr_cell() {
+    let (tools, _memory) = hub();
+    let (number, _) = create_task(&tools, "t: docs-only artifact", "## Постановка\n\nx.\n").await;
+
+    // Агент финализирует docs-only задачу: PR-ячейка = URL вики-артефакта,
+    // ветки кода нет и не будет (канон AGENTS.md).
+    call(
+        &tools,
+        "task_edit",
+        json!({
+            "number": number,
+            "pr": "https://github.com/yurvon-screamo/uwuwu-hub/blob/main/docs/Projects/uwuwu/Design%20Spec.md"
+        }),
+    )
+    .await
+    .expect("pr edit");
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    assert!(
+        card.contains(
+            "pr: https://github.com/yurvon-screamo/uwuwu-hub/blob/main/docs/Projects/uwuwu/Design%20Spec.md"
+        ),
+        "{card}"
+    );
+    assert!(card.contains("branch: —"), "{card}");
+}
+
+/// #1155/true-washing#379: чужовендорный pull-URL на безветочной строке
+/// (env:false-проекты) — тот же рендер без вендор-гейта.
+#[tokio::test]
+async fn task_get_renders_foreign_vendor_pull_url() {
+    let (tools, _memory) = hub();
+    let (number, _) = create_task(&tools, "t: forgejo pull", "## Постановка\n\nx.\n").await;
+
+    call(
+        &tools,
+        "task_edit",
+        json!({
+            "number": number,
+            "pr": "https://git.true-wash.com/true-wash/deploy/pulls/9"
+        }),
+    )
+    .await
+    .expect("pr edit");
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    assert!(
+        card.contains("pr: https://git.true-wash.com/true-wash/deploy/pulls/9"),
+        "{card}"
+    );
+    assert!(card.contains("branch: —"), "{card}");
+}
+
+/// #1155 (поручение владельца): автомерж-ячейка живёт на mock-носителе —
+/// create пишет дефолт on, edit переключает, fm рендерит фактическое
+/// состояние (без хранения на носителе fm и тик стенда врали «false»).
+#[tokio::test]
+async fn automerge_cell_roundtrips_on_mock_carrier() {
+    let (tools, _memory) = hub();
+    let (number, _) = create_task(&tools, "t: automerge roundtrip", "## Постановка\n\nx.\n").await;
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    assert!(
+        card.contains("automerge: true"),
+        "create-дефолт on рендерится: {card}"
+    );
+
+    call(
+        &tools,
+        "task_edit",
+        json!({ "number": number, "automerge": false }),
+    )
+    .await
+    .expect("automerge edit");
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    assert!(
+        card.contains("automerge: false"),
+        "edit off рендерится: {card}"
+    );
 }

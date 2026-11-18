@@ -6,7 +6,7 @@ pub mod analyst_review;
 pub mod dreamer;
 pub mod tick;
 #[cfg(test)]
-mod tick_tests;
+pub(crate) mod tick_tests;
 
 pub use analyst::{AnalystBoard, AnalystUseCase};
 pub use analyst_review::AnalystReviewUseCase;

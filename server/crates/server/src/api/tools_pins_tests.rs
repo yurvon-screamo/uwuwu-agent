@@ -11,9 +11,10 @@ use crate::mockhub::MemoryHub;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use uwuwu_domain::{Slot, Status};
 use uwuwu_usecase::{
     AgentSessionGateway, Liveness, SearchUseCase, SessionInfo, SessionSpec, TaskBoardRepo,
-    TaskView, TaskWriteUseCase, UsecaseResult, WikiRepo,
+    TaskView, TaskWriteUseCase, TickStateStore, UsecaseResult, WikiRepo,
 };
 
 /// Сессии в пинах не вызываются: гварды армов стреляют до gateway.
@@ -53,6 +54,69 @@ impl AgentSessionGateway for StubSessions {
     }
 }
 
+/// No-op TickStateStore: писателю нужен факт вызова mark_own_comment,
+/// состояние в пробах пинов не проверяется.
+struct StubState;
+
+impl TickStateStore for StubState {
+    fn last_comment_id(&self, _: &str, _: u64) -> Option<String> {
+        None
+    }
+    fn last_seen_status(&self, _: &str, _: u64) -> Option<Status> {
+        None
+    }
+    fn set_last_seen_status(&self, _: &str, _: u64, _: Status) {}
+    fn set_last_comment_id(&self, _: &str, _: u64, _: &str) {}
+    fn dreamer_done(&self, _: &str) -> bool {
+        false
+    }
+    fn mark_dreamer_done(&self, _: &str) {}
+    fn dreamer_day_spawns(&self, _: &str) -> u32 {
+        0
+    }
+    fn mark_dreamer_spawn(&self, _: &str) {}
+    fn last_spawn_ms(&self, _: &str, _: u64, _: Slot) -> Option<u64> {
+        None
+    }
+    fn mark_spawn(&self, _: &str, _: u64, _: Slot, _: u64) {}
+    fn clear_spawn_ms(&self, _: &str, _: u64, _: Slot) {}
+    fn last_analys_ms(&self, _: &str, _: u64) -> Option<u64> {
+        None
+    }
+    fn mark_analys_spawn(&self, _: &str, _: u64, _: u64) {}
+    fn last_analys_review_ms(&self, _: &str, _: u64) -> Option<u64> {
+        None
+    }
+    fn mark_analys_review_spawn(&self, _: &str, _: u64, _: u64) {}
+    fn analys_loop(&self, _: &str, _: u64) -> Option<(Status, u32)> {
+        None
+    }
+    fn set_analys_loop(&self, _: &str, _: u64, _: Status, _: u32) {}
+    fn clear_analys_loop(&self, _: &str, _: u64) {}
+    fn analys_review_loop(&self, _: &str, _: u64) -> Option<(Status, u32)> {
+        None
+    }
+    fn set_analys_review_loop(&self, _: &str, _: u64, _: Status, _: u32) {}
+    fn clear_analys_review_loop(&self, _: &str, _: u64) {}
+    fn prune_analys_guards(&self, _: &std::collections::HashSet<String>) {}
+    fn stall_ping(&self, _: &str, _: u64) -> Option<(Status, u64, u32)> {
+        None
+    }
+    fn mark_stall_ping(&self, _: &str, _: u64, _: Status, _: u64) {}
+    fn spawn_loop(&self, _: &str, _: u64, _: Slot) -> Option<(Status, u32)> {
+        None
+    }
+    fn set_spawn_loop(&self, _: &str, _: u64, _: Slot, _: Status, _: u32) {}
+    fn reset_stale_spawn_loops(&self, _: &str, _: u64, _: Status) {}
+    fn own_comment(&self, _: &str) -> bool {
+        false
+    }
+    fn mark_own_comment(&self, _: &str, _: u64) {}
+    fn save(&self) -> UsecaseResult<()> {
+        Ok(())
+    }
+}
+
 /// ToolHub на MemoryHub (доска+вики+поля) и стабе сессий.
 fn hub() -> Arc<ToolHub> {
     let memory = Arc::new(MemoryHub::from_env());
@@ -68,6 +132,8 @@ fn hub() -> Arc<ToolHub> {
             board: board.clone(),
             fields: memory.clone(),
             boards,
+            clock: Arc::new(SystemClock),
+            state: Arc::new(StubState),
         }),
         wiki,
         sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(sessions)),
@@ -80,6 +146,7 @@ fn hub() -> Arc<ToolHub> {
             clock: Arc::new(SystemClock),
             models: Arc::new(uwuwu_usecase::SpawnModels::canonical()),
             checkout: String::new(),
+            cup: 7,
         }),
     })
 }

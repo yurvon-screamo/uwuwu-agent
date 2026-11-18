@@ -8,7 +8,7 @@ use crate::ports::{Clock, Liveness, PrGateway, TaskBoardRepo, TickStateStore};
 use crate::router::SessionRouter;
 use crate::spawn_models::SpawnModels;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uwuwu_domain::{
     decide, gate, spawn_guard, Action, Awaits, Gate, LoopOutcome, SessionSighting, Slot,
@@ -79,7 +79,8 @@ pub struct TickOutcome {
     pub wakeups: usize,
     /// Будильников/респавнов, отложенных политикой (пик/CUP — #1200).
     pub wakeups_deferred: usize,
-    pub autodone_done: usize,
+    /// Мержей автомержа: строка остаётся в Review (#1232).
+    pub automerged: usize,
     /// Строк, переведённых в Needs attention спавн-петлёй.
     pub attention_flagged: usize,
     /// Автопингов сталл-детекта (ход завершён, статус не переведён).
@@ -88,8 +89,15 @@ pub struct TickOutcome {
     pub soft_pings: usize,
     /// Строк, переведённых в Needs attention сталл-детектом.
     pub stall_flagged: usize,
+    /// Busy-сессии исполнителя по union-скану на старте тика (или
+    /// статусный фолбэк-подсчёт при недоступности скана) — наблюдаемость
+    /// единого капа (#1231).
+    pub sessions_busy: usize,
     /// Спавнов, удержанных гардом «одна живая сессия на строку» (#1163).
     pub held_live: usize,
+    /// Спавнов, удержанных слепотой: список исполнителя проекта недоступен,
+    /// спавн без зрения невозможен (#1263).
+    pub held_blind: usize,
     /// Строк, пропущенных тиком при отказе enrichment (#1163): решение
     /// по невидимым ячейкам — источник дублей, ждём следующий тик.
     pub enrich_skipped: usize,
@@ -116,31 +124,49 @@ pub struct TickUseCase {
     pub models: Arc<SpawnModels>,
 }
 
+/// Причина hold спавна: зрение недоступно или в env живая сестра.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpawnHold {
+    /// Список исполнителя проекта недоступен — спавн без зрения невозможен,
+    /// hold до восстановления скана (#1263).
+    BlindScan,
+    /// Живая сессия той же семьи в env строки (#1163).
+    Live,
+}
+
 /// Контекст строки тика: данные union-скана и enrichment, общие для
 /// прохода доски (#1163). Не решение — вход решений.
 pub(crate) struct RowContext<'a> {
-    /// Слепки сессий исполнителя (strict); None — скан недоступен,
-    /// гард спавна пропущен (never worse).
+    /// Слепки сессий исполнителя ЭТОГО проекта (пер-проектное зрение,
+    /// #1263); None — скан своего исполнителя недоступен, спавн держится
+    /// до восстановления (#1263 — инверсия never-worse: слепой спавн
+    /// поверх живой сестры = класс инцидента #1241).
     pub(crate) sightings: Option<&'a [SessionSighting]>,
     /// Строки с отказом enrichment — тиком пропускаются.
     pub(crate) enrich_failed: &'a HashSet<u64>,
 }
 
 impl TickUseCase {
-    /// Гард сработал: в env строки живёт сессия той же семьи (second
-    /// source #1163). Скан недоступен — не держит (never worse).
-    pub(crate) fn spawn_held_by_live(
+    /// Вердикт hold спавна слота (#1163 + #1263): слепой скан — hold без
+    /// зрения; живая сессия семьи в env строки — hold до её финала. None —
+    /// препятствий нет. Second source (sighting_known) — отдельная проверка
+    /// вызывающего, сюда не входит.
+    pub(crate) fn spawn_hold(
         &self,
         ctx: &RowContext<'_>,
         board: &BoardPlan,
         task: &Task,
         slot: Slot,
         now_ms: u64,
-    ) -> bool {
+    ) -> Option<SpawnHold> {
         let Some(list) = ctx.sightings else {
-            return false;
+            return Some(SpawnHold::BlindScan);
         };
-        spawn_guard(list, &board.env_repo_dir(task.number()), slot, now_ms) == SpawnGuard::Hold
+        if spawn_guard(list, &board.env_repo_dir(task.number()), slot, now_ms) == SpawnGuard::Hold {
+            Some(SpawnHold::Live)
+        } else {
+            None
+        }
     }
 
     pub async fn run(&self, plan: &TickPlan) -> UsecaseResult<TickOutcome> {
@@ -164,8 +190,8 @@ impl TickUseCase {
         for (bp, tasks) in boards.iter_mut() {
             for t in tasks.iter_mut() {
                 // stage-строки (wakeup/needs_spawn) + Review-строки
-                // (автодон: PR/ветка — глобальные поля, без enrichment
-                // автодон слеп — PR #338/#339 висели немержеными)
+                // (автомерж: PR/ветка — глобальные поля, без enrichment
+                // автомерж слеп — PR #338/#339 висели немержеными)
                 if t.stage_slot().is_some() || t.status() == Status::UserReview {
                     match self.board.issue_fields(t.number()).await {
                         Ok(f) => t.apply_fields(f),
@@ -183,96 +209,82 @@ impl TickUseCase {
             }
             let _ = bp;
         }
-        // CUP честный (#1200 + регресс 17.11 + дедлок #1244): кап держат
-        // только ФАКТИЧЕСКИ тратящие — busy-строки (ход идёт прямо сейчас);
-        // состоявшиеся спавны тика считаются активными через общий
-        // счётчик run_board (active_now). Конвейерная сессия между ходами
-        // «жива» в API, но не тратит — idle не держат кап (инцидент ночи
-        // 16-17.11: active=18 при cap=7 из спящих). Мёртвая сессия не
-        // тратит и кап не держит. Кандидаты без сессии — очередь, не
-        // нагрузка: старая формула (кандидаты = активные) при бэклоге
-        // больше капа держала кап сама на себя (прод 23:15: spawns=0,
-        // held=24). Недоступность исполнителя — fallback на статусный
-        // подсчёт (паралич конвейера хуже редкого овер-спавна).
-        // Union-скан один на тик: alive-множество для CUP + слепки для
-        // гарда «одна живая сессия на строку» (#1163). Strict (#1203):
-        // отказ ЛЮБОГО исполнителя → оба источника None — частичный список
-        // представил бы сессии офлайн-исполнителя мёртвыми (оверсел капа)
-        // и спрятал живую сироту от гарда (дубль-спавн).
-        let (alive, sightings): (Option<HashSet<String>>, Option<Vec<SessionSighting>>) =
-            match self.sessions.list_sessions_strict().await {
-                Ok(list) => {
-                    let alive = list
-                        .iter()
-                        .filter(|s| s.outcome.is_empty())
-                        .map(|s| s.id.clone())
-                        .collect();
-                    let sightings = list
-                        .into_iter()
-                        .map(|s| SessionSighting {
-                            id: s.id,
-                            directory: s.directory,
-                            agent: s.agent,
-                            outcome: s.outcome,
-                            updated_ms: s.updated_ms,
-                        })
-                        .collect();
-                    (Some(alive), Some(sightings))
+        // CUP единый (#1231) поверх пер-исполнительного зрения (#1263):
+        // union-скан одним проходом — busy-подсчёт CUP + слепки гарда
+        // «одна живая сессия на строку». Старый подсчёт (outcome-фильтр
+        // «живых» + per-session idle-пробы) терял сессии на 2+ ходе:
+        // outcome — атрибут последнего завершённого хода и при новом ходе
+        // не очищается (разбор #1231: 12 активных при cap=7). В union
+        // входят все источники: стадии, сайдкары, кроны, боты, ручные
+        // сессии владельца — единый кап на исполнителя.
+        // Strict для CUP (#1203/#1231): отказ ЛЮБОГО исполнителя → оба
+        // источника None — частичный список исказил бы busy-подсчёт и
+        // спрятал живую сироту от гарда (дубль-спавн); фолбэк — статусный
+        // подсчёт, консервативно против спавн-шторма (спавнить некому
+        // всё равно). Гард спавна читает список СВОЕГО исполнителя
+        // (sight_by_executor): отказ чужого зрение проекта не гасит
+        // (#1263). Кандидаты без сессии — очередь, не нагрузка (#1244).
+        let per_exec = self.sessions.list_sessions_per_executor().await;
+        let all_ok = per_exec.iter().all(|(_, r)| r.is_ok());
+        let scan: Option<Vec<crate::ports::SessionInfo>> = if all_ok {
+            Some(
+                per_exec
+                    .iter()
+                    .filter_map(|(_, r)| r.as_ref().ok())
+                    .flatten()
+                    .cloned()
+                    .collect(),
+            )
+        } else {
+            for (name, r) in &per_exec {
+                if let Err(e) = r {
+                    tracing::warn!(event = "cup.list_sessions_failed", executor = %name,
+                        error = %e, "list_sessions исполнителя недоступен — CUP по статусам");
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        event = "cup.list_sessions_failed",
-                        error = %e,
-                        "list_sessions недоступен — CUP по статусам, гард спавна пропущен"
-                    );
-                    (None, None)
-                }
-            };
-        // фаза 1: живые сессии stage-строк копим для idle-проверки (фаза 2).
-        // Кандидаты (строки без сессии) НЕ считаются активными (#1244):
-        // это очередь, а не нагрузка — старая формула при бэклоге
-        // кандидатов больше капа держала кап сама на себя (held всем
-        // навечно, ни одного спавна — прод 23:15 UTC: spawns=0, held=24).
-        // Fallback (исполнитель недоступен): статусный подсчёт с
-        // кандидатами — осознанно консервативно (спавнить некому всё равно).
-        let mut live_sessions: Vec<(&BoardPlan, String)> = Vec::new();
+            }
+            None
+        };
+        // Пер-проектное зрение: слепки по исполнителям, доска получает свой
+        let mut sight_by_executor: HashMap<String, Option<Vec<SessionSighting>>> = HashMap::new();
+        for (name, r) in &per_exec {
+            let list = r.as_ref().ok().map(|sessions| {
+                sessions
+                    .iter()
+                    .map(|s| SessionSighting {
+                        id: s.id.clone(),
+                        directory: s.directory.clone(),
+                        agent: s.agent.clone(),
+                        outcome: s.outcome.clone(),
+                        updated_ms: s.updated_ms,
+                    })
+                    .collect()
+            });
+            sight_by_executor.insert(name.clone(), list);
+        }
         let mut fallback_active = 0usize;
-        for (bp, tasks) in boards.iter() {
-            for t in tasks.iter() {
-                if !t.status().is_active() {
-                    continue;
-                }
-                match t.stage_slot().and_then(|slot| t.session_of(slot)) {
-                    Some(session) => match &alive {
-                        Some(alive) if !alive.contains(session) => {} // мёртвая
-                        Some(_) => live_sessions.push((*bp, session.to_string())),
-                        None => fallback_active += 1, // fallback: статусный подсчёт
-                    },
-                    None => {
-                        if alive.is_none() {
-                            fallback_active += 1; // кандидат — только в fallback
-                        }
+        if scan.is_none() {
+            for (_, tasks) in boards.iter() {
+                for t in tasks.iter() {
+                    if t.status().is_active() {
+                        fallback_active += 1; // сессионные и кандидаты — консервативно
                     }
                 }
             }
         }
-        // фаза 2: среди живых тратят только busy (ход идёт)
-        let mut busy = 0usize;
-        for (bp, session) in &live_sessions {
-            if !self.session_idle(bp, session).await {
-                busy += 1;
-            }
-        }
-        let global_active: usize = if alive.is_some() {
-            busy
-        } else {
-            fallback_active
+        let global_active: usize = match &scan {
+            Some(list) => list.iter().filter(|s| s.busy).count(),
+            None => fallback_active,
         };
+        out.sessions_busy = global_active;
         // Счётчик капа — один на весь тик, общий для всех досок (#1244):
         // спавн одной доски занимает слот глобального капа, следующая
         // доска видит занятость через ссылку
         let mut active_now = global_active;
         for (board, tasks) in boards {
+            // Пер-проектное зрение (#1263): контекст доски — список её
+            // исполнителя; чужие исполнители зрение проекта не гасят.
+            let executor = self.sessions.project_executor_name(&board.project);
+            let sightings = sight_by_executor.get(executor).and_then(|v| v.as_deref());
             out = self
                 .run_board(
                     plan,
@@ -280,7 +292,7 @@ impl TickUseCase {
                     tasks,
                     &mut active_now,
                     &RowContext {
-                        sightings: sightings.as_deref(),
+                        sightings,
                         enrich_failed: &enrich_failed,
                     },
                     out,
@@ -295,11 +307,14 @@ impl TickUseCase {
             rows = out.rows_total,
             spawns = out.spawns_done,
             held_cup = out.held_cup,
+            sessions_busy = out.sessions_busy,
             deferred_peak = out.deferred_peak,
             wakeups = out.wakeups,
             wakeups_deferred = out.wakeups_deferred,
-            autodone = out.autodone_done,
+            automerged = out.automerged,
             held_live = out.held_live,
+            observed = out.observed,
+            spawns_allowed = out.spawns_allowed,
             enrich_skipped = out.enrich_skipped,
             mode = ?plan.mode,
             failed = out.actions_failed,
@@ -423,19 +438,32 @@ impl TickUseCase {
                         }
                         continue;
                     }
-                    // Гард «одна живая сессия на строку» (#1163): второй
-                    // источник поверх ячейки — сироты спавна, клеймы в
-                    // гонке с тиком, невидимые ячейки не дублируют раунд.
-                    // Strict-скан недоступен → гард пропущен (never worse).
-                    if self.spawn_held_by_live(ctx, board, task, slot, now_ms) {
-                        out.held_live += 1;
-                        tracing::info!(
-                            event = "spawn.held_live_session",
-                            number = task.number(),
-                            slot = naming::slot_key(slot),
-                            "Spawn held: живая сессия в env строки (second source #1163)"
-                        );
-                        continue;
+                    // Гард «одна живая сессия на строку» (#1163) + зрение
+                    // (#1263): сироты спавна, клеймы в гонке с тиком и
+                    // невидимые ячейки не дублируют раунд; слепой скан —
+                    // hold без спавна до восстановления списка.
+                    match self.spawn_hold(ctx, board, task, slot, now_ms) {
+                        Some(SpawnHold::Live) => {
+                            out.held_live += 1;
+                            tracing::info!(
+                                event = "spawn.held_live_session",
+                                number = task.number(),
+                                slot = naming::slot_key(slot),
+                                "Spawn held: живая сессия в env строки (second source #1163)"
+                            );
+                            continue;
+                        }
+                        Some(SpawnHold::BlindScan) => {
+                            out.held_blind += 1;
+                            tracing::info!(
+                                event = "spawn.held_blind_scan",
+                                number = task.number(),
+                                slot = naming::slot_key(slot),
+                                "Spawn held: список исполнителя недоступен — спавн без зрения невозможен (#1263)"
+                            );
+                            continue;
+                        }
+                        None => {}
                     }
                     let gated = gate(task, &action, plan.policy, *active_now, now);
                     match gated {
@@ -517,18 +545,22 @@ impl TickUseCase {
                         }
                     }
                 }
-                Action::Autodone => {
+                Action::Automerge => {
                     if plan.mode == Mode::Live {
-                        out.autodone_done += 1;
-                        self.autodone(board, task)
+                        let merged = self
+                            .automerge(board, task)
                             .await
                             .map_err(|e| self.log_action_failed(task, e))?;
+                        // счётчик — факты мержа: bounce/pending/no-op не считаются
+                        if merged {
+                            out.automerged += 1;
+                        }
                     } else {
                         tracing::info!(
-                            event = "autodone.probe",
+                            event = "automerge.probe",
                             number = task.number(),
                             pr = task.pr().map(|u| u.as_str()).unwrap_or(""),
-                            "Autodone probe (observe)"
+                            "Automerge probe (observe)"
                         );
                     }
                 }
@@ -563,13 +595,18 @@ impl TickUseCase {
             .wakeup_if_fresh(board, plan.policy, task, *active_now, ctx)
             .await
         {
-            Ok(WakeAct::Woke) => out.wakeups += 1,
+            Ok(WakeAct::Woke) => {
+                out.wakeups += 1;
+                // доставленный ход занимает слот капа в этом же тике (#1231)
+                *active_now += 1;
+            }
             Ok(WakeAct::Respawned) => {
                 out.spawns_done += 1;
                 *active_now += 1;
             }
             Ok(WakeAct::Deferred) => out.wakeups_deferred += 1,
             Ok(WakeAct::Guarded) => out.held_live += 1,
+            Ok(WakeAct::GuardedBlind) => out.held_blind += 1,
             Ok(WakeAct::None) => match self.stall_pass(board, task).await {
                 Ok(StallAct::None) => {}
                 Ok(StallAct::Pinged) => out.stall_pings += 1,

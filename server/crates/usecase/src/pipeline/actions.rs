@@ -1,9 +1,9 @@
 //! Действия тика: спавн стадии (bootstrap /command → сессия в env),
-//! wakeup по свежим комментам, автодон (проба PR → мерж/Done/bounce).
+//! wakeup по свежим комментам, автомерж (проба PR → мерж без закрытия / bounce).
 
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
-use crate::pipeline::tick::{BoardPlan, RowContext, TickUseCase};
+use crate::pipeline::tick::{BoardPlan, RowContext, SpawnHold, TickUseCase};
 use crate::ports::{CommentRef, Liveness, SessionSpec};
 use crate::router::Gateway;
 use uwuwu_domain::{
@@ -22,6 +22,8 @@ pub enum WakeAct {
     Deferred,
     /// Гард «живая сессия в env» держит запуск (#1163).
     Guarded,
+    /// Список исполнителя недоступен — респавн без зрения невозможен (#1263).
+    GuardedBlind,
     /// Нечего будить: тишина, коммент уже отработан или луп-эскалация.
     None,
 }
@@ -38,7 +40,7 @@ impl TickUseCase {
     ) -> UsecaseResult<String> {
         let sessions = self.sessions.project(&board.project);
         let env_repo = board.env_repo_dir(task.number());
-        let title = format!("#{} {}", task.number(), task.title());
+        let title = session_title(task, slot);
         let boot_model = self.models.for_default();
         let bootstrap = sessions
             .create_session(&SessionSpec {
@@ -93,7 +95,7 @@ impl TickUseCase {
         let work = sessions
             .create_session(&SessionSpec {
                 directory: env_repo.to_string(),
-                title: format!("#{} {}", task.number(), task.title()),
+                title: session_title(task, slot),
                 custom_agent: None,
                 agent: AgentSlot::of(Agent::of_slot(slot)),
                 model: work_model.model,
@@ -116,9 +118,13 @@ impl TickUseCase {
     /// Wakeup: мёртвая сессия — респавн (dead-детект ПЕРВЫМ: даже без свежих
     /// комментов — строка не висит, DS «dead-детект решает: будить или
     /// респавнить»); живая — будим по свежим комментам (новее активности).
-    /// Политика запуска едина для всех путей (UC-05, #1200): пик-окно
-    /// откладывает не-high и будильник, и респавн; CUP-кап держит респавн
-    /// (новая сессия — новый LLM-слот; будильник будит уже учтённую строку).
+    /// Wakeup: мёртвая сессия — респавн (dead-детект ПЕРВЫМ: даже без свежих
+    /// комментов — строка не висит, DS «dead-детект решает: будить или
+    /// респавнить»); живая — будим по свежим комментам (новее активности).
+    /// Политика запуска едина для всех путей (UC-05, #1200/#1231): пик-окно
+    /// откладывает не-high и будильник, и респавн; CUP-кап держит и будильник,
+    /// и респавн — оба запускают ход (LLM-слот): будильник доставляет промпт
+    /// в idle-сессию, респавн создаёт новую сессию.
     pub(crate) async fn wakeup_if_fresh(
         &self,
         board: &BoardPlan,
@@ -176,19 +182,31 @@ impl TickUseCase {
                         "Проба Dead при живой сессии в списке исполнителя — респавн отменён");
                     return Ok(WakeAct::None);
                 }
-                // Env-гард на респавне (ревью Common-2): сеанс ячейки мёртв
-                // по-настоящему, но в env строки может жить сирота из
-                // crash-окна (падение процесса между prompt и set_session
-                // до зачистки) — респавн поверх живого хода = тот же класс
-                // дубля, что и на plain-пути.
-                if self.spawn_held_by_live(ctx, board, task, slot, self.clock.now_ms()) {
-                    tracing::warn!(
-                        event = "respawn.held_live_session",
-                        number = task.number(),
-                        slot = naming::slot_key(slot),
-                        "Респавн держится: живая сессия в env строки (second source #1163)"
-                    );
-                    return Ok(WakeAct::Guarded);
+                // Env-гард на респавне (ревью Common-2 + зрение #1263):
+                // сеанс ячейки мёртв по-настоящему, но в env строки может
+                // жить сирота из crash-окна — респавн поверх живого хода =
+                // тот же класс дубля, что и на plain-пути. Слепой скан —
+                // респавн без зрения невозможен, hold до восстановления.
+                match self.spawn_hold(ctx, board, task, slot, self.clock.now_ms()) {
+                    Some(SpawnHold::BlindScan) => {
+                        tracing::info!(
+                            event = "respawn.held_blind_scan",
+                            number = task.number(),
+                            slot = naming::slot_key(slot),
+                            "Респавн держится: список исполнителя недоступен — спавн без зрения невозможен (#1263)"
+                        );
+                        return Ok(WakeAct::GuardedBlind);
+                    }
+                    Some(SpawnHold::Live) => {
+                        tracing::warn!(
+                            event = "respawn.held_live_session",
+                            number = task.number(),
+                            slot = naming::slot_key(slot),
+                            "Респавн держится: живая сессия в env строки (second source #1163)"
+                        );
+                        return Ok(WakeAct::Guarded);
+                    }
+                    None => {}
                 }
                 // респавн = фактический спавн — полный гейт (пик + CUP)
                 let spawn = Action::Spawn { slot };
@@ -243,7 +261,31 @@ impl TickUseCase {
             // застынет ниже коммента» заменена честным idle-критерием)
             let idle = !fresh && self.session_idle(board, session).await;
             if fresh || idle {
-                let body = tail
+                let foreign = self.slice_self_echo(task.number(), &tail, activity);
+                if foreign.is_empty() {
+                    // Хвост целиком свой (#1204): тихо двигаем бейзлайн —
+                    // следующий чужой коммент доставится без накопленного эха
+                    self.state
+                        .set_last_comment_id(&board.board, task.number(), &last.id);
+                    return Ok(WakeAct::None);
+                }
+                // CUP-гвард (#1231): доставка промпта — новый ход, тот же
+                // LLM-слот, что и спавн. «Будильник будит уже учтённую
+                // строку» было неверно: idle-сессия в подсчёт капа не
+                // входит. При полном капе — отложить, seen не писать:
+                // доставка повторится на свободном тике, комменты не
+                // теряются (см. WakeAct::Deferred).
+                if global_active >= policy.cup {
+                    tracing::info!(
+                        event = "wakeup.held_cup",
+                        number = task.number(),
+                        active = global_active,
+                        cap = policy.cup,
+                        "Wakeup held: CUP cap"
+                    );
+                    return Ok(WakeAct::Deferred);
+                }
+                let body = foreign
                     .iter()
                     .map(|c| c.body.as_str())
                     .collect::<Vec<_>>()
@@ -273,6 +315,38 @@ impl TickUseCase {
             // seen НЕ пишем, доставка повторится на тике после ответа
             Ok(WakeAct::None)
         }
+    }
+
+    /// Own-срез self-эха (#1204): коммент хвоста — «свой» для держащей
+    /// сессии, если он из реестра серверных постов (MCP task_comment) и не
+    /// свежее её последней активности — ход после поста двигает активность
+    /// (инвариант own-среза ADR-050). Чужие агентские (вердикты других
+    /// стадий) и юзерские будят. Активность недоступна — без среза:
+    /// лишняя эхо-будка лучше потерянного коммента (fail-open, семантика TS).
+    fn slice_self_echo<'a>(
+        &self,
+        number: u64,
+        tail: &'a [CommentRef],
+        activity: Option<u64>,
+    ) -> Vec<&'a CommentRef> {
+        let Some(active_at) = activity else {
+            return tail.iter().collect();
+        };
+        let foreign: Vec<&CommentRef> = tail
+            .iter()
+            .filter(|c| !(self.state.own_comment(&c.id) && c.created_ms <= active_at))
+            .collect();
+        let own = tail.len() - foreign.len();
+        if own > 0 {
+            tracing::info!(
+                event = "wakeup.self_echo_sliced",
+                number,
+                own,
+                foreign = foreign.len(),
+                "Self-echo sliced: own comments do not wake the holder"
+            );
+        }
+        foreign
     }
 
     /// Ход сессии завершён: последнее сообщение — финальный ассистентский
@@ -364,9 +438,13 @@ impl TickUseCase {
         Ok(true)
     }
 
-    /// Автодон: проба PR → мерж/Done/bounce. Без PR и без ветки — Done сразу
-    /// (docs-only); ветка без PR — возврат в работу (PR ещё не создан).
-    pub async fn autodone(&self, board: &BoardPlan, task: &Task) -> UsecaseResult<()> {
+    /// Автомерж (#1232): проба PR → мерж (строка остаётся в Review — Done
+    /// всегда за владельцем) / bounce в работу. Ветка без PR — возврат в
+    /// работу (PR ещё не создан); docs-only до сюда не доходит (домен
+    /// automerge_ready не прощупывает безветочные ячейки — Vcs::Local и
+    /// Artifact, #1155: мержить нечего, строка ждёт владельца).
+    /// Возвращает true — PR смержен этим вызовом (счётчик тика).
+    pub async fn automerge(&self, board: &BoardPlan, task: &Task) -> UsecaseResult<bool> {
         use crate::ports::PrState;
         let state = self
             .prs
@@ -378,27 +456,45 @@ impl TickUseCase {
             .await?;
         if state == PrState::Pending {
             tracing::info!(
-                event = "autodone.pending",
+                event = "automerge.pending",
                 number = task.number(),
-                "Autodone: PR pending (mergeable/чекси считаются) — ждём следующего тика"
+                "Automerge: PR pending (mergeable/чекси считаются) — ждём следующего тика"
             );
-            return Ok(());
+            return Ok(false);
         }
         match state {
             PrState::Pending => unreachable!("pending обработан выше"),
-            PrState::Merged => self.finish_done(board, task, "PR смержен").await?,
-            PrState::Missing if task.branch().is_none() => {
-                self.finish_done(board, task, "задача без PR (docs-only)")
-                    .await?
+            // Уже влит (вручную или раньше): no-op — merge-API не зовётся,
+            // строка остаётся в Review и ждёт владельца (инцидент #1151/#1162:
+            // ложный bounce вручную смерженной строки недопустим)
+            PrState::Merged => {
+                tracing::info!(
+                    event = "automerge.merged",
+                    number = task.number(),
+                    "Automerge: PR уже смержен — строка ждёт владельца в Review"
+                );
+                Ok(false)
             }
-            PrState::Missing => self.bounce(board, task, "ветка есть, PR не найден").await?,
-            PrState::Closed => self.bounce(board, task, "PR закрыт без мержа").await?,
+            PrState::Missing => {
+                self.bounce(board, task, "ветка есть, PR не найден").await?;
+                Ok(false)
+            }
+            PrState::Closed => {
+                self.bounce(board, task, "PR закрыт без мержа").await?;
+                Ok(false)
+            }
             PrState::Open {
                 mergeable: false, ..
-            } => self.bounce(board, task, "PR в конфликте с master").await?,
+            } => {
+                self.bounce(board, task, "PR в конфликте с master").await?;
+                Ok(false)
+            }
             PrState::Open {
                 ci_green: false, ..
-            } => self.bounce(board, task, "красный CI у PR").await?,
+            } => {
+                self.bounce(board, task, "красный CI у PR").await?;
+                Ok(false)
+            }
             PrState::Open {
                 mergeable: true,
                 ci_green: true,
@@ -406,31 +502,23 @@ impl TickUseCase {
                 let pr = task.pr().map(|u| u.as_str()).unwrap_or_default();
                 match self.prs.merge(&board.repo, pr).await {
                     Ok(()) => {
-                        self.finish_done(board, task, "PR смержен автодоном")
-                            .await?
+                        // мерж без закрытия: строка остаётся в Review —
+                        // финализация (Done) всегда за владельцем (#1232)
+                        tracing::info!(
+                            event = "automerge.merged",
+                            number = task.number(),
+                            "Automerge: PR смержен — строка остаётся в Review"
+                        );
+                        Ok(true)
                     }
                     Err(e) => {
                         self.bounce(board, task, &format!("мерж не прошёл: {e}"))
-                            .await?
+                            .await?;
+                        Ok(false)
                     }
                 }
             }
         }
-        Ok(())
-    }
-
-    async fn finish_done(&self, board: &BoardPlan, task: &Task, why: &str) -> UsecaseResult<()> {
-        self.board
-            .set_status(&board.board, task.number(), Status::Done)
-            .await?;
-        self.board.close_issue(task.number()).await?;
-        tracing::info!(
-            event = "autodone.done",
-            number = task.number(),
-            why,
-            "Autodone: done"
-        );
-        Ok(())
     }
 
     async fn bounce(&self, board: &BoardPlan, task: &Task, why: &str) -> UsecaseResult<()> {
@@ -440,17 +528,23 @@ impl TickUseCase {
         self.board
             .post_comment(
                 task.number(),
-                &format!("Автодон: возврат в работу — {why}."),
+                &format!("Автомерж: возврат в работу — {why}."),
             )
             .await?;
         tracing::info!(
-            event = "autodone.bounce",
+            event = "automerge.bounce",
             number = task.number(),
             why,
-            "Autodone: bounce"
+            "Automerge: bounce"
         );
         Ok(())
     }
+}
+
+/// Тайтл конвейерной сессии: `#<номер> <эмодзи стадии> <тайтл>` (задача
+/// #1212); единая точка сборки — bootstrap наследует тем же значением.
+fn session_title(task: &Task, slot: Slot) -> String {
+    format!("#{} {} {}", task.number(), slot.emoji(), task.title())
 }
 
 pub(crate) fn spawn_prompt(board: &BoardPlan, task: &Task, slot: Slot) -> String {

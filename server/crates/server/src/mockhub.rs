@@ -18,7 +18,8 @@ struct HubState {
     tasks: HashMap<u64, Task>,
     /// number → доска (тег; без тега — видна на всех досках стенда)
     board_tags: HashMap<u64, String>,
-    /// number → поля (сессии/ветка/PR)
+    /// number → поля (сессии/ветка/PR); Приоритет/Automerge — поле строки
+    /// (#402/#1258: set_board_cells пишет в Task, load проектирует наружу)
     fields: HashMap<u64, TaskFields>,
     /// number → тело issue
     bodies: HashMap<u64, String>,
@@ -186,6 +187,20 @@ impl TaskBoardRepo for MemoryHub {
         })
     }
 
+    async fn row_status(&self, board: &str, number: u64) -> UsecaseResult<Option<Status>> {
+        self.with_state(|state| {
+            self.ensure_seed(state);
+            Ok(state
+                .tasks
+                .get(&number)
+                .filter(|t| match state.board_tags.get(&t.number()) {
+                    Some(tag) => tag == board,
+                    None => true,
+                })
+                .map(|t| t.status()))
+        })
+    }
+
     async fn set_session(
         &self,
         _board: &str,
@@ -217,6 +232,32 @@ impl TaskBoardRepo for MemoryHub {
         })
     }
 
+    async fn set_board_cells(
+        &self,
+        _board: &str,
+        number: u64,
+        priority: Option<&str>,
+        automerge: Option<bool>,
+    ) -> UsecaseResult<()> {
+        self.with_state(|state| {
+            // сид материализуется лениво — симметрично row_status/set_status
+            self.ensure_seed(state);
+            let task = state
+                .tasks
+                .get_mut(&number)
+                .ok_or_else(|| UsecaseError::Board(format!("mockhub: #{number} нет")))?;
+            // ячейки снапшота — часть строки стенда; apply_fields при
+            // read_board Empty-приоритет не стирает (домен)
+            if let Some(p) = priority {
+                task.set_priority(uwuwu_usecase::parse_priority(p));
+            }
+            if let Some(a) = automerge {
+                task.set_automerge(a);
+            }
+            Ok(())
+        })
+    }
+
     async fn clear_session(&self, _board: &str, number: u64, slot: Slot) -> UsecaseResult<()> {
         self.with_state(|state| {
             state.fields.entry(number).or_default().clear_session(slot);
@@ -228,20 +269,21 @@ impl TaskBoardRepo for MemoryHub {
         self.with_state(|state| Ok(state.fields.get(&number).cloned().unwrap_or_default()))
     }
 
-    async fn post_comment(&self, number: u64, body: &str) -> UsecaseResult<()> {
+    async fn post_comment(&self, number: u64, body: &str) -> UsecaseResult<String> {
         self.with_state(|state| {
             let counter = &mut state.counter;
             *counter += 1;
+            let id = format!("mockc-{counter}");
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
             state.comments.entry(number).or_default().push(CommentRef {
-                id: format!("mockc-{counter}"),
+                id: id.clone(),
                 created_ms: now,
                 body: body.to_string(),
             });
-            Ok(())
+            Ok(id)
         })
     }
 
@@ -414,6 +456,25 @@ impl IssueFieldStore for MemoryHub {
                     out.insert("PR".into(), p.as_str().to_string());
                 }
             }
+            // автомерж — поле строки (#402/#1258: один механизм): наружу
+            // нормализованное «Automerge» on/off — гейт #1280 читает здесь.
+            // Приоритет — тоже поле строки: имя high/medium/low, Empty
+            // не отдаётся (пустота = отсутствие ключа, как в живом fields.rs)
+            if let Some(t) = state.tasks.get(&number) {
+                out.insert(
+                    uwuwu_usecase::F_AUTOMERGE.into(),
+                    if t.automerge() { "on" } else { "off" }.into(),
+                );
+                let name = match t.priority() {
+                    uwuwu_domain::Priority::High => Some("high"),
+                    uwuwu_domain::Priority::Medium => Some("medium"),
+                    uwuwu_domain::Priority::Low => Some("low"),
+                    uwuwu_domain::Priority::Empty => None,
+                };
+                if let Some(n) = name {
+                    out.insert(uwuwu_usecase::F_PRIORITY.into(), n.into());
+                }
+            }
             Ok(out)
         })
     }
@@ -444,15 +505,178 @@ impl IssueFieldStore for MemoryHub {
                             f.set_branch(b);
                         }
                     }
-                    ("PR", Some(v)) => {
-                        if let Some(p) = uwuwu_domain::PrUrl::parse(v) {
-                            let _ = f.open_pr(p);
+                    ("Automerge" | "Autodone", Some(v)) => {
+                        // автомерж-ячейка (#1232): canonical «Automerge»,
+                        // legacy «Autodone» — в одну клетку; on/true — вкл.
+                        // Хранилище — поле строки (#402/#1258: один механизм,
+                        // карта снесена; load нормализует наружу — #1280)
+                        if let Some(task) = state.tasks.get_mut(&number) {
+                            task.set_automerge(v == "on" || v == "true");
                         }
                     }
+                    ("Automerge" | "Autodone", None) => {
+                        // очистка по контракту store (None — снять);
+                        // в поле строки два состояния — false как default
+                        if let Some(task) = state.tasks.get_mut(&number) {
+                            task.set_automerge(false);
+                        }
+                    }
+                    ("PR", Some(v)) => {
+                        if let Some(p) = uwuwu_domain::PrUrl::parse(v) {
+                            // зеркально мапперу носителя (#1155): ветка есть —
+                            // кодовый PullRequest, нет — безветочный артефакт
+                            if f.branch().is_some() {
+                                let _ = f.open_pr(p);
+                            } else {
+                                f.set_artifact(p);
+                            }
+                        }
+                    }
+                    // «Приоритет» — поле строки (#402 set_board_cells):
+                    // issue-филд store больше не пишет приоритет, ветка
+                    // выпилена (#1280 резолв мержа — мёртвый носитель)
                     _ => {}
                 }
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Пины порта на MemoryHub (#1235): досочный фильтр row_status и
+    //! свежесть носителя после записи. Гард канона edit() сверяется с
+    //! row_status — семантика носителя (борд-уважение, read-your-writes)
+    //! не должна ползти.
+
+    use super::*;
+
+    #[tokio::test]
+    async fn row_status_respects_board_tag() {
+        let hub = MemoryHub::with_seeds(vec![SeedRow {
+            board: Some("Задачи uwuwu".into()),
+            number: 11,
+            status: Status::Analys,
+        }]);
+        let own = hub
+            .row_status("Задачи uwuwu", 11)
+            .await
+            .expect("чтение своей доски");
+        assert_eq!(own, Some(Status::Analys));
+        // номер на чужой доске — None («строка не на доске»), а не статус
+        // чужой доски: код-ревью #1235 Low-1, носители борд-уважающие
+        let foreign = hub
+            .row_status("Задачи origa", 11)
+            .await
+            .expect("чтение чужой доски");
+        assert_eq!(foreign, None, "строка другой доски — None");
+        // без тега — видна на любой доске стенда
+        let hub_free = MemoryHub::with_seed(Some((7, Status::InProgress)));
+        let any = hub_free
+            .row_status("какая-то доска", 7)
+            .await
+            .expect("чтение без тега");
+        assert_eq!(any, Some(Status::InProgress));
+    }
+
+    #[tokio::test]
+    async fn set_status_is_visible_to_row_status_immediately() {
+        // read-your-writes на носителе: запись статусного пути видна
+        // свежему чтению без окна стэйла (#1235). Порядок — как в edit():
+        // гард читает row_status ДО set_status (заодно материализует сид).
+        let hub = MemoryHub::with_seed(Some((7, Status::Analys)));
+        let current = hub.row_status("B", 7).await.expect("чтение до записи");
+        assert_eq!(current, Some(Status::Analys));
+        hub.set_status("B", 7, Status::ReviewAnalys)
+            .await
+            .expect("легальное ребро Analys → Review Analys");
+        let fresh = hub.row_status("B", 7).await.expect("чтение после записи");
+        assert_eq!(
+            fresh,
+            Some(Status::ReviewAnalys),
+            "свежая запись видна сразу"
+        );
+    }
+
+    #[tokio::test]
+    async fn automerge_field_persists_to_rows() {
+        // #1155 (поручение владельца): mock-носитель хранит автомерж-ячейку —
+        // write-path («Automerge», legacy «Autodone» в одну клетку) →
+        // снапшот-риды несут флаг; без этого тик стенда слеп к мерж-гейту
+        // (automerge_ready всегда false) и fm врёт «automerge: false».
+        // Хранилище — поле строки (#1258: один механизм, карта снесена)
+        let hub = MemoryHub::with_seed(Some((9, Status::UserReview)));
+        use uwuwu_usecase::IssueFieldStore;
+        // сид материализуется лениво (ensure_seed на ридах) — как в пине
+        // row_status #1235: чтение до записи
+        hub.read_board("B").await.expect("материализация сида");
+        hub.store(9, &[(uwuwu_usecase::F_AUTOMERGE, Some("on".to_string()))])
+            .await
+            .expect("canonical write");
+        let rows = hub.read_board("B").await.expect("board");
+        assert!(
+            rows.iter().find(|t| t.number() == 9).unwrap().automerge(),
+            "canonical «Automerge»: on → true на строке снапшота"
+        );
+        assert!(hub.read_issue("B", 9).await.unwrap().task.automerge());
+
+        hub.store(9, &[("Autodone", Some("off".to_string()))])
+            .await
+            .expect("legacy write");
+        assert!(
+            !hub.read_board("B").await.unwrap()[0].automerge(),
+            "legacy «Autodone» пишет в ту же ячейку (off)"
+        );
+
+        hub.store(9, &[("Automerge", None)]).await.expect("clear");
+        assert!(
+            !hub.read_board("B").await.unwrap()[0].automerge(),
+            "None — очистка по контракту store"
+        );
+    }
+
+    /// Read-your-writes нестатусных ячеек снапшота (#1258): запись
+    /// Приоритета/Automerge видна read_board сразу. До фикса поля шли
+    /// мимо стейта (fields.store их терял) — task_list показывал
+    /// до-мутационные значения до TTL (проба на проде 18.11).
+    #[tokio::test]
+    async fn board_cells_are_visible_to_read_board_immediately() {
+        let hub = MemoryHub::with_seed(Some((7, Status::Analys)));
+        hub.set_board_cells("B", 7, Some("high"), Some(true))
+            .await
+            .expect("запись ячеек");
+        let rows = hub.read_board("B").await.expect("чтение доски");
+        let t = rows
+            .iter()
+            .find(|t| t.number() == 7)
+            .expect("строка на доске");
+        assert_eq!(
+            t.priority(),
+            uwuwu_domain::Priority::High,
+            "приоритет виден сразу"
+        );
+        assert!(t.automerge(), "automerge виден сразу");
+    }
+
+    /// Свежая строка (окно create: add_to_board инвалидирует снапшот ДО
+    /// записи полей) — записанные поля приземляются в read_board (#1258).
+    #[tokio::test]
+    async fn created_row_board_cells_landed_in_read_board() {
+        let hub = MemoryHub::with_seed(None);
+        let n = hub
+            .create_issue("B", "uwuwu", "строка", "тело")
+            .await
+            .expect("создание строки");
+        hub.set_board_cells("B", n, Some("low"), Some(false))
+            .await
+            .expect("запись ячеек свежей строки");
+        let rows = hub.read_board("B").await.expect("чтение доски");
+        let t = rows
+            .iter()
+            .find(|t| t.number() == n)
+            .expect("строка на доске");
+        assert_eq!(t.priority(), uwuwu_domain::Priority::Low);
+        assert!(!t.automerge());
     }
 }

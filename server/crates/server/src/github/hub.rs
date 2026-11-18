@@ -1,6 +1,6 @@
 //! gh-hub adapter: доска (bulk select-колонки) + issue REST (тело/комменты/
 //! нативные поля). fm-зеркало снесено (владелец 15.11): операционные данные —
-//! Status/Приоритет/Autodone на доске, сессии/ветка/PR — глобальные поля issue
+//! Status/Приоритет/Automerge на доске, сессии/ветка/PR — глобальные поля issue
 //! (fields.rs). Тело задачи — чистый контент.
 
 use super::fields::{parse_field_values, Fields, IssueFields};
@@ -98,9 +98,53 @@ impl<T> TtlCache<T> {
             .insert(key.to_string(), (now, arc.clone()));
         arc
     }
+
+    /// Точечный сброс ключа: мутация доски — read-your-writes (#1235).
+    fn invalidate(&self, key: &str) {
+        self.cells.write().expect("ttl cache lock").remove(key);
+    }
+
+    /// Сброс всех ключей: тайтл строки живёт в снапшотах всех досок.
+    fn invalidate_all(&self) {
+        self.cells.write().expect("ttl cache lock").clear();
+    }
 }
 
-#[derive(Default)]
+/// Исход verify-after-write (#1235, семья #1213).
+enum VerifyOutcome {
+    /// Чтение подтвердило запись.
+    Ok,
+    /// Rate limit: ретраи не продолжаем — мутация принята GitHub,
+    /// write-through сохранён (окно возможно-ложного кэша ограничено TTL).
+    SkippedRateLimited,
+    /// Три чтения не подтвердили запись — громкий отказ + откат write-through.
+    Mismatch,
+}
+
+/// Единый тег классификации в тексте отказа gql-транспорта: kind —
+/// «RATE_LIMITED» (Core/Secondary и GraphQL-лимит) или «PERMISSION»
+/// (настоящий отказ доступа). Verify-логика матчит ТОЛЬКО этот тег,
+/// не тексты GitHub — иначе Permission-отказ («не rate limit» в Display)
+/// читался как rate limit (код-ревью #1235 Common-1).
+fn gh_tagged(fail: &crate::gherr::GhFail) -> UsecaseError {
+    let kind = match fail {
+        crate::gherr::GhFail::Permission => "PERMISSION",
+        crate::gherr::GhFail::Core { .. } | crate::gherr::GhFail::Secondary { .. } => {
+            "RATE_LIMITED"
+        }
+    };
+    UsecaseError::Board(format!("gh graphql [{kind}]: {fail}"))
+}
+
+/// Rate-limit отказ транспорта: только собственный тег gql-точки,
+/// не строковые эвристики по текстам GitHub.
+fn is_rate_limited(e: &UsecaseError) -> bool {
+    e.to_string()
+        .to_lowercase()
+        .contains("gh graphql [rate_limited]")
+}
+
+#[derive(Default, Clone)]
 struct BoardMeta {
     project_id: String,
     status_field_id: String,
@@ -118,9 +162,11 @@ impl GitHubHub {
                 .user_agent(concat!("uwuwu-server/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .expect("reqwest client"),
-            // 120 c ≤ тик (poll 180 c): снимок освежается раз в тик,
-            // мутации тика шарят один снимок
-            snap_cache: TtlCache::new(std::time::Duration::from_secs(120)),
+            // 240 c > тик (poll 180 c): снимок живёт через тик — полный
+            // рефреш раз в два тика (−50% GraphQL-трафика; доска 746 строк
+            // выжигала часовой бюджет, инцидент 18.11), мутации шарят
+            // снимок. Свежесть статусов для decide — ≤ двух тиков.
+            snap_cache: TtlCache::new(std::time::Duration::from_secs(240)),
             status_cache: TtlCache::new(std::time::Duration::from_secs(60)),
             gql_block: std::sync::RwLock::new(None),
             last_rate_limit: std::sync::RwLock::new(None),
@@ -148,7 +194,7 @@ impl GitHubHub {
         let now = std::time::Instant::now();
         if let Some(until) = self.gql_blocked(now) {
             return Err(UsecaseError::Board(format!(
-                "graphql budget: RATE_LIMITED бэкофф ещё {:?}",
+                "gh graphql [RATE_LIMITED]: бэкофф ещё {:?}",
                 until.duration_since(now)
             )));
         }
@@ -167,7 +213,7 @@ impl GitHubHub {
             .await
             .map_err(|e| UsecaseError::Board(format!("graphql body: {e}")))?;
         if let Some(fail) = crate::gherr::classify(status, &headers) {
-            return Err(UsecaseError::Board(format!("gh graphql: {fail}")));
+            return Err(gh_tagged(&fail));
         }
         let body: Value = serde_json::from_str(&text)
             .map_err(|e| UsecaseError::Board(format!("graphql не-JSON (HTTP {status}): {e}")))?;
@@ -190,7 +236,7 @@ impl GitHubHub {
                     until = ?until,
                     "GraphQL rate limit: бэкофф 5 мин (снапшоты без кеша выжигали бюджет — #1243)"
                 );
-                return Err(UsecaseError::Board(format!("gh graphql: {fail}")));
+                return Err(gh_tagged(&fail));
             }
             return Err(UsecaseError::Board(format!("graphql errors: {errors}")));
         }
@@ -234,7 +280,7 @@ impl GitHubHub {
         Ok((status, value))
     }
 
-    /// Снимок доски: bulk-задачи (Status/Приоритет/Autodone) + мета мутаций.
+    /// Снимок доски: bulk-задачи (Status/Приоритет/Automerge) + мета мутаций.
     /// TTL-кеш (#1243): тик и его мутации шарят один снимок. Строка,
     /// добавленная на доску младше TTL, может не иметь item-id в мете —
     /// мутация по ней ошибётся и самолечится следующим тиком (свежий снимок).
@@ -378,6 +424,176 @@ impl GitHubHub {
         Ok(String::new())
     }
 
+    /// Статусный value строки КОНКРЕТНОЙ доски (project-фильтр по тайтлу):
+    /// None — строки нет на этой доске; Some("") — есть, но Status не задан.
+    /// Против board_status_fetch, который берёт Status первой попавшейся
+    /// привязки (#1235 Low-1).
+    async fn carrier_status(&self, board: &str, number: u64) -> UsecaseResult<Option<String>> {
+        let q = r#"
+          query($owner:String!,$name:String!,$n:Int!){
+            repository(owner:$owner,name:$name){
+              issue(number:$n){
+                projectItems(first:10){
+                  nodes{
+                    project{ title }
+                    fieldValues(first:20){ nodes{
+                      __typename ...on ProjectV2ItemFieldSingleSelectValue{
+                        name field{ ...on ProjectV2FieldCommon{ name } } } } }
+                  }
+                }
+              }
+            }
+          }"#;
+        let (owner, name) = self
+            .repo
+            .split_once('/')
+            .ok_or_else(|| UsecaseError::Board(format!("repo: {}", self.repo)))?;
+        let data = self
+            .gql(
+                q,
+                json!({ "owner": owner, "name": name, "n": number as i64 }),
+            )
+            .await?;
+        let Some(items) = data["repository"]["issue"]["projectItems"]["nodes"].as_array() else {
+            return Ok(None);
+        };
+        for item in items {
+            if item["project"]["title"].as_str() != Some(board) {
+                continue;
+            }
+            let Some(vals) = item["fieldValues"]["nodes"].as_array() else {
+                return Ok(Some(String::new()));
+            };
+            for v in vals {
+                if v["field"]["name"].as_str() == Some("Status") {
+                    return Ok(Some(v["name"].as_str().unwrap_or_default().to_string()));
+                }
+            }
+            return Ok(Some(String::new()));
+        }
+        Ok(None)
+    }
+
+    /// Сброс снимка доски: мутация могла изменить строки/мету (#1235).
+    fn invalidate_snapshot(&self, board: &str) {
+        self.snap_cache.invalidate(board);
+    }
+
+    /// Write-through известного статуса в снапшот (#1235): клон с
+    /// обновлённой строкой под тем же ключом — read-лаг Projects v2
+    /// минутного масштаба не отдаёт собственную запись старой.
+    fn write_through_status(&self, board: &str, number: u64, status: Status) {
+        let now = std::time::Instant::now();
+        let Some(hit) = self.snap_cache.get(board, now) else {
+            return;
+        };
+        let (mut rows, meta) = hit.as_ref().clone();
+        for task in rows.iter_mut().filter(|t| t.number() == number) {
+            task.override_status(status);
+        }
+        self.snap_cache.put(board, (rows, meta), now);
+    }
+
+    /// Write-through статусного кэша строки (task_get читает отсюда).
+    fn write_through_status_cache(&self, number: u64, status: Status) {
+        let now = std::time::Instant::now();
+        self.status_cache.put(
+            &number.to_string(),
+            uwuwu_usecase::status_name(status).to_string(),
+            now,
+        );
+    }
+
+    /// Кеш-гигиена снапшота после записи нестатусных ячеек (#1258):
+    /// строка в кешированном снимке — write-through записанных значений
+    /// (read-your-writes, без рефетча и расхода GraphQL-бюджета);
+    /// снимка нет или строки в нём нет — инвалидация (окно create:
+    /// add_to_board инвалидирует до записи полей — свежий фетч мог
+    /// закешироваться без полей).
+    fn settle_board_cells(
+        &self,
+        board: &str,
+        number: u64,
+        priority: Option<&str>,
+        automerge: Option<bool>,
+    ) {
+        let now = std::time::Instant::now();
+        let Some(hit) = self.snap_cache.get(board, now) else {
+            return; // снимка нет — нечего гигиенить, фетч увидит поля
+        };
+        let (mut rows, meta) = hit.as_ref().clone();
+        let row_present = rows.iter_mut().any(|t| t.number() == number);
+        if !row_present {
+            // окно create: снимок мог закешироваться без полей — сброс,
+            // следующий фетч несёт записанные значения
+            self.invalidate_snapshot(board);
+            return;
+        }
+        for task in rows.iter_mut().filter(|t| t.number() == number) {
+            if let Some(p) = priority {
+                task.set_priority(uwuwu_usecase::parse_priority(p));
+            }
+            if let Some(a) = automerge {
+                task.set_automerge(a);
+            }
+        }
+        self.snap_cache.put(board, (rows, meta), now);
+    }
+
+    /// Контрольное чтение после мутации статуса (семья #1213): до 3
+    /// попыток с паузой 1 с. Rate limit — ретраи не продолжаются
+    /// (мутация принята GitHub); сетевой сбой и рассогласование —
+    /// полный цикл, дальше громкий отказ.
+    async fn verify_status(&self, number: u64, expected: Status) -> VerifyOutcome {
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            match self.board_status_fetch(number).await {
+                Ok(fetched) if uwuwu_usecase::parse_status(&fetched) == expected => {
+                    return VerifyOutcome::Ok;
+                }
+                Err(e) if is_rate_limited(&e) => return VerifyOutcome::SkippedRateLimited,
+                _ => {}
+            }
+        }
+        VerifyOutcome::Mismatch
+    }
+
+    /// Пост-мутационная гигиена кэша по исходу verify (код-ревью #1235
+    /// Common-3): write-through уже стоит — исход решает, остаётся ли он.
+    /// Ok/SkippedRateLimited → кэш держит записанное значение (окно
+    /// возможно-ложного значения при rate-limit ограничено TTL);
+    /// Mismatch → откат write-through (инвалидация) + громкий отказ —
+    /// не держим возможно-ложное значение 60–120 с (семья #1213).
+    fn settle_write_through(
+        &self,
+        board: &str,
+        number: u64,
+        outcome: VerifyOutcome,
+        status: Status,
+    ) -> UsecaseResult<()> {
+        match outcome {
+            VerifyOutcome::Ok => {}
+            VerifyOutcome::SkippedRateLimited => tracing::warn!(
+                event = "board.verify_skipped",
+                number,
+                to = %uwuwu_usecase::status_name(status),
+                "verify пропущен (rate limit): мутация принята GitHub, write-through сохранён"
+            ),
+            VerifyOutcome::Mismatch => {
+                self.invalidate_snapshot(board);
+                self.status_cache.invalidate(&number.to_string());
+                return Err(UsecaseError::Board(format!(
+                    "статус #{number}: запись «{}» не подтвердилась чтением — \
+                     GitHub отдаёт лаг или мутация не применилась; не ретраить слепо",
+                    uwuwu_usecase::status_name(status)
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Комменты задачи: свежий хвост (direction=desc, последние 100),
     /// возврат по возрастанию. GitHub без direction отдаёт старейшие —
     /// wakeup был слеп к свежим комментам при длинных тредах (раунд 3).
@@ -438,7 +654,7 @@ fn parse_page(items: &[Value], meta: &mut BoardMeta) -> Vec<Task> {
             };
             let mut task = Task::new(number, title, status);
             task.set_priority(uwuwu_usecase::parse_priority(&v.priority));
-            task.set_autodone(v.autodone);
+            task.set_automerge(v.automerge);
             meta.items
                 .insert(number, item["id"].as_str().unwrap_or_default().to_string());
             Some(task)
@@ -450,21 +666,21 @@ fn parse_page(items: &[Value], meta: &mut BoardMeta) -> Vec<Task> {
 struct ItemValues {
     status: String,
     priority: String,
-    autodone: bool,
+    automerge: bool,
 }
 
 fn item_values(item: &Value) -> ItemValues {
     let mut out = ItemValues {
         status: String::new(),
         priority: String::new(),
-        autodone: false,
+        automerge: false,
     };
     if let Some(vals) = item["fieldValues"]["nodes"].as_array() {
         for v in vals {
             let field = v["field"]["name"].as_str().unwrap_or_default();
             // Pv2-own поля несут значение на верхнем уровне узла;
             // issue-backed (каталог /user/issue-fields: «Приоритет»,
-            // «Autodone») — вложенным issueFieldValue (#1174)
+            // «Automerge») — вложенным issueFieldValue (#1174)
             let value = v["name"]
                 .as_str()
                 .or(v["issueFieldValue"]["name"].as_str())
@@ -472,7 +688,8 @@ fn item_values(item: &Value) -> ItemValues {
             match field {
                 "Status" => out.status = value.to_string(),
                 crate::github::fields::F_PRIORITY | "Priority" => out.priority = value.to_string(),
-                "Autodone" => out.autodone = value == "on" || value == "true",
+                // автомерж (#1232): новое имя, legacy «Autodone» — back-compat
+                "Automerge" | "Autodone" => out.automerge = value == "on" || value == "true",
                 _ => {}
             }
         }
@@ -522,8 +739,11 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
         .get(crate::github::fields::F_PRIORITY)
         .map(|v| uwuwu_usecase::parse_priority(v))
         .unwrap_or(uwuwu_domain::Priority::Empty);
-    // VCS-жизненный цикл явный; PR без ветки — кривые данные носителя,
-    // отбрасываем (домен PullRequest требует ветку)
+    // VCS-жизненный цикл явный; пара (Branch, PR) — кодовый цикл с веткой.
+    // Безветочная PR-ячейка — Artifact (канон ADR-021: ячейка несёт URL
+    // и без ветки кода — вики/issue/чужой-вендор PR; #1155 — рендер,
+    // не отброс). Кодовый инвариант «PR требует ветку» живёт в мутаторах
+    // домена (open_pr), не в загрузчике носителя.
     let vcs = match (
         raw.get(crate::github::fields::F_BRANCH)
             .and_then(|s| uwuwu_domain::BranchName::parse(s)),
@@ -531,10 +751,7 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
     ) {
         (Some(branch), Some(url)) => Vcs::PullRequest { branch, url },
         (Some(branch), None) => Vcs::Branch(branch),
-        (None, Some(_)) => {
-            tracing::warn!(event = "hub.pr_without_branch", "PR без ветки — отброшен");
-            Vcs::Local
-        }
+        (None, Some(url)) => Vcs::Artifact { url },
         (None, None) => Vcs::Local,
     };
     TaskFields::new(assignments, vcs, priority)
@@ -548,6 +765,13 @@ impl TaskBoardRepo for GitHubHub {
 
     async fn set_status(&self, board: &str, number: u64, status: Status) -> UsecaseResult<()> {
         let snap = self.snapshot(board).await?;
+        // last-known статус строки на момент мутации — для ребра в логах
+        // (Low-2 код-ревью #1235; значение со снапшота, может быть стэйл)
+        let from = snap
+            .0
+            .iter()
+            .find(|t| t.number() == number)
+            .map(|t| uwuwu_usecase::status_name(t.status()).to_string());
         let option = snap
             .1
             .options
@@ -575,7 +799,35 @@ impl TaskBoardRepo for GitHubHub {
             json!({ "p": project_id, "i": item, "f": status_field_id, "o": option }),
         )
         .await?;
+        // read-your-writes (#1235): собственная запись обслуживается кэшем,
+        // а не refetch'ем — read-лаг Projects v2 минутного масштаба не виден.
+        self.write_through_status(board, number, status);
+        self.write_through_status_cache(number, status);
+        // verify-after-write (семья #1213): мутация либо подтверждена
+        // чтением, либо громкая ошибка с откатом write-through.
+        let outcome = self.verify_status(number, status).await;
+        self.settle_write_through(board, number, outcome, status)?;
+        tracing::info!(
+            event = "board.set_status",
+            board,
+            number,
+            from = from.as_deref().unwrap_or("—"),
+            to = %uwuwu_usecase::status_name(status),
+            "Статус строки обновлён и подтверждён чтением (from — last-known со снапшота)"
+        );
         Ok(())
+    }
+
+    async fn row_status(&self, board: &str, number: u64) -> UsecaseResult<Option<Status>> {
+        // project-фильтр: номер на чужой доске — не наша строка (Low-1
+        // код-ревью #1235), а не «статус этой доски»
+        match self.carrier_status(board, number).await? {
+            // Status-значения на носителе нет (строка не на доске /
+            // поле не задано); непустое непарсящееся — Some(Empty)
+            None => Ok(None),
+            Some(raw) if raw.trim().is_empty() => Ok(None),
+            Some(raw) => Ok(Some(uwuwu_usecase::parse_status(&raw))),
+        }
     }
 
     async fn set_session(
@@ -595,7 +847,9 @@ impl TaskBoardRepo for GitHubHub {
         };
         self.fields
             .store(number, &[(name, Some(session.to_string()))])
-            .await
+            .await?;
+        self.invalidate_snapshot(_board);
+        Ok(())
     }
 
     async fn set_branch(
@@ -612,7 +866,39 @@ impl TaskBoardRepo for GitHubHub {
                     Some(branch.as_str().to_string()),
                 )],
             )
-            .await
+            .await?;
+        self.invalidate_snapshot(_board);
+        Ok(())
+    }
+
+    async fn set_board_cells(
+        &self,
+        board: &str,
+        number: u64,
+        priority: Option<&str>,
+        automerge: Option<bool>,
+    ) -> UsecaseResult<()> {
+        // поля — нативные issue (REST), как и у set_branch
+        let mut patch: Vec<(&str, Option<String>)> = Vec::new();
+        if let Some(p) = priority {
+            patch.push((
+                crate::github::fields::F_PRIORITY,
+                Some(p.trim().to_string()),
+            ));
+        }
+        if let Some(a) = automerge {
+            patch.push((
+                uwuwu_usecase::F_AUTOMERGE,
+                Some(if a { "on" } else { "off" }.to_string()),
+            ));
+        }
+        if !patch.is_empty() {
+            self.fields.store(number, &patch).await?;
+        }
+        // read-your-writes (#1258): кеш-гигиена снапшота — write-through
+        // записанных значений при живой строке, инвалидация при отсутствующей
+        self.settle_board_cells(board, number, priority, automerge);
+        Ok(())
     }
 
     async fn clear_session(
@@ -630,11 +916,13 @@ impl TaskBoardRepo for GitHubHub {
             }
             uwuwu_domain::Slot::Test => crate::github::fields::F_TEST_SESSION,
         };
-        self.fields.store(number, &[(name, None)]).await
+        self.fields.store(number, &[(name, None)]).await?;
+        self.invalidate_snapshot(_board);
+        Ok(())
     }
 
-    async fn post_comment(&self, number: u64, body: &str) -> UsecaseResult<()> {
-        let (status, _) = self
+    async fn post_comment(&self, number: u64, body: &str) -> UsecaseResult<String> {
+        let (status, resp) = self
             .rest(
                 reqwest::Method::POST,
                 &format!("/repos/{}/issues/{number}/comments", self.repo),
@@ -646,7 +934,9 @@ impl TaskBoardRepo for GitHubHub {
                 "comment #{number}: HTTP {status}"
             )));
         }
-        Ok(())
+        // node_id — та же идентичность, что в журнале latest_comments;
+        // пусто (нестандартный ответ) — маркировка невозможна, fail-open.
+        Ok(resp["node_id"].as_str().unwrap_or_default().to_string())
     }
 
     async fn close_issue(&self, number: u64) -> UsecaseResult<()> {
@@ -670,8 +960,18 @@ impl TaskBoardRepo for GitHubHub {
         } else {
             uwuwu_usecase::parse_status(&status)
         };
+        let raw = parse_field_values(&issue);
         let mut task = Task::new(number, title, status);
-        task.apply_fields(map_task_fields(&parse_field_values(&issue)));
+        task.apply_fields(map_task_fields(&raw));
+        // automerge с носителя (fm-вью честен, баг-репорт тестировщика #1232:
+        // read_issue не мапил значение — task_get врал automerge: false);
+        // тик-путь (snapshot item_values) уже читал, это REST-путь MCP
+        let automerge = raw
+            .get("Automerge")
+            .or_else(|| raw.get("Autodone"))
+            .map(|v| v == "on" || v == "true")
+            .unwrap_or(false);
+        task.set_automerge(automerge);
         let comments = self.all_comments(number).await?;
         Ok(IssueView {
             task,
@@ -735,6 +1035,8 @@ impl TaskBoardRepo for GitHubHub {
                 "rename #{number}: HTTP {status}"
             )));
         }
+        // тайтл живёт в снапшотах всех досок — сброс целиком (#1235)
+        self.snap_cache.invalidate_all();
         Ok(())
     }
 
@@ -832,6 +1134,7 @@ impl GitHubHub {
             )
             .await?;
         }
+        self.invalidate_snapshot(board);
         Ok(())
     }
 }
@@ -932,6 +1235,340 @@ mod tests {
         );
     }
 
+    /// Фикстура: снапшот с устаревшей строкой + write-through нового
+    /// статуса — состояние set_status сразу после мутации, до verify.
+    fn hub_after_write_through(board: &str, number: u64, status: Status) -> GitHubHub {
+        let hub = GitHubHub::new("o/r".into(), "t".into());
+        let now = std::time::Instant::now();
+        let rows = vec![Task::new(number, "строка".into(), Status::Analys)];
+        hub.snap_cache.put(board, (rows, BoardMeta::default()), now);
+        hub.write_through_status(board, number, status);
+        hub.write_through_status_cache(number, status);
+        hub
+    }
+
+    #[test]
+    fn settle_ok_keeps_write_through() {
+        let hub = hub_after_write_through("B", 7, Status::InProgress);
+        hub.settle_write_through("B", 7, VerifyOutcome::Ok, Status::InProgress)
+            .expect("Ok — кэш не трогается");
+        let snap = hub
+            .snap_cache
+            .get("B", std::time::Instant::now())
+            .expect("снапшот жив");
+        assert_eq!(
+            snap.0.iter().find(|t| t.number() == 7).unwrap().status(),
+            Status::InProgress
+        );
+        assert_eq!(
+            hub.status_cache
+                .get("7", std::time::Instant::now())
+                .as_deref(),
+            Some(&"In Progress".to_string())
+        );
+    }
+
+    #[test]
+    fn settle_rate_limit_skip_keeps_write_through() {
+        // RATE_LIMITED: write-through сохраняем — окно возможно-ложного
+        // значения ограничено TTL, шуметь ошибкой на бюджетный отказ не надо
+        let hub = hub_after_write_through("B", 7, Status::InProgress);
+        hub.settle_write_through(
+            "B",
+            7,
+            VerifyOutcome::SkippedRateLimited,
+            Status::InProgress,
+        )
+        .expect("skip — не ошибка");
+        assert!(
+            hub.snap_cache.get("B", std::time::Instant::now()).is_some(),
+            "write-through сохранён"
+        );
+    }
+
+    #[test]
+    fn settle_mismatch_rolls_back_write_through_and_errors() {
+        // Деликатная ветка: «success без эффекта» не должен держать ложный
+        // статус в кэше 60–120 с (#1213-семья, код-ревью Common-3)
+        let hub = hub_after_write_through("B", 7, Status::InProgress);
+        let err = hub
+            .settle_write_through("B", 7, VerifyOutcome::Mismatch, Status::InProgress)
+            .expect_err("mismatch — громкая ошибка");
+        assert!(
+            err.to_string().contains("не подтвердилась"),
+            "текст отказа: {err}"
+        );
+        assert!(
+            hub.snap_cache.get("B", std::time::Instant::now()).is_none(),
+            "снапшот откатан"
+        );
+        assert!(
+            hub.status_cache
+                .get("7", std::time::Instant::now())
+                .is_none(),
+            "статусный кэш откатан"
+        );
+    }
+
+    /// #1258: write-through нестатусных ячеек — записанные Приоритет/
+    /// Automerge видны кешированному снапшоту сразу (read-your-writes,
+    /// симметрия write_through_status).
+    #[test]
+    fn board_cells_write_through_updates_snapshot() {
+        let hub = GitHubHub::new("o/r".into(), "t".into());
+        hub.snap_cache.put(
+            "B",
+            (
+                vec![Task::new(7, "строка".into(), Status::Analys)],
+                BoardMeta::default(),
+            ),
+            std::time::Instant::now(),
+        );
+        hub.settle_board_cells("B", 7, Some("high"), Some(true));
+        let snap = hub
+            .snap_cache
+            .get("B", std::time::Instant::now())
+            .expect("снапшот жив");
+        let t = snap
+            .0
+            .iter()
+            .find(|t| t.number() == 7)
+            .expect("строка в снапшоте");
+        assert_eq!(t.priority(), Priority::High, "приоритет write-through'нут");
+        assert!(t.automerge(), "automerge write-through'нут");
+    }
+
+    /// #1258: строки нет в снимке (окно create) — снимок инвалидируется,
+    /// следующий фетч видит поля; кеш без строки не держится.
+    #[test]
+    fn board_cells_missing_row_invalidates_snapshot() {
+        let hub = GitHubHub::new("o/r".into(), "t".into());
+        hub.snap_cache.put(
+            "B",
+            (
+                vec![Task::new(8, "другая строка".into(), Status::Analys)],
+                BoardMeta::default(),
+            ),
+            std::time::Instant::now(),
+        );
+        hub.settle_board_cells("B", 7, Some("high"), None);
+        assert!(
+            hub.snap_cache.get("B", std::time::Instant::now()).is_none(),
+            "снимок без строки сброшен"
+        );
+    }
+
+    /// #1258: пустой кеш — чистый no-op (инвалидация мимо, без паники).
+    #[test]
+    fn board_cells_without_snapshot_is_clean_noop() {
+        let hub = GitHubHub::new("o/r".into(), "t".into());
+        hub.settle_board_cells("B", 7, Some("high"), None);
+        assert!(hub.snap_cache.get("B", std::time::Instant::now()).is_none());
+    }
+
+    /// #1258 живая проба (tester): read-your-writes нестатусных ячеек
+    /// против реального носителя. МУТАЦИОННАЯ — пишет и восстанавливает;
+    /// носитель — sandbox #1265 (носитель живых проб #1232/#1174).
+    /// До фикса: set_board_cells мимо snap_cache → немедленный read_board
+    /// горячего хаба показывал до-мутационное значение до TTL (проба
+    /// на проде 18.11). Контракт под проверку: запись → немедленное
+    /// чтение тем же хабом несёт записанное (write-through снапшота);
+    /// свежий хаб — раунд-трип REST-записи на носителе. Автомерж на
+    /// свежем чтении ассертится (Pv2-отражение стабильно, NB #1232);
+    /// приоритет — informational-принт: Pv2-отражение issue-backed
+    /// Приоритета под задокументированным дрейфом GitHub (#1232).
+    #[test]
+    #[ignore] // живой прогон: GH_TOKEN + сеть; MUTATION — пишет и восстанавливает
+    fn live_board_cells_write_through_on_real_carrier() {
+        let repo =
+            std::env::var("UWUWU_HUB_REPO").unwrap_or_else(|_| "yurvon-screamo/uwuwu-hub".into());
+        let token = std::env::var("GH_TOKEN").expect("GH_TOKEN");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let board = "Задачи sandbox";
+            let n = 1265u64;
+            // 1. базлайн: холодный хаб наполняет кеш живым фетчем
+            let hub = GitHubHub::new(repo.clone(), token.clone());
+            let base = hub.read_board(board).await.expect("read_board базлайн");
+            let row = base
+                .iter()
+                .find(|t| t.number() == n)
+                .expect("#1265 на доске sandbox");
+            let base_priority = row.priority();
+            let base_automerge = row.automerge();
+            // проба пишет значение, ОТЛИЧНОЕ от базлайна — ассерты значимы
+            // при любом состоянии носителя
+            let probe_priority: &str = match base_priority {
+                Priority::High | Priority::Medium => "low",
+                Priority::Low | Priority::Empty => "high",
+            };
+            let probe_automerge = !base_automerge;
+            // 2. контракт фикса: запись → СРАЗУ чтение тем же хабом
+            hub.set_board_cells(board, n, Some(probe_priority), Some(probe_automerge))
+                .await
+                .expect("set_board_cells");
+            let after = hub
+                .read_board(board)
+                .await
+                .expect("read_board сразу после записи");
+            let row2 = after
+                .iter()
+                .find(|t| t.number() == n)
+                .expect("#1265 жив после записи");
+            assert_eq!(
+                row2.priority(),
+                uwuwu_usecase::parse_priority(probe_priority),
+                "read-your-writes: приоритет виден сразу (write-through снапшота, #1258)"
+            );
+            assert_eq!(
+                row2.automerge(),
+                probe_automerge,
+                "read-your-writes: automerge виден сразу (write-through снапшота, #1258)"
+            );
+            // 3. свежий хаб (холодный кеш): раунд-трип записи на носителе;
+            // до 3 попыток с паузой (Pv2-отражение REST-записи — секундное)
+            let mut roundtrip = false;
+            for attempt in 0..3 {
+                let fresh = GitHubHub::new(repo.clone(), token.clone());
+                let rows = fresh.read_board(board).await.expect("read_board носителя");
+                let matched = rows.iter().find(|t| t.number() == n).map(|t| {
+                    println!(
+                        "инфо: свежий хаб, попытка {}: приоритет = {:?} (Pv2-отражение \
+                         issue-backed Приоритета под дрейфом #1232 — не ассерт)",
+                        attempt + 1,
+                        t.priority()
+                    );
+                    t.automerge() == probe_automerge
+                });
+                if matched == Some(true) {
+                    roundtrip = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            assert!(
+                roundtrip,
+                "носитель не отдал записанный automerge за 3 попытки (раунд-трип REST #1258)"
+            );
+            // 4. восстановление базлайна + контроль тем же хабом
+            let base_priority_arg: &str = match base_priority {
+                Priority::High => "high",
+                Priority::Medium => "medium",
+                Priority::Low => "low",
+                Priority::Empty => "", // очистка ячейки
+            };
+            hub.set_board_cells(board, n, Some(base_priority_arg), Some(base_automerge))
+                .await
+                .expect("восстановление базлайна");
+            let restored = hub
+                .read_board(board)
+                .await
+                .expect("read_board после отката");
+            let row4 = restored
+                .iter()
+                .find(|t| t.number() == n)
+                .expect("#1265 жив после отката");
+            assert_eq!(
+                row4.priority(),
+                base_priority,
+                "базлайн приоритета восстановлен"
+            );
+            assert_eq!(
+                row4.automerge(),
+                base_automerge,
+                "базлайн automerge восстановлен"
+            );
+        });
+    }
+
+    #[test]
+    fn is_rate_limited_matches_only_owned_tag_not_github_texts() {
+        // Permission-отказ: Display содержит «не rate limit» — старый
+        // строковый матч читал его как rate limit (код-ревью Common-1)
+        let permission = UsecaseError::Board(
+            "gh graphql [PERMISSION]: HTTP 403 (не rate limit): проверь GH_TOKEN/права токена"
+                .into(),
+        );
+        assert!(!is_rate_limited(&permission), "Permission — не rate limit");
+        let limited = UsecaseError::Board(
+            "gh graphql [RATE_LIMITED]: GitHub rate limit (core): квота исчерпана".into(),
+        );
+        assert!(is_rate_limited(&limited));
+        let backoff = UsecaseError::Board("gh graphql [RATE_LIMITED]: бэкофф ещё 4 мин".into());
+        assert!(is_rate_limited(&backoff));
+        let unrelated = UsecaseError::Board("graphql errors: NOT_FOUND".into());
+        assert!(!is_rate_limited(&unrelated));
+    }
+
+    #[test]
+    fn ttl_cache_invalidate_drops_key_only() {
+        let cache: TtlCache<u64> = TtlCache::new(std::time::Duration::from_secs(60));
+        let now = std::time::Instant::now();
+        cache.put("a", 1, now);
+        cache.put("b", 2, now);
+        cache.invalidate("a");
+        assert!(cache.get("a", now).is_none(), "сброшенный ключ — мимо");
+        assert_eq!(cache.get("b", now).as_deref(), Some(&2), "сосед жив");
+    }
+
+    #[test]
+    fn ttl_cache_invalidate_all_clears_every_key() {
+        let cache: TtlCache<u64> = TtlCache::new(std::time::Duration::from_secs(60));
+        let now = std::time::Instant::now();
+        cache.put("a", 1, now);
+        cache.put("b", 2, now);
+        cache.invalidate_all();
+        assert!(cache.get("a", now).is_none() && cache.get("b", now).is_none());
+    }
+
+    #[test]
+    fn write_through_status_updates_cached_row() {
+        let hub = GitHubHub::new("o/r".into(), "t".into());
+        let now = std::time::Instant::now();
+        let rows = vec![Task::new(7, "строка".into(), Status::Analys)];
+        hub.snap_cache.put("B", (rows, BoardMeta::default()), now);
+        hub.write_through_status("B", 7, Status::InProgress);
+        let snap = hub
+            .snap_cache
+            .get("B", std::time::Instant::now())
+            .expect("write-through сохраняет ключ");
+        assert_eq!(
+            snap.0.iter().find(|t| t.number() == 7).unwrap().status(),
+            Status::InProgress,
+            "собственная запись видна из кэша сразу (read-your-writes #1235)"
+        );
+    }
+
+    #[test]
+    fn write_through_status_without_snapshot_is_noop() {
+        let hub = GitHubHub::new("o/r".into(), "t".into());
+        hub.write_through_status("B", 7, Status::InProgress);
+        assert!(
+            hub.snap_cache.get("B", std::time::Instant::now()).is_none(),
+            "нет снапшота — write-through не создаёт пустой записи"
+        );
+    }
+
+    #[test]
+    fn write_through_status_row_absent_keeps_snapshot_intact() {
+        // Живой случай тест-раунда #1235: GitHub-лаг — мутируемой строки
+        // нет в снапшоте (проектный вью отдаёт частичное представление).
+        // Write-through не паникует и не портит снапшот: недостающую
+        // строку покажет refetch после TTL, чужие строки не тронуты.
+        let hub = GitHubHub::new("o/r".into(), "t".into());
+        let now = std::time::Instant::now();
+        let rows = vec![Task::new(8, "другая строка".into(), Status::Todo)];
+        hub.snap_cache.put("B", (rows, BoardMeta::default()), now);
+        hub.write_through_status("B", 7, Status::InProgress);
+        let snap = hub
+            .snap_cache
+            .get("B", std::time::Instant::now())
+            .expect("ключ снапшота жив");
+        assert_eq!(snap.0.len(), 1, "мусор в снапшот не добавлен");
+        assert_eq!(snap.0[0].number(), 8, "чужие строки не тронуты");
+        assert_eq!(snap.0[0].status(), Status::Todo);
+    }
+
     #[test]
     fn ttl_cache_hits_within_ttl_and_misses_after() {
         // #1243: кеш снапшотов/статусов — попадание внутри TTL, промах
@@ -997,21 +1634,41 @@ mod tests {
                         "name": "on", "value": "on", "optionId": "IFSSO_y"
                     }
                 },
+                {
+                    "__typename": "ProjectV2ItemIssueFieldValue",
+                    "field": { "__typename": "ProjectV2SingleSelectField", "name": "Automerge" },
+                    "issueFieldValue": {
+                        "__typename": "IssueFieldSingleSelectValue",
+                        "name": "on", "value": "on", "optionId": "IFSSO_z"
+                    }
+                },
                 { "__typename": "ProjectV2ItemFieldSingleSelectValue",
                   "name": "Design", "field": { "__typename": "ProjectV2FieldCommon", "name": "Status" } },
             ]}
         });
         let v = item_values(&item);
         assert_eq!(v.priority, "medium");
-        assert!(v.autodone);
+        assert!(v.automerge);
         assert_eq!(v.status, "Design");
     }
 
     #[test]
     #[ignore] // живой прогон: GH_TOKEN + сеть к api.github.com (read-only)
-    fn live_snapshot_reads_issue_backed_priorities() {
-        // #1174: живой e2e read-path — снапшот доски «Задачи uwuwu»
-        // против реального hub; сверка с REST-носителем issue_field_values
+    fn live_snapshot_reads_issue_backed_automerge() {
+        // #1174: живой e2e read-path — снапшот парсит issue-backed
+        // single-select значения (каталог /user/issue-fields) из Pv2-отражения.
+        // Носитель — sandbox #1265 (Autodone=on, раунд тестирования #1232,
+        // строка открыта): отражение стабильно с 17.11.
+        //
+        // NB дрейф GitHub (дельта-раунд #1232, 18.11): Pv2-отражение
+        // issue-backed значений стало избирательным. Приоритет перестал
+        // отражаться вовсе (носители #1174/#1232/#1272 живы по REST,
+        // ProjectV2ItemIssueFieldValue для «Приоритет» отсутствует); у
+        // закрытой #1174 отражение существовало 17.11 и исчезло. Пин на
+        // priority-через-снапшот на живом носителе не держится; приоритет
+        // конвейерных стадий читается enrichment'ом (REST, #1163), для
+        // не-stage строк (#1174-срез CUP-очереди) — слепота, флаг
+        // владельцу в отчёте #1232.
         let repo =
             std::env::var("UWUWU_HUB_REPO").unwrap_or_else(|_| "yurvon-screamo/uwuwu-hub".into());
         let token = std::env::var("GH_TOKEN").expect("GH_TOKEN");
@@ -1019,25 +1676,78 @@ mod tests {
         let rows: Vec<Task> = rt
             .block_on(async {
                 let hub = GitHubHub::new(repo, token);
-                hub.read_board("Задачи uwuwu").await
+                hub.read_board("Задачи sandbox").await
             })
             .expect("read_board");
         assert!(!rows.is_empty(), "доска не пуста");
 
-        // #1174: на носителе medium (REST issue_field_values) — снапшот
-        // обязан показать то же; до фикса priority был всегда Empty
+        // носитель on (REST issue_field_values) — снапшот обязан показать то же
         let t = rows
             .iter()
-            .find(|t| t.number() == 1174)
-            .expect("#1174 на доске");
-        assert_eq!(t.priority(), Priority::Medium);
+            .find(|t| t.number() == 1265)
+            .expect("#1265 на доске");
+        assert!(
+            t.automerge(),
+            "снапшот слеп к issue-backed automerge-носителю (Autodone=on у #1265): \
+             #1174-срез парсинга Pv2-отражения деградировал"
+        );
+    }
 
-        let filled = rows
-            .iter()
-            .filter(|t| t.priority() != Priority::Empty)
-            .count();
-        println!("строк с приоритетом на снапшоте: {filled}");
-        assert!(filled > 0, "снапшот видит приоритеты строк");
+    #[test]
+    #[ignore] // живой прогон: GH_TOKEN + сеть к api.github.com (read-only)
+    fn live_read_issue_sees_automerge() {
+        // БАГ-ПИН ручного прогона #1232 (tester, 17.11): fm-вью task_get
+        // показывает automerge: false при Autodone=on на носителе —
+        // read_issue собирает Task через map_task_fields, который не мапит
+        // automerge из issue_field_values (тик-снапшот item_values видит
+        // верно). Красный до фикса; зелёный — после. Строка sandbox #1265
+        // («Автомерж-bounce: битый PR») выставлена в on ручным прогоном.
+        let repo =
+            std::env::var("UWUWU_HUB_REPO").unwrap_or_else(|_| "yurvon-screamo/uwuwu-hub".into());
+        let token = std::env::var("GH_TOKEN").expect("GH_TOKEN");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let view = rt
+            .block_on(async {
+                let hub = GitHubHub::new(repo, token);
+                hub.read_issue("Задачи sandbox", 1265).await
+            })
+            .expect("read_issue");
+        assert!(
+            view.task.automerge(),
+            "fm-вью read_issue слеп к automerge-носителю (Autodone=on у #1265): \
+             баг-пин ручного прогона #1232"
+        );
+    }
+
+    #[test]
+    #[ignore] // живой прогон: GH_TOKEN + сеть к api.github.com (read-only)
+    fn live_issue_fields_render_branchless_pr_cells() {
+        // #1155: docs-only ячейки рендерятся против реального hub —
+        // #52 (uwuwu, issue-URL) и #379 (true-washing, forgejo-pull):
+        // значения в носителях живы (пробы #1157/#1251), fm обязан показывать
+        let repo =
+            std::env::var("UWUWU_HUB_REPO").unwrap_or_else(|_| "yurvon-screamo/uwuwu-hub".into());
+        let token = std::env::var("GH_TOKEN").expect("GH_TOKEN");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (uwuwu52, tw379): (uwuwu_domain::TaskFields, uwuwu_domain::TaskFields) =
+            rt.block_on(async {
+                let hub = GitHubHub::new(repo, token);
+                let a = hub.issue_fields(52).await.expect("#52 issue_fields");
+                let b = hub.issue_fields(379).await.expect("#379 issue_fields");
+                (a, b)
+            });
+        let uwuwu52_url = uwuwu52.pr().map(|u| u.as_str()).unwrap_or_default();
+        assert!(
+            uwuwu52_url.contains("github.com/yurvon-screamo/uwuwu-hub/issues/52"),
+            "#52: issue-URL в fm, got {uwuwu52_url:?}"
+        );
+        assert!(uwuwu52.branch().is_none(), "#52: ветки кода нет");
+        let tw379_url = tw379.pr().map(|u| u.as_str()).unwrap_or_default();
+        assert!(
+            tw379_url.contains("git.true-wash.com/true-wash/deploy/pulls/9"),
+            "#379: forgejo-pull в fm, got {tw379_url:?}"
+        );
+        assert!(tw379.branch().is_none(), "#379: ветки кода нет");
     }
 
     #[test]
@@ -1048,12 +1758,13 @@ mod tests {
                 { "name": "In Progress", "field": { "name": "Status" } },
                 { "name": "high", "field": { "name": "Приоритет" } },
                 { "name": "on", "field": { "name": "Autodone" } },
+                { "name": "on", "field": { "name": "Automerge" } },
             ]}
         });
         let v = item_values(&item);
         assert_eq!(v.status, "In Progress");
         assert_eq!(v.priority, "high");
-        assert!(v.autodone);
+        assert!(v.automerge);
     }
 
     #[test]
@@ -1139,5 +1850,86 @@ mod slot_mapping_tests {
             map_task_fields(&raw).priority(),
             uwuwu_domain::Priority::Empty
         );
+    }
+}
+
+#[cfg(test)]
+mod vcs_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn branchless_artifact_url_renders_pr() {
+        // #1155: вики-артефакт без ветки (канон ADR-021, жертва #1153) —
+        // рендер pr без Branch, а не отброс
+        let mut raw = Fields::new();
+        raw.insert(
+            "PR".into(),
+            "https://github.com/yurvon-screamo/uwuwu-hub/blob/main/docs/Projects/uwuwu/Design%20Spec.md"
+                .into(),
+        );
+        let f = map_task_fields(&raw);
+        assert!(
+            f.pr().is_some(),
+            "безветочный артефакт-URL обязан рендериться в fm"
+        );
+        assert!(f.branch().is_none());
+    }
+
+    #[test]
+    fn branchless_foreign_pull_url_renders_pr() {
+        // #1155/true-washing#379: forgejo-pull на безветочной строке —
+        // значение живо в носителе, рендер обязан его показывать
+        let mut raw = Fields::new();
+        raw.insert(
+            "PR".into(),
+            "https://git.true-wash.com/true-wash/deploy/pulls/9".into(),
+        );
+        let f = map_task_fields(&raw);
+        assert!(f.pr().is_some(), "чужовендорный pull без ветки — рендер");
+        assert!(f.branch().is_none());
+    }
+
+    #[test]
+    fn branch_and_pr_pair_maps_pull_request() {
+        let mut raw = Fields::new();
+        raw.insert("Branch".into(), "work/task-1".into());
+        raw.insert(
+            "PR".into(),
+            "https://github.com/yurvon-screamo/uwuwu-agent/pull/293".into(),
+        );
+        let f = map_task_fields(&raw);
+        assert!(f.pr().is_some());
+        assert_eq!(f.branch().map(|b| b.as_str()), Some("work/task-1"));
+    }
+
+    #[test]
+    fn branch_with_artifact_url_pair_maps_pull_request() {
+        // #1153 после воркараунда: Branch=main + blob-URL — кодовая пара
+        // с артефакт-URL живёт в PullRequest до очистки ветки
+        let mut raw = Fields::new();
+        raw.insert("Branch".into(), "main".into());
+        raw.insert(
+            "PR".into(),
+            "https://github.com/yurvon-screamo/uwuwu-hub/blob/main/docs/x.md".into(),
+        );
+        let f = map_task_fields(&raw);
+        assert!(f.pr().is_some());
+        assert_eq!(f.branch().map(|b| b.as_str()), Some("main"));
+    }
+
+    #[test]
+    fn branch_without_pr_maps_branch() {
+        let mut raw = Fields::new();
+        raw.insert("Branch".into(), "work/task-2".into());
+        let f = map_task_fields(&raw);
+        assert!(f.pr().is_none());
+        assert_eq!(f.branch().map(|b| b.as_str()), Some("work/task-2"));
+    }
+
+    #[test]
+    fn empty_vcs_fields_map_local() {
+        let f = map_task_fields(&Fields::new());
+        assert!(f.pr().is_none());
+        assert!(f.branch().is_none());
     }
 }

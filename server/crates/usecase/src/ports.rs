@@ -16,6 +16,11 @@ pub type FmMutator =
 pub trait TaskBoardRepo: Send + Sync {
     async fn read_board(&self, board: &str) -> UsecaseResult<Vec<Task>>;
     async fn set_status(&self, board: &str, number: u64, status: Status) -> UsecaseResult<()>;
+    /// Свежий статус строки с носителя, мимо кэшей доски — гард канона
+    /// edit() обязан сверяться с носителем, не со снапшотом (#1235).
+    /// None — Status-значения на носителе нет (строки нет на доске /
+    /// поле не задано); Some(Empty) — значение носителя непарсящееся.
+    async fn row_status(&self, board: &str, number: u64) -> UsecaseResult<Option<Status>>;
     /// Заявка сессии в слот (claim/спавн-привязка).
     async fn set_session(
         &self,
@@ -29,10 +34,28 @@ pub trait TaskBoardRepo: Send + Sync {
     /// ветка `work/task-<row>` существует — ячейка правдива; ADR-041).
     async fn set_branch(&self, board: &str, number: u64, branch: &BranchName) -> UsecaseResult<()>;
 
+    /// Запись нестатусных ячеек снапшота доски (Приоритет, Automerge):
+    /// поле + кеш-гигиена одним методом (паттерн set_session/set_branch).
+    /// Контракт read-your-writes (#1258): после записи read_board отражает
+    /// записанные значения сразу — write-through кешированного снапшота
+    /// при живой строке, инвалидация при отсутствующей (окно create).
+    /// None — ячейку не трогаем. Ветка/PR/Тип живут мимо снапшота —
+    /// идут через IssueFieldStore напрямую.
+    async fn set_board_cells(
+        &self,
+        board: &str,
+        number: u64,
+        priority: Option<&str>,
+        automerge: Option<bool>,
+    ) -> UsecaseResult<()>;
+
     /// Очистить сессию слота строки (переход в раунд свежих глаз:
     /// ревью/тест-сессии не переживают смену стадии — канон сессий).
     async fn clear_session(&self, board: &str, number: u64, slot: Slot) -> UsecaseResult<()>;
-    async fn post_comment(&self, number: u64, body: &str) -> UsecaseResult<()>;
+    /// Опубликовать коммент; возвращает node_id созданного коммента
+    /// (пустая строка — id недоступен: маркировка реестра невозможна,
+    /// self-эхо-фильтр деградирует честно — fail-open).
+    async fn post_comment(&self, number: u64, body: &str) -> UsecaseResult<String>;
     /// Закрыть issue (Done по канону = closed).
     async fn close_issue(&self, number: u64) -> UsecaseResult<()>;
     /// Хвост комментов задачи (для wakeup: новые против последнего).
@@ -178,13 +201,19 @@ pub struct SessionInfo {
     pub directory: String,
     /// ms эпохи последнего обновления.
     pub updated_ms: u64,
-    /// «succeeded»|«failed»|… финала (пусто — живая).
+    /// «succeeded»|«failed»|… финал ПОСЛЕДНЕГО завершённого хода (при новом
+    /// ходе не очищается — живость не выражает, для этого `busy`).
     pub outcome: String,
     /// Токены сессии (in+out): пустышки-прерывания = 0 — дример их не берёт.
     pub total_tokens: u64,
+    /// Ход идёт прямо сейчас (`time.busy > time.idle` в API исполнителя):
+    /// семантика LLM-траты для CUP-капа. `outcome` — атрибут последнего
+    /// завершённого хода и при новом ходе не очищается, «живость» он не
+    /// выражает (разбор #1231).
+    pub busy: bool,
 }
 
-/// Состояние PR проекта: источник вердиктов автодона.
+/// Состояние PR проекта: источник вердиктов автомержа.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrState {
     /// PR не найден ни по ячейке, ни по ветке.
@@ -295,5 +324,9 @@ pub trait TickStateStore: Send + Sync {
     /// Инцидент #1046 (15.11): счётчик (In Progress, 2) пережил путь
     /// IP→Design→Ревью плана→IP и эскалировал первый же спавн.
     fn reset_stale_spawn_loops(&self, board: &str, number: u64, current: Status);
+    /// Реестр серверных постов (self-эхо-фильтр #1204): коммент опубликован
+    /// агентом через MCP task_comment (не юзером и не фабрикой).
+    fn own_comment(&self, id: &str) -> bool;
+    fn mark_own_comment(&self, id: &str, posted_ms: u64);
     fn save(&self) -> UsecaseResult<()>;
 }
