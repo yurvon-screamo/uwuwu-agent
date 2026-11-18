@@ -22,7 +22,8 @@ pub struct SessionSighting {
     /// пустая — ответ исполнителя
     /// без location, сессия вне раскладки гарда (никогда не держит).
     pub directory: String,
-    /// Имя агента; пустое — деф-сессия исполнителя (дев-семья Design/Dev).
+    /// Имя агента; пустое — легаси-дев-сессия до пина #1300 (или ответ
+    /// исполнителя без имени) — та же дев-семья, что и "developer".
     pub agent: String,
     /// Финал хода («succeeded»|…); пустой — ход в полёте или тишина.
     pub outcome: String,
@@ -53,17 +54,24 @@ fn directory_matches(a: &str, b: &str) -> bool {
     !a.is_empty() && a == b
 }
 
-/// Семья слота по имени агента: дев-семья (Design/Dev) — деф-сессии без
-/// имени; ревью/тест — именованные агенты. Ревьювер, досматривающий
-/// вердикт прошлого раунда, спавн нового дева не держит (семьи разные).
+/// Семья слота по имени агента. Дев-семья (Design/Dev) — две формы
+/// имени: явный пин "developer" (#1300) и легаси-пустое (сессии,
+/// рождённые до пина). Ревью/тест — именованные. Ревьювер,
+/// досматривающий вердикт прошлого раунда, спавн нового дева не держит
+/// (семьи разные).
 pub fn slot_agent_matches(slot: Slot, agent: &str) -> bool {
+    if matches!(slot, Slot::Design | Slot::Dev) {
+        return agent == slot_agent_name(slot) || agent.is_empty();
+    }
     agent == slot_agent_name(slot)
 }
 
-/// Ожидаемое имя агента слота (пустое — деф-сессия дев-семьи).
+/// Ожидаемое имя агента слота (пустое — легаси-дев-сессия или ответ
+/// исполнителя без имени).
 pub fn slot_agent_name(slot: Slot) -> &'static str {
     match crate::agent::Agent::of_slot(slot) {
         Some(agent) => match agent {
+            crate::agent::Agent::Developer => "developer",
             crate::agent::Agent::PlanReviewer => "plan-reviewer",
             crate::agent::Agent::CodeQualityReviewer => "code-quality-reviewer",
             crate::agent::Agent::Tester => "tester",
@@ -155,6 +163,24 @@ mod tests {
     }
 
     #[test]
+    fn pinned_developer_session_holds_dev_spawn() {
+        // #1300: дев-сессия с пином (agent="developer") — та же дев-семья,
+        // что и легаси-пустая; спавн поверх живого пиненого дева держится
+        let pinned = sighting("s1", ENV, "developer", "", NOW - 60_000);
+        assert_eq!(
+            spawn_guard(&[pinned], ENV, Slot::Dev, NOW),
+            SpawnGuard::Hold,
+            "пиненый дев держит спавн своей семьи"
+        );
+        let analyst = sighting("s2", ENV, "analyst", "", NOW - 60_000);
+        assert_eq!(
+            spawn_guard(&[analyst], ENV, Slot::Dev, NOW),
+            SpawnGuard::Allow,
+            "чужая роль (аналитик) дев-спавн не держит"
+        );
+    }
+
+    #[test]
     fn reviewer_session_does_not_hold_dev_spawn() {
         let reviewer = sighting("s1", ENV, "code-quality-reviewer", "", NOW - 60_000);
         assert_eq!(
@@ -206,12 +232,20 @@ mod tests {
 
     #[test]
     fn slot_agent_names_bind_families() {
-        assert_eq!(slot_agent_name(Slot::Dev), "");
-        assert_eq!(slot_agent_name(Slot::Design), "");
+        // #1300: дев-семья несёт явного developer (пин агента слота)
+        assert_eq!(slot_agent_name(Slot::Dev), "developer");
+        assert_eq!(slot_agent_name(Slot::Design), "developer");
         assert_eq!(slot_agent_name(Slot::PlanReview), "plan-reviewer");
         assert_eq!(slot_agent_name(Slot::ResultReview), "code-quality-reviewer");
         assert_eq!(slot_agent_name(Slot::Test), "tester");
+        // семья дев-слота — две формы имени: явный пин и легаси-пустое
+        // (сессии, рождённые до #1300); ревью-семья пустым не матчится
+        assert!(slot_agent_matches(Slot::Dev, "developer"));
         assert!(slot_agent_matches(Slot::Dev, ""));
-        assert!(!slot_agent_matches(Slot::Dev, "developer"));
+        assert!(!slot_agent_matches(Slot::Dev, "analyst"));
+        assert!(!slot_agent_matches(Slot::Dev, "plan-reviewer"));
+        assert!(slot_agent_matches(Slot::PlanReview, "plan-reviewer"));
+        assert!(!slot_agent_matches(Slot::PlanReview, ""));
+        assert!(!slot_agent_matches(Slot::PlanReview, "developer"));
     }
 }

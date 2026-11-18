@@ -4,7 +4,9 @@
 
 use crate::error::UsecaseResult;
 use async_trait::async_trait;
-use uwuwu_domain::{AgentSlot, BranchName, ModelRef, Slot, Status, Task, TaskFields, UtcMinute};
+use uwuwu_domain::{
+    Agent, AgentSlot, BranchName, ModelRef, Slot, Status, Task, TaskFields, UtcMinute,
+};
 
 /// Мутатор fm-ячеек задачи (branch/pr/priority/…).
 pub type FmMutator =
@@ -177,6 +179,16 @@ pub struct AssistantReply {
 pub trait AgentSessionGateway: Send + Sync {
     async fn create_session(&self, spec: &SessionSpec) -> UsecaseResult<String>;
     async fn prompt(&self, session: &str, text: &str) -> UsecaseResult<()>;
+    /// Пин агента слота на живой сессии перед доставкой хода (#1300):
+    /// opencode `POST /session/:id/agent` (switchAgent). Живая проба
+    /// 2.3.2: session.agent персистится; prompt-эндпоинт агент-поле не
+    /// несёт (openapi additionalProperties:false — тихий discard), поэтому
+    /// пин живёт отдельным зовном. Дефолт no-op — гейтвеи без ручки
+    /// (фейки портов) не переопределяют; прод-клиент и бюджет-обёртка
+    /// несут настоящую механику (прецедент abort_session).
+    async fn switch_agent(&self, _session: &str, _agent: Agent) -> UsecaseResult<()> {
+        Ok(())
+    }
     /// Slash-команда сессии (детерминированные shell-блоки — env-подготовка).
     async fn run_command(&self, session: &str, name: &str, args: &str) -> UsecaseResult<()>;
     async fn liveness(&self, session: &str) -> Liveness;

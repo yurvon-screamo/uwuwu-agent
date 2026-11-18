@@ -11,8 +11,8 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use uwuwu_domain::{
-    decide, gate, spawn_guard, Action, Awaits, Gate, LoopOutcome, Priority, SessionSighting, Slot,
-    SpawnGuard, SpawnLoop, SpawnPolicy, Status, Task,
+    decide, gate, spawn_guard, Action, Agent, Awaits, Gate, LoopOutcome, Priority, SessionSighting,
+    Slot, SpawnGuard, SpawnLoop, SpawnPolicy, Status, Task,
 };
 
 /// Режим конвейера: observe — только решения в лог; live — исполнение.
@@ -1087,20 +1087,23 @@ impl TickUseCase {
         now: u64,
     ) -> UsecaseResult<StallAct> {
         if soft {
-            self.sessions
-                .project(&board.project)
-                .prompt(
-                    session,
-                    &format!(
-                        "⏰ Мягкий пинг: ход завершён, статусный перевод не выполнен — \
-                         строка #{} стоит. Заверши транзакцию по контракту хода: \
-                         uwuwu_task_edit {{number: {}, status: <следующая стадия>}} \
-                         или вопрос владельцу комментом + Needs attention.",
-                        task.number(),
-                        task.number()
-                    ),
-                )
-                .await?;
+            let gw = self.sessions.project(&board.project);
+            // пин агента слота перед ходом (#1300) — как на будильнике
+            if let Some(agent) = Agent::of_slot(slot) {
+                gw.switch_agent(session, agent).await?;
+            }
+            gw.prompt(
+                session,
+                &format!(
+                    "⏰ Мягкий пинг: ход завершён, статусный перевод не выполнен — \
+                     строка #{} стоит. Заверши транзакцию по контракту хода: \
+                     uwuwu_task_edit {{number: {}, status: <следующая стадия>}} \
+                     или вопрос владельцу комментом + Needs attention.",
+                    task.number(),
+                    task.number()
+                ),
+            )
+            .await?;
             self.state
                 .mark_stall_ping(&board.board, task.number(), task.status(), now);
             tracing::info!(
