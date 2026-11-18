@@ -57,6 +57,13 @@ fn parse_session_page(
         .map(|list| {
             list.iter()
                 .filter_map(|s| {
+                    // busy = ход в полёте (Started): time.busy пишется на
+                    // старте хода и не очищается, time.idle — на idle;
+                    // busy ⟺ busy > idle (сверено с бинарём 2.3.0, #1231).
+                    // При апгрейде opencode семантику перепроверить.
+                    let busy_ms = s["time"]["busy"].as_u64();
+                    let idle_ms = s["time"]["idle"].as_u64();
+                    let busy = busy_ms.is_some_and(|b| idle_ms.is_none_or(|i| b > i));
                     Some(SessionInfo {
                         id: s["id"].as_str()?.to_string(),
                         agent: s["agent"].as_str().unwrap_or_default().to_string(),
@@ -68,6 +75,7 @@ fn parse_session_page(
                         outcome: s["outcome"].as_str().unwrap_or_default().to_string(),
                         total_tokens: s["tokens"]["input"].as_u64().unwrap_or_default()
                             + s["tokens"]["output"].as_u64().unwrap_or_default(),
+                        busy,
                     })
                 })
                 .collect()
@@ -100,6 +108,39 @@ pub fn liveness_of_status(status: reqwest::StatusCode) -> Liveness {
     } else {
         Liveness::Unknown
     }
+}
+
+/// HTML-ответ = без-cookie заглушка гейта (Caddy @nologin рерайтит любой
+/// путь в страницу «Войти», #1160): content-type text/html; при
+/// отсутствии классифицирующего заголовка — doctype-снифф начала тела.
+/// Детектор вызывается в call() — единственной точке парсинга — поэтому
+/// накрывает всех потребителей трейта; HTML-ответ = отказ пробы (Err),
+/// не «факт» о сессиях.
+fn html_gate_response(content_type: Option<&str>, body: &str) -> bool {
+    if content_type.is_some_and(|ct| ct.to_ascii_lowercase().contains("text/html")) {
+        return true;
+    }
+    // снифф — только когда заголовок не классифицировал ответ (middlebox
+    // без content-type): иначе false positive на легитимный plain-text,
+    // начинающийся с HTML-документа (Low ревью #1160; заглушка гейта
+    // всегда несёт text/html — живая проба 18.11)
+    if content_type.is_some() {
+        return false;
+    }
+    let trimmed = body.trim_start();
+    starts_with_ci(trimmed, b"<!doctype html") || starts_with_ci(trimmed, b"<html")
+}
+
+/// Регистронезависимый префикс первых байтов — без копии тела целиком
+/// (Low ревью #1160: to_ascii_lowercase на каждом ответе — лишняя
+/// аллокация больших страниц списка на каждом тике).
+fn starts_with_ci(haystack: &str, needle: &[u8]) -> bool {
+    let bytes = haystack.as_bytes();
+    bytes.len() >= needle.len()
+        && bytes[..needle.len()]
+            .iter()
+            .zip(needle)
+            .all(|(b, n)| b.to_ascii_lowercase() == *n)
 }
 
 impl OpencodeClient {
@@ -140,10 +181,25 @@ impl OpencodeClient {
             .await
             .map_err(|e| UsecaseError::Session(format!("transport {path}: {e}")))?;
         let status = resp.status();
+        // content-type в owned-строку до text() (он потребляет resp)
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         let text = resp
             .text()
             .await
             .map_err(|e| UsecaseError::Session(format!("body {path}: {e}")))?;
+        // HTML-ответ гейта (без-cookie заглушка «Войти») — отказ пробы,
+        // не данные: молчаливый Null здесь давал Ok(пусто) в списке
+        // сессий, ложный Alive/Dead в liveness и «успешную» недоставку
+        // промптов с записью seen-маркера (потеря комментов) — #1160
+        if html_gate_response(content_type.as_deref(), &text) {
+            return Err(UsecaseError::Session(format!(
+                "gate HTML-заглушка на {path} (без-cookie ответ гейта?)"
+            )));
+        }
         let value = if text.trim().is_empty() {
             Value::Null
         } else {
@@ -434,6 +490,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn html_gate_response_detects_content_type_and_body_sniff() {
+        // #1160: text/html в заголовке — детект независимо от тела
+        assert!(html_gate_response(Some("text/html; charset=utf-8"), ""));
+        // снифф тела без заголовка: doctype и <html>, case-insensitive
+        assert!(html_gate_response(None, "  <!DOCTYPE HTML><html>"));
+        assert!(html_gate_response(None, "<HTML>\n"));
+        // JSON / пустое тело / plain-text — не HTML (легитимные пути)
+        assert!(!html_gate_response(Some("application/json"), "{\"a\":1}"));
+        assert!(!html_gate_response(None, ""));
+        assert!(!html_gate_response(None, "502 Bad Gateway"));
+        // Low дельты #1160: классифицирующий заголовок отключает снифф —
+        // plain-text (экспорт), начинающийся с HTML-документа, не Err
+        assert!(!html_gate_response(
+            Some("text/plain"),
+            "<!doctype html><html><body>экспорт</body></html>"
+        ));
+    }
+
     fn page_item(id: &str, directory: &str) -> serde_json::Value {
         serde_json::json!({
             "id": id,
@@ -443,6 +518,49 @@ mod tests {
             "outcome": null,
             "tokens": { "input": 3, "output": 4 }
         })
+    }
+
+    fn parsed_with_time(busy: serde_json::Value, idle: serde_json::Value) -> bool {
+        let mut item = page_item("s", "/x");
+        item["time"]["busy"] = busy;
+        item["time"]["idle"] = idle;
+        parse_session_page(&serde_json::json!({ "data": [item] }), 1)
+            .0
+            .remove(0)
+            .busy
+    }
+
+    #[test]
+    fn session_page_busy_semantics() {
+        // #1231: busy ⟺ time.busy > time.idle — ход в полёте (Started
+        // пишет time.busy, idle-финал пишет time.idle). outcome — атрибут
+        // последнего завершённого хода, живость не выражает.
+        // ход в полёте: Started есть, idle ещё не ставился
+        assert!(parsed_with_time(
+            serde_json::json!(1000u64),
+            serde_json::Value::Null
+        ));
+        // завершённый ход: idle позже Started — слот свободен
+        assert!(!parsed_with_time(
+            serde_json::json!(1000u64),
+            serde_json::json!(2000u64)
+        ));
+        // корень бага #1231: второй ход поверх финала (outcome непуст) —
+        // Started позже последнего idle, сессия держит кап
+        assert!(parsed_with_time(
+            serde_json::json!(2000u64),
+            serde_json::json!(1000u64)
+        ));
+        // без события Started — не busy (ручная/легаси-сессия)
+        assert!(!parsed_with_time(
+            serde_json::Value::Null,
+            serde_json::json!(1000u64)
+        ));
+        // событий нет вовсе — не busy (page_item без time.busy/idle)
+        assert!(!parsed_with_time(
+            serde_json::Value::Null,
+            serde_json::Value::Null
+        ));
     }
 
     #[test]
@@ -506,5 +624,143 @@ mod tests {
             Some("oc_gate=g77a99dcff9257cb30992ef970d7e8d1668d1130f".into()),
         );
         assert_eq!(c.base, "https://x.y");
+    }
+
+    /// Стаб-сервер: один canned-ответ на любой запрос (TcpListener в
+    /// потоке, без новых дев-депов — прецедент tg.rs). Запрос читается
+    /// целиком (заголовки + тело по Content-Length) — иначе ранний close
+    /// даёт RST и reqwest падает на отправке.
+    fn stub_server(status: &'static str, content_type: &'static str, body: &'static str) -> String {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut data = Vec::new();
+            let mut buf = [0u8; 2048];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => data.extend_from_slice(&buf[..n]),
+                }
+                if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let cl: usize = data[..pos]
+                        .split(|b| *b == b'\n')
+                        .find_map(|line| {
+                            String::from_utf8_lossy(line)
+                                .to_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse().ok())
+                        })
+                        .unwrap_or(0);
+                    if data.len() >= pos + 4 + cl {
+                        break;
+                    }
+                }
+            }
+            let resp = format!(
+                "{status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    const GATE_STUB_BODY: &str =
+        "<!doctype html><html lang=\"ru\"><title>OpenCode — доступ</title></html>";
+
+    #[tokio::test]
+    async fn list_sessions_gate_html_stub_is_error_not_empty_list() {
+        // #1160: без-cookie заглушка гейта (200 + text/html) сегодня
+        // молча даёт Ok(пусто) — CUP видит 0, гард спавна проходит
+        // насквозь; контракт: Err (strict-скан → hold)
+        let base = stub_server(
+            "HTTP/1.1 200 OK",
+            "text/html; charset=utf-8",
+            GATE_STUB_BODY,
+        );
+        let c = OpencodeClient::new(base, "p".into(), None);
+        let res = c.list_sessions().await;
+        assert!(
+            res.is_err(),
+            "HTML-заглушка не должна выглядеть как пустой список: {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn liveness_gate_html_200_stub_is_unknown_not_alive() {
+        // #1160: 200-HTML-проба — «проба не удалась», не Alive
+        let base = stub_server(
+            "HTTP/1.1 200 OK",
+            "text/html; charset=utf-8",
+            GATE_STUB_BODY,
+        );
+        let c = OpencodeClient::new(base, "p".into(), None);
+        assert_eq!(c.liveness("ses_x").await, Liveness::Unknown);
+    }
+
+    #[tokio::test]
+    async fn liveness_gate_html_404_stub_is_unknown_not_dead() {
+        // #1160: 404-вариант заглушки (файл index.html отсутствует на VPS)
+        // — прямой симптом «Dead на живых сессиях»; контракт: Unknown
+        let base = stub_server(
+            "HTTP/1.1 404 Not Found",
+            "text/html; charset=utf-8",
+            GATE_STUB_BODY,
+        );
+        let c = OpencodeClient::new(base, "p".into(), None);
+        assert_eq!(c.liveness("ses_x").await, Liveness::Unknown);
+    }
+
+    #[tokio::test]
+    async fn prompt_gate_html_stub_is_error_delivery_retries_next_tick() {
+        // #1160: «успешный» промпт на заглушке писал seen-маркер — коммент
+        // терялся навсегда; контракт: Err (seen не пишется, повтор доставки)
+        let base = stub_server(
+            "HTTP/1.1 200 OK",
+            "text/html; charset=utf-8",
+            GATE_STUB_BODY,
+        );
+        let c = OpencodeClient::new(base, "p".into(), None);
+        let res = c.prompt("ses_x", "Wakeup").await;
+        assert!(
+            res.is_err(),
+            "HTML-заглушка не должна выглядеть как доставка: {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn liveness_json_404_stays_dead() {
+        // регресс: легитимный 404-JSON от опенкода (сессия снесена) —
+        // по-прежнему Dead, снифф его не задевает
+        let base = stub_server(
+            "HTTP/1.1 404 Not Found",
+            "application/json",
+            "{\"errors\":[]}",
+        );
+        let c = OpencodeClient::new(base, "p".into(), None);
+        assert_eq!(c.liveness("ses_gone").await, Liveness::Dead);
+    }
+
+    #[tokio::test]
+    async fn last_activity_ms_gate_html_stub_is_error_stall_logic_not_blind() {
+        // #1160, пин тестировщика: GET /message на заглушке — сталл-логике
+        // нужен Err («проба не удалась»), а не Ok(None) «активности нет»:
+        // слепой сталл-детект — соседний класс «всё пусто/всё ок»
+        let base = stub_server(
+            "HTTP/1.1 200 OK",
+            "text/html; charset=utf-8",
+            GATE_STUB_BODY,
+        );
+        let c = OpencodeClient::new(base, "p".into(), None);
+        let res = c.last_activity_ms("ses_x").await;
+        assert!(
+            res.is_err(),
+            "HTML-заглушка не должна выглядеть как отсутствие активности: {res:?}"
+        );
     }
 }

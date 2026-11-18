@@ -34,6 +34,21 @@ pub trait TaskBoardRepo: Send + Sync {
     /// ветка `work/task-<row>` существует — ячейка правдива; ADR-041).
     async fn set_branch(&self, board: &str, number: u64, branch: &BranchName) -> UsecaseResult<()>;
 
+    /// Запись нестатусных ячеек снапшота доски (Приоритет, Automerge):
+    /// поле + кеш-гигиена одним методом (паттерн set_session/set_branch).
+    /// Контракт read-your-writes (#1258): после записи read_board отражает
+    /// записанные значения сразу — write-through кешированного снапшота
+    /// при живой строке, инвалидация при отсутствующей (окно create).
+    /// None — ячейку не трогаем. Ветка/PR/Тип живут мимо снапшота —
+    /// идут через IssueFieldStore напрямую.
+    async fn set_board_cells(
+        &self,
+        board: &str,
+        number: u64,
+        priority: Option<&str>,
+        automerge: Option<bool>,
+    ) -> UsecaseResult<()>;
+
     /// Очистить сессию слота строки (переход в раунд свежих глаз:
     /// ревью/тест-сессии не переживают смену стадии — канон сессий).
     async fn clear_session(&self, board: &str, number: u64, slot: Slot) -> UsecaseResult<()>;
@@ -184,10 +199,16 @@ pub struct SessionInfo {
     pub directory: String,
     /// ms эпохи последнего обновления.
     pub updated_ms: u64,
-    /// «succeeded»|«failed»|… финала (пусто — живая).
+    /// «succeeded»|«failed»|… финал ПОСЛЕДНЕГО завершённого хода (при новом
+    /// ходе не очищается — живость не выражает, для этого `busy`).
     pub outcome: String,
     /// Токены сессии (in+out): пустышки-прерывания = 0 — дример их не берёт.
     pub total_tokens: u64,
+    /// Ход идёт прямо сейчас (`time.busy > time.idle` в API исполнителя):
+    /// семантика LLM-траты для CUP-капа. `outcome` — атрибут последнего
+    /// завершённого хода и при новом ходе не очищается, «живость» он не
+    /// выражает (разбор #1231).
+    pub busy: bool,
 }
 
 /// Состояние PR проекта: источник вердиктов автомержа.

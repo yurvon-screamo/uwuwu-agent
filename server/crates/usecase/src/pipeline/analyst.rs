@@ -24,6 +24,9 @@ pub struct AnalystUseCase {
     pub sessions: Arc<crate::router::SessionRouter>,
     pub state: Arc<dyn TickStateStore>,
     pub clock: Arc<dyn crate::ports::Clock>,
+    /// Единый кап активных ходов исполнителя (policy.cup): волна не
+    /// спавнится при полном капе (#1231).
+    pub cup: usize,
 }
 
 /// Доска аналитики: где искать очередь и где спавнить агента.
@@ -44,14 +47,30 @@ impl AnalystUseCase {
     /// очередь доски летит в одну сессию пачкой (мультиборд: чекаут и
     /// проект — своей доски, C3 ревью).
     pub async fn tick(&self) -> UsecaseResult<usize> {
-        // ≤1 живого аналитика одновременно (паттерн дримера)
+        // ≤1 живого аналитика: busy-признак («ход в полёте», #1231) —
+        // outcome атрибут последнего финала и при новом ходе не
+        // очищается, дубль-волна на 2+ ходе аналитика была незаметна.
         // Strict union (#1203): живой аналитик на офлайн-исполнителе не
         // должен порождать дубль-спавн волны на другом — как CUP, отказ
         // любого исполнителя честно останавливает волну до следующего тика
-        if self.sessions.list_sessions_strict().await?.iter().any(|s| {
-            s.outcome.is_empty() && crate::naming::parse_agent(&s.agent) == Some(Agent::Analyst)
-        }) {
+        let scan = self.sessions.list_sessions_strict().await?;
+        if crate::router::has_busy_agent(&scan, Agent::Analyst) {
             tracing::debug!(event = "analys.alive_skip", "Живой аналитик — волна ждёт");
+            return Ok(0);
+        }
+        // CUP-гвард (#1231): волна — запуск хода, ей нужен свободный слот
+        // единого капа. Отложка — не спавн: кулдауны/цикл-гарды строк не
+        // заряжаются (канон «failed spawn не заряжает»). Счётчик на тик:
+        // спавны волн текущего тика занимают слоты — иначе мультиборд при
+        // busy == cap−1 оверселлит до cap+N−1 (#1244-класс, ревью #1231).
+        let mut busy = crate::router::busy_count(&scan);
+        if busy >= self.cup {
+            tracing::info!(
+                event = "analys.held_cup",
+                active = busy,
+                cap = self.cup,
+                "Волна аналитики отложена: CUP cap"
+            );
             return Ok(0);
         }
         let now = self.clock.now_ms();
@@ -149,6 +168,18 @@ impl AnalystUseCase {
             if wave.is_empty() {
                 continue;
             }
+            // CUP-гвард на доску (#1231): волны предыдущих досок этого тика
+            // заняли слоты — при полном капе доска откладывается целиком
+            if busy >= self.cup {
+                tracing::info!(
+                    event = "analys.held_cup",
+                    board = %tb.board,
+                    active = busy,
+                    cap = self.cup,
+                    "Волна доски отложена: CUP cap"
+                );
+                continue;
+            }
             // порядок пачки — приоритет очереди (high → … → пусто)
             wave.sort_by_key(|t| t.priority().rank());
             // Спавн ДО зарядки счётчиков (канон «failed spawn не заряжает»,
@@ -167,6 +198,7 @@ impl AnalystUseCase {
             let session = sessions.create_session(&spec).await?;
             let prompt = analyst_prompt(&tb.project, &wave);
             sessions.prompt(&session, &prompt).await?;
+            busy += 1; // спавн этого тика занимает слот капа
             for t in &wave {
                 let rounds = self
                     .state

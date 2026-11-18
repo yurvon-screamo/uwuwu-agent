@@ -61,6 +61,16 @@ impl TaskBoardRepo for FakeBoard {
             .push(format!("branch#{n}={}", branch.as_str()));
         Ok(())
     }
+    async fn set_board_cells(
+        &self,
+        _b: &str,
+        _n: u64,
+        _p: Option<&str>,
+        _a: Option<bool>,
+    ) -> UsecaseResult<()> {
+        Ok(())
+    }
+
     async fn clear_session(&self, _b: &str, n: u64, slot: Slot) -> UsecaseResult<()> {
         self.log
             .lock()
@@ -181,6 +191,11 @@ struct FakeSessions {
     /// Живые сессии исполнителя — слепки для second source (#1163):
     /// синтетические роли аналитики и матрица гарда (директория/финал/след).
     live: Mutex<Vec<LiveSighting>>,
+    /// Сессии с ходом в полёте (busy по union-скану, #1231).
+    busy_ids: Mutex<Vec<String>>,
+    /// Синтетические записи union-скана (регрессы busy-учёта: сессии 2+
+    /// хода, непайплайн-агенты) — попадают в список как есть.
+    extra: Mutex<Vec<crate::ports::SessionInfo>>,
     /// Отказ prompt (сирота спавна #1163).
     prompt_fails: bool,
     /// Журнал удалений сессий (ассерты сирота-зачистки).
@@ -210,6 +225,8 @@ impl FakeSessions {
             dead_sessions: Mutex::default(),
             list_fails: false,
             idle_reply: false,
+            busy_ids: Mutex::default(),
+            extra: Mutex::default(),
             prompt_fails: false,
             deleted: Mutex::default(),
         }
@@ -316,12 +333,14 @@ impl AgentSessionGateway for FakeSessions {
                 "list недоступен (мок)".into(),
             ));
         }
-        // spawned = живые сессии (outcome пуст — финала нет), мёртвые вне
-        // списка: list и GET согласованы, сессия, которую serve 404-ит,
-        // в list не попадает (контракт second source #1163);
-        // live = синтетические роли для alive-гвардов тестов аналитики
-        // (#1135) и матрица гарда спавна (#1163)
+        // spawned = созданные тиком сессии (idle между ходами — кап не
+        // держат, #1244), мёртвые вне списка: list и GET согласованы,
+        // сессия, которую serve 404-ит, в list не попадает (контракт
+        // second source #1163); live = синтетические роли для alive-гвардов
+        // тестов аналитики (#1135) и матрица гарда спавна (#1163);
+        // extra = записи union-скана (#1231).
         let dead = self.dead_sessions.lock().unwrap().clone();
+        let busy = self.busy_ids.lock().unwrap().clone();
         let mut out: Vec<crate::ports::SessionInfo> = self
             .spawned
             .lock()
@@ -335,11 +354,14 @@ impl AgentSessionGateway for FakeSessions {
                 updated_ms: 0,
                 outcome: String::new(),
                 total_tokens: 0,
+                busy: busy.contains(id),
             })
             .collect();
         for s in self.live.lock().unwrap().iter() {
+            let id = s.id.clone();
             out.push(crate::ports::SessionInfo {
-                id: s.id.clone(),
+                busy: busy.contains(&id),
+                id,
                 agent: s.agent.clone(),
                 directory: s.directory.clone(),
                 updated_ms: s.updated_ms,
@@ -347,6 +369,7 @@ impl AgentSessionGateway for FakeSessions {
                 total_tokens: s.total_tokens,
             });
         }
+        out.extend(self.extra.lock().unwrap().iter().cloned());
         Ok(out)
     }
     async fn export_session(&self, _s: &str) -> UsecaseResult<String> {
@@ -397,8 +420,10 @@ struct MemStateInner {
     /// (number, status, repeats) — цикл-гвард ревью-контура
     analys_review_loops: Vec<(u64, Status, u32)>,
     /// (number, ts) — кулдауны волн аналитика/ревьювера
-    analys_ms: Vec<(u64, u64)>,
-    analys_review_ms: Vec<(u64, u64)>,
+    /// (board, number, ts) — ключи борд-скоупные, как в реальном store
+    /// ({board}:{number}:analys); number-only маскировал мультиборд-оверселл
+    analys_ms: Vec<(String, u64, u64)>,
+    analys_review_ms: Vec<(String, u64, u64)>,
     resets: Vec<(u64, Status)>,
     /// сталл-детект: (number, статус раунда, ms пинга)
     stalls: Vec<(u64, Status, u64)>,
@@ -463,32 +488,35 @@ impl TickStateStore for MemState {
             .spawn_ms
             .retain(|(num, slot, _)| !(*num == n && *slot == s));
     }
-
-    fn last_analys_ms(&self, _b: &str, n: u64) -> Option<u64> {
+    fn last_analys_ms(&self, b: &str, n: u64) -> Option<u64> {
         self.0
             .lock()
             .unwrap()
             .analys_ms
             .iter()
             .rev()
-            .find(|(num, _)| *num == n)
-            .map(|(_, ts)| *ts)
+            .find(|(board, num, _)| board == b && *num == n)
+            .map(|(_, _, ts)| *ts)
     }
-    fn mark_analys_spawn(&self, _b: &str, n: u64, at: u64) {
-        self.0.lock().unwrap().analys_ms.push((n, at));
+    fn mark_analys_spawn(&self, b: &str, n: u64, at: u64) {
+        self.0.lock().unwrap().analys_ms.push((b.into(), n, at));
     }
-    fn last_analys_review_ms(&self, _b: &str, n: u64) -> Option<u64> {
+    fn last_analys_review_ms(&self, b: &str, n: u64) -> Option<u64> {
         self.0
             .lock()
             .unwrap()
             .analys_review_ms
             .iter()
             .rev()
-            .find(|(num, _)| *num == n)
-            .map(|(_, ts)| *ts)
+            .find(|(board, num, _)| board == b && *num == n)
+            .map(|(_, _, ts)| *ts)
     }
-    fn mark_analys_review_spawn(&self, _b: &str, n: u64, at: u64) {
-        self.0.lock().unwrap().analys_review_ms.push((n, at));
+    fn mark_analys_review_spawn(&self, b: &str, n: u64, at: u64) {
+        self.0
+            .lock()
+            .unwrap()
+            .analys_review_ms
+            .push((b.into(), n, at));
     }
     fn analys_loop(&self, _b: &str, n: u64) -> Option<(Status, u32)> {
         self.0
@@ -702,7 +730,8 @@ fn peak_usecase(
         idle_reply: false,
         specs: Mutex::default(),
         live: Mutex::default(),
-
+        busy_ids: Mutex::default(),
+        extra: Mutex::default(),
         prompt_fails: false,
         deleted: Mutex::default(),
     });
@@ -803,6 +832,8 @@ fn wake_usecase(
         dead_sessions: Mutex::default(),
         list_fails: false,
         idle_reply,
+        busy_ids: Mutex::default(),
+        extra: Mutex::default(),
         prompt_fails: false,
         deleted: Mutex::default(),
         specs: Mutex::default(),
@@ -1631,6 +1662,8 @@ async fn dead_stage_and_candidate_hold_blind_when_list_unavailable() {
         idle_reply: false,
         specs: Mutex::default(),
         live: Mutex::default(),
+        busy_ids: Mutex::default(),
+        extra: Mutex::default(),
         prompt_fails: false,
         deleted: Mutex::default(),
     };
@@ -1766,6 +1799,211 @@ async fn foreign_executor_failure_does_not_blind_project_guard() {
         "зрение проекта живо при чужом отказе: сестра держит live-hold"
     );
     assert_eq!(out.held_blind, 0, "чужой отказ не слепит проект");
+    assert_eq!(out.spawns_done, 0);
+}
+
+#[tokio::test]
+async fn cup_counts_second_turn_sessions() {
+    // Регресс #1231 (12 активных при cap=7): outcome — атрибут последнего
+    // завершённого хода и при новом ходе не очищается. Сессия стадии на
+    // 2+ ходе (busy, финал уже был) раньше выпадала из alive-фильтра
+    // outcome.is_empty() и кап не держала — утренний штурм будильников
+    // делал невидимыми почти все тратящие сессии.
+    let mut working = task(150, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_2nd_150").unwrap(),
+    );
+    working.apply_fields(f);
+    let candidate = task(151, Status::InProgress);
+    let (u, _, sessions, _) = usecase(vec![working, candidate], PrState::Missing);
+    sessions
+        .extra
+        .lock()
+        .unwrap()
+        .push(crate::ports::SessionInfo {
+            id: "ses_2nd_150".into(),
+            agent: "developer".into(),
+            updated_ms: 0,
+            outcome: "succeeded".into(),
+            total_tokens: 5000,
+            directory: String::new(),
+            busy: true,
+        });
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(
+        out.spawns_done, 0,
+        "busy-сессия 2+ хода держит кап — кандидат ждёт"
+    );
+    assert_eq!(out.held_cup, 1);
+    assert_eq!(out.sessions_busy, 1, "наблюдаемость: busy в исходе тика");
+}
+
+#[tokio::test]
+async fn cup_busy_counts_non_pipeline_sessions() {
+    // Единый учёт (#1231): busy-сессия без строки доски (бот, крон-ран,
+    // сайдкар, ручная сессия владельца) тратит тот же LLM-бюджет —
+    // union-скан считает ВСЕ ходы исполнителя, не только stage-строки.
+    let candidate = task(160, Status::InProgress);
+    let (u, _, sessions, _) = usecase(vec![candidate], PrState::Missing);
+    sessions
+        .extra
+        .lock()
+        .unwrap()
+        .push(crate::ports::SessionInfo {
+            id: "ses_bot".into(),
+            agent: String::new(),
+            updated_ms: 0,
+            outcome: String::new(),
+            total_tokens: 9000,
+            directory: String::new(),
+            busy: true,
+        });
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(
+        out.spawns_done, 0,
+        "непайплайн busy-сессия держит единый кап"
+    );
+    assert_eq!(out.held_cup, 1);
+}
+
+#[tokio::test]
+async fn wakeup_held_when_cup_full() {
+    // #1231: доставка промпта в idle-сессию — новый ход, тот же LLM-слот.
+    // При полном капе будильник откладывается; seen-маркер не пишется —
+    // доставка повторится на свободном тике (комменты не теряются).
+    let state = Arc::new(MemState(Mutex::default()));
+    let mut t = task(170, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_wake_170").unwrap(),
+    );
+    t.apply_fields(f);
+    let board = Arc::new(FakeBoard {
+        rows: vec![t],
+        log: Mutex::default(),
+        comments: vec![CommentRef {
+            id: "c1".into(),
+            created_ms: 3000,
+            body: "свежий коммент владельца".into(),
+        }],
+        fields_fails: false,
+        set_session_fails: false,
+    });
+    let sessions = Arc::new(FakeSessions {
+        activity_ms: Some(1000), // коммент свежее активности сессии → fresh
+        ..Default::default()
+    });
+    // сама строка idle + чужой ход в полёте — единый кап занят
+    for (id, busy) in [("ses_wake_170", false), ("ses_other", true)] {
+        sessions
+            .extra
+            .lock()
+            .unwrap()
+            .push(crate::ports::SessionInfo {
+                id: id.into(),
+                agent: String::new(),
+                directory: String::new(),
+                updated_ms: 0,
+                outcome: "succeeded".into(),
+                total_tokens: 0,
+                busy,
+            });
+    }
+    let prs = Arc::new(FakePrs {
+        state: PrState::Missing,
+        merges: Mutex::default(),
+        probes: Mutex::default(),
+    });
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        prs: prs.clone(),
+        clock: Arc::new(FixedClock),
+        state: state.clone(),
+        spawn_model: None,
+    };
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert!(
+        sessions.prompts.lock().unwrap().is_empty(),
+        "при полном капе будильник не доставляется"
+    );
+    assert_eq!(out.wakeups, 0);
+    assert_eq!(out.wakeups_deferred, 1);
+    assert!(
+        state.0.lock().unwrap().comments.is_empty(),
+        "seen не пишется — доставка повторится на свободном тике"
+    );
+}
+
+#[tokio::test]
+async fn wakeup_delivery_occupies_cup_slot() {
+    // Доставленный будильник занимает слот капа в этом же тике (#1231):
+    // кандидат на спавн после доставки ждёт следующего тика — массовый
+    // штурм комментариев/бэклога не плодит ходы сверх капа.
+    let state = Arc::new(MemState(Mutex::default()));
+    let mut woken = task(180, Status::InProgress);
+    let mut fw = TaskFields::default();
+    fw.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_wake_180").unwrap(),
+    );
+    woken.apply_fields(fw);
+    let candidate = task(181, Status::InProgress);
+    let board = Arc::new(FakeBoard {
+        rows: vec![woken, candidate],
+        log: Mutex::default(),
+        comments: vec![CommentRef {
+            id: "c180".into(),
+            created_ms: 3000,
+            body: "свежий коммент владельца".into(),
+        }],
+        fields_fails: false,
+        set_session_fails: false,
+    });
+    let sessions = Arc::new(FakeSessions {
+        activity_ms: Some(1000),
+        ..Default::default()
+    });
+    sessions
+        .extra
+        .lock()
+        .unwrap()
+        .push(crate::ports::SessionInfo {
+            id: "ses_wake_180".into(),
+            agent: String::new(),
+            updated_ms: 0,
+            outcome: "succeeded".into(),
+            total_tokens: 0,
+            directory: String::new(),
+            busy: false,
+        });
+    let prs = Arc::new(FakePrs {
+        state: PrState::Missing,
+        merges: Mutex::default(),
+        probes: Mutex::default(),
+    });
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        prs: prs.clone(),
+        clock: Arc::new(FixedClock),
+        state: state.clone(),
+        spawn_model: None,
+    };
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(
+        sessions.prompts.lock().unwrap().len(),
+        1,
+        "будильник доставлен"
+    );
+    assert_eq!(out.wakeups, 1);
+    assert_eq!(
+        out.held_cup, 1,
+        "слот занят доставленным ходом — кандидат ждёт следующего тика"
+    );
     assert_eq!(out.spawns_done, 0);
 }
 
@@ -2044,7 +2282,8 @@ async fn undelivered_comment_is_not_marked_seen() {
             idle_reply: false,
             specs: Mutex::default(),
             live: Mutex::default(),
-
+            busy_ids: Mutex::default(),
+            extra: Mutex::default(),
             prompt_fails: false,
             deleted: Mutex::default(),
         });
@@ -2102,7 +2341,8 @@ async fn undelivered_comment_is_not_marked_seen() {
         idle_reply: false,
         specs: Mutex::default(),
         live: Mutex::default(),
-
+        busy_ids: Mutex::default(),
+        extra: Mutex::default(),
         prompt_fails: false,
         deleted: Mutex::default(),
     });
@@ -2170,7 +2410,8 @@ async fn multi_comment_tail_delivered_together() {
         idle_reply: false,
         specs: Mutex::default(),
         live: Mutex::default(),
-
+        busy_ids: Mutex::default(),
+        extra: Mutex::default(),
         prompt_fails: false,
         deleted: Mutex::default(),
     });
@@ -2295,6 +2536,8 @@ async fn busy_session_not_pinged_early() {
         idle_reply: false,
         specs: Mutex::default(),
         live: Mutex::default(),
+        busy_ids: Mutex::default(),
+        extra: Mutex::default(),
         prompt_fails: false,
         deleted: Mutex::default(),
         ..Default::default()
@@ -2520,45 +2763,10 @@ async fn failed_spawn_does_not_charge_loop_or_cooldown() {
     // 15.11, #1151 (high): временный отказ спавна (бюджет 10/ч) не должен
     // заряжать луп-счётчик (3 отказа = ложная эскалация) и кулдаун слота —
     // заряжаем только состоявшийся спавн
-    struct FailingSessions;
-    #[async_trait::async_trait]
-    impl AgentSessionGateway for FailingSessions {
-        async fn create_session(&self, _s: &SessionSpec) -> UsecaseResult<String> {
-            Err(crate::error::UsecaseError::Session(
-                "бюджет исчерпан (мок)".into(),
-            ))
-        }
-        async fn prompt(&self, _s: &str, _t: &str) -> UsecaseResult<()> {
-            Ok(())
-        }
-        async fn run_command(&self, _s: &str, _n: &str, _a: &str) -> UsecaseResult<()> {
-            Ok(())
-        }
-        async fn delete_session(&self, _s: &str) -> UsecaseResult<()> {
-            Ok(())
-        }
-        async fn liveness(&self, _s: &str) -> Liveness {
-            Liveness::Alive
-        }
-        async fn last_activity_ms(&self, _s: &str) -> UsecaseResult<Option<u64>> {
-            Ok(None)
-        }
-        async fn last_assistant_reply(
-            &self,
-            _s: &str,
-        ) -> UsecaseResult<Option<crate::ports::AssistantReply>> {
-            Ok(None)
-        }
-        async fn list_sessions(&self) -> UsecaseResult<Vec<crate::ports::SessionInfo>> {
-            Ok(vec![])
-        }
-        async fn export_session(&self, _s: &str) -> UsecaseResult<String> {
-            Ok(String::new())
-        }
-    }
+    let sessions = Arc::new(FailingCreate);
     let state = Arc::new(MemState(Mutex::default()));
     let (mut u, _, _, _) = usecase(vec![task(40, Status::InProgress)], PrState::Missing);
-    u.sessions = Arc::new(SessionRouter::uniform(Arc::new(FailingSessions)));
+    u.sessions = Arc::new(SessionRouter::uniform(sessions.clone()));
     u.state = state.clone();
     for round in 0..4 {
         let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
@@ -2575,6 +2783,7 @@ async fn failed_spawn_does_not_charge_loop_or_cooldown() {
 
 use crate::pipeline::analyst::{AnalystBoard, AnalystUseCase};
 use crate::pipeline::analyst_review::AnalystReviewUseCase;
+use crate::pipeline::dreamer::DreamerUseCase;
 use uwuwu_domain::{Agent, AgentSlot};
 
 fn analyst_board() -> AnalystBoard {
@@ -2590,21 +2799,7 @@ fn analyst_uc(
     state: Arc<MemState>,
     sessions: Arc<dyn AgentSessionGateway>,
 ) -> (AnalystUseCase, Arc<FakeBoard>) {
-    let board = Arc::new(FakeBoard {
-        rows,
-        log: Mutex::default(),
-        comments: vec![],
-        fields_fails: false,
-        set_session_fails: false,
-    });
-    let u = AnalystUseCase {
-        board: board.clone(),
-        boards: vec![analyst_board()],
-        sessions: Arc::new(SessionRouter::uniform(sessions)),
-        state,
-        clock: Arc::new(FixedClock),
-    };
-    (u, board)
+    analyst_uc_with_cup(rows, state, sessions, 7)
 }
 
 fn review_uc(
@@ -2612,25 +2807,243 @@ fn review_uc(
     state: Arc<MemState>,
     sessions: Arc<dyn AgentSessionGateway>,
 ) -> (AnalystReviewUseCase, Arc<FakeBoard>) {
+    review_uc_with_cup(rows, state, sessions, 7)
+}
+
+#[tokio::test]
+async fn analyst_multiboard_no_oversell_within_tick() {
+    // #1244-класс (ревью #1231, раунд 2): снимок CUP один, спавны волн
+    // тика занимают слоты — при busy == cap−1 волна второй доски
+    // откладывается, а не спавнится поверх (оверселл cap+N−1).
+    let state = Arc::new(MemState(Mutex::default()));
+    let sessions = Arc::new(FakeSessions::new());
+    sessions
+        .extra
+        .lock()
+        .unwrap()
+        .push(fake_session("ses_stage", "developer", "", 100, true));
     let board = Arc::new(FakeBoard {
-        rows,
+        rows: vec![
+            titled(400, "заявка 1", Status::Analys),
+            titled(401, "заявка 2", Status::Analys),
+        ],
         log: Mutex::default(),
         comments: vec![],
         fields_fails: false,
         set_session_fails: false,
     });
-    let u = AnalystReviewUseCase {
+    let u = AnalystUseCase {
         board: board.clone(),
-        boards: vec![analyst_board()],
-        sessions: Arc::new(SessionRouter::uniform(sessions)),
+        boards: vec![
+            AnalystBoard {
+                project: "p".into(),
+                board: "B1".into(),
+                checkout: "/checkout-1".into(),
+            },
+            AnalystBoard {
+                project: "p".into(),
+                board: "B2".into(),
+                checkout: "/checkout-2".into(),
+            },
+        ],
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         state,
         clock: Arc::new(FixedClock),
+        cup: 2,
     };
-    (u, board)
+    let spawned = u.tick().await.unwrap();
+    assert_eq!(spawned, 1, "вторая волна отложена занятым слотом");
+    let specs = sessions.specs.lock().unwrap();
+    assert_eq!(specs.len(), 1, "спавн только первой доски");
+    assert_eq!(specs[0].directory, "/checkout-1");
+}
+
+/// Билдер юзкейса сайдкара аналитики: доска + роутер + кап (общая
+/// механика для аналитика и ревьювера, ревью #1231 similar-code).
+macro_rules! sidecar_uc_with_cup {
+    ($fn_name:ident, $ty:ident) => {
+        fn $fn_name(
+            rows: Vec<Task>,
+            state: Arc<MemState>,
+            sessions: Arc<dyn AgentSessionGateway>,
+            cup: usize,
+        ) -> ($ty, Arc<FakeBoard>) {
+            let board = Arc::new(FakeBoard {
+                rows,
+                log: Mutex::default(),
+                comments: vec![],
+                fields_fails: false,
+                set_session_fails: false,
+            });
+            let u = $ty {
+                board: board.clone(),
+                boards: vec![analyst_board()],
+                sessions: Arc::new(SessionRouter::uniform(sessions)),
+                state,
+                clock: Arc::new(FixedClock),
+                cup,
+            };
+            (u, board.clone())
+        }
+    };
+}
+sidecar_uc_with_cup!(analyst_uc_with_cup, AnalystUseCase);
+sidecar_uc_with_cup!(review_uc_with_cup, AnalystReviewUseCase);
+
+/// Прогон тика аналитики с предзаряженным стейтом: возвращает стейт
+/// после тика (сценарии сброса/чистки гвардов).
+async fn analyst_tick_precharged(inner: MemStateInner, rows: Vec<Task>) -> Arc<MemState> {
+    let state = Arc::new(MemState(Mutex::new(inner)));
+    let sessions = Arc::new(FakeSessions::new());
+    let (u, _) = analyst_uc(rows, state.clone(), sessions);
+    u.tick().await.unwrap();
+    state
 }
 
 fn titled(n: u64, title: &str, status: Status) -> Task {
     Task::new(n, title.into(), status)
+}
+
+fn fake_session(
+    id: &str,
+    agent: &str,
+    outcome: &str,
+    tokens: u64,
+    busy: bool,
+) -> crate::ports::SessionInfo {
+    crate::ports::SessionInfo {
+        id: id.into(),
+        agent: agent.into(),
+        directory: String::new(),
+        updated_ms: 0,
+        outcome: outcome.into(),
+        total_tokens: tokens,
+        busy,
+    }
+}
+
+#[tokio::test]
+async fn analyst_wave_held_when_cup_full() {
+    // Единый кап (#1231): волна аналитики — такой же запуск хода, как
+    // спавн стадии. При полном капе волна откладывается; гарды и
+    // кулдауны строк не заряжаются (отложка — не спавн).
+    let state = Arc::new(MemState(Mutex::default()));
+    let sessions = Arc::new(FakeSessions::new());
+    sessions
+        .extra
+        .lock()
+        .unwrap()
+        .push(fake_session("ses_stage", "developer", "", 100, true));
+    let (u, board) = analyst_uc_with_cup(
+        vec![titled(300, "заявка на разбор", Status::Analys)],
+        state.clone(),
+        sessions.clone(),
+        1,
+    );
+    let spawned = u.tick().await.unwrap();
+    assert_eq!(spawned, 0, "волна при полном капе не спавнится");
+    assert!(sessions.spawned.lock().unwrap().is_empty(), "спавна нет");
+    assert!(
+        state.0.lock().unwrap().analys_ms.is_empty(),
+        "кулдауны строк не заряжаются отложкой"
+    );
+    assert!(
+        state.0.lock().unwrap().analys_loops.is_empty(),
+        "цикл-гвард не заряжается отложкой"
+    );
+    assert!(board.log.lock().unwrap().is_empty(), "статусы не тронуты");
+}
+
+#[tokio::test]
+async fn analyst_alive_guard_sees_second_turn() {
+    // Регресс #1231: outcome — атрибут последнего финала, при новом ходе
+    // не очищается. Аналитик на 2+ ходе (wakeup, busy=true, финал уже
+    // был) старым outcome-гвардом не замечался → дубль-волна поверх
+    // живого аналитика.
+    let state = Arc::new(MemState(Mutex::default()));
+    let sessions = Arc::new(FakeSessions::new());
+    sessions.extra.lock().unwrap().push(fake_session(
+        "ses_analyst",
+        "analyst",
+        "succeeded",
+        71_000,
+        true,
+    ));
+    let (u, _) = analyst_uc_with_cup(
+        vec![titled(301, "заявка на разбор", Status::Analys)],
+        state,
+        sessions.clone(),
+        7,
+    );
+    let spawned = u.tick().await.unwrap();
+    assert_eq!(spawned, 0, "живой аналитик (2+ ход) блокирует волну");
+    assert!(sessions.spawned.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn analyst_review_held_when_cup_full() {
+    // Ревью-волна аналитики подчинена единому капу, как спавн стадии.
+    let state = Arc::new(MemState(Mutex::default()));
+    let sessions = Arc::new(FakeSessions::new());
+    sessions
+        .extra
+        .lock()
+        .unwrap()
+        .push(fake_session("ses_stage", "developer", "", 100, true));
+    let (u, _) = review_uc_with_cup(
+        vec![titled(302, "проработанная заявка", Status::ReviewAnalys)],
+        state,
+        sessions.clone(),
+        1,
+    );
+    let spawned = u.tick().await.unwrap();
+    assert_eq!(spawned, 0, "ревью-волна при полном капе не спавнится");
+    assert!(sessions.spawned.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn dreamer_held_when_cup_full() {
+    // Дример-спавн — тоже запуск хода: при полном капе откладывается.
+    struct BigClock;
+    impl Clock for BigClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            100_000_000
+        }
+    }
+    let sessions = Arc::new(FakeSessions::new());
+    // готовая цель дримера (финал, токены, idle > 30 мин) + чужой ход
+    sessions.extra.lock().unwrap().push(fake_session(
+        "ses_target",
+        "developer",
+        "succeeded",
+        500,
+        false,
+    ));
+    sessions
+        .extra
+        .lock()
+        .unwrap()
+        .push(crate::ports::SessionInfo {
+            updated_ms: 100_000_000 - 31 * 60_000,
+            ..fake_session("ses_stage", "developer", "", 0, true)
+        });
+    let u = DreamerUseCase {
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        state: Arc::new(MemState(Mutex::default())),
+        clock: Arc::new(BigClock),
+        spawn_model: None,
+        checkout: "/tmp/checkout".into(),
+        cup: 1,
+    };
+    let spawned = u.tick().await.unwrap();
+    assert_eq!(spawned, 0, "дример-спавн при полном капе отложен");
+    assert!(sessions.spawned.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -2697,9 +3110,14 @@ async fn analyst_wave_orders_by_priority() {
 
 #[tokio::test]
 async fn analyst_alive_skip_and_parity() {
-    // живой аналитик — волна ждёт
+    // живой аналитик — волна ждёт («живой» = ход в полёте, busy; #1231)
     let state = Arc::new(MemState(Mutex::default()));
     let sessions = Arc::new(FakeSessions::with_live("analyst"));
+    sessions
+        .busy_ids
+        .lock()
+        .unwrap()
+        .push("ses_live_analyst".into());
     let (u, _) = analyst_uc(
         vec![titled(1, "a", Status::Analys)],
         state,
@@ -2710,6 +3128,11 @@ async fn analyst_alive_skip_and_parity() {
     // живой ревьювер волну аналитика НЕ блокирует (парность ролей)
     let state2 = Arc::new(MemState(Mutex::default()));
     let sessions2 = Arc::new(FakeSessions::with_live("analyst-reviewer"));
+    sessions2
+        .busy_ids
+        .lock()
+        .unwrap()
+        .push("ses_live_analyst-reviewer".into());
     let (u2, _) = analyst_uc(vec![titled(1, "a", Status::Analys)], state2, sessions2);
     assert_eq!(u2.tick().await.unwrap(), 1);
 }
@@ -2733,7 +3156,7 @@ async fn analyst_skips_cron_and_empty_titles() {
 #[tokio::test]
 async fn analyst_cooldown_holds_row() {
     let inner = MemStateInner {
-        analys_ms: vec![(1, 2000)],
+        analys_ms: vec![("B".into(), 1, 2000)],
         ..Default::default()
     };
     let state = Arc::new(MemState(Mutex::new(inner)));
@@ -2782,18 +3205,14 @@ async fn analyst_escalates_after_three_cycles() {
 #[tokio::test]
 async fn analyst_resets_stale_cycle_counter() {
     // строка уехала из цикла (Todo) — счётчик кругов устарел
-    let inner = MemStateInner {
-        analys_loops: vec![(2, Status::Analys, 2)],
-        ..Default::default()
-    };
-    let state = Arc::new(MemState(Mutex::new(inner)));
-    let sessions = Arc::new(FakeSessions::new());
-    let (u, _) = analyst_uc(
+    let state = analyst_tick_precharged(
+        MemStateInner {
+            analys_loops: vec![(2, Status::Analys, 2)],
+            ..Default::default()
+        },
         vec![titled(2, "в пайпе", Status::Todo)],
-        state.clone(),
-        sessions,
-    );
-    u.tick().await.unwrap();
+    )
+    .await;
     assert!(
         state.0.lock().unwrap().analys_loops.is_empty(),
         "вне цикла Analys↔Review Analys счётчик сбрасывается"
@@ -2835,6 +3254,7 @@ async fn analyst_verdictless_waves_do_not_burn_cycles() {
         sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         state: state.clone(),
         clock: clock.clone(),
+        cup: 7,
     };
     // четыре волны подряд (сессия аналитика гибнет без вердикта, строка
     // не двигается) — старый код сжигал круг за кругом и эскалировал
@@ -2947,6 +3367,7 @@ async fn analyst_three_real_rounds_escalate_with_honest_message() {
         sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         state: state.clone(),
         clock: clock.clone(),
+        cup: 7,
     };
     let pair = |state: &Arc<MemState>| {
         state
@@ -3048,14 +3469,19 @@ async fn reviewer_spawns_for_review_analys_wave() {
 
 #[tokio::test]
 async fn reviewer_alive_skip_and_cooldown() {
-    // парность: живой ревьювер — спавна нет
+    // парность: живой ревьювер — спавна нет («живой» = ход в полёте, #1231)
     let state = Arc::new(MemState(Mutex::default()));
     let sessions = Arc::new(FakeSessions::with_live("analyst-reviewer"));
+    sessions
+        .busy_ids
+        .lock()
+        .unwrap()
+        .push("ses_live_analyst-reviewer".into());
     let (u, _) = review_uc(vec![titled(1, "x", Status::ReviewAnalys)], state, sessions);
     assert_eq!(u.tick().await.unwrap(), 0);
     // кулдаун по строке
     let inner = MemStateInner {
-        analys_review_ms: vec![(1, 2000)],
+        analys_review_ms: vec![("B".into(), 1, 2000)],
         ..Default::default()
     };
     let state = Arc::new(MemState(Mutex::new(inner)));
@@ -3188,6 +3614,16 @@ impl TaskBoardRepo for FakeMultiBoard {
     async fn set_branch(&self, _: &str, _: u64, _: &uwuwu_domain::BranchName) -> UsecaseResult<()> {
         Ok(())
     }
+    async fn set_board_cells(
+        &self,
+        _b: &str,
+        _n: u64,
+        _p: Option<&str>,
+        _a: Option<bool>,
+    ) -> UsecaseResult<()> {
+        Ok(())
+    }
+
     async fn clear_session(&self, _b: &str, _n: u64, _s: Slot) -> UsecaseResult<()> {
         Ok(())
     }
@@ -3342,6 +3778,7 @@ async fn analyst_wave_per_board_own_checkout_and_project() {
         sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         state: Arc::new(MemState(Mutex::default())),
         clock: Arc::new(FixedClock),
+        cup: 7,
     };
     assert_eq!(u.tick().await.unwrap(), 2, "по сессии на доску");
     let specs = sessions.specs.lock().unwrap();
@@ -3464,18 +3901,14 @@ async fn reviewer_guard_survives_while_row_in_review_analys() {
 #[tokio::test]
 async fn analyst_prunes_review_loops_of_gone_rows() {
     // R2-L1: review-loop ключи ушедших строк вычищаются вместе с аналитическими
-    let inner = MemStateInner {
-        analys_review_loops: vec![(9, Status::ReviewAnalys, 1)],
-        ..Default::default()
-    };
-    let state = Arc::new(MemState(Mutex::new(inner)));
-    let sessions = Arc::new(FakeSessions::new());
-    let (u, _) = analyst_uc(
+    let state = analyst_tick_precharged(
+        MemStateInner {
+            analys_review_loops: vec![(9, Status::ReviewAnalys, 1)],
+            ..Default::default()
+        },
         vec![titled(1, "живая", Status::Analys)],
-        state.clone(),
-        sessions,
-    );
-    u.tick().await.unwrap();
+    )
+    .await;
     assert!(
         state.0.lock().unwrap().analys_review_loops.is_empty(),
         "мёртвый review-loop вычищен"
@@ -3522,6 +3955,7 @@ async fn prune_skipped_when_a_board_read_fails() {
         sessions: Arc::new(SessionRouter::uniform(sessions)),
         state: state.clone(),
         clock: Arc::new(FixedClock),
+        cup: 7,
     };
     u.tick().await.unwrap();
     assert!(
@@ -3593,6 +4027,16 @@ impl TaskBoardRepo for CloseBoard {
     async fn set_branch(&self, _: &str, _: u64, _: &uwuwu_domain::BranchName) -> UsecaseResult<()> {
         Ok(())
     }
+    async fn set_board_cells(
+        &self,
+        _b: &str,
+        _n: u64,
+        _p: Option<&str>,
+        _a: Option<bool>,
+    ) -> UsecaseResult<()> {
+        Ok(())
+    }
+
     async fn clear_session(&self, _: &str, _: u64, _: Slot) -> UsecaseResult<()> {
         Ok(())
     }
@@ -3737,46 +4181,41 @@ async fn task_close_missing_row_is_a_loud_error_without_mutations() {
 // роли несёт маркер таблицы Agent::emoji; если маппинг отломают — тест падает.
 
 #[tokio::test]
-async fn analyst_wave_title_carries_marker() {
-    // 🧠 в тайтле волновой сессии аналитика (свой юзкейс, вне конвейерного тика)
+async fn analyst_family_titles_carry_role_marker() {
+    // 🧠/⚖️ в тайтлах волновых сессий аналитика и ревью-аналитики
     let state = Arc::new(MemState(Mutex::default()));
     let sessions = Arc::new(FakeSessions::new());
     let (u, _) = analyst_uc(
         vec![titled(1, "заявка", Status::Analys)],
-        state,
+        state.clone(),
         sessions.clone(),
     );
     assert_eq!(u.tick().await.unwrap(), 1);
-    let specs = sessions.specs.lock().unwrap();
-    let spec = specs.last().expect("волновая сессия");
-    assert_eq!(
-        spec.title,
-        format!("{} аналитика волны", Agent::Analyst.emoji())
-    );
-    assert!(matches!(spec.agent, AgentSlot::Role(Agent::Analyst)));
-}
-
-#[tokio::test]
-async fn analyst_review_title_carries_marker() {
-    // ⚖️ в тайтле парной сессии ревью-аналитики
-    let state = Arc::new(MemState(Mutex::default()));
-    let sessions = Arc::new(FakeSessions::new());
     let (r, _) = review_uc(
-        vec![titled(1, "заявка", Status::ReviewAnalys)],
+        vec![titled(2, "заявка", Status::ReviewAnalys)],
         state,
         sessions.clone(),
     );
     assert_eq!(r.tick().await.unwrap(), 1);
     let specs = sessions.specs.lock().unwrap();
-    let spec = specs.last().expect("сессия ревью-аналитики");
+    let (a, rv) = (
+        specs
+            .iter()
+            .find(|s| matches!(s.agent, AgentSlot::Role(Agent::Analyst)))
+            .expect("волна"),
+        specs
+            .iter()
+            .find(|s| matches!(s.agent, AgentSlot::Role(Agent::AnalystReviewer)))
+            .expect("ревью-волна"),
+    );
     assert_eq!(
-        spec.title,
+        a.title,
+        format!("{} аналитика волны", Agent::Analyst.emoji())
+    );
+    assert_eq!(
+        rv.title,
         format!("{} ревью аналитики", Agent::AnalystReviewer.emoji())
     );
-    assert!(matches!(
-        spec.agent,
-        AgentSlot::Role(Agent::AnalystReviewer)
-    ));
 }
 
 #[tokio::test]
@@ -3802,6 +4241,7 @@ async fn dreamer_title_carries_marker() {
         clock: Arc::new(FarClock(AtomicU64::new(2_000_000))), // > idle-порога 30 мин
         spawn_model: None,
         checkout: "/tmp/checkout".into(),
+        cup: 7,
     };
     assert_eq!(u.tick().await.unwrap(), 1);
     let specs = sessions.specs.lock().unwrap();

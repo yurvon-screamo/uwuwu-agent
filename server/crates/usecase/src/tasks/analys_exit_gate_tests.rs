@@ -50,6 +50,16 @@ impl TaskBoardRepo for GateBoard {
         Ok(())
     }
 
+    async fn set_board_cells(
+        &self,
+        _b: &str,
+        _n: u64,
+        _p: Option<&str>,
+        _a: Option<bool>,
+    ) -> UsecaseResult<()> {
+        Ok(())
+    }
+
     async fn row_status(&self, _b: &str, n: u64) -> UsecaseResult<Option<Status>> {
         Ok(self.statuses.lock().expect("gate board").get(&n).copied())
     }
