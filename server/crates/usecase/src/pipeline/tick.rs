@@ -343,7 +343,7 @@ impl TickUseCase {
                     let Some(session) = t.session_of(slot) else {
                         continue;
                     };
-                    let Some(info) = list.iter().find(|s| &s.id == session) else {
+                    let Some(info) = list.iter().find(|s| s.id == *session) else {
                         continue; // мёртвая — гасить нечего
                     };
                     if !info.busy {
