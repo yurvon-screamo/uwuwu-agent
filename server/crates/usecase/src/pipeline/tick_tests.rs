@@ -1466,6 +1466,7 @@ async fn dev_spawn_pins_the_developer_agent() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
     });
     let sessions = Arc::new(FakeSessions::new());
     let mut map = std::collections::HashMap::new();
