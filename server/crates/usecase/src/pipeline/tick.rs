@@ -100,6 +100,9 @@ pub struct TickOutcome {
     /// Строк, пропущенных тиком при отказе enrichment (#1163): решение
     /// по невидимым ячейкам — источник дублей, ждём следующий тик.
     pub enrich_skipped: usize,
+    /// Строк с недостоверной пробой активности исполнителя (Err): отказ
+    /// сталл-прохода строки — без эскалации и записи каунтеров (#1281).
+    pub probe_failed: usize,
 }
 
 /// Результат прохода сталл-детекта по строке.
@@ -110,7 +113,17 @@ enum StallAct {
     /// Мягкий пинг: ход завершён (idle), прямой промпт в сессию.
     SoftPinged,
     Flagged,
+    /// Недостоверная проба исполнителя: сталл-проход строки отложен —
+    /// вердикт о тишине не может быть получен (#1281, срез честности
+    /// пробы). Эскалация и запись каунтеров не выполняются.
+    ProbeFailed,
 }
+
+/// Полоса отказов пробы за тик, при которой тик сигнализирует деградацию
+/// пробы одним громким событием (прецедент ограниченной деградации
+/// ADR-086); обработка остальных строк не останавливается — изоляция
+/// построчная (#1281).
+pub const PROBE_DEGRADE_MIN_ROWS: usize = 5;
 
 /// Оркестратор тика: порты внедряются извне (композиция в uwuwu-server).
 pub struct TickUseCase {
@@ -307,6 +320,16 @@ impl TickUseCase {
         if let Err(e) = self.state.save() {
             tracing::error!(event = "state.save_failed", error = %e, "Failed to save tick state");
         }
+        // Полоса отказов пробы за тик — одно громкое событие деградации
+        // (массовый Err = класс гейт-окна #1160); обработка строк при этом
+        // не останавливалась — изоляция построчная (#1281).
+        if out.probe_failed >= PROBE_DEGRADE_MIN_ROWS {
+            tracing::error!(
+                event = "stall.probe_degraded",
+                probe_failed = out.probe_failed,
+                "Проба активности исполнителя деградировала: массовый отказ сталл-проб — вердикты тишины недостоверны"
+            );
+        }
         tracing::info!(
             event = "tick.completed",
             rows = out.rows_total,
@@ -321,6 +344,7 @@ impl TickUseCase {
             observed = out.observed,
             spawns_allowed = out.spawns_allowed,
             enrich_skipped = out.enrich_skipped,
+            probe_failed = out.probe_failed,
             mode = ?plan.mode,
             failed = out.actions_failed,
             "Tick completed"
@@ -617,6 +641,7 @@ impl TickUseCase {
                 Ok(StallAct::Pinged) => out.stall_pings += 1,
                 Ok(StallAct::SoftPinged) => out.soft_pings += 1,
                 Ok(StallAct::Flagged) => out.stall_flagged += 1,
+                Ok(StallAct::ProbeFailed) => out.probe_failed += 1,
                 Err(e) => {
                     out.actions_failed += 1;
                     self.log_action_failed(task, e);
@@ -719,15 +744,19 @@ impl TickUseCase {
             .await
         {
             Ok(Some(ms)) => self.clock.now_ms().saturating_sub(ms),
+            // пустой журнал легитимной сессии — тишина 0, тихий пропуск
             Ok(None) => 0,
+            // недостоверная проба (транспорт, окно гейт-заглушки #1160):
+            // сталл-проход строки откладывается громко — эскалация и
+            // запись каунтеров по ненадёжному вердикту недопустимы (#1281)
             Err(e) => {
                 tracing::warn!(
                     event = "stall.activity_err",
                     number = task.number(),
                     error = %e,
-                    "stall_pass: last_activity_ms ошибка"
+                    "Сталл-проход отложен: проба активности исполнителя недостоверна"
                 );
-                0
+                return Ok(StallAct::ProbeFailed);
             }
         };
         if silence < STALL_SOFT_SILENCE_MS {

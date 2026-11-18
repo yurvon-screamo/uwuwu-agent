@@ -200,6 +200,9 @@ struct FakeSessions {
     prompt_fails: bool,
     /// Журнал удалений сессий (ассерты сирота-зачистки).
     deleted: Mutex<Vec<String>>,
+    /// Сессии с недостоверной пробой активности (Err) — срез честности
+    /// пробы #1281: изоляция построчная, вердикт тишины не выдаётся.
+    activity_fails_sessions: Mutex<Vec<String>>,
 }
 
 /// Слепок живой сессии в фейке: (id, agent, directory, outcome, updated).
@@ -229,6 +232,7 @@ impl FakeSessions {
             extra: Mutex::default(),
             prompt_fails: false,
             deleted: Mutex::default(),
+            activity_fails_sessions: Mutex::default(),
         }
     }
     fn with_live(agent: &str) -> Self {
@@ -312,7 +316,18 @@ impl AgentSessionGateway for FakeSessions {
         self.deleted.lock().unwrap().push(s.into());
         Ok(())
     }
-    async fn last_activity_ms(&self, _s: &str) -> UsecaseResult<Option<u64>> {
+    async fn last_activity_ms(&self, s: &str) -> UsecaseResult<Option<u64>> {
+        if self
+            .activity_fails_sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|x| x == s)
+        {
+            return Err(UsecaseError::Session(
+                "activity probe недоступен (мок #1281)".into(),
+            ));
+        }
         Ok(self.activity_ms)
     }
     async fn last_assistant_reply(
@@ -735,6 +750,7 @@ fn peak_usecase(
         extra: Mutex::default(),
         prompt_fails: false,
         deleted: Mutex::default(),
+        activity_fails_sessions: Mutex::default(),
     });
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
@@ -841,6 +857,7 @@ fn wake_usecase(
         deleted: Mutex::default(),
         specs: Mutex::default(),
         live: Mutex::default(),
+        activity_fails_sessions: Mutex::default(),
     });
     let u = TickUseCase {
         board,
@@ -1670,6 +1687,7 @@ async fn dead_stage_and_candidate_hold_blind_when_list_unavailable() {
         extra: Mutex::default(),
         prompt_fails: false,
         deleted: Mutex::default(),
+        activity_fails_sessions: Mutex::default(),
     };
     let (u, _, _, _) = usecase_with_sessions(
         vec![dead, candidate],
@@ -2294,6 +2312,7 @@ async fn undelivered_comment_is_not_marked_seen() {
             extra: Mutex::default(),
             prompt_fails: false,
             deleted: Mutex::default(),
+            activity_fails_sessions: Mutex::default(),
         });
         let prs = Arc::new(FakePrs {
             state: PrState::Missing,
@@ -2354,6 +2373,7 @@ async fn undelivered_comment_is_not_marked_seen() {
         extra: Mutex::default(),
         prompt_fails: false,
         deleted: Mutex::default(),
+        activity_fails_sessions: Mutex::default(),
     });
     let u2 = TickUseCase {
         board: board.clone(),
@@ -2424,6 +2444,7 @@ async fn multi_comment_tail_delivered_together() {
         extra: Mutex::default(),
         prompt_fails: false,
         deleted: Mutex::default(),
+        activity_fails_sessions: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -2769,6 +2790,147 @@ async fn counters_earned_by_current_process_still_escalate() {
     assert_eq!(
         out.stall_flagged, 1,
         "раунд, заработанный текущим процессом, эскалирует как раньше"
+    );
+}
+
+/// Срез честности пробы (#1281): недостоверная проба активности (Err) —
+/// отказ сталл-прохода строки фиксируется в outcome как probe_failed,
+/// без эскалации и без записи каунтеров пингов.
+#[tokio::test]
+async fn probe_failure_records_outcome_without_escalation_or_counters() {
+    const NOW: u64 = 100_000_000;
+    struct BigClock;
+    impl Clock for BigClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            NOW
+        }
+    }
+    let board = Arc::new(FakeBoard {
+        rows: vec![dev_task(64, "ses_dev_64")],
+        log: Mutex::default(),
+        comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
+    });
+    let sess = Arc::new(FakeSessions {
+        activity_ms: Some(NOW - 25 * 60_000),
+        idle_reply: true,
+        activity_fails_sessions: Mutex::new(vec!["ses_dev_64".into()]),
+        ..Default::default()
+    });
+    let state = Arc::new(MemState(Mutex::default()));
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sess.clone())),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+            probes: Mutex::default(),
+        }),
+        clock: Arc::new(BigClock),
+        state: state.clone(),
+        spawn_model: None,
+        boot_ms: 0,
+    };
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.probe_failed, 1, "недостоверная проба видна в outcome");
+    assert_eq!(out.stall_flagged, 0, "эскалации по недостоверной пробе нет");
+    assert_eq!(
+        out.soft_pings, 0,
+        "пинг по ненадёжному вердикту не отправляется"
+    );
+    assert!(
+        state.0.lock().unwrap().stalls.is_empty(),
+        "каунтеры пингов не пишутся при недостоверной пробе"
+    );
+    assert!(
+        !board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("status#64=NeedsAttention")),
+        "строка не паркуется по недостоверной пробе"
+    );
+}
+
+/// Изоляция построчная (#1281): массовый отказ пробы (класс гейт-окна
+/// #1160) не глушит обработку остальных строк — строка с живой пробой
+/// получает свой сталл-вердикт, отказные считаются в outcome.
+#[tokio::test]
+async fn probe_failure_isolated_per_row_other_rows_processed() {
+    const NOW: u64 = 100_000_000;
+    struct BigClock;
+    impl Clock for BigClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            NOW
+        }
+    }
+    let mut rows = Vec::new();
+    for n in 61..66u64 {
+        rows.push(dev_task(n, &format!("ses_dev_{n}")));
+    }
+    let board = Arc::new(FakeBoard {
+        rows,
+        log: Mutex::default(),
+        comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
+    });
+    let sess = Arc::new(FakeSessions {
+        activity_ms: Some(NOW - 16 * 60_000),
+        idle_reply: true,
+        // полоса отказов выше порога деградации: четыре строки слепы
+        activity_fails_sessions: Mutex::new(vec![
+            "ses_dev_61".into(),
+            "ses_dev_62".into(),
+            "ses_dev_63".into(),
+            "ses_dev_64".into(),
+        ]),
+        ..Default::default()
+    });
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sess.clone())),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+            probes: Mutex::default(),
+        }),
+        clock: Arc::new(BigClock),
+        state: Arc::new(MemState(Mutex::default())),
+        spawn_model: None,
+        boot_ms: 0,
+    };
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.probe_failed, 4,
+        "полоса отказов считается построчно — порог деградации превышен"
+    );
+    assert_eq!(
+        out.soft_pings, 1,
+        "строка с достоверной пробой обработана: живой пинг ушёл"
+    );
+    assert!(
+        !board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("NeedsAttention")),
+        "массовый отказ пробы не паркует строки"
     );
 }
 
