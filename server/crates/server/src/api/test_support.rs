@@ -124,6 +124,10 @@ impl TickStateStore for StubState {
     }
     fn set_spawn_loop(&self, _: &str, _: u64, _: Slot, _: Status, _: u32) {}
     fn reset_stale_spawn_loops(&self, _: &str, _: u64, _: Status) {}
+    fn review_rounds(&self, _: &str, _: u64) -> u32 {
+        0
+    }
+    fn set_review_rounds(&self, _: &str, _: u64, _: u32) {}
     fn own_comment(&self, _: &str) -> bool {
         false
     }

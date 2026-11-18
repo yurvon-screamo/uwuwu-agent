@@ -11,8 +11,8 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use uwuwu_domain::{
-    decide, gate, spawn_guard, Action, Agent, Awaits, Gate, LoopOutcome, Priority, SessionSighting,
-    Slot, SpawnGuard, SpawnLoop, SpawnPolicy, Status, Task,
+    decide, gate, spawn_guard, Action, Agent, Awaits, Gate, LoopOutcome, Priority, ReviewRoundStep,
+    SessionSighting, Slot, SpawnGuard, SpawnLoop, SpawnPolicy, Status, Task, REVIEW_ROUND_CAP,
 };
 
 /// Режим конвейера: observe — только решения в лог; live — исполнение.
@@ -89,6 +89,8 @@ pub struct TickOutcome {
     pub soft_pings: usize,
     /// Строк, переведённых в Needs attention сталл-детектом.
     pub stall_flagged: usize,
+    /// Строк, снятых с раунда капом ревью-раундов (#1311).
+    pub review_flagged: usize,
     /// Busy-сессии исполнителя по union-скану на старте тика (или
     /// статусный фолбэк-подсчёт при недоступности скана) — наблюдаемость
     /// единого капа (#1231).
@@ -438,6 +440,10 @@ impl TickUseCase {
             wakeups_deferred = out.wakeups_deferred,
             automerged = out.automerged,
             held_live = out.held_live,
+            stall_pings = out.stall_pings,
+            soft_pings = out.soft_pings,
+            stall_flagged = out.stall_flagged,
+            review_flagged = out.review_flagged,
             observed = out.observed,
             spawns_allowed = out.spawns_allowed,
             enrich_skipped = out.enrich_skipped,
@@ -505,6 +511,15 @@ impl TickUseCase {
                         task_ref.number(),
                         task_ref.status(),
                     );
+                    // Цикл-гвард ревью-контура (#1311): счёт подряд
+                    // request_changes по статус-переходам; кап достигнут —
+                    // эскалация вместо раунда N+1, строка снята с тика.
+                    if self
+                        .review_round_pass(board, prev, task_ref, &mut out)
+                        .await
+                    {
+                        continue;
+                    }
                 }
             }
             // тень: если слот снят переходом — работаем с очищенным клоном
@@ -841,6 +856,85 @@ impl TickUseCase {
                 out.actions_failed += 1;
                 self.log_action_failed(task, e);
             }
+        }
+    }
+
+    /// Цикл-гвард ревью-контура (#1311): статус-переход классифицирует
+    /// домен, счётчик — персистентный state тика. Считаются переходы
+    /// «ревьювер вернул строку в работу» (ReviewResult→InProgress /
+    /// ReviewPlan→Design — констатация request_changes без парсинга
+    /// вердиктов, ADR-106); кап — REVIEW_ROUND_CAP. Кап достигнут —
+    /// эскалация: Needs attention + структурный дайджест вместо раунда
+    /// N+1, конвейер бросает строку. Возвращает true — строка снята
+    /// с тика (вызывающему: continue).
+    async fn review_round_pass(
+        &self,
+        board: &BoardPlan,
+        prev: Option<Status>,
+        task: &Task,
+        out: &mut TickOutcome,
+    ) -> bool {
+        let rounds = self.state.review_rounds(&board.board, task.number());
+        // слот последней ревью-сессии — по паре цикла счёт-перехода
+        let round_slot = if prev == Some(Status::ReviewPlan) {
+            Slot::PlanReview
+        } else {
+            Slot::ResultReview
+        };
+        match uwuwu_domain::review_round_step(prev, task.status(), rounds) {
+            ReviewRoundStep::Count { escalate } => {
+                let next = rounds + 1;
+                self.state
+                    .set_review_rounds(&board.board, task.number(), next);
+                if !escalate {
+                    return false;
+                }
+                out.review_flagged += 1;
+                tracing::warn!(
+                    event = "review.rounds_escalated",
+                    number = task.number(),
+                    rounds = next,
+                    cap = REVIEW_ROUND_CAP,
+                    "Кап ревью-раундов: подряд request_changes без approve"
+                );
+                // дайджест: id последней ревью-сессии из слота строки
+                // (на счёт-переходе слот ревью ещё не очищен — очистка
+                // идёт при ре-входе в ревью); нет сессии — честное «—»
+                let last = task
+                    .session_of(round_slot)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "—".into());
+                if let Err(e) = self
+                    .board
+                    .set_status(&board.board, task.number(), Status::NeedsAttention)
+                    .await
+                {
+                    // счётчик стоит на капе: эскалация ретраится следующим
+                    // count-переходом (раунд N+1 пройдёт — деградация benign)
+                    out.actions_failed += 1;
+                    self.log_action_failed(task, e);
+                    return false;
+                }
+                let digest = format!(
+                    "⚠︎ Кап ревью-раундов: {next}-й подряд request_changes без approve \
+                     (порог {REVIEW_ROUND_CAP}) — раунд {} не назначается, строка в \
+                     Needs attention, разбор владельца. Находки и вердикты — в треде \
+                     выше; последняя ревью-сессия: {last}.",
+                    next + 1
+                );
+                if let Err(e) = self.board.post_comment(task.number(), &digest).await {
+                    out.actions_failed += 1;
+                    self.log_action_failed(task, e);
+                }
+                // эскалация состоялась: после разбора владельца — свежий бюджет
+                self.state.set_review_rounds(&board.board, task.number(), 0);
+                true
+            }
+            ReviewRoundStep::Reset => {
+                self.state.set_review_rounds(&board.board, task.number(), 0);
+                false
+            }
+            ReviewRoundStep::None => false,
         }
     }
 
