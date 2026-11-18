@@ -5151,3 +5151,27 @@ async fn cup_no_preempt_in_peak_for_low_waiter() {
     assert!(sessions.aborted.lock().unwrap().is_empty());
     assert!(sessions.deleted.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn cup_no_preempt_in_fallback_scan_unavailable() {
+    // Пин склейки #1259×#1263: пул жертв наполняется только при валидном
+    // union-скане — fallback (list_sessions недоступен) жертв не гасит.
+    // Слепое гашение = класс инцидента #1241: без зрения исполнителя
+    // преемпшен невозможен, кандидат держится статусным подсчётом.
+    let v = row_with_session(1, "ses_v1", Priority::Low);
+    let mut waiter = task(2, Status::InProgress);
+    waiter.set_priority(Priority::High);
+    let mut sessions = FakeSessions::new();
+    sessions.list_fails = true;
+    let (u, _, sessions, _) = usecase_with_sessions(
+        vec![v, waiter],
+        PrState::Missing,
+        sessions,
+        Arc::new(MemState(Mutex::default())),
+    );
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(out.held_blind, 1, "кандидат в слепом hold");
+    assert_eq!(out.preempts, 0, "fallback жертв не гасит");
+    assert!(sessions.aborted.lock().unwrap().is_empty());
+    assert!(sessions.deleted.lock().unwrap().is_empty());
+}
