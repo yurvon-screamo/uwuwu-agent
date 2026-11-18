@@ -1,6 +1,7 @@
 //! Конвейер: доменная служба над задачами — решение тика, гейты
 //! спавн-политики (CUP/пик), круги ревью. Состояние живёт в задачах
-//! и ReviewRounds; правила — здесь. Чистые функции.
+//! и персистентном state тика (счётчики петель и ревью-раундов);
+//! правила — здесь. Чистые функции.
 
 use crate::task::{Priority, Slot, Status, Task};
 
@@ -143,6 +144,50 @@ pub fn can_preempt(waiter: Priority, victim: Priority) -> bool {
     matches!(victim, Priority::Low | Priority::Empty) && waiter.rank() < victim.rank()
 }
 
+/// Кап подряд request_changes ревью-контура (#1311): 4-й подряд без
+/// approve эскалирует строку владельцу вместо назначения следующего
+/// раунда. Калибровка семейства ADR-107 (порог 4, владелец 15.11:
+/// «Лупы в сложных задачах бываю это ок»).
+pub const REVIEW_ROUND_CAP: u32 = 4;
+
+/// Шаг цикл-гварда ревью-контура на статус-переходе строки.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewRoundStep {
+    /// Констатация N-го подряд request_changes; escalate — кап достигнут,
+    /// раунд N+1 не назначается.
+    Count { escalate: bool },
+    /// Строка вышла из цикла (approve, Needs attention, доработка плана):
+    /// счётчик с нуля.
+    Reset,
+    /// Переход не про счётчик ревью-раундов.
+    None,
+}
+
+/// Классификация статус-перехода для цикл-гварда ревью-контура (#1311).
+/// Считаются переходы «ревьювер вернул строку в работу»: ReviewResult →
+/// InProgress и ReviewPlan → Design — по статусам, тексты вердиктов не
+/// интерпретируются (ADR-106). Выход из пары цикла в любой другой статус
+/// (approve в Testing/InProgress, Needs attention, терминальные, возврат
+/// на доработку плана) — сброс; ре-вход в ревью-статус — не событие.
+pub fn review_round_step(prev: Option<Status>, current: Status, rounds: u32) -> ReviewRoundStep {
+    use Status::{Design, InProgress, ReviewPlan, ReviewResult};
+    let Some(prev) = prev else {
+        return ReviewRoundStep::None;
+    };
+    let count = |next: u32| ReviewRoundStep::Count {
+        escalate: next >= REVIEW_ROUND_CAP,
+    };
+    match (prev, current) {
+        (ReviewResult, InProgress) | (ReviewPlan, Design) => count(rounds + 1),
+        (ReviewResult, cur) if cur != ReviewResult && cur != InProgress => ReviewRoundStep::Reset,
+        (InProgress, cur) if cur != ReviewResult && cur != InProgress => ReviewRoundStep::Reset,
+        (ReviewPlan, cur) if cur != ReviewPlan && cur != Design => ReviewRoundStep::Reset,
+        (Design, cur) if cur != ReviewPlan && cur != Design => ReviewRoundStep::Reset,
+        // движение внутри пары (ре-вход в ревью) и прочие статусы
+        _ => ReviewRoundStep::None,
+    }
+}
+
 /// Attention-механика (директива владельца 15.11): спавн слота при
 /// неизменном статусе строки — повтор; третий повтор = петля, строка
 /// эскалируется владельцу (Needs attention), конвейер её бросает.
@@ -267,6 +312,92 @@ mod tests {
         assert_eq!(guard.status(), Status::ReviewResult);
         guard.register_spawn(Status::ReviewResult);
         assert_eq!(guard.repeats(), 2);
+    }
+
+    #[test]
+    fn review_rounds_count_and_escalate_at_cap() {
+        // первый-третий request_changes — счёт без эскалации; 4-й — кап
+        let step = |prev, cur, rounds| review_round_step(prev, cur, rounds);
+        assert_eq!(
+            step(Some(Status::ReviewResult), Status::InProgress, 0),
+            ReviewRoundStep::Count { escalate: false }
+        );
+        assert_eq!(
+            step(Some(Status::ReviewResult), Status::InProgress, 2),
+            ReviewRoundStep::Count { escalate: false }
+        );
+        assert_eq!(
+            step(Some(Status::ReviewResult), Status::InProgress, 3),
+            ReviewRoundStep::Count { escalate: true },
+            "4-й подряд request_changes — эскалация вместо 5-го раунда"
+        );
+        // план-контур: тот же счёт и тот же кап
+        assert_eq!(
+            step(Some(Status::ReviewPlan), Status::Design, 3),
+            ReviewRoundStep::Count { escalate: true }
+        );
+        assert_eq!(
+            step(Some(Status::ReviewPlan), Status::Design, 0),
+            ReviewRoundStep::Count { escalate: false }
+        );
+    }
+
+    #[test]
+    fn review_rounds_reentry_and_foreign_transitions_are_none() {
+        let step = |prev, cur, rounds| review_round_step(prev, cur, rounds);
+        // ре-вход в ревью (дев закончил) — не событие счётчика
+        assert_eq!(
+            step(Some(Status::InProgress), Status::ReviewResult, 1),
+            ReviewRoundStep::None
+        );
+        assert_eq!(
+            step(Some(Status::Design), Status::ReviewPlan, 0),
+            ReviewRoundStep::None
+        );
+        // переходы вне пар циклов (тест-контур, вход, терминалы)
+        assert_eq!(
+            step(Some(Status::Testing), Status::InProgress, 3),
+            ReviewRoundStep::None
+        );
+        assert_eq!(step(None, Status::ReviewResult, 3), ReviewRoundStep::None);
+        assert_eq!(
+            step(Some(Status::UserReview), Status::Done, 1),
+            ReviewRoundStep::None
+        );
+    }
+
+    #[test]
+    fn review_rounds_reset_on_approve_and_owner_takeover() {
+        let step = |prev, cur, rounds| review_round_step(prev, cur, rounds);
+        // approve результата: ревьювер передал в тестирование — цикл сошёлся
+        assert_eq!(
+            step(Some(Status::ReviewResult), Status::Testing, 2),
+            ReviewRoundStep::Reset
+        );
+        // approve плана: ревьювер запустил дева — цикл сошёлся
+        assert_eq!(
+            step(Some(Status::ReviewPlan), Status::InProgress, 1),
+            ReviewRoundStep::Reset
+        );
+        // владелец вмешался (в т.ч. после эскалации)
+        assert_eq!(
+            step(Some(Status::InProgress), Status::NeedsAttention, 3),
+            ReviewRoundStep::Reset
+        );
+        assert_eq!(
+            step(Some(Status::ReviewResult), Status::NeedsAttention, 1),
+            ReviewRoundStep::Reset
+        );
+        // возврат на доработку плана из ревью результата — выход из цикла
+        assert_eq!(
+            step(Some(Status::InProgress), Status::Design, 2),
+            ReviewRoundStep::Reset
+        );
+        // терминалы
+        assert_eq!(
+            step(Some(Status::InProgress), Status::Done, 2),
+            ReviewRoundStep::Reset
+        );
     }
 
     #[test]

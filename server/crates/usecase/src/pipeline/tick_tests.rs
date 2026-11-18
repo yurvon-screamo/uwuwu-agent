@@ -435,6 +435,8 @@ struct MemStateInner {
     statuses: Vec<(u64, Status)>,
     /// (number, slot) → (status, repeats)
     loops: Vec<(u64, Slot, Status, u32)>,
+    /// (number, rounds) — цикл-гвард ревью-контура (#1311)
+    review_rounds: Vec<(u64, u32)>,
     /// (number, status, rounds) — цикл-гвард аналитики (#1135)
     analys_loops: Vec<(u64, Status, u32)>,
     /// (number, status, repeats) — цикл-гвард ревью-контура
@@ -639,6 +641,25 @@ impl TickStateStore for MemState {
         g.resets.push((n, current));
         g.loops
             .retain(|(num, _, st, _)| !(*num == n && *st != current));
+    }
+    fn review_rounds(&self, _b: &str, n: u64) -> u32 {
+        self.0
+            .lock()
+            .unwrap()
+            .review_rounds
+            .iter()
+            .rev()
+            .find(|(num, _)| *num == n)
+            .map(|(_, r)| *r)
+            .unwrap_or(0)
+    }
+    fn set_review_rounds(&self, _b: &str, n: u64, rounds: u32) {
+        let mut g = self.0.lock().unwrap();
+        if let Some(e) = g.review_rounds.iter_mut().find(|(num, _)| *num == n) {
+            e.1 = rounds;
+        } else {
+            g.review_rounds.push((n, rounds));
+        }
     }
     fn own_comment(&self, id: &str) -> bool {
         self.0.lock().unwrap().own.contains_key(id)
@@ -1537,6 +1558,216 @@ async fn multi_round_reentry_never_escalates() {
         let _ = sessions;
     }
     assert_eq!(escalations, 0, "три круга доработки — ни одной эскалации");
+}
+
+#[tokio::test]
+async fn fourth_consecutive_request_changes_escalates() {
+    // #1311: кап ревью-раундов. Переход ReviewResult → InProgress —
+    // констатация request_changes (ревьювер вернул строку в работу);
+    // 4-й подряд без approve эскалирует строку в Needs attention с
+    // дайджестом вместо назначения 5-го раунда. Баг (до фикса): attention-
+    // гвард слепа к смене статуса, цикл #1248 докрутился до раунда 12.
+    let state = Arc::new(MemState(Mutex::default()));
+    for round in 0..5u32 {
+        // между кругами проходит время > кулдауна слота (фейк-часы
+        // заморожены — кулдаун иначе держал бы спавн круга, #1163)
+        state.0.lock().unwrap().spawn_ms.clear();
+        let (u, board, _, _) = usecase_with_state(
+            vec![task(40, Status::InProgress)],
+            PrState::Missing,
+            state.clone(),
+        );
+        let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+        if round == 4 {
+            // 4-й подряд request_changes: эскалация вместо 5-го раунда
+            let log = board.log.lock().unwrap();
+            assert!(
+                log.iter()
+                    .any(|l| l.starts_with("status#40=NeedsAttention")),
+                "4-й подряд request_changes — строка в Needs attention: {log:?}"
+            );
+            assert!(
+                log.iter()
+                    .any(|l| l.starts_with("comment#40=⚠︎ Кап ревью-раундов")),
+                "дайджест эскалации владельцу: {log:?}"
+            );
+            assert_eq!(
+                out.spawns_done, 0,
+                "5-й раунд не назначается — конвейер бросает строку"
+            );
+            break;
+        }
+        assert_eq!(
+            out.spawns_done, 1,
+            "раунд {round}: кап не достигнут, дев работает"
+        );
+        // строка уезжает на ревью: In Progress → Ревью результата
+        let mut t = task(40, Status::ReviewResult);
+        let mut f = TaskFields::default();
+        f.set_session(
+            Slot::Dev,
+            uwuwu_domain::SessionRef::parse(&format!("ses_dev{round}")).unwrap(),
+        );
+        t.apply_fields(f);
+        let (u2, _, _, _) = usecase_with_state(vec![t], PrState::Missing, state.clone());
+        let _ = u2.run(&plan(Mode::Live, 7)).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn review_rounds_approve_resets_counter() {
+    // approve (ReviewResult → Testing) — цикл сошёлся: счётчик с нуля,
+    // следующий цикл считает заново и не наследует старый баланс
+    let state = Arc::new(MemState(Mutex::default()));
+    // request_changes #1: ReviewResult → InProgress
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((42, Status::ReviewResult));
+    let (u, _, _, _) = usecase_with_state(
+        vec![task(42, Status::InProgress)],
+        PrState::Missing,
+        state.clone(),
+    );
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        state.review_rounds("B", 42),
+        1,
+        "первый request_changes — счёт 1"
+    );
+    // approve: строка уехала в тестирование — сброс
+    let (u2, _, _, _) = usecase_with_state(
+        vec![task(42, Status::Testing)],
+        PrState::Missing,
+        state.clone(),
+    );
+    u2.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        state.review_rounds("B", 42),
+        0,
+        "approve — цикл сошёлся, счётчик с нуля"
+    );
+    // новый цикл: снова на ревью и снова вернулся — счёт 1, не 2
+    let (u3, _, _, _) = usecase_with_state(
+        vec![task(42, Status::ReviewResult)],
+        PrState::Missing,
+        state.clone(),
+    );
+    u3.run(&plan(Mode::Live, 7)).await.unwrap();
+    let (u4, _, _, _) = usecase_with_state(
+        vec![task(42, Status::InProgress)],
+        PrState::Missing,
+        state.clone(),
+    );
+    u4.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        state.review_rounds("B", 42),
+        1,
+        "новый цикл после approve считается с нуля"
+    );
+}
+
+#[tokio::test]
+async fn review_rounds_retry_spawn_does_not_count() {
+    // ретрай спавна ревьювера в том же статусе (мёртвая сессия того же
+    // раунда) — не request_changes: счётчик не инкрементится
+    let state = Arc::new(MemState(Mutex::default()));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((43, Status::ReviewResult));
+    state.0.lock().unwrap().spawn_ms.clear();
+    let (u1, _, _, _) = usecase_with_state(
+        vec![task(43, Status::ReviewResult)],
+        PrState::Missing,
+        state.clone(),
+    );
+    u1.run(&plan(Mode::Live, 7)).await.unwrap();
+    state.0.lock().unwrap().spawn_ms.clear();
+    let (u2, _, _, _) = usecase_with_state(
+        vec![task(43, Status::ReviewResult)],
+        PrState::Missing,
+        state.clone(),
+    );
+    u2.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        state.review_rounds("B", 43),
+        0,
+        "спавн без смены статуса — тот же раунд"
+    );
+}
+
+#[tokio::test]
+async fn review_rounds_observe_mode_does_not_write() {
+    // observe-режим: решения в лог, state не пишется — счётчик не двигается
+    let state = Arc::new(MemState(Mutex::default()));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((44, Status::ReviewResult));
+    let (u, _, _, _) = usecase_with_state(
+        vec![task(44, Status::InProgress)],
+        PrState::Missing,
+        state.clone(),
+    );
+    u.run(&plan(Mode::Observe, 7)).await.unwrap();
+    assert_eq!(
+        state.review_rounds("B", 44),
+        0,
+        "observe не накручивает счётчики"
+    );
+}
+
+#[tokio::test]
+async fn plan_review_loop_escalates_by_same_cap() {
+    // #1311 (план-контур): цикл Design ↔ Ревью плана дыряв так же —
+    // 4-й подряд request_changes плана (ReviewPlan → Design) эскалирует
+    // строку вместо назначения 5-го круга
+    let state = Arc::new(MemState(Mutex::default()));
+    for round in 0..5u32 {
+        state.0.lock().unwrap().spawn_ms.clear();
+        let (u, board, _, _) = usecase_with_state(
+            vec![task(45, Status::Design)],
+            PrState::Missing,
+            state.clone(),
+        );
+        let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+        if round == 4 {
+            let log = board.log.lock().unwrap();
+            assert!(
+                log.iter()
+                    .any(|l| l.starts_with("status#45=NeedsAttention")),
+                "план-контур: 4-й подряд request_changes — Needs attention: {log:?}"
+            );
+            assert!(
+                log.iter()
+                    .any(|l| l.starts_with("comment#45=⚠︎ Кап ревью-раундов")),
+                "дайджест эскалации владельцу: {log:?}"
+            );
+            assert_eq!(out.spawns_done, 0, "5-й круг плана не назначается");
+            break;
+        }
+        assert_eq!(
+            out.spawns_done, 1,
+            "круг {round}: кап не достигнут, дизайнер работает"
+        );
+        // дизайнер отправил план на ревью: Design → Ревью плана
+        let mut t = task(45, Status::ReviewPlan);
+        let mut f = TaskFields::default();
+        f.set_session(
+            Slot::Design,
+            uwuwu_domain::SessionRef::parse(&format!("ses_dsn{round}")).unwrap(),
+        );
+        t.apply_fields(f);
+        let (u2, _, _, _) = usecase_with_state(vec![t], PrState::Missing, state.clone());
+        let _ = u2.run(&plan(Mode::Live, 7)).await.unwrap();
+    }
 }
 
 #[tokio::test]

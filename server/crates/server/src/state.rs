@@ -54,6 +54,11 @@ struct StateFile {
     /// attention-механика.
     #[serde(default)]
     spawn_loops: BTreeMap<String, (String, u32)>,
+    /// «board:number» → подряд request_changes ревью-контура без approve
+    /// (#1311): персистентный счётчик, смены статуса внутри цикла не
+    /// сбрасывают.
+    #[serde(default)]
+    review_rounds: BTreeMap<String, u32>,
     /// «board:number» → (статус цикла, кругов) — цикл-гвард аналитики (#1135).
     #[serde(default)]
     analys_loops: BTreeMap<String, (String, u32)>,
@@ -114,6 +119,13 @@ impl JsonStateStore {
                 let cut = guard.spawn_loops.len() - 5000;
                 for k in keys.into_iter().take(cut) {
                     guard.spawn_loops.remove(&k);
+                }
+            }
+            if guard.review_rounds.len() > 5000 {
+                let keys: Vec<String> = guard.review_rounds.keys().cloned().collect();
+                let cut = guard.review_rounds.len() - 5000;
+                for k in keys.into_iter().take(cut) {
+                    guard.review_rounds.remove(&k);
                 }
             }
             // legacy-ключи триажа (эпоха до #1135) — вечный мёртвый груз
@@ -396,6 +408,26 @@ impl TickStateStore for JsonStateStore {
         for key in stale {
             guard.spawn_loops.remove(&key);
         }
+    }
+
+    fn review_rounds(&self, board: &str, number: u64) -> u32 {
+        let key = Self::key(board, number);
+        self.state
+            .lock()
+            .expect("state lock")
+            .review_rounds
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn set_review_rounds(&self, board: &str, number: u64, rounds: u32) {
+        let key = Self::key(board, number);
+        self.state
+            .lock()
+            .expect("state lock")
+            .review_rounds
+            .insert(key, rounds);
     }
 
     fn own_comment(&self, id: &str) -> bool {

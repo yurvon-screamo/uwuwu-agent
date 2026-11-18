@@ -335,6 +335,12 @@ pub trait TickStateStore: Send + Sync {
     /// Инцидент #1046 (15.11): счётчик (In Progress, 2) пережил путь
     /// IP→Design→Ревью плана→IP и эскалировал первый же спавн.
     fn reset_stale_spawn_loops(&self, board: &str, number: u64, current: Status);
+    /// Цикл-гвард ревью-контура (#1311): счёт подряд request_changes
+    /// (переходы ReviewResult→InProgress / ReviewPlan→Design) без
+    /// approve. Персистентный, смены статуса внутри цикла не сбрасывают —
+    /// в отличие от spawn_loop (слепота attention-гварда к циклу ревью).
+    fn review_rounds(&self, board: &str, number: u64) -> u32;
+    fn set_review_rounds(&self, board: &str, number: u64, rounds: u32);
     /// Реестр серверных постов (self-эхо-фильтр #1204): коммент опубликован
     /// агентом через MCP task_comment (не юзером и не фабрикой).
     fn own_comment(&self, id: &str) -> bool;
