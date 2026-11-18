@@ -701,8 +701,11 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
         .get(crate::github::fields::F_PRIORITY)
         .map(|v| uwuwu_usecase::parse_priority(v))
         .unwrap_or(uwuwu_domain::Priority::Empty);
-    // VCS-жизненный цикл явный; PR без ветки — кривые данные носителя,
-    // отбрасываем (домен PullRequest требует ветку)
+    // VCS-жизненный цикл явный; пара (Branch, PR) — кодовый цикл с веткой.
+    // Безветочная PR-ячейка — Artifact (канон ADR-021: ячейка несёт URL
+    // и без ветки кода — вики/issue/чужой-вендор PR; #1155 — рендер,
+    // не отброс). Кодовый инвариант «PR требует ветку» живёт в мутаторах
+    // домена (open_pr), не в загрузчике носителя.
     let vcs = match (
         raw.get(crate::github::fields::F_BRANCH)
             .and_then(|s| uwuwu_domain::BranchName::parse(s)),
@@ -710,10 +713,7 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
     ) {
         (Some(branch), Some(url)) => Vcs::PullRequest { branch, url },
         (Some(branch), None) => Vcs::Branch(branch),
-        (None, Some(_)) => {
-            tracing::warn!(event = "hub.pr_without_branch", "PR без ветки — отброшен");
-            Vcs::Local
-        }
+        (None, Some(url)) => Vcs::Artifact { url },
         (None, None) => Vcs::Local,
     };
     TaskFields::new(assignments, vcs, priority)
@@ -1481,6 +1481,37 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // живой прогон: GH_TOKEN + сеть к api.github.com (read-only)
+    fn live_issue_fields_render_branchless_pr_cells() {
+        // #1155: docs-only ячейки рендерятся против реального hub —
+        // #52 (uwuwu, issue-URL) и #379 (true-washing, forgejo-pull):
+        // значения в носителях живы (пробы #1157/#1251), fm обязан показывать
+        let repo =
+            std::env::var("UWUWU_HUB_REPO").unwrap_or_else(|_| "yurvon-screamo/uwuwu-hub".into());
+        let token = std::env::var("GH_TOKEN").expect("GH_TOKEN");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (uwuwu52, tw379): (uwuwu_domain::TaskFields, uwuwu_domain::TaskFields) =
+            rt.block_on(async {
+                let hub = GitHubHub::new(repo, token);
+                let a = hub.issue_fields(52).await.expect("#52 issue_fields");
+                let b = hub.issue_fields(379).await.expect("#379 issue_fields");
+                (a, b)
+            });
+        let uwuwu52_url = uwuwu52.pr().map(|u| u.as_str()).unwrap_or_default();
+        assert!(
+            uwuwu52_url.contains("github.com/yurvon-screamo/uwuwu-hub/issues/52"),
+            "#52: issue-URL в fm, got {uwuwu52_url:?}"
+        );
+        assert!(uwuwu52.branch().is_none(), "#52: ветки кода нет");
+        let tw379_url = tw379.pr().map(|u| u.as_str()).unwrap_or_default();
+        assert!(
+            tw379_url.contains("git.true-wash.com/true-wash/deploy/pulls/9"),
+            "#379: forgejo-pull в fm, got {tw379_url:?}"
+        );
+        assert!(tw379.branch().is_none(), "#379: ветки кода нет");
+    }
+
+    #[test]
     fn item_values_maps_board_columns() {
         let item = json!({
             "content": { "__typename": "Issue", "number": 1, "title": "t", "state": "open" },
@@ -1580,5 +1611,86 @@ mod slot_mapping_tests {
             map_task_fields(&raw).priority(),
             uwuwu_domain::Priority::Empty
         );
+    }
+}
+
+#[cfg(test)]
+mod vcs_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn branchless_artifact_url_renders_pr() {
+        // #1155: вики-артефакт без ветки (канон ADR-021, жертва #1153) —
+        // рендер pr без Branch, а не отброс
+        let mut raw = Fields::new();
+        raw.insert(
+            "PR".into(),
+            "https://github.com/yurvon-screamo/uwuwu-hub/blob/main/docs/Projects/uwuwu/Design%20Spec.md"
+                .into(),
+        );
+        let f = map_task_fields(&raw);
+        assert!(
+            f.pr().is_some(),
+            "безветочный артефакт-URL обязан рендериться в fm"
+        );
+        assert!(f.branch().is_none());
+    }
+
+    #[test]
+    fn branchless_foreign_pull_url_renders_pr() {
+        // #1155/true-washing#379: forgejo-pull на безветочной строке —
+        // значение живо в носителе, рендер обязан его показывать
+        let mut raw = Fields::new();
+        raw.insert(
+            "PR".into(),
+            "https://git.true-wash.com/true-wash/deploy/pulls/9".into(),
+        );
+        let f = map_task_fields(&raw);
+        assert!(f.pr().is_some(), "чужовендорный pull без ветки — рендер");
+        assert!(f.branch().is_none());
+    }
+
+    #[test]
+    fn branch_and_pr_pair_maps_pull_request() {
+        let mut raw = Fields::new();
+        raw.insert("Branch".into(), "work/task-1".into());
+        raw.insert(
+            "PR".into(),
+            "https://github.com/yurvon-screamo/uwuwu-agent/pull/293".into(),
+        );
+        let f = map_task_fields(&raw);
+        assert!(f.pr().is_some());
+        assert_eq!(f.branch().map(|b| b.as_str()), Some("work/task-1"));
+    }
+
+    #[test]
+    fn branch_with_artifact_url_pair_maps_pull_request() {
+        // #1153 после воркараунда: Branch=main + blob-URL — кодовая пара
+        // с артефакт-URL живёт в PullRequest до очистки ветки
+        let mut raw = Fields::new();
+        raw.insert("Branch".into(), "main".into());
+        raw.insert(
+            "PR".into(),
+            "https://github.com/yurvon-screamo/uwuwu-hub/blob/main/docs/x.md".into(),
+        );
+        let f = map_task_fields(&raw);
+        assert!(f.pr().is_some());
+        assert_eq!(f.branch().map(|b| b.as_str()), Some("main"));
+    }
+
+    #[test]
+    fn branch_without_pr_maps_branch() {
+        let mut raw = Fields::new();
+        raw.insert("Branch".into(), "work/task-2".into());
+        let f = map_task_fields(&raw);
+        assert!(f.pr().is_none());
+        assert_eq!(f.branch().map(|b| b.as_str()), Some("work/task-2"));
+    }
+
+    #[test]
+    fn empty_vcs_fields_map_local() {
+        let f = map_task_fields(&Fields::new());
+        assert!(f.pr().is_none());
+        assert!(f.branch().is_none());
     }
 }

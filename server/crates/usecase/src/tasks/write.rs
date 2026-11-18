@@ -492,6 +492,7 @@ mod tests {
             Ok(Vec::new())
         }
         async fn row_status(&self, _b: &str, _n: u64) -> UsecaseResult<Option<Status>> {
+            // create-тесты: доска пуста, гард канона видит отсутствие строки
             Ok(None)
         }
         async fn set_status(&self, _b: &str, _n: u64, _s: Status) -> UsecaseResult<()> {

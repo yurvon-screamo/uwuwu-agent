@@ -836,3 +836,97 @@ async fn task_get_renders_pr_after_factory_branch_without_manual_branch_edit() {
     assert!(card.contains("branch: work/task-8"), "{card}");
     assert!(card.contains("pr: https://github.com/o/r/pull/9"), "{card}");
 }
+
+/// #1155: docs-only ячейка (вики-артефакт без ветки кода) рендерится в fm —
+/// `pr: <URL>`, `branch: —` (инцидент #1153: два раунда ревью на «pr: —»
+/// при живом в носителе значении).
+#[tokio::test]
+async fn task_get_renders_branchless_pr_cell() {
+    let (tools, _memory) = hub();
+    let (number, _) = create_task(&tools, "t: docs-only artifact", "## Постановка\n\nx.\n").await;
+
+    // Агент финализирует docs-only задачу: PR-ячейка = URL вики-артефакта,
+    // ветки кода нет и не будет (канон AGENTS.md).
+    call(
+        &tools,
+        "task_edit",
+        json!({
+            "number": number,
+            "pr": "https://github.com/yurvon-screamo/uwuwu-hub/blob/main/docs/Projects/uwuwu/Design%20Spec.md"
+        }),
+    )
+    .await
+    .expect("pr edit");
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    assert!(
+        card.contains(
+            "pr: https://github.com/yurvon-screamo/uwuwu-hub/blob/main/docs/Projects/uwuwu/Design%20Spec.md"
+        ),
+        "{card}"
+    );
+    assert!(card.contains("branch: —"), "{card}");
+}
+
+/// #1155/true-washing#379: чужовендорный pull-URL на безветочной строке
+/// (env:false-проекты) — тот же рендер без вендор-гейта.
+#[tokio::test]
+async fn task_get_renders_foreign_vendor_pull_url() {
+    let (tools, _memory) = hub();
+    let (number, _) = create_task(&tools, "t: forgejo pull", "## Постановка\n\nx.\n").await;
+
+    call(
+        &tools,
+        "task_edit",
+        json!({
+            "number": number,
+            "pr": "https://git.true-wash.com/true-wash/deploy/pulls/9"
+        }),
+    )
+    .await
+    .expect("pr edit");
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    assert!(
+        card.contains("pr: https://git.true-wash.com/true-wash/deploy/pulls/9"),
+        "{card}"
+    );
+    assert!(card.contains("branch: —"), "{card}");
+}
+
+/// #1155 (поручение владельца): автомерж-ячейка живёт на mock-носителе —
+/// create пишет дефолт on, edit переключает, fm рендерит фактическое
+/// состояние (без хранения на носителе fm и тик стенда врали «false»).
+#[tokio::test]
+async fn automerge_cell_roundtrips_on_mock_carrier() {
+    let (tools, _memory) = hub();
+    let (number, _) = create_task(&tools, "t: automerge roundtrip", "## Постановка\n\nx.\n").await;
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    assert!(
+        card.contains("automerge: true"),
+        "create-дефолт on рендерится: {card}"
+    );
+
+    call(
+        &tools,
+        "task_edit",
+        json!({ "number": number, "automerge": false }),
+    )
+    .await
+    .expect("automerge edit");
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    assert!(
+        card.contains("automerge: false"),
+        "edit off рендерится: {card}"
+    );
+}

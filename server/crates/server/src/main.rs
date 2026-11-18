@@ -251,6 +251,20 @@ async fn run(
             ))),
         )),
     };
+    // Ассеты ботов (#1171): прод — коммит в hub-репо (ff-only), e2e/
+    // memory — приёмник стенда (полный media-флоу без GitHub).
+    let asset_store: Arc<dyn uwuwu_usecase::bots::BotAssetStore> = match &memory_hub {
+        Some(_) => Arc::new(bots::MemoryAssetStore::default()),
+        None => Arc::new(bots::GitAssetStore::new(
+            Arc::new(wiki::GitWikiWriter::new(
+                cfg.hub.repo.clone(),
+                "main".to_string(),
+                secrets.gh_token.clone(),
+            )),
+            cfg.hub.repo.clone(),
+            "main".to_string(),
+        )),
+    };
     // Семантика: LanceDB embedded + Ollama-туннель (env UWUWU_EMBED_URL;
     // нет туннеля — поиск честно без индекса)
     let embed_url = std::env::var("UWUWU_EMBED_URL")
@@ -451,6 +465,7 @@ async fn run(
             wiki.clone(),
             bot_sessions,
             state.clone(),
+            asset_store.clone(),
             state.clone() as Arc<dyn uwuwu_usecase::TickStateStore>,
             clock.clone(),
             Arc::new(|token| {
