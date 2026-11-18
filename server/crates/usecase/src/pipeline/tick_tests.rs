@@ -5177,3 +5177,39 @@ async fn cup_no_preempt_in_fallback_scan_unavailable() {
     assert!(sessions.aborted.lock().unwrap().is_empty());
     assert!(sessions.deleted.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn cup_idle_low_row_not_preempted_when_cap_held_by_others() {
+    // Пин склейки #1259×#1231: busy в пуле жертв — из union-скана
+    // (SessionInfo.busy). Idle low-строка (сессия жива на исполнителе,
+    // ход завершён) капа не держит и жертвой не становится — даже когда
+    // кап полон от busy-чужих. Сломанный busy-фильтр гасил бы спящую
+    // сессию зря (abort+delete) вместо ожидания свободного слота.
+    let idle = row_with_session(1, "ses_idle_low", Priority::Low);
+    let busy = row_with_session(2, "ses_m", Priority::Medium);
+    let mut waiter = task(3, Status::InProgress);
+    waiter.set_priority(Priority::High);
+    let (u, _, sessions, _) = usecase(vec![idle, busy, waiter], PrState::Missing);
+    live_busy(&sessions, "ses_m");
+    // idle-сайтинг: сессия жива в скане (alive), busy не несёт —
+    // между ходами, капа не держит (#1231)
+    sessions.live.lock().unwrap().push(LiveSighting {
+        id: "ses_idle_low".into(),
+        agent: String::new(),
+        directory: String::new(),
+        outcome: "succeeded".into(),
+        updated_ms: 0,
+        total_tokens: 0,
+    });
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(out.preempts, 0, "idle low-строка — не жертва");
+    assert_eq!(out.held_cup, 1, "кап полон от busy medium — кандидат ждёт");
+    assert!(
+        sessions.aborted.lock().unwrap().is_empty(),
+        "спящая сессия не абортится"
+    );
+    assert!(
+        sessions.deleted.lock().unwrap().is_empty(),
+        "спящая сессия не удаляется"
+    );
+}
