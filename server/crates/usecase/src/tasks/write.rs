@@ -150,6 +150,56 @@ impl TaskWriteUseCase {
         }
         Ok(())
     }
+
+    /// Гейт полноты обязательных полей на выходе из Analys (#1280).
+    /// Эффективное значение = патч, иначе носитель (одно-вызовное
+    /// «заполни и перейди» легально); мусорный приоритет (не
+    /// high/medium/low) = пустота — не явное решение. Отказ с перечнем
+    /// возвращает строку на дозаполнение: не стоп-кран, владельца
+    /// не спрашивает (ADR-074).
+    async fn ensure_analys_exit_complete(
+        &self,
+        number: u64,
+        patch: &TaskPatch,
+    ) -> UsecaseResult<()> {
+        // патч несёт оба значения и приоритет распознан — носитель не
+        // читается: результат гейта известен, GitHub round-trip не нужен
+        // (Low ревью #1280). Мусорный патч-приоритет ранний выход не
+        // получает — идёт через общую ветку и отклоняется как пустота
+        // (Common ревью-раунда 2: семантика гейта не зависит от формы
+        // вызова; иначе «urgent» с automerge просачивался бы на носитель,
+        // CUP ранжировал бы его ниже low)
+        if let (Some(raw), Some(_)) = (patch.priority.as_deref(), patch.automerge) {
+            if naming::parse_priority(raw) != uwuwu_domain::Priority::Empty {
+                return Ok(());
+            }
+        }
+        let carrier = self.fields.load(number).await?;
+        let priority = match patch.priority.as_deref() {
+            Some(raw) => naming::parse_priority(raw),
+            None => carrier
+                .get(naming::F_PRIORITY)
+                .map(|raw| naming::parse_priority(raw))
+                .unwrap_or(uwuwu_domain::Priority::Empty),
+        };
+        let mut empty: Vec<&str> = Vec::new();
+        if priority == uwuwu_domain::Priority::Empty {
+            empty.push(naming::F_PRIORITY);
+        }
+        let automerge_explicit =
+            patch.automerge.is_some() || carrier.contains_key(naming::F_AUTOMERGE);
+        if !automerge_explicit {
+            empty.push(naming::F_AUTOMERGE);
+        }
+        if empty.is_empty() {
+            return Ok(());
+        }
+        Err(UsecaseError::Board(format!(
+            "переход из Analys #{number}: не заполнены обязательные поля — {}; \
+             заполни (task_edit priority / automerge) и повтори переход",
+            empty.join(", ")
+        )))
+    }
 }
 
 #[async_trait]
@@ -244,6 +294,15 @@ impl TaskWriter for TaskWriteUseCase {
                     "переход {:?} → {:?} вне канона конвейера",
                     current, status
                 )));
+            }
+            // Гейт полноты полей на выходе из Analys (#1280): волна
+            // аналитики обязана выпускать строки с явными Приоритетом
+            // и Automerge — решение разбора, не пустота носителя.
+            // Идемпотентная переустановка (current == status) — тоже выход
+            // из Analys под гейтом; снос (Deleted) мимо — task_close
+            // дубликатов полей не требует.
+            if current == Status::Analys && status != Status::Deleted {
+                self.ensure_analys_exit_complete(number, &patch).await?;
             }
             tracing::info!(
                 event = "board.status_transition",
@@ -465,11 +524,6 @@ mod tests {
         }
         async fn set_status(&self, _b: &str, _n: u64, _s: Status) -> UsecaseResult<()> {
             Ok(())
-        }
-        async fn row_status(&self, _b: &str, _n: u64) -> UsecaseResult<Option<Status>> {
-            // create-тесты: доска пуста, гард канона видит отсутствие строки
-            // (резолв rebase #1258 — эквивалентно master #400)
-            Ok(None)
         }
         async fn set_session(&self, _b: &str, _n: u64, _slot: Slot, _s: &str) -> UsecaseResult<()> {
             Ok(())

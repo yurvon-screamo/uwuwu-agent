@@ -117,12 +117,18 @@ impl TaskBoardRepo for StaleBoard {
     }
 }
 
-struct NopFields;
+/// Носитель полон (Приоритет + Automerge): гейт полноты #1280 не мешает
+/// этим тестам — они про гарда канона переходов (#1235). Поведение самого
+/// гейта (пустые/мусорные поля) — матрица analys_exit_gate_tests.
+struct FilledFields;
 
 #[async_trait]
-impl IssueFieldStore for NopFields {
+impl IssueFieldStore for FilledFields {
     async fn load(&self, _: u64) -> UsecaseResult<std::collections::HashMap<String, String>> {
-        Ok(std::collections::HashMap::new())
+        Ok(std::collections::HashMap::from([
+            (crate::naming::F_PRIORITY.to_string(), "medium".to_string()),
+            (crate::naming::F_AUTOMERGE.to_string(), "on".to_string()),
+        ]))
     }
 
     async fn store(&self, _: u64, _: &[(&str, Option<String>)]) -> UsecaseResult<()> {
@@ -239,7 +245,7 @@ impl TickStateStore for NopState {
 fn writer(board: Arc<StaleBoard>) -> TaskWriteUseCase {
     TaskWriteUseCase {
         board,
-        fields: Arc::new(NopFields),
+        fields: Arc::new(FilledFields),
         boards: vec![("uwuwu".into(), "B".into())],
         clock: Arc::new(FixedClock),
         state: Arc::new(NopState),

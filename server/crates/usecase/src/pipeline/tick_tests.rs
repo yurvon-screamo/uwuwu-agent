@@ -1915,6 +1915,7 @@ async fn wakeup_held_when_cup_full() {
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
         merges: Mutex::default(),
+        probes: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -1982,6 +1983,7 @@ async fn wakeup_delivery_occupies_cup_slot() {
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
         merges: Mutex::default(),
+        probes: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),

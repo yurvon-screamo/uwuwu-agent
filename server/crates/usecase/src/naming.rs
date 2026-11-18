@@ -123,7 +123,8 @@ pub const F_PRIORITY: &str = "Приоритет";
 
 /// Единое имя поля автомержа (#1232): записывается create/task_edit.
 /// Legacy «Autodone» резолвится на границе носителя (fields.rs store,
-/// item_values) — сервер читает/пишет оба имени.
+/// item_values, parse_field_values — read-нормализация #1280) — сервер
+/// читает/пишет оба имени, наружу всегда новое.
 pub const F_AUTOMERGE: &str = "Automerge";
 
 /// Парсинг приоритета; пустое/неизвестное → Empty (ниже low в очереди CUP).

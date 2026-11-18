@@ -18,7 +18,8 @@ struct HubState {
     tasks: HashMap<u64, Task>,
     /// number → доска (тег; без тега — видна на всех досках стенда)
     board_tags: HashMap<u64, String>,
-    /// number → поля (сессии/ветка/PR)
+    /// number → поля (сессии/ветка/PR); Приоритет/Automerge — поле строки
+    /// (#402/#1258: set_board_cells пишет в Task, load проектирует наружу)
     fields: HashMap<u64, TaskFields>,
     /// number → тело issue
     bodies: HashMap<u64, String>,
@@ -455,6 +456,25 @@ impl IssueFieldStore for MemoryHub {
                     out.insert("PR".into(), p.as_str().to_string());
                 }
             }
+            // автомерж — поле строки (#402/#1258: один механизм): наружу
+            // нормализованное «Automerge» on/off — гейт #1280 читает здесь.
+            // Приоритет — тоже поле строки: имя high/medium/low, Empty
+            // не отдаётся (пустота = отсутствие ключа, как в живом fields.rs)
+            if let Some(t) = state.tasks.get(&number) {
+                out.insert(
+                    uwuwu_usecase::F_AUTOMERGE.into(),
+                    if t.automerge() { "on" } else { "off" }.into(),
+                );
+                let name = match t.priority() {
+                    uwuwu_domain::Priority::High => Some("high"),
+                    uwuwu_domain::Priority::Medium => Some("medium"),
+                    uwuwu_domain::Priority::Low => Some("low"),
+                    uwuwu_domain::Priority::Empty => None,
+                };
+                if let Some(n) = name {
+                    out.insert(uwuwu_usecase::F_PRIORITY.into(), n.into());
+                }
+            }
             Ok(out)
         })
     }
@@ -488,8 +508,8 @@ impl IssueFieldStore for MemoryHub {
                     ("Automerge" | "Autodone", Some(v)) => {
                         // автомерж-ячейка (#1232): canonical «Automerge»,
                         // legacy «Autodone» — в одну клетку; on/true — вкл.
-                        // Хранилище — поле строки (#1258: один механизм,
-                        // карта снесена; set_board_cells пишет туда же)
+                        // Хранилище — поле строки (#402/#1258: один механизм,
+                        // карта снесена; load нормализует наружу — #1280)
                         if let Some(task) = state.tasks.get_mut(&number) {
                             task.set_automerge(v == "on" || v == "true");
                         }
@@ -512,6 +532,9 @@ impl IssueFieldStore for MemoryHub {
                             }
                         }
                     }
+                    // «Приоритет» — поле строки (#402 set_board_cells):
+                    // issue-филд store больше не пишет приоритет, ветка
+                    // выпилена (#1280 резолв мержа — мёртвый носитель)
                     _ => {}
                 }
             }
