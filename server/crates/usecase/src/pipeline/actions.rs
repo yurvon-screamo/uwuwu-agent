@@ -88,6 +88,9 @@ impl TickUseCase {
         self.board
             .set_branch(&board.board, task.number(), &branch)
             .await?;
+        // #1300: с пином агента дев-семья берёт модель из developer-ключа
+        // карты (раньше шла по default-ключу); переход пинен тестом
+        // dev_spawn_pins_the_developer_agent, ключи канонически одинаковы
         let work_model = match Agent::of_slot(slot) {
             Some(agent) => self.models.for_agent(agent),
             None => self.models.for_default(),

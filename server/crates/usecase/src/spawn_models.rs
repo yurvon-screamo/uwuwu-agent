@@ -4,7 +4,8 @@
 //! владельца (11.11 «качественные контуры не режутся» + 1135 «Ревьювер —
 //! полный 5.3»): качественные — полный glm-5.3, рутинные — flash.
 //! Ключи карты — имена агентов (naming::agent_name) + "default"
-//! (Dev/Design/bootstrap — default_agent опенкода — developer).
+//! (bootstrap-сессии подготовки env; до #1300 — также дев-семья, после
+//! пина агента Design/Dev берут ключ "developer").
 
 use crate::naming;
 use std::collections::HashMap;
@@ -59,8 +60,9 @@ impl SpawnModels {
         self.map.get(key)
     }
 
-    /// Модель default-слота: Dev/Design (default_agent опенкода —
-    /// developer) и bootstrap-сессии подготовки env.
+    /// Модель bootstrap-сессий подготовки env (ключ "default"). Рабочие
+    /// дев-сессии с #1300 берут ключ "developer" (for_agent) — переход
+    /// осознанный, ключи карты канонически одинаковы.
     pub fn for_default(&self) -> SpawnModel {
         self.by_key("default")
             .cloned()

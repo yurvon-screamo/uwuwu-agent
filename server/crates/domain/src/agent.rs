@@ -21,11 +21,12 @@ pub enum Agent {
 
 impl Agent {
     /// Жёсткая привязка слот стадии → агент (канон конвейера).
-    /// Dev/Design — дефолтная сессия исполнителя, без кастомного агента.
+    /// #1300: Design/Dev пинятся на явного developer — опора на
+    /// ambient-дефолт исполнителя (`default_agent` опенкода) при сбое
+    /// резолва подменяла агента дев-сессии (инцидент #1044).
     pub fn of_slot(slot: Slot) -> Option<Self> {
         match slot {
-            Slot::Design => None,
-            Slot::Dev => None,
+            Slot::Design | Slot::Dev => Some(Self::Developer),
             Slot::PlanReview => Some(Self::PlanReviewer),
             Slot::ResultReview => Some(Self::CodeQualityReviewer),
             Slot::Test => Some(Self::Tester),
@@ -34,7 +35,8 @@ impl Agent {
 
     /// Эмодзи-маркер роли в тайтле спавн-сессии (1:1 черновику владельца,
     /// задача #1212). Пара Design/Dev == 🔨 осознанна и связана тестом
-    /// в task.rs — слот без агента это тот же исполнитель.
+    /// в task.rs — оба слота несут одного исполнителя (пин Developer,
+    /// #1300).
     pub fn emoji(self) -> &'static str {
         match self {
             Self::Developer => "🔨",
@@ -129,8 +131,11 @@ mod tests {
             Some(Agent::CodeQualityReviewer)
         );
         assert_eq!(Agent::of_slot(Slot::Test), Some(Agent::Tester));
-        assert_eq!(Agent::of_slot(Slot::Dev), None, "dev — дефолтная сессия");
-        assert_eq!(Agent::of_slot(Slot::Design), None);
+        // #1300: дев-семья пинится на явного developer — опора на
+        // ambient-дефолт исполнителя подменяла агента дев-сессии
+        // (инцидент #1044: рестарт будил ход под аналитиком)
+        assert_eq!(Agent::of_slot(Slot::Dev), Some(Agent::Developer));
+        assert_eq!(Agent::of_slot(Slot::Design), Some(Agent::Developer));
     }
 
     #[test]

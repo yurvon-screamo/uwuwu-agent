@@ -1366,6 +1366,67 @@ async fn live_spawns_and_claims_session() {
         .any(|l| l.starts_with("session#1")));
 }
 
+/// Пин агента слота в спавн-конверте (#1300): дев-сессия рождается с
+/// явным `agent=developer` и моделью из developer-ключа карты моделей
+/// (ключ "default" остаётся bootstrap-сессиям) — опора на ambient-дефолт
+/// исполнителя подменяла агента дев-сессии (инцидент #1044).
+#[tokio::test]
+async fn dev_spawn_pins_the_developer_agent() {
+    // Кастомная карта с разведёнными ключами default/developer — пин
+    // перехода модели: рабочая дев-сессия берёт developer-ключ.
+    let board = Arc::new(FakeBoard {
+        rows: vec![task(1, Status::InProgress)],
+        log: Mutex::default(),
+        comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
+    });
+    let sessions = Arc::new(FakeSessions::new());
+    let mut map = std::collections::HashMap::new();
+    map.insert(
+        "default".to_string(),
+        uwuwu_domain::SpawnModel::parse("p/default").unwrap(),
+    );
+    map.insert(
+        "developer".to_string(),
+        uwuwu_domain::SpawnModel::parse("p/dev").unwrap(),
+    );
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+            probes: Mutex::default(),
+        }),
+        clock: Arc::new(FixedClock),
+        state: Arc::new(MemState(Mutex::default())),
+        models: Arc::new(crate::spawn_models::SpawnModels::new(map)),
+    };
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.spawns_done, 1);
+    let specs = sessions.specs.lock().unwrap();
+    assert_eq!(specs.len(), 2, "bootstrap + work");
+    let boot = &specs[0];
+    let work = &specs[1];
+    assert!(
+        matches!(boot.agent, AgentSlot::Default),
+        "bootstrap-сессия остаётся без агент-пина"
+    );
+    assert_eq!(boot.model.id(), "default", "bootstrap — default-ключ карты");
+    assert!(
+        matches!(work.agent, AgentSlot::Role(Agent::Developer)),
+        "дев-сессия рождается с явным developer, получено {:?}",
+        work.agent
+    );
+    assert_eq!(work.model.provider(), "p");
+    assert_eq!(
+        work.model.id(),
+        "dev",
+        "модель дева — из developer-ключа карты (переход с default-ключа осознанный)"
+    );
+}
+
 /// Тайтл спавн-сессии несёт эмодзи-маркер стадии между номером и тайтлом
 /// (задача #1212); bootstrap наследует тем же значением.
 #[tokio::test]
