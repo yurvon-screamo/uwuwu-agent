@@ -282,10 +282,23 @@ mod tests {
     #[test]
     fn decide_automerge_needs_mergeable_carrier() {
         // docs-only (нет PR и ветки) мержить нечего: строка ждёт владельца,
-        // тик не прощупывает (#1232)
+        // тик не прощупывает (#1232); безветочный артефакт-URL (#1155) —
+        // тот же класс «нечего мержить», не гейт мержа
         let mut t = task(Status::UserReview);
         t.set_automerge(true);
         assert!(matches!(decide(&t), Action::Observe { .. }));
+        t.apply_fields(crate::task::TaskFields::new(
+            std::collections::BTreeMap::new(),
+            crate::task::Vcs::Artifact {
+                url: crate::task::PrUrl::parse("https://github.com/a/b/blob/main/docs/x.md")
+                    .unwrap(),
+            },
+            crate::task::Priority::Empty,
+        ));
+        assert!(
+            matches!(decide(&t), Action::Observe { .. }),
+            "Artifact — не мерж-гейт"
+        );
         let branch = crate::task::BranchName::parse("work/x").unwrap();
         t.apply_fields(crate::task::TaskFields::new(
             std::collections::BTreeMap::new(),

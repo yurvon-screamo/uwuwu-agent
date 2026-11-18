@@ -97,7 +97,13 @@ impl TaskBoardRepo for FakeBoard {
                     f.set_branch(b);
                 }
                 if let Some(p) = t.pr().cloned() {
-                    let _ = f.open_pr(p);
+                    // зеркально мапперу носителя (#1155): ветка есть —
+                    // кодовый PullRequest, нет — безветочный артефакт
+                    if f.branch().is_some() {
+                        let _ = f.open_pr(p);
+                    } else {
+                        f.set_artifact(p);
+                    }
                 }
                 f
             })
@@ -351,11 +357,14 @@ impl AgentSessionGateway for FakeSessions {
 struct FakePrs {
     state: PrState,
     merges: Mutex<Vec<String>>,
+    /// URL-аргументы probe — фикс «артефакт доезжает до gateway» (#1155)
+    probes: Mutex<Vec<Option<String>>>,
 }
 
 #[async_trait]
 impl PrGateway for FakePrs {
-    async fn probe(&self, _r: &str, _u: Option<&str>, _b: Option<&str>) -> UsecaseResult<PrState> {
+    async fn probe(&self, _r: &str, u: Option<&str>, _b: Option<&str>) -> UsecaseResult<PrState> {
+        self.probes.lock().unwrap().push(u.map(str::to_string));
         Ok(self.state)
     }
     async fn merge(&self, _r: &str, pr: &str) -> UsecaseResult<()> {
@@ -642,6 +651,7 @@ fn usecase_with_state(
     let prs = Arc::new(FakePrs {
         state: pr,
         merges: Mutex::default(),
+        probes: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -699,6 +709,7 @@ fn peak_usecase(
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
         merges: Mutex::default(),
+        probes: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -729,6 +740,7 @@ fn usecase_with_sessions(
     let prs = Arc::new(FakePrs {
         state: pr,
         merges: Mutex::default(),
+        probes: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -802,6 +814,7 @@ fn wake_usecase(
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            probes: Mutex::default(),
         }),
         clock: Arc::new(FixedClock),
         state: state.clone(),
@@ -1312,6 +1325,59 @@ async fn automerge_docs_only_is_not_probed() {
             .any(|l| l.contains("status#7") || l.contains("comment#7")),
         "docs-only строка не трогается: {log:?}"
     );
+}
+
+#[tokio::test]
+async fn branchless_pr_cell_is_not_probed_and_waits_for_owner() {
+    // #1155 + #1232: безветочная ячейка (Artifact) — мержить нечего, тик
+    // строку не прощупывает (никаких probe/bounce/Done) — она ждёт владельца
+    // в Review; URL при этом виден на карточке (fm, см. e2e tools_tests).
+    // До #1232 исходом был Done «без PR» — класс ложного Done закрыт гейтом.
+    let mut t = task(8, Status::UserReview);
+    t.set_automerge(true);
+    let mut f = TaskFields::default();
+    f.set_artifact(PrUrl::parse("https://github.com/a/c/pull/9").unwrap());
+    t.apply_fields(f);
+    let (u, board, _, prs) = usecase(vec![t], PrState::Missing);
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert!(
+        prs.probes.lock().unwrap().is_empty(),
+        "нечего мержить — probe не зовётся"
+    );
+    let log = board.log.lock().unwrap();
+    assert!(
+        !log.iter().any(|l| l.contains("status#8")),
+        "строка ждёт владельца — статус не меняется"
+    );
+    assert!(!log.iter().any(|l| l.contains("close#8")));
+}
+
+#[tokio::test]
+async fn branchless_real_pull_url_also_waits_for_owner() {
+    // #1155 (пин 52fda41, семантика #1232): даже РЕАЛЬНЫЙ github pull-URL
+    // на безветочной строке не мерж-гейт — ветки нет, кодовый цикл не начат;
+    // строка ждёт владельца (PR виден на карточке — fm рендерит Artifact),
+    // данные чинятся у источника (#1166 — фабрика пишет Branch при спавне)
+    let mut t = task(9, Status::UserReview);
+    t.set_automerge(true);
+    let mut f = TaskFields::default();
+    f.set_artifact(PrUrl::parse("https://github.com/a/c/pull/9").unwrap());
+    t.apply_fields(f);
+    let (u, board, _, prs) = usecase(
+        vec![t],
+        PrState::Open {
+            mergeable: true,
+            ci_green: true,
+        },
+    );
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert!(
+        prs.probes.lock().unwrap().is_empty() && prs.merges.lock().unwrap().is_empty(),
+        "без ветки кодового цикла нет — probe/merge не зовутся"
+    );
+    let log = board.log.lock().unwrap();
+    assert!(!log.iter().any(|l| l.contains("status#9")));
+    assert!(!log.iter().any(|l| l.contains("close#9")));
 }
 
 #[tokio::test]
@@ -1983,6 +2049,7 @@ async fn undelivered_comment_is_not_marked_seen() {
         let prs = Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            probes: Mutex::default(),
         });
         let uc = TickUseCase {
             board: board.clone(),
@@ -2043,6 +2110,7 @@ async fn undelivered_comment_is_not_marked_seen() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            probes: Mutex::default(),
         }),
         clock: Arc::new(FixedClock),
         state,
@@ -2110,6 +2178,7 @@ async fn multi_comment_tail_delivered_together() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            probes: Mutex::default(),
         }),
         clock: Arc::new(FixedClock),
         state: state.clone(),
@@ -2171,6 +2240,7 @@ async fn inflight_comment_delivered_after_agent_reply() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            probes: Mutex::default(),
         }),
         clock: Arc::new(FixedClock),
         state,
@@ -2233,6 +2303,7 @@ async fn busy_session_not_pinged_early() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            probes: Mutex::default(),
         }),
         clock: Arc::new(BigClock),
         state: Arc::new(MemState(Mutex::default())),
@@ -2291,6 +2362,7 @@ async fn soft_ping_wakes_idle_session_without_transaction() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            probes: Mutex::default(),
         }),
         clock: Arc::new(BigClock),
         state: Arc::new(MemState(Mutex::default())),
@@ -2373,6 +2445,7 @@ async fn idle_sessions_do_not_hold_cup() {
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
         merges: Mutex::default(),
+        probes: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -3771,6 +3844,7 @@ fn tick_with_clock(
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
         merges: Mutex::default(),
+        probes: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -3968,6 +4042,7 @@ async fn enrichment_failure_skips_row() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            probes: Mutex::default(),
         }),
         clock: Arc::new(FixedClock),
         state: Arc::new(MemState(Mutex::default())),
@@ -4003,6 +4078,7 @@ async fn orphan_deleted_when_set_session_fails() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            probes: Mutex::default(),
         }),
         clock: Arc::new(FixedClock),
         state: Arc::new(MemState(Mutex::default())),

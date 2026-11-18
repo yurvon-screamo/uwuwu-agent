@@ -416,7 +416,8 @@ impl TickUseCase {
     /// Автомерж (#1232): проба PR → мерж (строка остаётся в Review — Done
     /// всегда за владельцем) / bounce в работу. Ветка без PR — возврат в
     /// работу (PR ещё не создан); docs-only до сюда не доходит (домен
-    /// automerge_ready не прощупывает Vcs::Local).
+    /// automerge_ready не прощупывает безветочные ячейки — Vcs::Local и
+    /// Artifact, #1155: мержить нечего, строка ждёт владельца).
     /// Возвращает true — PR смержен этим вызовом (счётчик тика).
     pub async fn automerge(&self, board: &BoardPlan, task: &Task) -> UsecaseResult<bool> {
         use crate::ports::PrState;
