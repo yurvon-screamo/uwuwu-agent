@@ -2,7 +2,9 @@
 //! (тело задачи #1236, 18.11): numeric field/item id, hex option id,
 //! Status в value.name.raw, Link-курсор пагинации.
 
-use crate::github::pv2_parse::{next_after, parse_field_catalog, parse_item_entry, parse_status_value};
+use crate::github::pv2_parse::{
+    next_after, parse_field_catalog, parse_item_entry, parse_status_value,
+};
 use serde_json::json;
 
 /// Живой каталог GET /projectsV2/{n}/fields (проба 18.11): Status —
@@ -19,8 +21,14 @@ fn field_catalog_matches_live_probe_shape() {
     let meta = parse_field_catalog(5, &fields, "Задачи uwuwu").expect("catalog parses");
     assert_eq!(meta.project_number, 5);
     assert_eq!(meta.status_field_id, 442951857);
-    assert_eq!(meta.options.get("Analys").map(String::as_str), Some("eff28a30"));
-    assert_eq!(meta.options.get("Todo").map(String::as_str), Some("79e23eab"));
+    assert_eq!(
+        meta.options.get("Analys").map(String::as_str),
+        Some("eff28a30")
+    );
+    assert_eq!(
+        meta.options.get("Todo").map(String::as_str),
+        Some("79e23eab")
+    );
 }
 
 /// Статус-поле отсутствует в каталоге — громкий отказ, не тихий None.
@@ -66,7 +74,8 @@ fn next_after_reads_live_link_cursor() {
 /// Последняя страница: Link без rel="next" — None (конец пагинации).
 #[test]
 fn next_after_without_next_branch_is_none() {
-    let link = r#"<https://api.github.com/user/109030262/projectsV2/5/items?per_page=100>; rel="prev""#;
+    let link =
+        r#"<https://api.github.com/user/109030262/projectsV2/5/items?per_page=100>; rel="prev""#;
     assert_eq!(next_after(Some(link)), None);
     assert_eq!(next_after(None), None);
 }

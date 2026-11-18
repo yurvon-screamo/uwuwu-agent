@@ -3,9 +3,9 @@
 //! hex-строка; Status single-select живёт в `value.name.raw`;
 //! пагинация list items — Link-курсор `after`, параметр `page` игнорируется.
 
+use serde_json::Value;
 use std::collections::HashMap;
 use uwuwu_usecase::UsecaseError;
-use serde_json::Value;
 
 use super::pv2::Pv2Meta;
 
@@ -20,11 +20,13 @@ pub(crate) fn parse_field_catalog(
         .as_array()
         .and_then(|list| list.iter().find(|f| f["name"] == "Status"))
         .ok_or_else(|| {
-            UsecaseError::Board(format!("доска «{board}»: Status-поле в каталоге не найдено"))
+            UsecaseError::Board(format!(
+                "доска «{board}»: Status-поле в каталоге не найдено"
+            ))
         })?;
-    let status_field_id = field["id"].as_u64().ok_or_else(|| {
-        UsecaseError::Board(format!("доска «{board}»: Status-поле без id"))
-    })?;
+    let status_field_id = field["id"]
+        .as_u64()
+        .ok_or_else(|| UsecaseError::Board(format!("доска «{board}»: Status-поле без id")))?;
     let mut options = HashMap::new();
     if let Some(list) = field["options"].as_array() {
         for option in list {

@@ -5,9 +5,9 @@ mod fields;
 mod hub;
 mod prgate;
 mod pv2;
+mod pv2_parse;
 #[cfg(test)]
 mod pv2_tests;
-mod pv2_parse;
 
 pub use fields::{F_DEV_SESSION, F_REVIEW_SESSION, F_TEST_SESSION};
 pub use hub::GitHubHub;

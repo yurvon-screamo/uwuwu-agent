@@ -123,7 +123,11 @@ impl Pv2Rest {
                 text.chars().take(140).collect::<String>()
             )));
         }
-        Ok(RestResponse { status, link, body: parsed })
+        Ok(RestResponse {
+            status,
+            link,
+            body: parsed,
+        })
     }
 
     /// Мета доски: резолв номера проекта по тайтлу + каталог Status-поля.
@@ -179,7 +183,10 @@ impl Pv2Rest {
         let meta = self.meta(board).await?;
         let owner = self.owner()?;
         let mut map = HashMap::new();
-        let mut url = format!("/users/{owner}/projectsV2/{}/items?per_page=100", meta.project_number);
+        let mut url = format!(
+            "/users/{owner}/projectsV2/{}/items?per_page=100",
+            meta.project_number
+        );
         for _ in 0..ITEM_PAGES {
             let resp = self.rest(reqwest::Method::GET, &url, None).await?;
             if let Some(list) = resp.body.as_array() {
@@ -219,7 +226,10 @@ impl Pv2Rest {
         let resp = self
             .rest(
                 reqwest::Method::GET,
-                &format!("/users/{owner}/projectsV2/{}/items/{item}", meta.project_number),
+                &format!(
+                    "/users/{owner}/projectsV2/{}/items/{item}",
+                    meta.project_number
+                ),
                 None,
             )
             .await?;
@@ -228,7 +238,9 @@ impl Pv2Rest {
             self.items.invalidate(board);
             return Ok(None);
         }
-        Ok(Some(parse_status_value(&resp.body["fields"]).unwrap_or_default()))
+        Ok(Some(
+            parse_status_value(&resp.body["fields"]).unwrap_or_default(),
+        ))
     }
 
     /// Raw-имя Status строки на доске для гарда: None — строки нет;
@@ -269,7 +281,10 @@ impl Pv2Rest {
         let resp = self
             .rest(
                 reqwest::Method::PATCH,
-                &format!("/users/{owner}/projectsV2/{}/items/{item}", meta.project_number),
+                &format!(
+                    "/users/{owner}/projectsV2/{}/items/{item}",
+                    meta.project_number
+                ),
                 Some(json!({ "fields": [
                     { "id": meta.status_field_id, "value": option }
                 ] })),
@@ -282,7 +297,8 @@ impl Pv2Rest {
             )));
         }
         let key = format!("{board}#{number}");
-        self.status_wt.put(&key, status_name.to_string(), std::time::Instant::now());
+        self.status_wt
+            .put(&key, status_name.to_string(), std::time::Instant::now());
         Ok(parse_status_value(&resp.body["fields"]))
     }
 
