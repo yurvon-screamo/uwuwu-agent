@@ -231,6 +231,10 @@ pub struct SessionInfo {
 pub enum PrState {
     /// PR не найден ни по ячейке, ни по ветке.
     Missing,
+    /// PR-URL задан в PR-форме, но вендор хоста гейтвеем не управляется
+    /// (чужой GHE-хост, Gitea-инстанс без токена, API-отказ инстанса):
+    /// строка ждёт владельца в Review — не bounce (#1269).
+    Foreign,
     /// GitHub считает (mergeable=null / чеки бегут): вердикт следующего тика.
     Pending,
     Open {

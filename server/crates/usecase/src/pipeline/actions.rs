@@ -476,6 +476,14 @@ impl TickUseCase {
                 );
                 Ok(false)
             }
+            PrState::Foreign => {
+                tracing::info!(
+                    event = "automerge.foreign",
+                    number = task.number(),
+                    "Automerge: PR-URL неуправляемого вендора — строка ждёт владельца в Review (#1269)"
+                );
+                Ok(false)
+            }
             PrState::Missing => {
                 self.bounce(board, task, "ветка есть, PR не найден").await?;
                 Ok(false)
