@@ -159,14 +159,23 @@ pub struct TaskFields {
     priority: Priority,
 }
 
-/// VCS-состояние задачи: без ветки → ветка → PR. Инвариант: PR не бывает
-/// раньше ветки (PR без ветки — кривые данные носителя, загрузчик их
-/// отбрасывает с warn).
+/// VCS-состояние задачи: без ветки → ветка → PR. Кодовый инвариант:
+/// PullRequest не бывает без ветки (мутаторы требуют Branch-ячейку).
+/// Безветочная PR-ячейка — Artifact: URL-артефакт по канону ADR-021
+/// (вики/issue/чужой-вендор PR) — рендерится в fm без Branch (#1155).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Vcs {
     Local,
     Branch(BranchName),
-    PullRequest { branch: BranchName, url: PrUrl },
+    PullRequest {
+        branch: BranchName,
+        url: PrUrl,
+    },
+    /// PR-ячейка несёт URL без ветки кода (docs-only артефакт, чужой
+    /// вендор) — fm рендерит pr, branch остаётся пустым.
+    Artifact {
+        url: PrUrl,
+    },
 }
 
 impl Default for TaskFields {
@@ -210,17 +219,17 @@ impl TaskFields {
     /// Ветка, если есть.
     pub fn branch(&self) -> Option<&BranchName> {
         match &self.vcs {
-            Vcs::Local => None,
+            Vcs::Local | Vcs::Artifact { .. } => None,
             Vcs::Branch(b) => Some(b),
             Vcs::PullRequest { branch, .. } => Some(branch),
         }
     }
 
-    /// PR, если есть.
+    /// PR, если есть (включая безветочный артефакт — fm рендерит оба вида).
     pub fn pr(&self) -> Option<&PrUrl> {
         match &self.vcs {
-            Vcs::PullRequest { url, .. } => Some(url),
-            _ => None,
+            Vcs::PullRequest { url, .. } | Vcs::Artifact { url } => Some(url),
+            Vcs::Local | Vcs::Branch(_) => None,
         }
     }
 
@@ -236,7 +245,7 @@ impl TaskFields {
     }
 
     /// Мутатор: заявка/смена ветки; открытый PR сохраняется (ветка задачи
-    /// одна — канон).
+    /// одна — канон); Artifact вытесняется веткой кода.
     pub fn set_branch(&mut self, name: BranchName) {
         self.vcs = match std::mem::replace(&mut self.vcs, Vcs::Local) {
             Vcs::PullRequest { url, .. } => Vcs::PullRequest { branch: name, url },
@@ -244,10 +253,16 @@ impl TaskFields {
         };
     }
 
+    /// Мутатор: безветочная PR-ячейка — URL-артефакт (канон ADR-021:
+    /// «PR-ячейка заполняется всегда, включая docs-only»).
+    pub fn set_artifact(&mut self, url: PrUrl) {
+        self.vcs = Vcs::Artifact { url };
+    }
+
     /// Мутатор: открытие PR (требуется ветка — канон: PR из ветки задачи).
     pub fn open_pr(&mut self, url: PrUrl) -> Result<(), &'static str> {
         match self.vcs.clone() {
-            Vcs::Local => Err("PR без ветки: сначала Branch-ячейка"),
+            Vcs::Local | Vcs::Artifact { .. } => Err("PR без ветки: сначала Branch-ячейка"),
             Vcs::Branch(branch) => {
                 self.vcs = Vcs::PullRequest { branch, url };
                 Ok(())
@@ -450,11 +465,14 @@ impl Task {
         self.fields = fields;
     }
 
-    /// Автомерж-кандидат (#1232): Review + automerge + носитель мержа
-    /// (PR или ветка). Docs-only (Vcs::Local) мержить нечего — строка
-    /// ждёт владельца в Review, тик её не прощупывает.
+    /// Автомерж-кандидат (#1232): Review + automerge + кодовый носитель
+    /// (ветка/PR). Безветочная ячейка (Local и Artifact — docs-only
+    /// артефакт/чужой-вендор URL, #1155) мержить нечего — строка ждёт
+    /// владельца в Review, тик её не прощупывает.
     pub fn automerge_ready(&self) -> bool {
-        self.status == Status::UserReview && self.automerge && self.fields.vcs() != &Vcs::Local
+        self.status == Status::UserReview
+            && self.automerge
+            && matches!(self.fields.vcs(), Vcs::Branch(_) | Vcs::PullRequest { .. })
     }
 }
 
@@ -568,6 +586,49 @@ mod tests {
         f.set_branch(BranchName::parse("work/task-1b").unwrap());
         assert!(f.pr().is_some());
         assert_eq!(f.branch().map(|b| b.as_str()), Some("work/task-1b"));
+    }
+
+    #[test]
+    fn artifact_url_renders_pr_without_branch() {
+        // #1155: безветочная PR-ячейка — Artifact, fm рендерит pr, branch пуст
+        let mut f = TaskFields::default();
+        f.set_artifact(PrUrl::parse("https://github.com/x/y/blob/main/docs/a.md").unwrap());
+        assert!(matches!(f.vcs(), Vcs::Artifact { .. }));
+        assert_eq!(
+            f.pr().map(|u| u.as_str()),
+            Some("https://github.com/x/y/blob/main/docs/a.md")
+        );
+        assert!(f.branch().is_none());
+    }
+
+    #[test]
+    fn open_pr_from_artifact_requires_branch() {
+        // инвариант кодового цикла: PR без ветки — ошибка и из Artifact
+        let mut f = TaskFields::default();
+        f.set_artifact(PrUrl::parse("https://x/1").unwrap());
+        assert!(f.open_pr(PrUrl::parse("https://x/2").unwrap()).is_err());
+    }
+
+    #[test]
+    fn set_branch_displaces_artifact() {
+        let mut f = TaskFields::default();
+        f.set_artifact(PrUrl::parse("https://x/1").unwrap());
+        f.set_branch(BranchName::parse("work/task-1").unwrap());
+        assert!(
+            matches!(f.vcs(), Vcs::Branch(_)),
+            "ветка вытесняет артефакт"
+        );
+        assert!(f.pr().is_none());
+        f.open_pr(PrUrl::parse("https://x/2").unwrap()).unwrap();
+        assert!(matches!(f.vcs(), Vcs::PullRequest { .. }));
+    }
+
+    #[test]
+    fn set_artifact_replaces_url() {
+        let mut f = TaskFields::default();
+        f.set_artifact(PrUrl::parse("https://x/1").unwrap());
+        f.set_artifact(PrUrl::parse("https://x/2").unwrap());
+        assert_eq!(f.pr().map(|u| u.as_str()), Some("https://x/2"));
     }
 
     #[test]

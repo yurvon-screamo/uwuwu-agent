@@ -228,7 +228,8 @@ impl WikiRepo for GitHubWiki {
 
 /// Путь в URL: пробелы и не-ascii — percent-encoding (без новой зависимости:
 /// кодируруем всё вне безопасного множества).
-fn encode_path(path: &str) -> String {
+// pub(crate) — реюз в asset_store для raw-ссылок ассетов ботов (#1171)
+pub(crate) fn encode_path(path: &str) -> String {
     let mut out = String::new();
     for b in path.bytes() {
         match b {
