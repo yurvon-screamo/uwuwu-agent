@@ -78,19 +78,7 @@ impl DreamerUseCase {
             );
             return Ok(0);
         }
-        let candidate = list.iter().find(|s| {
-            !s.outcome.is_empty()
-                && s.total_tokens > 0
-                && now.saturating_sub(s.updated_ms) > IDLE_MS
-                && naming::parse_agent(&s.agent)
-                    .map(|a| !SKIP_AGENTS.contains(&a))
-                    .unwrap_or(true)
-                && match self.state.dreamer_mark(&s.id) {
-                    None => true,
-                    Some(DreamerMark::Forever) => false,
-                    Some(DreamerMark::UpTo(pos)) => s.updated_ms > pos,
-                }
-        });
+        let candidate = list.iter().find(|s| self.is_fresh_candidate(s, now));
         let Some(target) = candidate else {
             return Ok(0);
         };
@@ -111,6 +99,30 @@ impl DreamerUseCase {
             }
         }
         Ok(1)
+    }
+
+    /// Кандидат пост-обработки: финал + реальная работа (токены > 0,
+    /// не пустышки) + idle ≥ IDLE_MS + не сайдкар-агент + свежесть против
+    /// watermark (#1306): UpTo-позиция ниже активности — сессия снова
+    /// кандидат (revival); Forever — вечный скип (боты).
+    fn is_fresh_candidate(&self, s: &SessionInfo, now: u64) -> bool {
+        if s.outcome.is_empty() || s.total_tokens == 0 {
+            return false;
+        }
+        if now.saturating_sub(s.updated_ms) <= IDLE_MS {
+            return false;
+        }
+        if naming::parse_agent(&s.agent)
+            .map(|a| SKIP_AGENTS.contains(&a))
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        match self.state.dreamer_mark(&s.id) {
+            None => true,
+            Some(DreamerMark::Forever) => false,
+            Some(DreamerMark::UpTo(pos)) => s.updated_ms > pos,
+        }
     }
 
     /// Носитель прогона (ADR-005 1:1): живой линк — wakeup существующей
