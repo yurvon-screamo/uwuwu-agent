@@ -405,7 +405,6 @@ impl TickUseCase {
             held_cup = out.held_cup,
             sessions_busy = out.sessions_busy,
             preempts = out.preempts,
-
             deferred_peak = out.deferred_peak,
             wakeups = out.wakeups,
             wakeups_deferred = out.wakeups_deferred,

@@ -502,7 +502,7 @@ impl IssueFieldStore for MemoryHub {
             // на стенде значение живёт в самой строке (Task::set_priority)
             if let Some(v) = patch
                 .iter()
-                .find(|(name, _)| matches!(*name, uwuwu_usecase::F_PRIORITY | "Priority"))
+                .find(|(name, _)| matches!(*name, uwuwu_usecase::F_PRIORITY))
                 .and_then(|(_, v)| v.as_deref())
             {
                 let task = state.tasks.get_mut(&number).expect("checked above");
