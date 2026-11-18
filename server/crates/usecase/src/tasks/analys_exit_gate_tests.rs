@@ -290,6 +290,47 @@ async fn analys_exit_passes_when_patch_carries_values() {
         .expect("патч несёт оба значения — пропуск");
 }
 
+/// Мусорный патч-приоритет (с automerge) — тот же отказ: ранний выход
+/// не применяется к нераспознанному значению, семантика гейта не зависит
+/// от формы вызова (Common ревью-раунда 2).
+#[tokio::test]
+async fn patch_garbage_priority_is_rejected() {
+    let (u, board, _) = case(Status::Analys, &[]);
+    let mut p = status_patch(Status::ReviewAnalys);
+    p.priority = Some("urgent".into());
+    p.automerge = Some(true);
+    let err = u
+        .edit("uwuwu", 1, p)
+        .await
+        .expect_err("мусорный патч-приоритет — не явное решение");
+    assert!(
+        err.to_string().contains("Приоритет"),
+        "перечень без Приоритета: {err}"
+    );
+    assert!(
+        board.writes().is_empty(),
+        "отказ записал статус: {:?}",
+        board.writes()
+    );
+}
+
+/// Мусорный патч-приоритет без automerge — тот же отказ (форма вызова
+/// без automerge идёт через носитель-ветку): перечень называет поле.
+#[tokio::test]
+async fn patch_garbage_priority_without_automerge_is_rejected() {
+    let (u, _, _) = case(Status::Analys, &[]);
+    let mut p = status_patch(Status::ReviewAnalys);
+    p.priority = Some("urgent".into());
+    let err = u
+        .edit("uwuwu", 1, p)
+        .await
+        .expect_err("мусорный патч-приоритет без automerge — тоже отказ");
+    assert!(
+        err.to_string().contains("Приоритет"),
+        "перечень без Приоритета: {err}"
+    );
+}
+
 /// Переход не из Analys гейт не трогает (поля пусты, переход легален).
 #[tokio::test]
 async fn non_analys_transition_is_not_gated() {

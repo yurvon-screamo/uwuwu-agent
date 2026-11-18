@@ -162,10 +162,17 @@ impl TaskWriteUseCase {
         number: u64,
         patch: &TaskPatch,
     ) -> UsecaseResult<()> {
-        // патч несёт оба значения — носитель не читается: результат гейта
-        // уже известен, GitHub round-trip не нужен (Low ревью #1280)
-        if patch.priority.is_some() && patch.automerge.is_some() {
-            return Ok(());
+        // патч несёт оба значения и приоритет распознан — носитель не
+        // читается: результат гейта известен, GitHub round-trip не нужен
+        // (Low ревью #1280). Мусорный патч-приоритет ранний выход не
+        // получает — идёт через общую ветку и отклоняется как пустота
+        // (Common ревью-раунда 2: семантика гейта не зависит от формы
+        // вызова; иначе «urgent» с automerge просачивался бы на носитель,
+        // CUP ранжировал бы его ниже low)
+        if let (Some(raw), Some(_)) = (patch.priority.as_deref(), patch.automerge) {
+            if naming::parse_priority(raw) != uwuwu_domain::Priority::Empty {
+                return Ok(());
+            }
         }
         let carrier = self.fields.load(number).await?;
         let priority = match patch.priority.as_deref() {
