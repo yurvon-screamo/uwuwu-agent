@@ -21,6 +21,8 @@ impl SpawnModels {
     }
 
     /// Канон владельца — дефолт карты при отсутствии секции в конфиге.
+    /// Синхрон с config.example (кросс-гвард): везде flash#high,
+    /// ревьюверы полный 5.3#high (поручение владельца 18.11, f1b9091c).
     pub fn canonical() -> Self {
         let mut map = HashMap::new();
         let mut put = |key: &str, raw: &str| {
@@ -29,11 +31,11 @@ impl SpawnModels {
                 SpawnModel::parse(raw).expect("канон-карта"),
             );
         };
-        put("default", "zai-coding-plan/glm-5.3");
-        put("developer", "zai-coding-plan/glm-5.3");
-        put("plan-reviewer", "zai-coding-plan/glm-5.3");
-        put("code-quality-reviewer", "zai-coding-plan/glm-5.3");
-        put("tester", "zai-coding-plan/glm-5.3-flash#max");
+        put("default", "zai-coding-plan/glm-5.3-flash#high");
+        put("developer", "zai-coding-plan/glm-5.3-flash#high");
+        put("plan-reviewer", "zai-coding-plan/glm-5.3#high");
+        put("code-quality-reviewer", "zai-coding-plan/glm-5.3#high");
+        put("tester", "zai-coding-plan/glm-5.3-flash#high");
         put("analyst", "zai-coding-plan/glm-5.3-flash#high");
         put("analyst-reviewer", "zai-coding-plan/glm-5.3#high");
         put("dreamer", "zai-coding-plan/glm-5.3-flash#high");
@@ -100,8 +102,8 @@ mod tests {
         let m = SpawnModels::canonical();
         assert_eq!(
             m.for_agent(Agent::PlanReviewer),
-            SpawnModel::parse("zai-coding-plan/glm-5.3").unwrap(),
-            "ревьюверы — полный 5.3 (канон 1135)"
+            SpawnModel::parse("zai-coding-plan/glm-5.3#high").unwrap(),
+            "ревьюверы — полный 5.3#high (поручение владельца 18.11, f1b9091c)"
         );
         assert_eq!(
             m.for_agent(Agent::Dreamer),
@@ -109,7 +111,7 @@ mod tests {
         );
         assert_eq!(
             m.for_agent(Agent::Tester),
-            SpawnModel::parse("zai-coding-plan/glm-5.3-flash#max").unwrap()
+            SpawnModel::parse("zai-coding-plan/glm-5.3-flash#high").unwrap()
         );
         assert_eq!(m.for_default(), m.for_agent(Agent::Developer));
     }
