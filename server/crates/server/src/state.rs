@@ -51,9 +51,13 @@ struct StateFile {
     /// «исходная → дример-сессия» — инвариант 1:1 ADR-005 (#1306).
     #[serde(default)]
     dreamer_links: BTreeMap<String, String>,
-    /// Legacy вечных маркеров (эпоха до #1306): мигрирует при загрузке
-    /// в `UpTo(now)`, в новом файле не пишется.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Legacy вечных маркеров (эпоха до #1306): читается со старого ключа,
+    /// мигрирует при загрузке в `UpTo(now)`, в новом файле не пишется.
+    #[serde(
+        default,
+        rename = "dreamer_done",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     legacy_dreamer_done: Vec<String>,
     /// «board:number:slot» → ms последнего спавна (анти-шторм).
     #[serde(default)]
@@ -616,6 +620,70 @@ mod tests {
             s.own_comment("MAC_new"),
             "марка доезжает после легаси-чтения"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dreamer_marks_and_links_persist_across_restart() {
+        // #1306: watermark-метки и связки «исходная → дример-сессия»
+        // переживают рестарт — revival-дообработка не теряется.
+        let dir = std::env::temp_dir().join(format!("uwuwu-state-dream-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        {
+            let s = store(path.clone());
+            s.mark_dreamer("ses_a", DreamerMark::UpTo(100_500));
+            s.mark_dreamer("ses_bot", DreamerMark::Forever);
+            s.link_dreamer_session("ses_a", "ses_dream_a");
+            TickStateStore::save(&s).unwrap();
+        }
+        let s = store(path.clone());
+        assert_eq!(
+            s.dreamer_mark("ses_a"),
+            Some(DreamerMark::UpTo(100_500)),
+            "watermark переживает рестарт"
+        );
+        assert_eq!(s.dreamer_mark("ses_bot"), Some(DreamerMark::Forever));
+        assert_eq!(
+            s.dreamer_session("ses_a").as_deref(),
+            Some("ses_dream_a"),
+            "линк носителя переживает рестарт"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn legacy_dreamer_done_migrates_to_position_marks() {
+        // #1306: legacy вечных маркеров (Vec) мигрирует при загрузке в
+        // UpTo(момент загрузки) — post-deploy revival дообрабатывается,
+        // старые сессии молчат; поле в новом файле не пишется.
+        let dir = std::env::temp_dir().join(format!("uwuwu-state-dream-lg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"rows":{},"dreamer_done":["ses_old1","ses_old2"],"spawns":{}}"#,
+        )
+        .unwrap();
+        let week_ms = 7 * 24 * 60 * 60 * 1000;
+        let s = store_at(path.clone(), 10 * week_ms);
+        assert_eq!(
+            s.dreamer_mark("ses_old1"),
+            Some(DreamerMark::UpTo(10 * week_ms)),
+            "legacy-маркер = позиция момента загрузки"
+        );
+        assert_eq!(
+            s.dreamer_mark("ses_old2"),
+            Some(DreamerMark::UpTo(10 * week_ms))
+        );
+        s.mark_dreamer("ses_new", DreamerMark::UpTo(10 * week_ms + 500));
+        TickStateStore::save(&s).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("\"dreamer_done\""),
+            "legacy-поле в новом файле не пишется"
+        );
+        assert!(raw.contains("\"dreamer\""), "новая секция меток на месте");
         std::fs::remove_dir_all(&dir).ok();
     }
 
