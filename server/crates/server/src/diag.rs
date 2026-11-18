@@ -75,6 +75,20 @@ mod tests {
     }
 
     #[test]
+    fn rollup_garbage_value_is_none_not_panic() {
+        // Контракт snapshot(): мусорный вход → None (не паника) — событие
+        // server.thp уходит с "n/a", бут сервера не ломается.
+        assert_eq!(parse_rollup("AnonHugePages:       abc kB\n"), None);
+        assert_eq!(parse_rollup("AnonHugePages: -42 kB\n"), None);
+    }
+
+    #[test]
+    fn enabled_empty_or_garbage_is_none() {
+        assert_eq!(parse_enabled(""), None);
+        assert_eq!(parse_enabled("AnonHugePages: 0 kB\n"), None);
+    }
+
+    #[test]
     fn snapshot_reads_host_env() {
         // На хосте/в контейнере файлы ядра доступны; проверяем форму, не значение
         let snap = snapshot();
