@@ -6982,6 +6982,7 @@ async fn executor_failure_lands_in_outcome_by_name() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        status_fails: AtomicBool::new(false),
     });
     let sessions = Arc::new(FakeSessions {
         list_fails: true,
@@ -7025,6 +7026,7 @@ async fn named_executor_failure_is_isolated_from_healthy_peer() {
             comments: Vec::default(),
             fields_fails: false,
             set_session_fails: false,
+            status_fails: AtomicBool::new(false),
         }),
         sessions: Arc::new(SessionRouter::new(
             "kisa",
