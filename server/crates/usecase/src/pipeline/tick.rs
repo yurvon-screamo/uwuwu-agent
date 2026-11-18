@@ -6,13 +6,13 @@ use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
 use crate::ports::{Clock, Liveness, PrGateway, TaskBoardRepo, TickStateStore};
 use crate::router::SessionRouter;
+use crate::spawn_models::SpawnModels;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use uwuwu_domain::{
-    decide, gate, spawn_guard, Action, Awaits, Gate, LoopOutcome, ModelRef, Priority,
-    ReviewRoundStep, SessionSighting, Slot, SpawnGuard, SpawnLoop, SpawnPolicy, Status, Task,
-    REVIEW_ROUND_CAP,
+    decide, gate, spawn_guard, Action, Awaits, Gate, LoopOutcome, Priority, ReviewRoundStep,
+    SessionSighting, Slot, SpawnGuard, SpawnLoop, SpawnPolicy, Status, Task, REVIEW_ROUND_CAP,
 };
 
 /// Режим конвейера: observe — только решения в лог; live — исполнение.
@@ -125,8 +125,7 @@ pub struct TickUseCase {
     pub prs: Arc<dyn PrGateway>,
     pub clock: Arc<dyn Clock>,
     pub state: Arc<dyn TickStateStore>,
-    /// Модель спавна (provider, id); None — дефолт исполнителя.
-    pub spawn_model: Option<ModelRef>,
+    pub models: Arc<SpawnModels>,
 }
 
 /// Причина hold спавна: зрение недоступно или в env живая сестра.

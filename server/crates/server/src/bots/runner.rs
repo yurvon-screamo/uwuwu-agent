@@ -251,7 +251,7 @@ async fn ensure_session(deps: &BotDeps) -> UsecaseResult<String> {
         directory: deps.structural.workspace.clone(),
         title: format!("Бот: {}", deps.structural.title),
         agent: AgentSlot::Default,
-        model: Some(ModelRef::new(m.provider.clone(), m.id.clone())),
+        model: ModelRef::new(m.provider.clone(), m.id.clone()),
         variant: m.variant.clone(),
         bootstrap: true,
     };

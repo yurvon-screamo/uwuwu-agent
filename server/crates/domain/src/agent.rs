@@ -89,6 +89,34 @@ impl ModelRef {
     }
 }
 
+/// Модель спавна с вариантом: `provider/id[#variant]` (канон #1154 —
+/// единственный механизм конфигурации моделей: карта сервера в теле
+/// спавна, деф-файлы агентов моделей не несут).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnModel {
+    pub model: ModelRef,
+    pub variant: Option<String>,
+}
+
+impl SpawnModel {
+    /// `provider/id[#variant]` → SpawnModel.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let (prov_id, variant) = raw
+            .split_once('#')
+            .map_or((raw, None), |(p, v)| (p, Some(v.trim().to_string())));
+        let (provider, id) = prov_id
+            .split_once('/')
+            .ok_or("модель не в форме provider/id")?;
+        if provider.trim().is_empty() || id.trim().is_empty() {
+            return Err("модель: пустой provider или id".into());
+        }
+        Ok(Self {
+            model: ModelRef::new(provider.trim(), id.trim()),
+            variant: variant.filter(|v| !v.is_empty()),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
