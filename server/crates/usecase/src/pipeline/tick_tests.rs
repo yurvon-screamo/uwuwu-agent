@@ -3019,7 +3019,7 @@ async fn probe_failure_isolated_per_row_other_rows_processed() {
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
         out.probe_failed, 4,
-        "полоса отказов считается построчно — порог деградации превышен"
+        "полоса отказов считается построчно — ниже порога деградации, изоляция чистая"
     );
     assert_eq!(
         out.soft_pings, 1,
