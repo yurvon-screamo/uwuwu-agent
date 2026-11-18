@@ -1,0 +1,12 @@
+# Таймер пары on-boot refresh (#1312): одно срабатывание через 3 мин после
+# бута (user-manager с linger стартует при загрузке). Семантика таймера —
+# OnBootSec без периодических On*Sec: дальше живёт до следующего бута.
+[Unit]
+Description=Schedule one-shot rathole opencode tunnel refresh after boot
+
+[Timer]
+OnBootSec=3min
+Unit=rathole-opencode-boot-refresh.service
+
+[Install]
+WantedBy=timers.target
