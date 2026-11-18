@@ -8,6 +8,7 @@ mod api;
 mod bots;
 mod clock;
 mod config;
+mod diag;
 mod executor;
 mod gherr;
 #[cfg(test)]
@@ -63,6 +64,19 @@ fn main() -> Result<(), BootError> {
         poll_sec = cfg.poll_sec,
         config = %config_path.display(),
         "Server started"
+    );
+    // Срез A #1294: THP-контекст процесса — вердикт THP-пробы прямым
+    // наблюдением (Railway-метрика = cgroup, THP раздувает cgroup-учёт).
+    let thp = diag::snapshot();
+    tracing::info!(
+        event = "server.thp",
+        thp = thp.thp.as_deref().unwrap_or("n/a"),
+        anon_hugepages_kb = thp
+            .anon_hugepages_kb
+            .map(|v| v.to_string())
+            .as_deref()
+            .unwrap_or("n/a"),
+        "THP snapshot"
     );
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
