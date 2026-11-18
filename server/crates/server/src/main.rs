@@ -10,6 +10,8 @@ mod clock;
 mod config;
 mod diag;
 mod executor;
+#[cfg(test)]
+mod executor_signal_tests;
 mod gherr;
 #[cfg(test)]
 mod gherr_tests;
@@ -26,8 +28,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 use uwuwu_usecase::{
-    Clock as _, IncidentLoudness, TickOutcome, TickUseCase, STALL_INCIDENT_COOLDOWN_MS,
-    STALL_INCIDENT_THRESHOLD, STALL_INCIDENT_WINDOW_MS,
+    Clock as _, ExecutorLoudness, IncidentLoudness, TickOutcome, TickUseCase,
+    EXECUTOR_UNAVAILABLE_COOLDOWN_MS, EXECUTOR_UNAVAILABLE_THRESHOLD,
+    EXECUTOR_UNAVAILABLE_WINDOW_MS, STALL_INCIDENT_COOLDOWN_MS, STALL_INCIDENT_THRESHOLD,
+    STALL_INCIDENT_WINDOW_MS,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -710,6 +714,49 @@ async fn incident_signal(
     }
 }
 
+/// Транспортная деградация executor'а (#1312): отказы union-скана за
+/// скользящее окно — один ТГ-сигнал владельцу per-executor через тот же
+/// инцидент-контур #1281. [notify] не настроен — громкий лог.
+async fn executor_unavailable_signal(
+    notify: &Option<(Arc<dyn uwuwu_usecase::bots::TelegramGateway>, i64)>,
+    incidents: &mut ExecutorLoudness,
+    executor: &str,
+    now_ms: u64,
+) {
+    let Some(incident) = incidents.register_failure(executor, now_ms) else {
+        return;
+    };
+    let text = format!(
+        "⚠︎ uwuwu: executor «{}» недоступен — {} транспортных отказов за {} мин: \
+         дример/CUP деградированы, спавны в hold. Лечение: рестарт rathole-клиента на ноде.",
+        incident.executor,
+        incident.failures_in_window,
+        EXECUTOR_UNAVAILABLE_WINDOW_MS / 60_000,
+    );
+    match notify {
+        Some((tg, chat)) => match tg.send_message(*chat, &text).await {
+            Ok(()) => tracing::warn!(
+                event = "executor.unavailable",
+                executor = %incident.executor,
+                failures = incident.failures_in_window,
+                "Executor-сигнал владельцу отправлен"
+            ),
+            Err(e) => tracing::error!(
+                event = "executor.unavailable_failed",
+                executor = %incident.executor,
+                error = %e,
+                "Executor-сигнал не отправлен"
+            ),
+        },
+        None => tracing::warn!(
+            event = "executor.unavailable_unnotified",
+            executor = %incident.executor,
+            failures = incident.failures_in_window,
+            "Executor недоступен: [notify] не настроен — сигнала нет"
+        ),
+    }
+}
+
 async fn tick_loop(args: TickLoopArgs) {
     let TickLoopArgs {
         poll_sec,
@@ -730,12 +777,29 @@ async fn tick_loop(args: TickLoopArgs) {
         STALL_INCIDENT_WINDOW_MS,
         STALL_INCIDENT_COOLDOWN_MS,
     );
+    // Громкость деградации executor'ов (#1312): per-executor инциденты —
+    // те же параметры окна, что у сталла; окно неперсистентно осознанно
+    // («рестарт = свежее окно», философия ADR-107).
+    let mut executor_incidents = ExecutorLoudness::new(
+        EXECUTOR_UNAVAILABLE_THRESHOLD,
+        EXECUTOR_UNAVAILABLE_WINDOW_MS,
+        EXECUTOR_UNAVAILABLE_COOLDOWN_MS,
+    );
     loop {
         let started = std::time::Instant::now();
         match usecase.run(&plan).await {
             Ok(outcome) => {
                 for _ in 0..outcome.stall_flagged {
                     incident_signal(&notify, &mut loudness, clock.now_ms()).await;
+                }
+                for executor in &outcome.executors_failed {
+                    executor_unavailable_signal(
+                        &notify,
+                        &mut executor_incidents,
+                        executor,
+                        clock.now_ms(),
+                    )
+                    .await;
                 }
                 *shared.write().expect("tick lock") = outcome;
             }

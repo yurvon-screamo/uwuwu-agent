@@ -30,6 +30,8 @@ pub use naming::{
     schedule_label, slot_key, status_name, task_type_name, F_AUTOMERGE, F_PRIORITY, TASK_TYPES,
 };
 pub use pipeline::{
+    executor::ExecutorLoudness, executor::EXECUTOR_UNAVAILABLE_COOLDOWN_MS,
+    executor::EXECUTOR_UNAVAILABLE_THRESHOLD, executor::EXECUTOR_UNAVAILABLE_WINDOW_MS,
     incident::IncidentLoudness, incident::STALL_INCIDENT_COOLDOWN_MS,
     incident::STALL_INCIDENT_THRESHOLD, incident::STALL_INCIDENT_WINDOW_MS, AnalystBoard,
     AnalystReviewUseCase, AnalystUseCase, BoardPlan, DreamerUseCase, Mode, TickOutcome, TickPlan,

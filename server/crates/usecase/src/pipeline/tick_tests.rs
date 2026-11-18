@@ -6622,3 +6622,88 @@ async fn cup_idle_low_row_not_preempted_when_cap_held_by_others() {
         "спящая сессия не удаляется"
     );
 }
+
+/// Транспортный отказ executor'а — факт тика поимённо (#1312): громкость
+/// (порог/анти-повтор) и ТГ-сигнал живут в tick_loop (main.rs), тик несёт
+/// имена отказавших — один источник факта, дубль-детекции нет.
+#[tokio::test]
+async fn executor_failure_lands_in_outcome_by_name() {
+    let board = Arc::new(FakeBoard {
+        rows: vec![],
+        log: Mutex::default(),
+        comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
+    });
+    let sessions = Arc::new(FakeSessions {
+        list_fails: true,
+        ..FakeSessions::new()
+    });
+    let u = TickUseCase {
+        board,
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+            probes: Mutex::default(),
+        }),
+        clock: Arc::new(FixedClock),
+        state: Arc::new(MemState(Mutex::default())),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        boot_ms: 0,
+    };
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.executors_failed,
+        vec!["default".to_string()],
+        "отказ union-скана — имя executor'а в outcome"
+    );
+}
+
+/// Отказ named-исполнителя изолирован от здорового пира (#1263-карта,
+/// #1312): в отказ-список попадает только реальный виновник — сигнал
+/// громкости не назовёт здорового.
+#[tokio::test]
+async fn named_executor_failure_is_isolated_from_healthy_peer() {
+    let default_gw = Arc::new(FakeSessions::new());
+    let named_gw = Arc::new(FakeSessions {
+        list_fails: true,
+        ..FakeSessions::new()
+    });
+    let u = TickUseCase {
+        board: Arc::new(FakeBoard {
+            rows: vec![],
+            log: Mutex::default(),
+            comments: Vec::default(),
+            fields_fails: false,
+            set_session_fails: false,
+        }),
+        sessions: Arc::new(SessionRouter::new(
+            "kisa",
+            default_gw.clone(),
+            vec![(
+                "1xgames".to_string(),
+                named_gw.clone() as Arc<dyn AgentSessionGateway>,
+            )],
+            std::collections::HashMap::from([(
+                "1xgames".to_string(),
+                named_gw.clone() as Arc<dyn AgentSessionGateway>,
+            )]),
+        )),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+            probes: Mutex::default(),
+        }),
+        clock: Arc::new(FixedClock),
+        state: Arc::new(MemState(Mutex::default())),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        boot_ms: 0,
+    };
+    let out = u.run(&routed_plan(Mode::Live)).await.unwrap();
+    assert_eq!(
+        out.executors_failed,
+        vec!["1xgames".to_string()],
+        "здоровый пир не попадает в отказ-список"
+    );
+}
