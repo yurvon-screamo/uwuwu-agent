@@ -14,6 +14,9 @@ mod router;
 #[cfg(test)]
 mod router_tests;
 mod search;
+#[cfg(test)]
+mod spawn_model_tests;
+pub mod spawn_models;
 mod tasks;
 
 pub use bots::{
@@ -39,6 +42,7 @@ pub use ports::{
 };
 pub use router::SessionRouter;
 pub use search::{sync_allowed, SearchHit, SearchUseCase, SemanticBackend};
+pub use spawn_models::SpawnModels;
 pub use tasks::body_hash;
 pub use tasks::views::{DocsView, PersonView, TaskView, ViewError};
 pub use tasks::write::{

@@ -17,12 +17,18 @@ name = "kisa"
 url = "https://opencode.uwuwu.net"
 # basic-пароль опенкода: env UWUWU_OPENCODE_PASSWORD
 
-[executor.spawn_model]
-provider = "zai-coding-plan"
-id = "glm-5.3-flash"
+[executor.models]
+default = "zai-coding-plan/glm-5.3-flash#high"
+developer = "zai-coding-plan/glm-5.3-flash#high"
+plan-reviewer = "zai-coding-plan/glm-5.3#high"
+code-quality-reviewer = "zai-coding-plan/glm-5.3#high"
+tester = "zai-coding-plan/glm-5.3-flash#high"
+analyst = "zai-coding-plan/glm-5.3-flash#high"
+analyst-reviewer = "zai-coding-plan/glm-5.3#high"
+dreamer = "zai-coding-plan/glm-5.3-flash#high"
 
 [policy]
-cup = 12
+cup = 7
 # пик-окно GLM: будни 06:00–10:00 UTC (минуты от полуночи UTC), off = false
 peak = { enabled = true, start_min = 360, end_min = 600 }
 

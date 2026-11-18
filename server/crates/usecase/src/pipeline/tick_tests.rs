@@ -732,7 +732,7 @@ fn usecase_with_state(
         prs: prs.clone(),
         clock: Arc::new(FixedClock),
         state,
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
     };
     (u, board, sessions, prs)
@@ -797,7 +797,7 @@ fn peak_usecase(
         prs: prs.clone(),
         clock: Arc::new(PeakClock),
         state,
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
     };
     (u, board, sessions, prs)
@@ -829,7 +829,7 @@ fn usecase_with_sessions(
         prs: prs.clone(),
         clock: Arc::new(FixedClock),
         state,
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
     };
     (u, board, sessions, prs)
@@ -851,6 +851,202 @@ impl Clock for PeakClock {
 
 fn task(n: u64, status: Status) -> Task {
     Task::new(n, format!("t{n}"), status)
+}
+
+/// Роутинг тика «проект → executor» (#1248): юзкейс на двух фейк-гейтвеях
+/// (дефолт kisa + named redmi), проект → named — как memory-multi конфиг.
+/// Возвращает юзкейс и оба гейтвея (default, named).
+fn routed_usecase(
+    rows: Vec<Task>,
+    comments: Vec<CommentRef>,
+    clock: Arc<dyn Clock>,
+    default_gw: Arc<FakeSessions>,
+    named_gw: Arc<FakeSessions>,
+) -> TickUseCase {
+    TickUseCase {
+        board: Arc::new(FakeBoard {
+            rows,
+            log: Mutex::default(),
+            comments,
+            fields_fails: false,
+            set_session_fails: false,
+        }),
+        sessions: Arc::new(SessionRouter::new(
+            "kisa",
+            default_gw.clone(),
+            Vec::new(),
+            std::collections::HashMap::from([(
+                "1xgames".to_string(),
+                named_gw.clone() as Arc<dyn AgentSessionGateway>,
+            )]),
+        )),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+            probes: Mutex::default(),
+        }),
+        clock,
+        state: Arc::new(MemState(Mutex::default())),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+    }
+}
+
+/// План тика с routed-доской (проект 1xgames).
+fn routed_plan(mode: Mode) -> TickPlan {
+    TickPlan {
+        mode,
+        policy: SpawnPolicy {
+            cup: 7,
+            peak: PeakWindow {
+                enabled: false,
+                start_min: 0,
+                end_min: 0,
+            },
+        },
+        boards: vec![BoardPlan {
+            project: "1xgames".into(),
+            board: "B".into(),
+            repo: "a/c".into(),
+            checkout: "/tmp/checkout".into(),
+            env_root: "/tmp/env".into(),
+        }],
+    }
+}
+
+/// Пин lifecycle-роутинга (#1248): Design-спавн routed-проекта — create
+/// (bootstrap и рабочая) И начальный prompt уходят в один гейтвей —
+/// исполнителя проекта; дефолтный prompt не получил вовсе.
+#[tokio::test]
+async fn spawn_design_routes_create_and_initial_prompt_to_project_executor() {
+    let default_gw = Arc::new(FakeSessions::new());
+    let named_gw = Arc::new(FakeSessions::new());
+    let u = routed_usecase(
+        vec![task(438, Status::Design)],
+        Vec::new(),
+        Arc::new(FixedClock),
+        default_gw.clone(),
+        named_gw.clone(),
+    );
+    let out = u.run(&routed_plan(Mode::Live)).await.unwrap();
+    assert_eq!(out.spawns_done, 1, "Design-строка заспавнена");
+    // bootstrap + рабочая сессия — на исполнителе проекта
+    assert_eq!(
+        named_gw.specs.lock().unwrap().len(),
+        2,
+        "create_session на named-исполнителе (bootstrap + рабочая)"
+    );
+    assert!(
+        default_gw.specs.lock().unwrap().is_empty(),
+        "дефолт не создаёт сессии routed-проекта"
+    );
+    // начальный prompt рабочей сессии — на исполнителе проекта
+    let named_prompts = named_gw.prompts.lock().unwrap();
+    assert_eq!(
+        named_prompts.len(),
+        1,
+        "начальный prompt на named-исполнителе, получено: {named_prompts:?}"
+    );
+    let (session, _) = named_prompts[0].split_once('|').expect("session|text");
+    let named_ids = named_gw.spawned.lock().unwrap();
+    assert!(
+        named_ids.contains(&session.to_string()),
+        "промптится сессия, созданная на том же исполнителе"
+    );
+    assert!(
+        default_gw.prompts.lock().unwrap().is_empty(),
+        "дефолтный гейтвей начальный prompt НЕ получил"
+    );
+}
+
+/// Пин lifecycle-роутинга (#1248): будильник живой stage-сессии routed-проекта
+/// ходит в гейтвей проекта; дефолтный prompt не получил.
+#[tokio::test]
+async fn wakeup_prompt_routes_to_project_executor() {
+    let mut t = task(440, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dev_live").unwrap(),
+    );
+    t.apply_fields(f);
+    let default_gw = Arc::new(FakeSessions::new());
+    // активность сессии старше коммента — fresh-доставка
+    let named_gw = Arc::new(FakeSessions {
+        activity_ms: Some(1000),
+        ..FakeSessions::new()
+    });
+    let u = routed_usecase(
+        vec![t],
+        vec![CommentRef {
+            id: "c1".into(),
+            created_ms: 3000,
+            body: "свежий коммент".into(),
+        }],
+        Arc::new(FixedClock),
+        default_gw.clone(),
+        named_gw.clone(),
+    );
+    let out = u.run(&routed_plan(Mode::Live)).await.unwrap();
+    assert_eq!(out.wakeups, 1, "будильник доставлен");
+    let named_prompts = named_gw.prompts.lock().unwrap();
+    assert!(
+        named_prompts.iter().any(|p| p.contains("Wakeup")),
+        "wakeup-prompt на гейтвее проекта: {named_prompts:?}"
+    );
+    assert!(
+        default_gw.prompts.lock().unwrap().is_empty(),
+        "дефолтный гейтвей wakeup-prompt НЕ получил"
+    );
+}
+
+/// Пин lifecycle-роутинга (#1248): мягкий сталл-пинг (прямой промпт) уходит
+/// в гейтвей проекта; дефолтный prompt не получил.
+#[tokio::test]
+async fn soft_ping_prompt_routes_to_project_executor() {
+    struct BigClock;
+    impl Clock for BigClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            100_000_000
+        }
+    }
+    let mut t = task(441, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dev_idle").unwrap(),
+    );
+    t.apply_fields(f);
+    let default_gw = Arc::new(FakeSessions::new());
+    // молчание 16 мин, ход завершён (idle) — мягкий пинг прямым промптом
+    let named_gw = Arc::new(FakeSessions {
+        activity_ms: Some(100_000_000 - 16 * 60_000),
+        idle_reply: true,
+        ..FakeSessions::new()
+    });
+    let u = routed_usecase(
+        vec![t],
+        Vec::new(),
+        Arc::new(BigClock),
+        default_gw.clone(),
+        named_gw.clone(),
+    );
+    let out = u.run(&routed_plan(Mode::Live)).await.unwrap();
+    assert_eq!(out.soft_pings, 1, "мягкий пинг ушёл");
+    let named_prompts = named_gw.prompts.lock().unwrap();
+    assert!(
+        named_prompts.iter().any(|p| p.contains("Мягкий пинг")),
+        "soft-ping на гейтвее проекта: {named_prompts:?}"
+    );
+    assert!(
+        default_gw.prompts.lock().unwrap().is_empty(),
+        "дефолтный гейтвей soft-ping НЕ получил"
+    );
 }
 
 /// Задача In Progress с живой дев-сессией (wake-сценарии #1204).
@@ -907,7 +1103,7 @@ fn wake_usecase(
         }),
         clock: Arc::new(FixedClock),
         state: state.clone(),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
     };
     (u, sessions, state)
@@ -1471,6 +1667,36 @@ async fn branchless_real_pull_url_also_waits_for_owner() {
 }
 
 #[tokio::test]
+async fn artifact_url_with_branch_waits_for_owner() {
+    // #1286: docs-only с фабричной веткой и артефакт-URL (wiki — инстанс
+    // #1159) в PR-ячейке — гейт не пускает строку в automerge-пробу:
+    // probe не зовётся, bounce «ветка есть, PR не найден» не случается,
+    // строка ждёт владельца в Review. Интеграционный провод доменного
+    // гейта (decide → Observe) до мок-hubа: на master тест был красным
+    // (Automerge → probe → bounce).
+    let mut t = task(21, Status::UserReview);
+    t.set_automerge(true);
+    let mut f = TaskFields::default();
+    f.set_branch(BranchName::parse("work/task-1159").unwrap());
+    f.open_pr(PrUrl::parse("https://github.com/a/c/wiki/Runbook").unwrap())
+        .unwrap();
+    t.apply_fields(f);
+    let (u, board, _, prs) = usecase(vec![t], PrState::Missing);
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert!(
+        prs.probes.lock().unwrap().is_empty(),
+        "URL не PR-формы — проба не зовётся вовсе"
+    );
+    let log = board.log.lock().unwrap();
+    assert!(
+        !log.iter()
+            .any(|l| l.contains("status#21") || l.contains("comment#21")),
+        "docs-only с веткой не бончится: {log:?}"
+    );
+    assert!(!log.iter().any(|l| l.contains("close#21")));
+}
+
+#[tokio::test]
 async fn observe_does_not_charge_spawn_loops() {
     // Инцидент #1046 (15.11): observe-тики заряжали счётчик спавн-петли
     // (set_spawn_loop звался до Live-гейта) — live эскалировал строку
@@ -1801,7 +2027,7 @@ async fn mixed_health_candidate_decided_by_status_fallback_at_cup_gate() {
             prs: prs.clone(),
             clock: Arc::new(FixedClock),
             state: Arc::new(MemState(Mutex::default())),
-            spawn_model: None,
+            models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
             boot_ms: 0,
         }
     };
@@ -1860,7 +2086,7 @@ async fn foreign_executor_failure_does_not_blind_project_guard() {
         prs: prs.clone(),
         clock: Arc::new(FixedClock),
         state,
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
@@ -1993,7 +2219,7 @@ async fn wakeup_held_when_cup_full() {
         prs: prs.clone(),
         clock: Arc::new(FixedClock),
         state: state.clone(),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
     };
     let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
@@ -2062,7 +2288,7 @@ async fn wakeup_delivery_occupies_cup_slot() {
         prs: prs.clone(),
         clock: Arc::new(FixedClock),
         state: state.clone(),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
     };
     let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
@@ -2375,7 +2601,7 @@ async fn undelivered_comment_is_not_marked_seen() {
             prs: prs.clone(),
             clock: Arc::new(FixedClock),
             state: state.clone(),
-            spawn_model: None,
+            models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
             boot_ms: 0,
         };
         (uc, board, sess, prs)
@@ -2439,7 +2665,7 @@ async fn undelivered_comment_is_not_marked_seen() {
         }),
         clock: Arc::new(FixedClock),
         state,
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
     };
     let out = u2.run(&plan(Mode::Live, 7)).await.unwrap();
@@ -2514,7 +2740,7 @@ async fn multi_comment_tail_delivered_together() {
         }),
         clock: Arc::new(FixedClock),
         state: state.clone(),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
@@ -2577,7 +2803,7 @@ async fn inflight_comment_delivered_after_agent_reply() {
         }),
         clock: Arc::new(FixedClock),
         state,
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
@@ -2643,7 +2869,7 @@ async fn busy_session_not_pinged_early() {
         }),
         clock: Arc::new(BigClock),
         state: Arc::new(MemState(Mutex::default())),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
@@ -2703,7 +2929,7 @@ async fn soft_ping_wakes_idle_session_without_transaction() {
         }),
         clock: Arc::new(BigClock),
         state: Arc::new(MemState(Mutex::default())),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
@@ -3227,7 +3453,7 @@ async fn idle_sessions_do_not_hold_cup() {
         prs: prs.clone(),
         clock: Arc::new(FixedClock),
         state,
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
@@ -3379,6 +3605,7 @@ async fn analyst_multiboard_no_oversell_within_tick() {
         sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         state,
         clock: Arc::new(FixedClock),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         cup: 2,
     };
     let spawned = u.tick().await.unwrap();
@@ -3411,6 +3638,7 @@ macro_rules! sidecar_uc_with_cup {
                 sessions: Arc::new(SessionRouter::uniform(sessions)),
                 state,
                 clock: Arc::new(FixedClock),
+                models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
                 cup,
             };
             (u, board.clone())
@@ -3567,7 +3795,7 @@ async fn dreamer_held_when_cup_full() {
         sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         state: Arc::new(MemState(Mutex::default())),
         clock: Arc::new(BigClock),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         checkout: "/tmp/checkout".into(),
         cup: 1,
     };
@@ -3598,7 +3826,14 @@ async fn analyst_wave_one_session_for_all_rows() {
         specs[0].directory, "/tmp/checkout",
         "мастер-чекаут, без env"
     );
-    assert!(specs[0].model.is_none(), "модель несёт деф-файл");
+    assert_eq!(
+        specs[0].model,
+        uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.3-flash#high")
+            .unwrap()
+            .model,
+        "модель аналитика — карта сервера (#1154)"
+    );
+    assert_eq!(specs[0].variant.as_deref(), Some("high"));
     // Todo-строка мимо волны; обе Analys-строки в пачке, счётчик первой попытки
     let inner = state.0.lock().unwrap();
     assert_eq!(inner.analys_loops.len(), 2, "только строки волны");
@@ -3784,6 +4019,7 @@ async fn analyst_verdictless_waves_do_not_burn_cycles() {
         sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         state: state.clone(),
         clock: clock.clone(),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         cup: 7,
     };
     // четыре волны подряд (сессия аналитика гибнет без вердикта, строка
@@ -3897,6 +4133,7 @@ async fn analyst_three_real_rounds_escalate_with_honest_message() {
         sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         state: state.clone(),
         clock: clock.clone(),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         cup: 7,
     };
     let pair = |state: &Arc<MemState>| {
@@ -3994,7 +4231,14 @@ async fn reviewer_spawns_for_review_analys_wave() {
         specs[0].agent,
         AgentSlot::Role(Agent::AnalystReviewer)
     ));
-    assert!(specs[0].model.is_none(), "модель несёт деф-файл");
+    assert_eq!(
+        specs[0].model,
+        uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.3#high")
+            .unwrap()
+            .model,
+        "модель ревьювера аналитики — карта сервера (#1154)"
+    );
+    assert_eq!(specs[0].variant.as_deref(), Some("high"));
 }
 
 #[tokio::test]
@@ -4308,6 +4552,7 @@ async fn analyst_wave_per_board_own_checkout_and_project() {
         sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         state: Arc::new(MemState(Mutex::default())),
         clock: Arc::new(FixedClock),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         cup: 7,
     };
     assert_eq!(u.tick().await.unwrap(), 2, "по сессии на доску");
@@ -4485,6 +4730,7 @@ async fn prune_skipped_when_a_board_read_fails() {
         sessions: Arc::new(SessionRouter::uniform(sessions)),
         state: state.clone(),
         clock: Arc::new(FixedClock),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         cup: 7,
     };
     u.tick().await.unwrap();
@@ -4769,7 +5015,7 @@ async fn dreamer_title_carries_marker() {
         sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         state: Arc::new(MemState(Mutex::default())),
         clock: Arc::new(FarClock(AtomicU64::new(2_000_000))), // > idle-порога 30 мин
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         checkout: "/tmp/checkout".into(),
         cup: 7,
     };
@@ -4824,7 +5070,7 @@ fn tick_with_clock(
         prs: prs.clone(),
         clock,
         state,
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
     };
     (u, board, sessions, prs)
@@ -5019,7 +5265,7 @@ async fn enrichment_failure_skips_row() {
         }),
         clock: Arc::new(FixedClock),
         state: Arc::new(MemState(Mutex::default())),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
@@ -5056,7 +5302,7 @@ async fn orphan_deleted_when_set_session_fails() {
         }),
         clock: Arc::new(FixedClock),
         state: Arc::new(MemState(Mutex::default())),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
@@ -5417,7 +5663,7 @@ async fn round_stale_reset_gives_true_fresh_round_two_pings_before_escalation() 
         }),
         clock: Arc::new(SettableClock(now.clone())),
         state: Arc::new(seeded),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: BOOT,
     };
     // тик 1 (сразу после рестарта): раунд чужой — сброс + свежий пинг
@@ -5449,6 +5695,69 @@ async fn round_stale_reset_gives_true_fresh_round_two_pings_before_escalation() 
         "подпись считает пинги ТЕКУЩЕГО процесса (2), а не persisted-мусор: {comment}",
     );
 }
+#[tokio::test]
+async fn stage_spawn_carries_model_from_server_map() {
+    // #1154 (решение владельца 17.11): модель спавна — карта сервера
+    // (SpawnModels), каждый спавн несёт её в теле сессии; деф-файлы
+    // агентов моделей не несут. Dev-стадия — default-ключ карты.
+    // Arrange
+    let (u, _, sessions, _) = usecase(vec![task(1, Status::InProgress)], PrState::Missing);
+
+    // Act
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+
+    // Assert
+    assert_eq!(out.spawns_done, 1, "спавн стадии состоялся");
+    let specs = sessions.specs.lock().unwrap();
+    assert_eq!(specs.len(), 2, "bootstrap + work");
+    let want = uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.3-flash#high").unwrap();
+    for spec in specs.iter() {
+        assert_eq!(spec.model, want.model, "модель спавна = default карты");
+        assert_eq!(spec.variant, want.variant, "default — вариант карты");
+    }
+}
+
+#[tokio::test]
+async fn review_and_test_spawns_carry_map_models_per_agent() {
+    // Low-пин ревью R5: for_agent-ветка spawn_stage_inner (PlanReview/
+    // ResultReview/Test) — модель каждой роли из карты, не дефолт.
+    // Arrange: по строке на стадию без сессии слота
+    let cases = [
+        (
+            Status::ReviewPlan,
+            "plan-reviewer",
+            "zai-coding-plan/glm-5.3#high",
+        ),
+        (
+            Status::ReviewResult,
+            "code-quality-reviewer",
+            "zai-coding-plan/glm-5.3#high",
+        ),
+        (
+            Status::Testing,
+            "tester",
+            "zai-coding-plan/glm-5.3-flash#high",
+        ),
+    ];
+    for (status, agent_name, raw) in cases {
+        let (u, _, sessions, _) = usecase(vec![task(5, status)], PrState::Missing);
+        let want = uwuwu_domain::SpawnModel::parse(raw).unwrap();
+
+        // Act
+        let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+
+        // Assert
+        assert_eq!(out.spawns_done, 1, "{agent_name}: спавн состоялся");
+        let specs = sessions.specs.lock().unwrap();
+        let work = specs
+            .iter()
+            .find(|s| !s.bootstrap)
+            .expect("рабочая сессия в спеках");
+        assert_eq!(work.model, want.model, "{agent_name}: модель из карты");
+        assert_eq!(work.variant, want.variant, "{agent_name}: вариант из карты");
+    }
+}
+
 // ---- преемпшен CUP: понижение приоритета отдаёт слот (#1259) ----
 
 /// Активная строка с привязанной dev-сессией (busy-актив при

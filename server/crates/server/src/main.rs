@@ -8,6 +8,7 @@ mod api;
 mod bots;
 mod clock;
 mod config;
+mod diag;
 mod executor;
 mod gherr;
 #[cfg(test)]
@@ -66,6 +67,19 @@ fn main() -> Result<(), BootError> {
         poll_sec = cfg.poll_sec,
         config = %config_path.display(),
         "Server started"
+    );
+    // Срез A #1294: THP-контекст процесса — вердикт THP-пробы прямым
+    // наблюдением (Railway-метрика = cgroup, THP раздувает cgroup-учёт).
+    let thp = diag::snapshot();
+    tracing::info!(
+        event = "server.thp",
+        thp = thp.thp.as_deref().unwrap_or("n/a"),
+        anon_hugepages_kb = thp
+            .anon_hugepages_kb
+            .map(|v| v.to_string())
+            .as_deref()
+            .unwrap_or("n/a"),
+        "THP snapshot"
     );
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -212,18 +226,27 @@ async fn run(
     let prs = Arc::new(github::GhPrGateway::new(secrets.gh_token.clone()));
     let state_path = cfg.state_path(&config_path);
     let state = Arc::new(state::JsonStateStore::load(state_path, clock.clone()));
-    let spawn_model_cfg = cfg
-        .executor
-        .spawn_model
-        .as_ref()
-        .map(|m| uwuwu_domain::ModelRef::new(m.provider.clone(), m.id.clone()));
+    let spawn_models = Arc::new(match cfg.executor.models.as_ref() {
+        Some(raw) => {
+            let mut map = std::collections::HashMap::new();
+            for (key, model) in raw {
+                map.insert(
+                    key.clone(),
+                    uwuwu_domain::SpawnModel::parse(model)
+                        .map_err(|e| format!("[executor.models] {key}: {e}"))?,
+                );
+            }
+            uwuwu_usecase::SpawnModels::new(map)
+        }
+        None => uwuwu_usecase::SpawnModels::canonical(),
+    });
     let usecase = Arc::new(TickUseCase {
         board: board.clone(),
         sessions: sessions.clone(),
         prs: prs.clone(),
         clock: clock.clone(),
         state: state.clone(),
-        spawn_model: spawn_model_cfg.clone(),
+        models: spawn_models.clone(),
         boot_ms: clock.now_ms(),
     });
 
@@ -326,7 +349,7 @@ async fn run(
             wiki: wiki.clone(),
             sessions: sessions.clone(),
             clock: clock.clone(),
-            spawn_model: spawn_model_cfg.clone(),
+            models: spawn_models.clone(),
             checkout: plan
                 .boards
                 .first()
@@ -368,7 +391,7 @@ async fn run(
             wiki: wiki.clone(),
             sessions: sessions.clone(),
             clock: clock.clone(),
-            spawn_model: spawn_model_cfg.clone(),
+            models: spawn_models.clone(),
             checkout: checkout.clone(),
             cup: plan.policy.cup,
         });
@@ -406,6 +429,7 @@ async fn run(
             sessions: sessions.clone(),
             state: state.clone(),
             clock: clock.clone(),
+            models: spawn_models.clone(),
             cup: plan.policy.cup,
         });
         let analyst_review = Arc::new(uwuwu_usecase::AnalystReviewUseCase {
@@ -414,13 +438,14 @@ async fn run(
             sessions: sessions.clone(),
             state: state.clone(),
             clock: clock.clone(),
+            models: spawn_models.clone(),
             cup: plan.policy.cup,
         });
         let dreamer = Arc::new(uwuwu_usecase::DreamerUseCase {
             sessions: sessions.clone(),
             state: state.clone(),
             clock: clock.clone(),
-            spawn_model: spawn_model_cfg.clone(),
+            models: spawn_models.clone(),
             checkout: boards_info
                 .first()
                 .map(|(_, _, checkout)| checkout.clone())

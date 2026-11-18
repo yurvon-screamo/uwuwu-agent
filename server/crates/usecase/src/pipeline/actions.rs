@@ -41,14 +41,15 @@ impl TickUseCase {
         let sessions = self.sessions.project(&board.project);
         let env_repo = board.env_repo_dir(task.number());
         let title = session_title(task, slot);
+        let boot_model = self.models.for_default();
         let bootstrap = sessions
             .create_session(&SessionSpec {
                 directory: board.checkout.clone(),
                 title: format!("bootstrap {title}"),
                 custom_agent: None,
                 agent: AgentSlot::Default,
-                model: self.spawn_model.clone(),
-                variant: None,
+                model: boot_model.model,
+                variant: boot_model.variant,
                 bootstrap: true,
             })
             .await?;
@@ -87,14 +88,18 @@ impl TickUseCase {
         self.board
             .set_branch(&board.board, task.number(), &branch)
             .await?;
+        let work_model = match Agent::of_slot(slot) {
+            Some(agent) => self.models.for_agent(agent),
+            None => self.models.for_default(),
+        };
         let work = sessions
             .create_session(&SessionSpec {
                 directory: env_repo.to_string(),
                 title: session_title(task, slot),
                 custom_agent: None,
                 agent: AgentSlot::of(Agent::of_slot(slot)),
-                model: self.spawn_model.clone(),
-                variant: None,
+                model: work_model.model,
+                variant: work_model.variant,
                 bootstrap: false,
             })
             .await?;
@@ -437,7 +442,8 @@ impl TickUseCase {
     /// всегда за владельцем) / bounce в работу. Ветка без PR — возврат в
     /// работу (PR ещё не создан); docs-only до сюда не доходит (домен
     /// automerge_ready не прощупывает безветочные ячейки — Vcs::Local и
-    /// Artifact, #1155: мержить нечего, строка ждёт владельца).
+    /// Artifact, #1155 — и PR-ячейки с URL не PR-формы: wiki/issues/blob
+    /// с фабричной веткой, #1286 — мержить нечего, строка ждёт владельца).
     /// Возвращает true — PR смержен этим вызовом (счётчик тика).
     pub async fn automerge(&self, board: &BoardPlan, task: &Task) -> UsecaseResult<bool> {
         use crate::ports::PrState;
