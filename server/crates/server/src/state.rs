@@ -94,13 +94,28 @@ impl JsonStateStore {
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok())
             .unwrap_or_default();
-        // Миграция legacy вечных маркеров (#1306): позиция = момент
-        // загрузки — revival'ы после деплоя дообрабатываются, старые
-        // сессии молчат (шторм повторных дримов исключён).
+        // Миграция legacy вечных маркеров (#1306) с разбором когорт:
+        // в старом векторе лежали и рабочие сессии, и бот-сессии (старый
+        // раннер маркировал их как вечный скип). Бот-когорта (id из
+        // реестра `bots[*].session`) сохраняет Forever — иначе живой бот
+        // после деплоя становится перманентным кандидатом дримера
+        // (сообщение → idle → дрим → снова, ревью #1306). Рабочие
+        // сессии — UpTo(момент загрузки): revival'ы после деплоя
+        // дообрабатываются, старые сессии молчат (шторм исключён).
         if !state.legacy_dreamer_done.is_empty() {
             let boot = clock.now_ms();
+            let bot_sessions: std::collections::HashSet<&String> = state
+                .bots
+                .values()
+                .filter_map(|bot| bot.session.as_ref())
+                .collect();
             for id in state.legacy_dreamer_done.drain(..) {
-                state.dreamer.entry(id).or_insert(DreamerMark::UpTo(boot));
+                let mark = if bot_sessions.contains(&id) {
+                    DreamerMark::Forever
+                } else {
+                    DreamerMark::UpTo(boot)
+                };
+                state.dreamer.entry(id).or_insert(mark);
             }
         }
         Self {
@@ -684,6 +699,39 @@ mod tests {
             "legacy-поле в новом файле не пишется"
         );
         assert!(raw.contains("\"dreamer\""), "новая секция меток на месте");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn legacy_migration_keeps_forever_skip_for_bot_sessions() {
+        // #1306 (ревью, high): в legacy-векторе лежали и бот-сессии
+        // (старый раннер маркировал их как вечный скип). Когорта ботов —
+        // по реестру `bots[*].session` — сохраняет Forever: иначе живой
+        // бот после деплоя становится перманентным кандидатом дримера
+        // (каждое сообщение поднимает updated_ms выше позиции).
+        let dir =
+            std::env::temp_dir().join(format!("uwuwu-state-dream-lgb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"rows":{},"dreamer_done":["ses_bot_alive","ses_work"],
+                "spawns":{},
+                "bots":{"Projects/uwuwu/Боты/Помощник":{"session":"ses_bot_alive","offset":5}}}"#,
+        )
+        .unwrap();
+        let week_ms = 7 * 24 * 60 * 60 * 1000;
+        let s = store_at(path.clone(), 10 * week_ms);
+        assert_eq!(
+            s.dreamer_mark("ses_bot_alive"),
+            Some(DreamerMark::Forever),
+            "легаси-бот — вечный скип, не кандидат даже при активности"
+        );
+        assert_eq!(
+            s.dreamer_mark("ses_work"),
+            Some(DreamerMark::UpTo(10 * week_ms)),
+            "рабочая сессия — позиция момента загрузки"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
