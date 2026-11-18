@@ -754,8 +754,10 @@ mod tests {
             state: Arc::new(crate::pipeline::tick_tests::MemState::empty()),
         };
         // строка 5 переименовывается в тайтл холодной #1243 — отказ
-        let mut p = TaskPatch::default();
-        p.title = Some("тайтл архивной задачи".into());
+        let p = TaskPatch {
+            title: Some("тайтл архивной задачи".into()),
+            ..Default::default()
+        };
         let err = u
             .edit("uwuwu", 5, p)
             .await
