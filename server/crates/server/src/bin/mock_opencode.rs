@@ -9,6 +9,10 @@
 //!   storm  — сессии мгновенно прерываются с 0 токенов (пустышки —
 //!            проверка SpawnLoop/attention/дример-фильтра)
 //!   dead   — созданные сессии сразу 404 (dead-respawn путь)
+//!   gate   — гейт-заглушка #1160: исполнитель жив, но без-cookie гейт
+//!            отдаёт 200 + text/html «Войти» на GET и 405 без тела на
+//!            POST (живая проба Caddy @nologin) — окно заглушки: скан
+//!            не «успешно пуст», а Err → слепой hold спавна
 //!
 //! Env: MOCK_MODE (деф. plain), MOCK_PORT (8099), MOCK_STEP_MS (1500),
 //!      MOCK_MCP_URL (http://127.0.0.1:8090), MOCK_MCP_TOKEN («»),
@@ -20,6 +24,7 @@
 use axum::{
     extract::{Path, Query},
     http::{HeaderMap, StatusCode},
+    response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -234,7 +239,14 @@ async fn main() {
                     let counter = counter.clone();
                     let salt = salt;
                     let mode = mode.clone();
-                    async move { create_session(store, counter, salt, mode, headers, body).await }
+                    async move {
+                        if mode == "gate" {
+                            return gate_post_reject();
+                        }
+                        create_session(store, counter, salt, mode, headers, body)
+                            .await
+                            .into_response()
+                    }
                 }
             }),
         )
@@ -242,21 +254,43 @@ async fn main() {
             "/api/session",
             get({
                 let store = store.clone();
-                move |q: Query<ListQuery>| list_sessions(store, q)
+                let mode = mode.clone();
+                move |q: Query<ListQuery>| {
+                    let store = store.clone();
+                    let mode = mode.clone();
+                    async move {
+                        if mode == "gate" {
+                            return gate_stub();
+                        }
+                        list_sessions(store, q).await.into_response()
+                    }
+                }
             }),
         )
         .route(
             "/api/session/{id}",
             get({
                 let store = store.clone();
-                move |Path(id): Path<String>| get_session(store, id)
+                let mode = mode.clone();
+                move |Path(id): Path<String>| {
+                    let store = store.clone();
+                    let mode = mode.clone();
+                    async move {
+                        if mode == "gate" {
+                            return gate_stub();
+                        }
+                        get_session(store, id).await.into_response()
+                    }
+                }
             }),
         )
         .route(
             "/api/session/{id}",
             delete({
                 let store = store.clone();
-                move |Path(id): Path<String>| delete_session(store, id)
+                move |Path(id): Path<String>| async move {
+                    delete_session(store, id).await.into_response()
+                }
             }),
         )
         .route(
@@ -272,23 +306,49 @@ async fn main() {
                     let mode = mode.clone();
                     let mcp_url = mcp_url.clone();
                     let mcp_token = mcp_token.clone();
-                    async move { prompt(store, mode, step, mcp_url, mcp_token, id, body).await }
+                    async move {
+                        if mode == "gate" {
+                            return gate_post_reject();
+                        }
+                        prompt(store, mode, step, mcp_url, mcp_token, id, body)
+                            .await
+                            .into_response()
+                    }
                 }
             }),
         )
         .route(
             "/api/session/{id}/command",
-            post(|Path(id): Path<String>| async move {
-                // bootstrap-команды детерминированы: принимаем, не эмулируя shell
-                tracing::info!(event = "mock.command", id = %id, "POST /command");
-                (StatusCode::OK, Json(json!({})))
+            post({
+                let mode = mode.clone();
+                move |Path(id): Path<String>| {
+                    let mode = mode.clone();
+                    async move {
+                        if mode == "gate" {
+                            return gate_post_reject();
+                        }
+                        // bootstrap-команды детерминированы: принимаем, не эмулируя shell
+                        tracing::info!(event = "mock.command", id = %id, "POST /command");
+                        (StatusCode::OK, Json(json!({}))).into_response()
+                    }
+                }
             }),
         )
         .route(
             "/api/session/{id}/message",
             get({
                 let store = store.clone();
-                move |Path(id): Path<String>| message_tail(store, id)
+                let mode = mode.clone();
+                move |Path(id): Path<String>| {
+                    let store = store.clone();
+                    let mode = mode.clone();
+                    async move {
+                        if mode == "gate" {
+                            return gate_stub();
+                        }
+                        message_tail(store, id).await.into_response()
+                    }
+                }
             }),
         )
         .route(
@@ -306,6 +366,24 @@ async fn main() {
 }
 
 type Resp = (StatusCode, Json<Value>);
+
+/// Страница «Войти» гейта — упрощённая копия прод-заглушки Caddy
+/// @nologin (живая проба #1160: 200 + text/html на любой GET-путь).
+const GATE_HTML: &str = "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">\
+<title>OpenCode — доступ</title></head><body><main><h1>OpenCode</h1>\
+<p>Приватный доступ. Нажми, чтобы войти.</p><a href=\"/gate-mock\">Войти</a></main></body></html>";
+
+/// gate-режим: GET-путь — 200 + text/html заглушка (клиент обязан дать
+/// Err сниффом, не «успешно пусто»)
+fn gate_stub() -> Response {
+    Html(GATE_HTML).into_response()
+}
+
+/// gate-режим: POST-путь — живой гейт отдаёт 405 (allow: GET, HEAD)
+/// без content-type и тела; клиент падает статусным чеком, не сниффом
+fn gate_post_reject() -> Response {
+    (StatusCode::METHOD_NOT_ALLOWED, [("allow", "GET, HEAD")]).into_response()
+}
 
 async fn create_session(
     store: Arc<Store>,

@@ -351,4 +351,49 @@ SRV_PID=""; MOCK_PID=""
 sleep 1
 say "фаза 6 ок: слепой hold держит спавн при мёртвом исполнителе и отпускает после возврата"
 
-say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + мульти-экзекьютор + гард #1163 + self-эхо + слепой hold #1263); логи: $RUN_DIR"
+say "фаза 7: gate-заглушка #1160 — исполнитель жив, но гейт отдаёт HTML «Войти» (без-cookie): спавн держится"
+# Отличие от фазы 6: HTTP отвечает 200 — до фикса call() молча парсил HTML
+# в Null и скан был «успешно пуст» (Ok(пусто) → спавн насквозь). Контракт
+# фикса: Err сниффа → strict-скан Err → hold; после снятия заглушки спавн.
+kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+SRV_PID=""; MOCK_PID=""
+sleep 1
+rm -f "$STATE"
+LOG_SRV_GATE="$RUN_DIR/server-gate.log"
+MOCK_MODE=gate MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=1500 \
+  "$BIN_DIR/mock_opencode" >"$LOG_MOCK" 2>&1 &
+MOCK_PID=$!
+sleep 1
+UWUWU_SERVER_CONFIG=$CONFIG UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
+  UWUWU_SERVER_MODE=live \
+  UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
+  UWUWU_MOCK_SEED="$SEED_N:In Progress" \
+  RUST_LOG=info "$BIN_DIR/uwuwu-server" >"$LOG_SRV_GATE" 2>&1 &
+SRV_PID=$!
+sleep 25   # 2+ тика в окне заглушки: спавн держится
+SPAWNS=$(grep -oE '"event":"spawn.done"' "$LOG_SRV_GATE" | wc -l || true)
+[ "$SPAWNS" -eq 0 ] || fail "спавн случился в окне заглушки (HTML прошёл как «успешно пусто»): $SPAWNS"
+grep -q '"event":"spawn.held_blind_scan"' "$LOG_SRV_GATE" \
+  || fail "нет spawn.held_blind_scan на gate-заглушке (скан не дал Err?)"
+grep -q '"event":"tick.completed"' "$LOG_SRV_GATE" || fail "тик умер на заглушке"
+grep -q 'gate HTML-заглушка' "$LOG_SRV_GATE" \
+  || say "примечание: маркер «gate HTML-заглушка» не найден в логе (Err может идти статусным чеком 405 на POST — ок)"
+say "gate-заглушка держит: спавнов 0, hold сработал, тик живёт"
+# восстановление: заглушку снимаем (мок в plain) — спавн происходит
+kill "$MOCK_PID" 2>/dev/null || true
+wait "$MOCK_PID" 2>/dev/null || true
+MOCK_PID=""
+MOCK_MODE=plain MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=1500 \
+  "$BIN_DIR/mock_opencode" >"$LOG_MOCK" 2>&1 &
+MOCK_PID=$!
+sleep 25
+grep -q '"event":"spawn.done"' "$LOG_SRV_GATE" \
+  || fail "спавна нет после снятия заглушки (hold перегораживает)"
+kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+SRV_PID=""; MOCK_PID=""
+sleep 1
+say "фаза 7 ок: окно gate-заглушки держит спавн и отпускает после снятия (#1160)"
+
+say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + мульти-экзекьютор + гард #1163 + self-эхо + слепой hold #1263 + gate-заглушка #1160); логи: $RUN_DIR"
