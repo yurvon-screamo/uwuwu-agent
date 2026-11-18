@@ -1140,6 +1140,36 @@ async fn alive_session_reused_dead_recreated() {
     );
 }
 
+#[tokio::test]
+async fn fresh_bot_session_marked_forever_for_dreamer() {
+    // #1306: свежая бот-сессия получает вечный скип дримера (раннер зовёт
+    // mark_dreamer(Forever) при создании). Если маркировку отломать, живой
+    // бот после деплоя становится перманентным кандидатом дримера:
+    // сообщение → idle → дрим → снова (ревью #1306, high).
+    let tick_state = Arc::new(MemTickState::default());
+    let update = private_update(12, "yurvon", "первое сообщение боту");
+    let mut d = deps(
+        FakeTg::new(vec![update.clone()]),
+        FakeSessions::new(),
+        Arc::new(FakeState::default()),
+        1,
+        1,
+        BotLive::new(Some("yurvon".into()), None, "м".into()),
+    );
+    d.tick_state = tick_state.clone();
+    let msg = update.message.expect("private-апдейт несёт message");
+    process_message(&d, &msg).await.expect("ход бота обработан");
+    let sid = d
+        .state
+        .bot_session(SLUG)
+        .expect("сессия бота создана и записана в state");
+    assert_eq!(
+        tick_state.dreamer_mark(&sid),
+        Some(DreamerMark::Forever),
+        "бот-сессия — вечный скип дримера"
+    );
+}
+
 // ---------- супервизор ----------
 
 #[tokio::test]
