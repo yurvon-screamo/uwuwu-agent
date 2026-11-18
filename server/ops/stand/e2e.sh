@@ -522,4 +522,89 @@ wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
 SRV_PID=""; MOCK_PID=""
 say "фаза 8 ок: понижение приоритета отдало слот (2046 abort+delete, 2048 заспавнен)"
 
-say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + мульти-экзекьютор + гард #1163 + self-эхо + слепой hold #1263 + преемпшен CUP #1259); логи: $RUN_DIR"
+say "фаза 9: клин холодного ящика #1293 — observe логирует кандидатов, live архивирует"
+CONFIG_SWEEP="$RUN_DIR/config.sweep.toml"
+cat > "$CONFIG_SWEEP" <<EOF
+mode = "live"
+poll_sec = 10
+sweep_days = 7
+port = $PORT_SRV
+
+[hub]
+repo = "yurvon-screamo/uwuwu-hub"
+driver = "memory"
+
+[executor]
+name = "local-mock"
+url = "http://127.0.0.1:$PORT_MOCK"
+
+[policy]
+cup = 1
+peak = { enabled = false, start_min = 0, end_min = 0 }
+
+[[project]]
+name = "uwuwu"
+board = "Задачи uwuwu"
+repo = "yurvon-screamo/uwuwu-agent"
+checkout = "/home/yurvon/uwuwu-agent"
+env_root = "/home/yurvon/agents-env"
+EOF
+# 2049 закрыта 14 суток назад (кандидат), 2050 — сутки назад (свежая);
+# done-сиды не занимают слоты CUP — мок-исполнитель не нужен живым ходам,
+# но sidecar sweeper дергает только хаб (без исполнителя)
+rm -f "$STATE"
+LOG_SRV_SWEEP="$RUN_DIR/server-sweep.log"
+MOCK_MODE=idle MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=100 \
+  "$BIN_DIR/mock_opencode" >"$LOG_MOCK" 2>&1 &
+MOCK_PID=$!
+sleep 1
+# 9a: observe — внутренний гейт клина: кандидаты в логе, строка на доске
+UWUWU_SERVER_CONFIG=$CONFIG_SWEEP UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
+  UWUWU_SERVER_MODE=observe \
+  UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
+  UWUWU_MOCK_SEED="Задачи uwuwu:2049:Done:low:14;Задачи uwuwu:2050:Done:low:1" \
+  RUST_LOG=info "$BIN_DIR/uwuwu-server" >"$LOG_SRV_SWEEP" 2>&1 &
+SRV_PID=$!
+SEEN=0
+while [ $SEEN -lt 10 ]; do
+  SEEN=$((SEEN + 1))
+  sleep 4
+  grep -q '"event":"sweep.observe"' "$LOG_SRV_SWEEP" && break
+done
+grep -q '"event":"sweep.observe"' "$LOG_SRV_SWEEP" \
+  || fail "observe-клин не показал кандидатов (внутренний гейт слепой)"
+mcp task_list '{"project":"uwuwu"}' | grep -q '2049' \
+  || fail "observe-клин мутировал: 2049 исчезла из task_list в observe"
+say "9a ок: observe показал кандидата и не мутировал"
+# 9b: live — архивация: 2049 уходит из снапшота, 2050 остаётся
+kill "$SRV_PID" 2>/dev/null || true
+wait "$SRV_PID" 2>/dev/null || true
+rm -f "$STATE"
+UWUWU_SERVER_CONFIG=$CONFIG_SWEEP UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
+  UWUWU_SERVER_MODE=live \
+  UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
+  UWUWU_MOCK_SEED="Задачи uwuwu:2049:Done:low:14;Задачи uwuwu:2050:Done:low:1" \
+  RUST_LOG=info "$BIN_DIR/uwuwu-server" >"$LOG_SRV_SWEEP" 2>&1 &
+SRV_PID=$!
+SEEN=0
+while [ $SEEN -lt 10 ]; do
+  SEEN=$((SEEN + 1))
+  sleep 4
+  grep -q '"event":"sweep.completed"' "$LOG_SRV_SWEEP" && break
+done
+grep -q '"event":"sweep.completed"' "$LOG_SRV_SWEEP" \
+  || fail "live-клин не отчитался проходом (sweep.completed нет за 40с)"
+SWEEP_LIST=$(mcp task_list '{"project":"uwuwu"}')
+echo "$SWEEP_LIST" | grep -q '2049' \
+  && fail "live-клин не сработал: 2049 осталась в task_list"
+echo "$SWEEP_LIST" | grep -q '2050' \
+  || fail "live-клин переложил свежую: 2050 исчезла из task_list"
+grep -q '"event":"sweep.failed"' "$LOG_SRV_SWEEP" \
+  && fail "sweep.failed в фазе 9 — архивация мок-хаба не удалась"
+# pid-scoped зачистка
+kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+SRV_PID=""; MOCK_PID=""
+say "фаза 9 ок: 2049 ушла в архив и из task_list, 2050 свежая осталась"
+
+say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + мульти-экзекьютор + гард #1163 + self-эхо + слепой hold #1263 + преемпшен CUP #1259 + клин #1293); логи: $RUN_DIR"

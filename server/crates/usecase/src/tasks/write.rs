@@ -216,6 +216,18 @@ impl TaskWriter for TaskWriteUseCase {
         }
         let rows = self.board.read_board(&board).await?;
         self.dup_check(&rows, spec.title.trim())?;
+        // холодный ящик (#1293): закрытые строки покидают снапшот, и
+        // снапшот-гард слепнет к старым тайтлам — точное равенство
+        // добивается поиском issues (REST, вне GraphQL-бюджета):
+        // инвариант «тайтл уникален» не сужается вместе с доской
+        let cold = self.board.issues_with_title(spec.title.trim()).await?;
+        if !cold.is_empty() {
+            return Err(UsecaseError::Board(format!(
+                "тайтл «{}» уже занят issue #{} — дубль запрещён (строка вне снапшота: холодный ящик)",
+                spec.title.trim(),
+                cold[0]
+            )));
+        }
         let number = self
             .board
             .create_issue(
@@ -571,6 +583,12 @@ mod tests {
         }
         async fn close_issue_ext(&self, _n: u64, _np: bool) -> UsecaseResult<()> {
             Ok(())
+        }
+        async fn archive_row(&self, _b: &str, _n: u64) -> UsecaseResult<()> {
+            Ok(())
+        }
+        async fn issues_with_title(&self, _title: &str) -> UsecaseResult<Vec<u64>> {
+            Ok(Vec::new())
         }
         async fn replace_body(&self, _n: u64, _b: &str) -> UsecaseResult<()> {
             Ok(())

@@ -168,6 +168,12 @@ impl TaskBoardRepo for FakeBoard {
         self.log.lock().unwrap().push(format!("close_ext#{n}"));
         Ok(())
     }
+    async fn archive_row(&self, _b: &str, _n: u64) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn issues_with_title(&self, _title: &str) -> UsecaseResult<Vec<u64>> {
+        Ok(Vec::new())
+    }
     async fn replace_body(&self, n: u64, _b: &str) -> UsecaseResult<()> {
         self.log.lock().unwrap().push(format!("body#{n}"));
         Ok(())
@@ -857,7 +863,7 @@ fn routed_usecase(
         }),
         clock,
         state: Arc::new(MemState(Mutex::default())),
-        spawn_model: None,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
     }
 }
 
@@ -3928,6 +3934,12 @@ impl TaskBoardRepo for FakeMultiBoard {
     async fn close_issue_ext(&self, _n: u64, _np: bool) -> UsecaseResult<()> {
         Ok(())
     }
+    async fn archive_row(&self, _b: &str, _n: u64) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn issues_with_title(&self, _title: &str) -> UsecaseResult<Vec<u64>> {
+        Ok(Vec::new())
+    }
     async fn replace_body(&self, _n: u64, _b: &str) -> UsecaseResult<()> {
         Ok(())
     }
@@ -4324,6 +4336,12 @@ impl TaskBoardRepo for CloseBoard {
     }
     async fn close_issue_ext(&self, _: u64, _: bool) -> UsecaseResult<()> {
         Ok(())
+    }
+    async fn archive_row(&self, _: &str, _: u64) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn issues_with_title(&self, _: &str) -> UsecaseResult<Vec<u64>> {
+        Ok(Vec::new())
     }
     async fn replace_body(&self, _: u64, _: &str) -> UsecaseResult<()> {
         Ok(())
@@ -5104,10 +5122,10 @@ async fn stage_spawn_carries_model_from_server_map() {
     assert_eq!(out.spawns_done, 1, "спавн стадии состоялся");
     let specs = sessions.specs.lock().unwrap();
     assert_eq!(specs.len(), 2, "bootstrap + work");
-    let want = uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.3").unwrap();
+    let want = uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.3-flash#high").unwrap();
     for spec in specs.iter() {
         assert_eq!(spec.model, want.model, "модель спавна = default карты");
-        assert_eq!(spec.variant, None, "default — без варианта");
+        assert_eq!(spec.variant, want.variant, "default — flash#high");
     }
 }
 
@@ -5120,17 +5138,17 @@ async fn review_and_test_spawns_carry_map_models_per_agent() {
         (
             Status::ReviewPlan,
             "plan-reviewer",
-            "zai-coding-plan/glm-5.3",
+            "zai-coding-plan/glm-5.3#high",
         ),
         (
             Status::ReviewResult,
             "code-quality-reviewer",
-            "zai-coding-plan/glm-5.3",
+            "zai-coding-plan/glm-5.3#high",
         ),
         (
             Status::Testing,
             "tester",
-            "zai-coding-plan/glm-5.3-flash#max",
+            "zai-coding-plan/glm-5.3-flash#high",
         ),
     ];
     for (status, agent_name, raw) in cases {

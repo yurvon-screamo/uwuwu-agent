@@ -44,7 +44,7 @@ const QUERY: &str = r#"
             pageInfo{ hasNextPage endCursor }
             nodes{
               id
-              content{ __typename ...on Issue{ number title state } }
+              content{ __typename ...on Issue{ number title state closedAt } }
               fieldValues(first:30){
                 nodes{ __typename
                   ...on ProjectV2ItemFieldSingleSelectValue{
@@ -653,6 +653,12 @@ fn parse_page(items: &[Value], meta: &mut BoardMeta) -> Vec<Task> {
                 uwuwu_usecase::parse_status(&v.status)
             };
             let mut task = Task::new(number, title, status);
+            // Дата закрытия issue — вход клина холодного ящика (#1293)
+            if let Some(raw) = issue["closedAt"].as_str() {
+                if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(raw) {
+                    task.set_closed_at(ts.timestamp_millis() as u64);
+                }
+            }
             task.set_priority(uwuwu_usecase::parse_priority(&v.priority));
             task.set_automerge(v.automerge);
             meta.items
@@ -1070,6 +1076,66 @@ impl TaskBoardRepo for GitHubHub {
             )));
         }
         Ok(())
+    }
+
+    async fn archive_row(&self, board: &str, number: u64) -> UsecaseResult<()> {
+        // item id — из меты снапшота: archiveProjectV2Item ест itemId
+        let snap = self.snapshot(board).await?;
+        let item = snap.1.items.get(&number).cloned().ok_or_else(|| {
+            UsecaseError::Board(format!("строка #{number} не на доске «{board}»"))
+        })?;
+        let project_id = snap.1.project_id.clone();
+        let mutation = r#"
+          mutation($p:ID!,$i:ID!){
+            archiveProjectV2Item(input:{projectId:$p, itemId:$i}){ projectV2Item{ id isArchived } }
+          }"#;
+        let data = self
+            .gql(mutation, json!({ "p": project_id, "i": item }))
+            .await?;
+        let archived = data["archiveProjectV2Item"]["projectV2Item"]["isArchived"].as_bool();
+        if archived != Some(true) {
+            return Err(UsecaseError::Board(format!(
+                "archive #{number}: false-success (isArchived={:?})",
+                archived
+            )));
+        }
+        // строка ушла из items: снапшот должен забыть её сразу (#1235,
+        // read-your-writes), иначе write-through тика вернёт призрак
+        self.invalidate_snapshot(board);
+        Ok(())
+    }
+
+    fn gql_budget_remaining(&self) -> Option<u64> {
+        Some(self.last_rate_limit.read().expect("rl lock").as_ref()?.0)
+    }
+
+    async fn issues_with_title(&self, title: &str) -> UsecaseResult<Vec<u64>> {
+        // REST search — вне GraphQL-бюджета (#1293, dup_check create);
+        // поиск фразой + клиентский фильтр точного равенства тайтла.
+        // percent-encode — реюз вики-энкодера (без новой зависимости,
+        // канон github_wiki::encode_path)
+        let query = format!("repo:{} in:title \"{}\"", self.repo, title.replace('"', ""));
+        let (status, body) = self
+            .rest(
+                reqwest::Method::GET,
+                &format!(
+                    "/search/issues?q={}&per_page=100",
+                    crate::wiki::encode_path(&query)
+                ),
+                None,
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(UsecaseError::Board(format!("issue search: HTTP {status}")));
+        }
+        let Some(items) = body["items"].as_array() else {
+            return Ok(Vec::new());
+        };
+        Ok(items
+            .iter()
+            .filter(|i| i["title"].as_str() == Some(title))
+            .filter_map(|i| i["number"].as_u64())
+            .collect())
     }
 
     async fn replace_body(&self, number: u64, body_md: &str) -> UsecaseResult<()> {
@@ -1778,6 +1844,31 @@ mod tests {
         let rows = parse_page(&items, &mut meta);
         assert_eq!(rows[0].status(), Status::Done);
         assert_eq!(meta.items.get(&7).map(String::as_str), Some("IT_x"));
+    }
+
+    #[test]
+    fn parse_page_carries_closed_at() {
+        // #1293: closedAt с носителя доезжает до агрегата — вход клина
+        let mut meta = BoardMeta::default();
+        let items = vec![json!({
+            "id": "IT_c",
+            "content": {
+                "__typename": "Issue", "number": 9, "title": "t", "state": "closed",
+                "closedAt": "2026-11-10T00:00:00Z"
+            },
+            "fieldValues": { "nodes": [] }
+        })];
+        let rows = parse_page(&items, &mut meta);
+        assert_eq!(rows[0].closed_at(), Some(1_794_268_800_000));
+        // открытый issue — даты нет
+        let mut meta2 = BoardMeta::default();
+        let open = vec![json!({
+            "id": "IT_o",
+            "content": { "__typename": "Issue", "number": 10, "title": "t", "state": "open", "closedAt": null },
+            "fieldValues": { "nodes": [] }
+        })];
+        let rows2 = parse_page(&open, &mut meta2);
+        assert_eq!(rows2[0].closed_at(), None);
     }
 }
 

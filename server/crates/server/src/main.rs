@@ -503,6 +503,42 @@ async fn run(
         });
     }
 
+    {
+        // клин холодного ящика (#1293): терминальные строки старше
+        // sweep_days суток уходят в архив Projects v2 — снапшот несёт
+        // активный контур. Обратите внимание: observe-гейт здесь
+        // **внутренний** (sweep_board логирует кандидатов и не мутирует),
+        // не общий no-op `if is_observe { return }` — observe-фаза
+        // обязана показывать кандидатов
+        let sweep_board_repo = board.clone();
+        let sweep_boards = plan.boards.clone();
+        let sweep_clock = clock.clone();
+        sidecars.push(Sidecar {
+            name: "sweeper".into(),
+            tick: Box::new(move || {
+                let board = sweep_board_repo.clone();
+                let boards = sweep_boards.clone();
+                let clock = sweep_clock.clone();
+                Box::pin(async move {
+                    let now_ms = clock.now_ms();
+                    for b in &boards {
+                        let tasks = board.read_board(&b.board).await?;
+                        uwuwu_usecase::sweeper::sweep_board(
+                            board.as_ref(),
+                            &b.board,
+                            &tasks,
+                            now_ms,
+                            cfg.sweep_days,
+                            is_observe,
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                })
+            }),
+        });
+    }
+
     if let Some(backend) = semantic_backend.clone() {
         let clock2 = clock.clone();
 
