@@ -9,8 +9,8 @@ use crate::pipeline::analyst::{AnalystBoard, AnalystUseCase};
 use crate::pipeline::analyst_review::AnalystReviewUseCase;
 use crate::pipeline::dreamer::DreamerUseCase;
 use crate::ports::{
-    AgentSessionGateway, AssistantReply, Clock, CommentRef, IssueView, Liveness, SessionInfo,
-    SessionSpec, TaskBoardRepo, TickStateStore, WikiRepo,
+    AgentSessionGateway, AssistantReply, Clock, CommentRef, DreamerMark, IssueView, Liveness,
+    SessionInfo, SessionSpec, TaskBoardRepo, TickStateStore, WikiRepo,
 };
 use crate::router::SessionRouter;
 use crate::spawn_models::SpawnModels;
@@ -101,10 +101,15 @@ impl TickStateStore for NoopState {
     }
     fn set_last_seen_status(&self, _b: &str, _n: u64, _s: Status) {}
     fn set_last_comment_id(&self, _b: &str, _n: u64, _id: &str) {}
-    fn dreamer_done(&self, _s: &str) -> bool {
-        false
+    fn dreamer_mark(&self, _s: &str) -> Option<DreamerMark> {
+        None
     }
-    fn mark_dreamer_done(&self, _s: &str) {}
+    fn mark_dreamer(&self, _s: &str, _m: DreamerMark) {}
+    fn dreamer_session(&self, _s: &str) -> Option<String> {
+        None
+    }
+    fn link_dreamer_session(&self, _s: &str, _d: &str) {}
+    fn prune_dreamer(&self, _live: &std::collections::HashSet<String>) {}
     fn dreamer_day_spawns(&self, _d: &str) -> u32 {
         0
     }

@@ -6,7 +6,8 @@
 
 use crate::error::UsecaseResult;
 use crate::ports::{
-    Clock, CommentRef, FmMutator, IssueFieldStore, IssueView, TaskBoardRepo, TickStateStore,
+    Clock, CommentRef, DreamerMark, FmMutator, IssueFieldStore, IssueView, TaskBoardRepo,
+    TickStateStore,
 };
 use crate::tasks::write::{TaskPatch, TaskWriteUseCase, TaskWriter};
 use async_trait::async_trait;
@@ -173,11 +174,19 @@ impl TickStateStore for NopState {
 
     fn set_last_comment_id(&self, _: &str, _: u64, _: &str) {}
 
-    fn dreamer_done(&self, _: &str) -> bool {
-        false
+    fn dreamer_mark(&self, _: &str) -> Option<DreamerMark> {
+        None
     }
 
-    fn mark_dreamer_done(&self, _: &str) {}
+    fn mark_dreamer(&self, _: &str, _: DreamerMark) {}
+
+    fn dreamer_session(&self, _: &str) -> Option<String> {
+        None
+    }
+
+    fn link_dreamer_session(&self, _: &str, _: &str) {}
+
+    fn prune_dreamer(&self, _: &std::collections::HashSet<String>) {}
 
     fn dreamer_day_spawns(&self, _: &str) -> u32 {
         0

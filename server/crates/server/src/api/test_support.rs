@@ -6,8 +6,8 @@
 use async_trait::async_trait;
 use uwuwu_domain::{Slot, Status};
 use uwuwu_usecase::{
-    AgentSessionGateway, Liveness, SessionInfo, SessionSpec, TickStateStore, UsecaseResult,
-    WikiRepo,
+    AgentSessionGateway, DreamerMark, Liveness, SessionInfo, SessionSpec, TickStateStore,
+    UsecaseResult, WikiRepo,
 };
 
 /// Вики в пробах диспетчера не читается: доков нет.
@@ -82,10 +82,15 @@ impl TickStateStore for StubState {
     }
     fn set_last_seen_status(&self, _: &str, _: u64, _: Status) {}
     fn set_last_comment_id(&self, _: &str, _: u64, _: &str) {}
-    fn dreamer_done(&self, _: &str) -> bool {
-        false
+    fn dreamer_mark(&self, _: &str) -> Option<DreamerMark> {
+        None
     }
-    fn mark_dreamer_done(&self, _: &str) {}
+    fn mark_dreamer(&self, _: &str, _: DreamerMark) {}
+    fn dreamer_session(&self, _: &str) -> Option<String> {
+        None
+    }
+    fn link_dreamer_session(&self, _: &str, _: &str) {}
+    fn prune_dreamer(&self, _: &std::collections::HashSet<String>) {}
     fn dreamer_day_spawns(&self, _: &str) -> u32 {
         0
     }

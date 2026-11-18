@@ -1,9 +1,10 @@
 //! Дример: пост-обработка уснувших сессий (REST-only, без opencode.db —
 //! решение #1133). Инвариант: 1 рабочая сессия = 1 дример-сессия;
-/// обработанные помечаются в состоянии тика.
+//! маркер обработки — watermark (revival ниже делает сессию кандидатом
+//! снова, #1306), вечный скип — только не-источники опыта (боты).
 use crate::error::UsecaseResult;
 use crate::naming;
-use crate::ports::{Clock, SessionSpec, TickStateStore};
+use crate::ports::{Clock, DreamerMark, SessionInfo, SessionSpec, TickStateStore};
 use crate::router::SessionRouter;
 use crate::spawn_models::SpawnModels;
 use std::sync::Arc;
@@ -32,7 +33,8 @@ pub struct DreamerUseCase {
 }
 
 impl DreamerUseCase {
-    /// Один проход: до одного дрим-спавна за тик. Капы (директива
+    /// Один проход: до одного дрим-действия за тик (спавн нового носителя
+    /// или wakeup существующего — ADR-005 1:1). Капы (директива
     /// владельца 15.11): ≤1 живого дримера, ≤24/день, цели — только
     /// сессии с финалом И реальной работой (токены > 0, не пустышки).
     pub async fn tick(&self) -> UsecaseResult<usize> {
@@ -42,6 +44,11 @@ impl DreamerUseCase {
         // Офлайн-исполнитель останавливает тик дримера до возврата
         // (пост-обработка догоняет на следующем тике).
         let list = self.sessions.list_sessions_strict().await?;
+        // Гигиена state сразу после живого скана и ДО гвардов (#1306):
+        // день с исчерпанным капом гигиену не пропускает — записи
+        // умерших сессий не копятся.
+        let live: std::collections::HashSet<String> = list.iter().map(|s| s.id.clone()).collect();
+        self.state.prune_dreamer(&live);
         // ≤1 живого дримера — busy-признак (ход в полёте, #1231): outcome
         // при новом ходе не очищается, дубль-дример на 2+ ходе был незаметен
         if crate::router::has_busy_agent(&list, Agent::Dreamer) {
@@ -71,18 +78,68 @@ impl DreamerUseCase {
             );
             return Ok(0);
         }
-        let candidate = list.into_iter().find(|s| {
-            !s.outcome.is_empty()
-                && s.total_tokens > 0
-                && now.saturating_sub(s.updated_ms) > IDLE_MS
-                && naming::parse_agent(&s.agent)
-                    .map(|a| !SKIP_AGENTS.contains(&a))
-                    .unwrap_or(true)
-                && !self.state.dreamer_done(&s.id)
-        });
+        let candidate = list.iter().find(|s| self.is_fresh_candidate(s, now));
         let Some(target) = candidate else {
             return Ok(0);
         };
+        let sessions = self.sessions.default();
+        let carrier = self.dreamer_carrier(target, &live).await?;
+        sessions
+            .prompt(carrier.session(), &carrier.prompt(&target.id))
+            .await?;
+        self.state
+            .mark_dreamer(&target.id, DreamerMark::UpTo(target.updated_ms));
+        self.state.mark_dreamer_spawn(&day_key);
+        match &carrier {
+            DreamerCarrier::Woke(session) => {
+                tracing::info!(event = "dreamer.wakeup", target = %target.id, session = %session, "Повторный прогон — wakeup дример-сессии");
+            }
+            DreamerCarrier::Spawned(session) => {
+                tracing::info!(event = "dreamer.spawned", target = %target.id, session = %session, "Dreamer spawned");
+            }
+        }
+        Ok(1)
+    }
+
+    /// Кандидат пост-обработки: финал + реальная работа (токены > 0,
+    /// не пустышки) + idle ≥ IDLE_MS + не сайдкар-агент + свежесть против
+    /// watermark (#1306): UpTo-позиция ниже активности — сессия снова
+    /// кандидат (revival); Forever — вечный скип (боты).
+    fn is_fresh_candidate(&self, s: &SessionInfo, now: u64) -> bool {
+        if s.outcome.is_empty() || s.total_tokens == 0 {
+            return false;
+        }
+        if now.saturating_sub(s.updated_ms) <= IDLE_MS {
+            return false;
+        }
+        if naming::parse_agent(&s.agent)
+            .map(|a| SKIP_AGENTS.contains(&a))
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        match self.state.dreamer_mark(&s.id) {
+            None => true,
+            Some(DreamerMark::Forever) => false,
+            Some(DreamerMark::UpTo(pos)) => s.updated_ms > pos,
+        }
+    }
+
+    /// Носитель прогона (ADR-005 1:1): живой линк — wakeup существующей
+    /// дример-сессии; линк мёртв или отсутствует — спавн нового носителя
+    /// и связка в state (#1306).
+    async fn dreamer_carrier(
+        &self,
+        target: &SessionInfo,
+        live: &std::collections::HashSet<String>,
+    ) -> UsecaseResult<DreamerCarrier> {
+        if let Some(id) = self
+            .state
+            .dreamer_session(&target.id)
+            .filter(|id| live.contains(id))
+        {
+            return Ok(DreamerCarrier::Woke(id));
+        }
         let sm = self.models.for_agent(Agent::Dreamer);
         let spec = SessionSpec {
             directory: self.checkout.clone(),
@@ -97,19 +154,49 @@ impl DreamerUseCase {
             variant: sm.variant,
             bootstrap: false,
         };
-        let sessions = self.sessions.default();
-        let session = sessions.create_session(&spec).await?;
-        let prompt = dreamer_prompt(&target.id);
-        sessions.prompt(&session, &prompt).await?;
-        self.state.mark_dreamer_done(&target.id);
-        self.state.mark_dreamer_spawn(&day_key);
-        tracing::info!(event = "dreamer.spawned", target = %target.id, session = %session, "Dreamer spawned");
-        Ok(1)
+        let session = self.sessions.default().create_session(&spec).await?;
+        self.state.link_dreamer_session(&target.id, &session);
+        Ok(DreamerCarrier::Spawned(session))
     }
 }
 
-/// Ключ суток JST (YYYY-MM-DD) для дневного капа.
-fn jst_day_key(ms: u64) -> String {
+/// Носитель дрим-прогона: существующая дример-сессия или новая.
+///
+/// Линк нового носителя пишется **до** доставки промпта: в окне
+/// «create ok / prompt упал» следующий тик по живому линку шлёт
+/// repeat-промпт носителю без прошлого дрима. Осознанный предел
+/// (ревью #1306, common): прогон корректен — методичку несёт агент-деф
+/// dreamer (AgentSlot::Role), текст лишь неточен про «после прошлого
+/// дрима»; инвариант 1:1 при ретрае сохранён. Альтернатива «линк после
+/// успешного промпта» отклонена: падение prompt оставляло спавн-сироту
+/// без линка — систематические отказы плодили бы дример-сессии.
+enum DreamerCarrier {
+    /// Линк жив — wakeup повторным прогоном (контекст дедупа сохранён).
+    Woke(String),
+    /// Первый прогон или прежний носитель умер — новый спавн.
+    Spawned(String),
+}
+
+impl DreamerCarrier {
+    fn session(&self) -> &str {
+        match self {
+            DreamerCarrier::Woke(id) | DreamerCarrier::Spawned(id) => id,
+        }
+    }
+
+    /// Wakeup-промпт «повторный прогон» для существующей сессии несёт
+    /// только дельту (методичка и контекст дедупа уже в ней, ADR-005);
+    /// новый носитель получает полный промпт пост-обработки.
+    fn prompt(&self, target: &str) -> String {
+        match self {
+            DreamerCarrier::Woke(_) => repeat_prompt(target),
+            DreamerCarrier::Spawned(_) => dreamer_prompt(target),
+        }
+    }
+}
+
+/// Ключ суток JST (YYYY-MM-DD) для дневного капа (pub(crate) — тесты капа).
+pub(crate) fn jst_day_key(ms: u64) -> String {
     let secs = ms / 1000 + 9 * 3600;
     let (y, mo, da) = uwuwu_domain::civil_from_days((secs / 86400) as i64);
     format!("{y:04}-{mo:02}-{da:02}")
@@ -125,5 +212,16 @@ fn dreamer_prompt(target: &str) -> String {
             новые статьи — умеренно; ADR — только если принято архитектурное решение.\n\
          4. Гигиена доков: устаревшее/дыры — точечные правки (uwuwu_docs_write).\n\
          Действуй автономно; итог — краткой строкой.",
+    )
+}
+
+/// Wakeup-промпт повторного прогона (ADR-005): сессия дополнилась после
+/// позиции прошлого дрима — дример-сессия уже несёт методичку и контекст
+/// дедупа, промпт несёт только факт дельты.
+fn repeat_prompt(target: &str) -> String {
+    format!(
+        "Повторный прогон: сессия {target} дополнилась новыми сообщениями после прошлого дрима.\n\
+         Перечитай экспорт (uwuwu_session_export {{session: \"{target}\"}}) и дообработай:\n\
+         дедуп с уже записанным, приписки классов, гигиена доков. Итог — краткой строкой.",
     )
 }

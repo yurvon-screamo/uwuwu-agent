@@ -9,6 +9,7 @@ use uwuwu_domain::{Slot, Status};
 use uwuwu_usecase as naming;
 use uwuwu_usecase::BotStateStore;
 use uwuwu_usecase::Clock;
+use uwuwu_usecase::DreamerMark;
 use uwuwu_usecase::TickStateStore;
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
@@ -44,9 +45,20 @@ struct StateFile {
     /// «board:number» → состояние строки.
     #[serde(default)]
     rows: BTreeMap<String, RowState>,
-    /// Сессии, отработанные дримером.
+    /// Метки дример-обработки: id сессии → watermark/вечный скип (#1306).
     #[serde(default)]
-    dreamer_done: Vec<String>,
+    dreamer: BTreeMap<String, DreamerMark>,
+    /// «исходная → дример-сессия» — инвариант 1:1 ADR-005 (#1306).
+    #[serde(default)]
+    dreamer_links: BTreeMap<String, String>,
+    /// Legacy вечных маркеров (эпоха до #1306): читается со старого ключа,
+    /// мигрирует при загрузке в `UpTo(now)`, в новом файле не пишется.
+    #[serde(
+        default,
+        rename = "dreamer_done",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    legacy_dreamer_done: Vec<String>,
     /// «board:number:slot» → ms последнего спавна (анти-шторм).
     #[serde(default)]
     spawns: BTreeMap<String, u64>,
@@ -83,10 +95,34 @@ pub struct JsonStateStore {
 
 impl JsonStateStore {
     pub fn load(path: PathBuf, clock: Arc<dyn Clock>) -> Self {
-        let state = std::fs::read_to_string(&path)
+        let mut state: StateFile = std::fs::read_to_string(&path)
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok())
             .unwrap_or_default();
+        // Миграция legacy вечных маркеров (#1306) с разбором когорт:
+        // в старом векторе лежали и рабочие сессии, и бот-сессии (старый
+        // раннер маркировал их как вечный скип). Бот-когорта (id из
+        // реестра `bots[*].session`) сохраняет Forever — иначе живой бот
+        // после деплоя становится перманентным кандидатом дримера
+        // (сообщение → idle → дрим → снова, ревью #1306). Рабочие
+        // сессии — UpTo(момент загрузки): revival'ы после деплоя
+        // дообрабатываются, старые сессии молчат (шторм исключён).
+        if !state.legacy_dreamer_done.is_empty() {
+            let boot = clock.now_ms();
+            let bot_sessions: std::collections::HashSet<&String> = state
+                .bots
+                .values()
+                .filter_map(|bot| bot.session.as_ref())
+                .collect();
+            for id in state.legacy_dreamer_done.drain(..) {
+                let mark = if bot_sessions.contains(&id) {
+                    DreamerMark::Forever
+                } else {
+                    DreamerMark::UpTo(boot)
+                };
+                state.dreamer.entry(id).or_insert(mark);
+            }
+        }
         Self {
             path,
             state: std::sync::Mutex::new(state),
@@ -100,13 +136,8 @@ impl JsonStateStore {
 
     /// Атомарная запись файла (единая точка: оба трейта — делегаты).
     fn save_now(&self) -> UsecaseResult<()> {
-        // гигиена роста: dreamer_done — последние 500
         {
             let mut guard = self.state.lock().expect("state lock");
-            if guard.dreamer_done.len() > 500 {
-                let cut = guard.dreamer_done.len() - 500;
-                guard.dreamer_done.drain(0..cut);
-            }
             if guard.spawns.len() > 5000 {
                 let keys: Vec<String> = guard.spawns.keys().cloned().collect();
                 let cut = guard.spawns.len() - 5000;
@@ -225,21 +256,46 @@ impl TickStateStore for JsonStateStore {
             .last_comment_id = Some(id.to_string());
     }
 
-    fn dreamer_done(&self, session: &str) -> bool {
+    fn dreamer_mark(&self, session: &str) -> Option<DreamerMark> {
         self.state
             .lock()
             .expect("state lock")
-            .dreamer_done
-            .iter()
-            .any(|s| s == session)
+            .dreamer
+            .get(session)
+            .copied()
     }
 
-    fn mark_dreamer_done(&self, session: &str) {
+    fn mark_dreamer(&self, session: &str, mark: DreamerMark) {
         self.state
             .lock()
             .expect("state lock")
-            .dreamer_done
-            .push(session.to_string());
+            .dreamer
+            .insert(session.to_string(), mark);
+    }
+
+    fn dreamer_session(&self, source: &str) -> Option<String> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .dreamer_links
+            .get(source)
+            .cloned()
+    }
+
+    fn link_dreamer_session(&self, source: &str, dreamer: &str) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .dreamer_links
+            .insert(source.to_string(), dreamer.to_string());
+    }
+
+    fn prune_dreamer(&self, live: &std::collections::HashSet<String>) {
+        let mut guard = self.state.lock().expect("state lock");
+        guard.dreamer.retain(|id, _| live.contains(id));
+        guard
+            .dreamer_links
+            .retain(|source, _| live.contains(source));
     }
 
     fn dreamer_day_spawns(&self, day_key: &str) -> u32 {
@@ -617,6 +673,103 @@ mod tests {
         assert!(
             s.own_comment("MAC_new"),
             "марка доезжает после легаси-чтения"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dreamer_marks_and_links_persist_across_restart() {
+        // #1306: watermark-метки и связки «исходная → дример-сессия»
+        // переживают рестарт — revival-дообработка не теряется.
+        let dir = std::env::temp_dir().join(format!("uwuwu-state-dream-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        {
+            let s = store(path.clone());
+            s.mark_dreamer("ses_a", DreamerMark::UpTo(100_500));
+            s.mark_dreamer("ses_bot", DreamerMark::Forever);
+            s.link_dreamer_session("ses_a", "ses_dream_a");
+            TickStateStore::save(&s).unwrap();
+        }
+        let s = store(path.clone());
+        assert_eq!(
+            s.dreamer_mark("ses_a"),
+            Some(DreamerMark::UpTo(100_500)),
+            "watermark переживает рестарт"
+        );
+        assert_eq!(s.dreamer_mark("ses_bot"), Some(DreamerMark::Forever));
+        assert_eq!(
+            s.dreamer_session("ses_a").as_deref(),
+            Some("ses_dream_a"),
+            "линк носителя переживает рестарт"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn legacy_dreamer_done_migrates_to_position_marks() {
+        // #1306: legacy вечных маркеров (Vec) мигрирует при загрузке в
+        // UpTo(момент загрузки) — post-deploy revival дообрабатывается,
+        // старые сессии молчат; поле в новом файле не пишется.
+        let dir = std::env::temp_dir().join(format!("uwuwu-state-dream-lg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"rows":{},"dreamer_done":["ses_old1","ses_old2"],"spawns":{}}"#,
+        )
+        .unwrap();
+        let week_ms = 7 * 24 * 60 * 60 * 1000;
+        let s = store_at(path.clone(), 10 * week_ms);
+        assert_eq!(
+            s.dreamer_mark("ses_old1"),
+            Some(DreamerMark::UpTo(10 * week_ms)),
+            "legacy-маркер = позиция момента загрузки"
+        );
+        assert_eq!(
+            s.dreamer_mark("ses_old2"),
+            Some(DreamerMark::UpTo(10 * week_ms))
+        );
+        s.mark_dreamer("ses_new", DreamerMark::UpTo(10 * week_ms + 500));
+        TickStateStore::save(&s).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("\"dreamer_done\""),
+            "legacy-поле в новом файле не пишется"
+        );
+        assert!(raw.contains("\"dreamer\""), "новая секция меток на месте");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn legacy_migration_keeps_forever_skip_for_bot_sessions() {
+        // #1306 (ревью, high): в legacy-векторе лежали и бот-сессии
+        // (старый раннер маркировал их как вечный скип). Когорта ботов —
+        // по реестру `bots[*].session` — сохраняет Forever: иначе живой
+        // бот после деплоя становится перманентным кандидатом дримера
+        // (каждое сообщение поднимает updated_ms выше позиции).
+        let dir =
+            std::env::temp_dir().join(format!("uwuwu-state-dream-lgb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"rows":{},"dreamer_done":["ses_bot_alive","ses_work"],
+                "spawns":{},
+                "bots":{"Projects/uwuwu/Боты/Помощник":{"session":"ses_bot_alive","offset":5}}}"#,
+        )
+        .unwrap();
+        let week_ms = 7 * 24 * 60 * 60 * 1000;
+        let s = store_at(path.clone(), 10 * week_ms);
+        assert_eq!(
+            s.dreamer_mark("ses_bot_alive"),
+            Some(DreamerMark::Forever),
+            "легаси-бот — вечный скип, не кандидат даже при активности"
+        );
+        assert_eq!(
+            s.dreamer_mark("ses_work"),
+            Some(DreamerMark::UpTo(10 * week_ms)),
+            "рабочая сессия — позиция момента загрузки"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
