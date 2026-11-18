@@ -28,6 +28,19 @@ fn message_activity_ms(msg: &Value) -> Option<u64> {
         .or_else(|| t["created"].as_u64())
 }
 
+/// busy-вердикт сессии по времени (#1231 семантика + #1295 зомби-гард):
+/// busy ⟺ busy > idle И флаг свежее 30 минут (оборванный ход оставляет
+/// busy>idle навсегда — крэш/рестарт исполнителя; 12 зомби на redmi
+/// держали глобальный кап при 1 работающей, 18.11).
+fn session_busy(s: &serde_json::Value, now_ms: u64) -> bool {
+    const ZOMBIE_BUSY_MS: u64 = 30 * 60_000;
+    let busy_ms = s["time"]["busy"].as_u64();
+    let idle_ms = s["time"]["idle"].as_u64();
+    busy_ms.is_some_and(|b| {
+        idle_ms.is_none_or(|i| b > i) && now_ms.saturating_sub(b) < ZOMBIE_BUSY_MS
+    })
+}
+
 /// Тело ответа message-эндпоинта opencode: голый массив ИЛИ обёртка
 /// {data: [...]} (обе формы в живом проде, opencode 2.3 — инцидент
 /// «строки стоят, сессии спят» 17.11: last_activity_ms не знал обёртки,
@@ -57,13 +70,14 @@ fn parse_session_page(
         .map(|list| {
             list.iter()
                 .filter_map(|s| {
-                    // busy = ход в полёте (Started): time.busy пишется на
-                    // старте хода и не очищается, time.idle — на idle;
-                    // busy ⟺ busy > idle (сверено с бинарём 2.3.0, #1231).
+                    // busy ⟺ busy > idle (сверено с бинарём 2.3.0, #1231),
+                    // зомби-гард 30 мин (#1295) — см. session_busy.
                     // При апгрейде opencode семантику перепроверить.
-                    let busy_ms = s["time"]["busy"].as_u64();
-                    let idle_ms = s["time"]["idle"].as_u64();
-                    let busy = busy_ms.is_some_and(|b| idle_ms.is_none_or(|i| b > i));
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or_default();
+                    let busy = session_busy(s, now_ms);
                     Some(SessionInfo {
                         id: s["id"].as_str()?.to_string(),
                         agent: s["agent"].as_str().unwrap_or_default().to_string(),
@@ -427,6 +441,32 @@ mod tests {
         assert_eq!(message_array(&bare).map(Vec::len), Some(1));
         assert_eq!(message_array(&wrapped).map(Vec::len), Some(1));
         assert!(message_array(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn zombie_busy_flag_expires_after_half_hour() {
+        // #1295: busy-флаг оборванного хода (busy > idle навсегда после
+        // крэша/рестарта исполнителя) не должен держать кап: ход старше
+        // 30 минут без завершения — протух. Свежий busy — держит.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let fresh = serde_json::json!({
+            "id": "s1", "agent": "developer",
+            "time": { "busy": now - 60_000, "idle": now - 120_000 }
+        });
+        let stale = serde_json::json!({
+            "id": "s2", "agent": "developer",
+            "time": { "busy": now - 31 * 60_000, "idle": now - 60 * 60_000 }
+        });
+        let idle_cleared = serde_json::json!({
+            "id": "s3", "agent": "developer",
+            "time": { "busy": now - 60 * 60_000, "idle": now - 5 * 60_000 }
+        });
+        assert!(session_busy(&fresh, now), "свежий ход — busy");
+        assert!(!session_busy(&stale, now), "зомби-флаг протух — не busy");
+        assert!(!session_busy(&idle_cleared, now), "idle новее busy — не busy");
     }
 
     #[test]
