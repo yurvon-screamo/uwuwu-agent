@@ -116,10 +116,12 @@ struct GateFields {
 impl GateFields {
     fn with(entries: &[(&str, &str)]) -> Self {
         Self {
-            stored: Mutex::new(entries
-                .iter()
-                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-                .collect()),
+            stored: Mutex::new(
+                entries
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+            ),
         }
     }
 }
@@ -180,7 +182,10 @@ async fn analys_exit_requires_priority() {
         .await
         .expect_err("пустой Приоритет должен отказать");
     let text = err.to_string();
-    assert!(text.contains("Приоритет"), "перечень без Приоритета: {text}");
+    assert!(
+        text.contains("Приоритет"),
+        "перечень без Приоритета: {text}"
+    );
     assert!(
         !text.contains("Automerge"),
         "перечень зовёт заполненное поле: {text}"
@@ -197,7 +202,10 @@ async fn analys_exit_requires_automerge() {
         .expect_err("пустой Automerge должен отказать");
     let text = err.to_string();
     assert!(text.contains("Automerge"), "перечень без Automerge: {text}");
-    assert!(!text.contains("Приоритет"), "заполненное поле в перечне: {text}");
+    assert!(
+        !text.contains("Приоритет"),
+        "заполненное поле в перечне: {text}"
+    );
 }
 
 /// Оба поля пусты → перечень называет оба.
@@ -240,7 +248,9 @@ async fn analys_exit_passes_when_patch_carries_values() {
     let mut p = status_patch(Status::ReviewAnalys);
     p.priority = Some("high".into());
     p.automerge = Some(true);
-    u.edit("uwuwu", 1, p).await.expect("патч несёт оба значения — пропуск");
+    u.edit("uwuwu", 1, p)
+        .await
+        .expect("патч несёт оба значения — пропуск");
 }
 
 /// Переход не из Analys гейт не трогает (поля пусты, переход легален).
@@ -270,10 +280,7 @@ async fn analys_idempotent_transition_is_gated() {
         .edit("uwuwu", 1, status_patch(Status::Analys))
         .await
         .expect_err("переустановка той же стадии — тоже выход под гейт");
-    assert!(
-        err.to_string().contains("Analys"),
-        "не тот отказ: {err}"
-    );
+    assert!(err.to_string().contains("Analys"), "не тот отказ: {err}");
 }
 
 /// Мусорный приоритет («urgent» — не high/medium/low) считается пустотой:

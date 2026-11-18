@@ -644,7 +644,10 @@ async fn analys_exit_gate_on_mcp_surface() {
     .await
     .expect_err("пустой Приоритет не выпускает строку из Analys");
     assert!(err.contains("Приоритет"), "перечень без Приоритета: {err}");
-    assert!(!err.contains("Automerge"), "заполненное поле в перечне: {err}");
+    assert!(
+        !err.contains("Automerge"),
+        "заполненное поле в перечне: {err}"
+    );
     // дозаполнение одним вызовом с переходом тоже легально —
     // здесь раздельно: сначала решение, потом выход
     call(
