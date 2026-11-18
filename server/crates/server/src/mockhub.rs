@@ -519,9 +519,7 @@ impl IssueFieldStore for MemoryHub {
                             }
                         }
                     }
-                    // «Приоритет» — как есть; «Automerge» — физическое имя
-                    // legacy «Autodone»: имитация resolve_field живого
-                    // носителя (каталог «Automerge» не содержит, #1280 ревью)
+                    // «Приоритет» — как есть (каталог содержит имя, #1280)
                     ("Приоритет", value) => match value {
                         Some(v) => {
                             state
@@ -533,20 +531,6 @@ impl IssueFieldStore for MemoryHub {
                         None => {
                             if let Some(raw) = state.raw_fields.get_mut(&number) {
                                 raw.remove(*name);
-                            }
-                        }
-                    },
-                    ("Automerge", value) => match value {
-                        Some(v) => {
-                            state
-                                .raw_fields
-                                .entry(number)
-                                .or_default()
-                                .insert("Autodone".into(), v.clone());
-                        }
-                        None => {
-                            if let Some(raw) = state.raw_fields.get_mut(&number) {
-                                raw.remove("Autodone");
                             }
                         }
                     },
