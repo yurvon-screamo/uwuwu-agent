@@ -435,6 +435,10 @@ struct MemStateInner {
     statuses: Vec<(u64, Status)>,
     /// Метки дример-обработки (dreamer-сценарии тиков).
     dreamer_marks: BTreeMap<String, DreamerMark>,
+    /// Связки «исходная → дример-сессия» (wakeup-сценарии, #1306).
+    dreamer_links: BTreeMap<String, String>,
+    /// Дневной счётчик дримера: (дата JST, спавнов).
+    dreamer_day: Option<(String, u32)>,
     /// (number, slot) → (status, repeats)
     loops: Vec<(u64, Slot, Status, u32)>,
     /// (number, status, rounds) — цикл-гвард аналитики (#1135)
@@ -488,15 +492,41 @@ impl TickStateStore for MemState {
     fn mark_dreamer(&self, s: &str, mark: DreamerMark) {
         self.0.lock().unwrap().dreamer_marks.insert(s.into(), mark);
     }
-    fn dreamer_session(&self, _s: &str) -> Option<String> {
-        None
+    fn dreamer_session(&self, s: &str) -> Option<String> {
+        self.0.lock().unwrap().dreamer_links.get(s).cloned()
     }
-    fn link_dreamer_session(&self, _s: &str, _d: &str) {}
-    fn prune_dreamer(&self, _live: &std::collections::HashSet<String>) {}
-    fn dreamer_day_spawns(&self, _day: &str) -> u32 {
-        0
+    fn link_dreamer_session(&self, s: &str, d: &str) {
+        self.0
+            .lock()
+            .unwrap()
+            .dreamer_links
+            .insert(s.into(), d.into());
     }
-    fn mark_dreamer_spawn(&self, _day: &str) {}
+    fn prune_dreamer(&self, live: &std::collections::HashSet<String>) {
+        let mut g = self.0.lock().unwrap();
+        g.dreamer_marks.retain(|id, _| live.contains(id));
+        g.dreamer_links.retain(|source, _| live.contains(source));
+    }
+    fn dreamer_day_spawns(&self, day: &str) -> u32 {
+        self.0
+            .lock()
+            .unwrap()
+            .dreamer_day
+            .as_ref()
+            .filter(|(d, _)| d == day)
+            .map(|(_, n)| *n)
+            .unwrap_or(0)
+    }
+    fn mark_dreamer_spawn(&self, day: &str) {
+        let mut g = self.0.lock().unwrap();
+        let n = g
+            .dreamer_day
+            .as_ref()
+            .filter(|(d, _)| d == day)
+            .map(|(_, n)| *n)
+            .unwrap_or(0);
+        g.dreamer_day = Some((day.into(), n + 1));
+    }
     fn last_spawn_ms(&self, _b: &str, n: u64, s: Slot) -> Option<u64> {
         self.0
             .lock()
@@ -3330,7 +3360,30 @@ async fn dreamer_revival_of_dreamed_session_reprompts() {
     // #1306: отдрименная сессия получила новые сообщения (revival → финал
     // хода → idle ≥ 30 мин) — дример обязан дообработать дополнение
     // повторным прогоном (ADR-005: инвариант 1:1, wakeup-модель).
-    // Маркер «навсегда» молчит — тест красный до фикса.
+    let state = Arc::new(MemState(Mutex::default()));
+    // Дрим в T1; revival — активность T2 > T1 (дополнение после дрима).
+    state.mark_dreamer("ses_target", DreamerMark::UpTo(DREAM_NOW - 40 * 60_000));
+    let sessions = Arc::new(FakeSessions::new());
+    sessions
+        .extra
+        .lock()
+        .unwrap()
+        .push(crate::ports::SessionInfo {
+            updated_ms: DREAM_NOW - 31 * 60_000,
+            ..fake_session("ses_target", "developer", "succeeded", 700, false)
+        });
+    let u = dreamer_uc(state, sessions.clone(), 7);
+    let spawned = u.tick().await.unwrap();
+    assert_eq!(spawned, 1, "revival отдрименной сессии — повторный прогон");
+}
+
+// ---- revival/wakeup контур (#1306, инвариант 1:1 — ADR-005) ----
+
+/// ms «сейчас» дример-сценариев (локальный FixedClock-эквивалент).
+const DREAM_NOW: u64 = 100_000_000;
+
+/// DreamerUseCase с локальными часами (now = DREAM_NOW) и канон-моделями.
+fn dreamer_uc(state: Arc<MemState>, sessions: Arc<FakeSessions>, cup: usize) -> DreamerUseCase {
     struct DreamClock;
     impl Clock for DreamClock {
         fn utc_minute(&self) -> UtcMinute {
@@ -3340,31 +3393,238 @@ async fn dreamer_revival_of_dreamed_session_reprompts() {
             }
         }
         fn now_ms(&self) -> u64 {
-            100_000_000
+            DREAM_NOW
         }
     }
+    DreamerUseCase {
+        sessions: Arc::new(SessionRouter::uniform(sessions)),
+        state,
+        clock: Arc::new(DreamClock),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        checkout: "/tmp/checkout".into(),
+        cup,
+    }
+}
+
+/// Кандидат-источник: дримлен в T1, дополнен в T2 > T1, idle ≥ 30 мин.
+fn revived_target() -> crate::ports::SessionInfo {
+    crate::ports::SessionInfo {
+        updated_ms: DREAM_NOW - 31 * 60_000,
+        ..fake_session("ses_target", "developer", "succeeded", 700, false)
+    }
+}
+
+#[tokio::test]
+async fn dreamer_repeat_wakes_linked_session_without_new_spawn() {
+    // ADR-005 1:1: revival отдрименной сессии — wakeup ТОЙ ЖЕ дример-сессии
+    // («повторный прогон»), нового спавна нет; watermark продвигается.
     let state = Arc::new(MemState(Mutex::default()));
-    // Дрим в T1; revival — активность T2 > T1 (дополнение после дрима).
-    state.mark_dreamer("ses_target", DreamerMark::UpTo(100_000_000 - 40 * 60_000));
+    state.mark_dreamer("ses_target", DreamerMark::UpTo(DREAM_NOW - 40 * 60_000));
+    state.link_dreamer_session("ses_target", "ses_dream");
     let sessions = Arc::new(FakeSessions::new());
+    sessions.extra.lock().unwrap().push(revived_target());
+    // живой носитель из реестра линков (дример-агент — вне кандидатов)
+    sessions.extra.lock().unwrap().push(fake_session(
+        "ses_dream",
+        "dreamer",
+        "succeeded",
+        9_000,
+        false,
+    ));
+    let u = dreamer_uc(state.clone(), sessions.clone(), 7);
+    let spawned = u.tick().await.unwrap();
+    assert_eq!(spawned, 1);
+    let prompts = sessions.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1, "одно дрим-действие за тик");
+    assert!(
+        prompts[0].starts_with("ses_dream|"),
+        "промпт в связанную дример-сессию"
+    );
+    assert!(
+        prompts[0].contains("Повторный прогон"),
+        "wakeup-промпт повторного прогона"
+    );
+    assert!(
+        prompts[0].contains("ses_target"),
+        "промпт называет источник"
+    );
+    drop(prompts);
+    assert!(
+        sessions.spawned.lock().unwrap().is_empty(),
+        "нового спавна нет — инвариант 1:1"
+    );
+    assert_eq!(
+        state.dreamer_mark("ses_target"),
+        Some(DreamerMark::UpTo(DREAM_NOW - 31 * 60_000)),
+        "watermark продвинут на позицию revival'а"
+    );
+}
+
+#[tokio::test]
+async fn dreamer_without_revival_stays_silent() {
+    // Контроль зелёного фона: дрим без последующей активности — тишина.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.mark_dreamer("ses_target", DreamerMark::UpTo(DREAM_NOW - 31 * 60_000));
+    let sessions = Arc::new(FakeSessions::new());
+    sessions.extra.lock().unwrap().push(revived_target());
+    let u = dreamer_uc(state, sessions.clone(), 7);
+    assert_eq!(u.tick().await.unwrap(), 0, "без revival дример молчит");
+    assert!(sessions.prompts.lock().unwrap().is_empty());
+    assert!(sessions.spawned.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn dreamer_forever_mark_skips_even_after_activity() {
+    // Боты (Forever) — не источники опыта: активность их не реанимирует.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.mark_dreamer("ses_target", DreamerMark::Forever);
+    let sessions = Arc::new(FakeSessions::new());
+    sessions.extra.lock().unwrap().push(revived_target());
+    let u = dreamer_uc(state, sessions.clone(), 7);
+    assert_eq!(u.tick().await.unwrap(), 0);
+    assert!(sessions.prompts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn dreamer_respawns_when_linked_dreamer_session_dead() {
+    // Линк на умерший носитель: спавн нового + релинк + повторный прогон.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.mark_dreamer("ses_target", DreamerMark::UpTo(DREAM_NOW - 40 * 60_000));
+    state.link_dreamer_session("ses_target", "ses_gone");
+    let sessions = Arc::new(FakeSessions::new());
+    sessions.extra.lock().unwrap().push(revived_target());
+    let u = dreamer_uc(state.clone(), sessions.clone(), 7);
+    let spawned = u.tick().await.unwrap();
+    assert_eq!(spawned, 1, "мёртвый носитель — респавн");
+    let created = sessions.spawned.lock().unwrap().clone();
+    assert_eq!(created.len(), 1);
+    assert_eq!(
+        state.dreamer_session("ses_target"),
+        Some(created[0].clone()),
+        "линк перезаписан на новый носитель"
+    );
+    let prompts = sessions.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1);
+    assert!(
+        prompts[0].starts_with(&format!("{}|", created[0])),
+        "прогон — в новый носитель"
+    );
+    assert!(
+        prompts[0].contains("Пост-обработка"),
+        "новый носитель без контекста дедупа получает полный промпт"
+    );
+}
+
+#[tokio::test]
+async fn dreamer_first_run_links_created_session() {
+    // Первый прогон: спавн + связка «исходная → её дример-сессия».
+    let state = Arc::new(MemState(Mutex::default()));
+    let sessions = Arc::new(FakeSessions::new());
+    sessions.extra.lock().unwrap().push(revived_target());
+    let u = dreamer_uc(state.clone(), sessions.clone(), 7);
+    let spawned = u.tick().await.unwrap();
+    assert_eq!(spawned, 1);
+    let created = sessions.spawned.lock().unwrap().clone();
+    assert_eq!(created.len(), 1);
+    assert_eq!(
+        state.dreamer_session("ses_target"),
+        Some(created[0].clone()),
+        "первый прогон связывает носителя с источником"
+    );
+    let prompts = sessions.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1);
+    assert!(
+        prompts[0].contains("Пост-обработка"),
+        "новый носитель получает полный промпт пост-обработки"
+    );
+}
+
+#[tokio::test]
+async fn dreamer_repeat_run_counts_into_day_cap() {
+    // Повторный прогон — такой же запуск хода: дневной кап его считает.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.mark_dreamer("ses_target", DreamerMark::UpTo(DREAM_NOW - 40 * 60_000));
+    state.link_dreamer_session("ses_target", "ses_dream");
+    let day = crate::pipeline::dreamer::jst_day_key(DREAM_NOW);
+    for _ in 0..24 {
+        state.mark_dreamer_spawn(&day);
+    }
+    let sessions = Arc::new(FakeSessions::new());
+    sessions.extra.lock().unwrap().push(revived_target());
+    sessions.extra.lock().unwrap().push(fake_session(
+        "ses_dream",
+        "dreamer",
+        "succeeded",
+        9_000,
+        false,
+    ));
+    let u = dreamer_uc(state, sessions.clone(), 7);
+    assert_eq!(
+        u.tick().await.unwrap(),
+        0,
+        "исчерпанный дневной кап держит и повторный прогон"
+    );
+    assert!(sessions.prompts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn dreamer_busy_dreamer_blocks_repeat_wakeup() {
+    // Живой дример (ход в полёте) блокирует и wakeup-путь — ≤1 живого.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.mark_dreamer("ses_target", DreamerMark::UpTo(DREAM_NOW - 40 * 60_000));
+    state.link_dreamer_session("ses_target", "ses_dream");
+    let sessions = Arc::new(FakeSessions::new());
+    sessions.extra.lock().unwrap().push(revived_target());
+    sessions.extra.lock().unwrap().push(fake_session(
+        "ses_dream",
+        "dreamer",
+        "succeeded",
+        9_000,
+        true,
+    ));
+    let u = dreamer_uc(state, sessions.clone(), 7);
+    assert_eq!(
+        u.tick().await.unwrap(),
+        0,
+        "живой дример — спавна и wakeup нет"
+    );
+    assert!(sessions.prompts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn dreamer_prune_drops_dead_session_state() {
+    // Гигиена: метки/линки сессий вне живого скана сносятся — рост state
+    // ограничен живыми сессиями (500-граница легаси ушла, #1306).
+    let state = Arc::new(MemState(Mutex::default()));
+    state.mark_dreamer("ses_live", DreamerMark::UpTo(DREAM_NOW - 40 * 60_000));
+    state.mark_dreamer("ses_dead", DreamerMark::UpTo(DREAM_NOW - 40 * 60_000));
+    state.link_dreamer_session("ses_live", "ses_l1");
+    state.link_dreamer_session("ses_dead", "ses_d1");
+    let sessions = Arc::new(FakeSessions::new());
+    // живая сессия — сама в скане (кандидат); ses_target/ses_dead вне него
     sessions
         .extra
         .lock()
         .unwrap()
         .push(crate::ports::SessionInfo {
-            updated_ms: 100_000_000 - 31 * 60_000,
-            ..fake_session("ses_target", "developer", "succeeded", 700, false)
+            updated_ms: DREAM_NOW - 31 * 60_000,
+            ..fake_session("ses_live", "developer", "succeeded", 700, false)
         });
-    let u = DreamerUseCase {
-        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
-        state,
-        clock: Arc::new(DreamClock),
-        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
-        checkout: "/tmp/checkout".into(),
-        cup: 7,
-    };
-    let spawned = u.tick().await.unwrap();
-    assert_eq!(spawned, 1, "revival отдрименной сессии — повторный прогон");
+    let u = dreamer_uc(state.clone(), sessions, 7);
+    assert_eq!(u.tick().await.unwrap(), 1);
+    assert!(
+        state.dreamer_mark("ses_dead").is_none(),
+        "метка мёртвой сессии снесена"
+    );
+    assert!(
+        state.dreamer_session("ses_dead").is_none(),
+        "линк мёртвой сессии снесён"
+    );
+    assert_eq!(
+        state.dreamer_mark("ses_live"),
+        Some(DreamerMark::UpTo(DREAM_NOW - 31 * 60_000)),
+        "живая сессия обработана штатно"
+    );
 }
 
 #[tokio::test]
