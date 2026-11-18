@@ -3,7 +3,7 @@
 //! логах (server.thp), а не корреляция падения Railway-метрики.
 
 /// Снимок THP-контекста процесса: режим хоста + huge-страницы процесса.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct ThpSnapshot {
     /// Активный режим хоста: содержимое
     /// /sys/kernel/mm/transparent_hugepage/enabled (режим в скобках).
@@ -14,15 +14,14 @@ pub struct ThpSnapshot {
 
 pub fn snapshot() -> ThpSnapshot {
     ThpSnapshot {
-        thp: read_sys(&["/sys/kernel/mm/transparent_hugepage/enabled"])
+        thp: read_sys("/sys/kernel/mm/transparent_hugepage/enabled")
             .and_then(|raw| parse_enabled(&raw)),
-        anon_hugepages_kb: read_sys(&["/proc/self/smaps_rollup"])
-            .and_then(|raw| parse_rollup(&raw)),
+        anon_hugepages_kb: read_sys("/proc/self/smaps_rollup").and_then(|raw| parse_rollup(&raw)),
     }
 }
 
-fn read_sys(paths: &[&str]) -> Option<String> {
-    paths.iter().find_map(|p| std::fs::read_to_string(p).ok())
+fn read_sys(path: &str) -> Option<String> {
+    std::fs::read_to_string(path).ok()
 }
 
 /// Активный THP-режим — в квадратных скобках: «always madvise [never]».
