@@ -221,6 +221,7 @@ async fn run(
         clock: clock.clone(),
         state: state.clone(),
         spawn_model: spawn_model_cfg.clone(),
+        boot_ms: clock.now_ms(),
     });
 
     let shared: Arc<std::sync::RwLock<TickOutcome>> = Arc::default();
