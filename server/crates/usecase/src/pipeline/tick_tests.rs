@@ -4886,7 +4886,8 @@ fn row_with_session(n: u64, session: &str, priority: Priority) -> Task {
     t
 }
 
-/// Живая busy-сессия исполнителя (union-скан: outcome пуст).
+/// Живая busy-сессия исполнителя (union-скан #1231: outcome пуст, ход в
+/// полёте — busy держит кап).
 fn live_busy(sessions: &Arc<FakeSessions>, id: &str) {
     sessions.live.lock().unwrap().push(LiveSighting {
         id: id.into(),
@@ -4896,6 +4897,7 @@ fn live_busy(sessions: &Arc<FakeSessions>, id: &str) {
         updated_ms: 0,
         total_tokens: 0,
     });
+    sessions.busy_ids.lock().unwrap().push(id.into());
 }
 
 #[tokio::test]

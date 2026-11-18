@@ -340,7 +340,9 @@ impl TickUseCase {
                         continue;
                     }
                     let Some(slot) = t.stage_slot() else { continue };
-                    let Some(session) = t.session_of(slot) else { continue };
+                    let Some(session) = t.session_of(slot) else {
+                        continue;
+                    };
                     let Some(info) = list.iter().find(|s| &s.id == session) else {
                         continue; // мёртвая — гасить нечего
                     };
@@ -367,10 +369,6 @@ impl TickUseCase {
         let global_active: usize = match &scan {
             Some(list) => list.iter().filter(|s| s.busy).count(),
             None => fallback_active,
-        };                    }
-                }
-            }
-        }
         };
         out.sessions_busy = global_active;
         // Счётчик капа — один на весь тик, общий для всех досок (#1244):

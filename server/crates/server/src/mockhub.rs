@@ -702,6 +702,8 @@ mod tests {
             .expect("строка на доске");
         assert_eq!(t.priority(), uwuwu_domain::Priority::Low);
         assert!(!t.automerge());
+    }
+
     #[tokio::test]
     async fn seeded_priority_reaches_read_board() {
         // Носитель приоритета на стенде (преемпшен CUP #1259): сид с
