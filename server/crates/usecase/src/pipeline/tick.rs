@@ -106,6 +106,10 @@ pub struct TickOutcome {
     /// Строк с недостоверной пробой активности исполнителя (Err): отказ
     /// сталл-прохода строки — без эскалации и записи каунтеров (#1281).
     pub probe_failed: usize,
+    /// Имена executor'ов с транспортным отказом union-скана (#1312):
+    /// громкость (порог/анти-повтор) и ТГ-сигнал — tick_loop (main.rs);
+    /// тик несёт факт поимённо, дубль-детекции нет.
+    pub executors_failed: Vec<String>,
 }
 
 /// Результат прохода сталл-детекта по строке.
@@ -309,12 +313,15 @@ impl TickUseCase {
                     .collect(),
             )
         } else {
+            let mut executors_failed = Vec::new();
             for (name, r) in &per_exec {
                 if let Err(e) = r {
+                    executors_failed.push(name.clone());
                     tracing::warn!(event = "cup.list_sessions_failed", executor = %name,
                         error = %e, "list_sessions исполнителя недоступен — CUP по статусам");
                 }
             }
+            out.executors_failed = executors_failed;
             None
         };
         // Пер-проектное зрение: слепки по исполнителям, доска получает свой
