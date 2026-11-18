@@ -336,6 +336,42 @@ mod tests {
     }
 
     #[test]
+    fn decide_automerge_rejects_non_pull_url() {
+        // docs-only с фабричной веткой: PR-ячейка несёт артефакт-URL —
+        // гейт не пускает строку в automerge-пробу, тик не бончит (#1286):
+        // wiki-URL (инстанс #1159) и issues-URL (инстанс #1279) —
+        // не мерж-носители, строка ждёт владельца в Review
+        let mut t = task(Status::UserReview);
+        t.set_automerge(true);
+        let fields = |url: &str| {
+            crate::task::TaskFields::new(
+                std::collections::BTreeMap::new(),
+                crate::task::Vcs::PullRequest {
+                    branch: crate::task::BranchName::parse("work/task-7").unwrap(),
+                    url: crate::task::PrUrl::parse(url).unwrap(),
+                },
+                crate::task::Priority::Empty,
+            )
+        };
+        t.apply_fields(fields("https://github.com/o/r/wiki/a"));
+        assert!(
+            matches!(decide(&t), Action::Observe { .. }),
+            "wiki-URL — артефакт, не мерж-носитель"
+        );
+        t.apply_fields(fields("https://github.com/o/r/issues/1279"));
+        assert!(
+            matches!(decide(&t), Action::Observe { .. }),
+            "issues-URL — артефакт, не мерж-носитель"
+        );
+        // настоящий PR-URL — мерж-кандидат; трейлинг-слэш допуск грубой
+        // формы не рвёт (пин ревью #1286)
+        t.apply_fields(fields("https://github.com/o/r/pull/7"));
+        assert_eq!(decide(&t), Action::Automerge);
+        t.apply_fields(fields("https://github.com/o/r/pull/7/"));
+        assert_eq!(decide(&t), Action::Automerge);
+    }
+
+    #[test]
     fn awaits_semantics_of_analysis_stage() {
         // #1135: Draft/Todo — мяч владельца; Analys/Review Analys — вход
         // в конвейер (очередь сайдкара аналитики)

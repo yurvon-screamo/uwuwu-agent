@@ -117,6 +117,7 @@ impl TickStateStore for NoopState {
         None
     }
     fn mark_stall_ping(&self, _b: &str, _n: u64, _s: Status, _at: u64) {}
+    fn clear_stall(&self, _b: &str, _n: u64) {}
     fn clear_spawn_ms(&self, _b: &str, _n: u64, _s: Slot) {}
     /// Аналитика: кулдауны волн/ревью и цикл-гварды (#1135).
     fn last_analys_ms(&self, _b: &str, _n: u64) -> Option<u64> {
@@ -386,7 +387,7 @@ async fn cron_run_carries_model_from_server_map() {
 
     // Assert
     assert_eq!(fired.len(), 1, "крон-файр состоялся");
-    // мастер без fm agent — Default-слот → default-модель карты (канон #417)
+    // мастер без fm agent — Default-слот → default-модель карты
     assert_model(
         sessions.spec_of(),
         "крон-спавн",

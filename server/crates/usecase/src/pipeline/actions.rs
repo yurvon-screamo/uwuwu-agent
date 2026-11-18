@@ -452,7 +452,8 @@ impl TickUseCase {
     /// всегда за владельцем) / bounce в работу. Ветка без PR — возврат в
     /// работу (PR ещё не создан); docs-only до сюда не доходит (домен
     /// automerge_ready не прощупывает безветочные ячейки — Vcs::Local и
-    /// Artifact, #1155: мержить нечего, строка ждёт владельца).
+    /// Artifact, #1155 — и PR-ячейки с URL не PR-формы: wiki/issues/blob
+    /// с фабричной веткой, #1286 — мержить нечего, строка ждёт владельца).
     /// Возвращает true — PR смержен этим вызовом (счётчик тика).
     pub async fn automerge(&self, board: &BoardPlan, task: &Task) -> UsecaseResult<bool> {
         use crate::ports::PrState;

@@ -103,6 +103,9 @@ pub struct TickOutcome {
     /// Строк, пропущенных тиком при отказе enrichment (#1163): решение
     /// по невидимым ячейкам — источник дублей, ждём следующий тик.
     pub enrich_skipped: usize,
+    /// Строк с недостоверной пробой активности исполнителя (Err): отказ
+    /// сталл-прохода строки — без эскалации и записи каунтеров (#1281).
+    pub probe_failed: usize,
 }
 
 /// Результат прохода сталл-детекта по строке.
@@ -113,7 +116,17 @@ enum StallAct {
     /// Мягкий пинг: ход завершён (idle), прямой промпт в сессию.
     SoftPinged,
     Flagged,
+    /// Недостоверная проба исполнителя: сталл-проход строки отложен —
+    /// вердикт о тишине не может быть получен (#1281, срез честности
+    /// пробы). Эскалация и запись каунтеров не выполняются.
+    ProbeFailed,
 }
+
+/// Полоса отказов пробы за тик, при которой тик сигнализирует деградацию
+/// пробы одним громким событием (прецедент ограниченной деградации
+/// ADR-086); обработка остальных строк не останавливается — изоляция
+/// построчная (#1281).
+pub const PROBE_DEGRADE_MIN_ROWS: usize = 5;
 
 /// Оркестратор тика: порты внедряются извне (композиция в uwuwu-server).
 pub struct TickUseCase {
@@ -124,6 +137,11 @@ pub struct TickUseCase {
     pub clock: Arc<dyn Clock>,
     pub state: Arc<dyn TickStateStore>,
     pub models: Arc<SpawnModels>,
+    /// ms старта процесса сервера: эскалация сталла требует пингов,
+    /// доставленных в текущем процессе — раунд из-под рестарта
+    /// недействителен (инцидент 18.11 #1281: persisted каунтеры volume
+    /// переживают пересоздание контейнера, парковка по чужому раунду).
+    pub boot_ms: u64,
 }
 
 /// Причина hold спавна: зрение недоступно или в env живая сестра.
@@ -398,6 +416,16 @@ impl TickUseCase {
         if let Err(e) = self.state.save() {
             tracing::error!(event = "state.save_failed", error = %e, "Failed to save tick state");
         }
+        // Полоса отказов пробы за тик — одно громкое событие деградации
+        // (массовый Err = класс гейт-окна #1160); обработка строк при этом
+        // не останавливалась — изоляция построчная (#1281).
+        if out.probe_failed >= PROBE_DEGRADE_MIN_ROWS {
+            tracing::error!(
+                event = "stall.probe_degraded",
+                probe_failed = out.probe_failed,
+                "Проба активности исполнителя деградировала: массовый отказ сталл-проб — вердикты тишины недостоверны"
+            );
+        }
         tracing::info!(
             event = "tick.completed",
             rows = out.rows_total,
@@ -413,6 +441,7 @@ impl TickUseCase {
             observed = out.observed,
             spawns_allowed = out.spawns_allowed,
             enrich_skipped = out.enrich_skipped,
+            probe_failed = out.probe_failed,
             mode = ?plan.mode,
             failed = out.actions_failed,
             "Tick completed"
@@ -802,6 +831,7 @@ impl TickUseCase {
                 Ok(StallAct::Pinged) => out.stall_pings += 1,
                 Ok(StallAct::SoftPinged) => out.soft_pings += 1,
                 Ok(StallAct::Flagged) => out.stall_flagged += 1,
+                Ok(StallAct::ProbeFailed) => out.probe_failed += 1,
                 Err(e) => {
                     out.actions_failed += 1;
                     self.log_action_failed(task, e);
@@ -904,15 +934,19 @@ impl TickUseCase {
             .await
         {
             Ok(Some(ms)) => self.clock.now_ms().saturating_sub(ms),
+            // пустой журнал легитимной сессии — тишина 0, тихий пропуск
             Ok(None) => 0,
+            // недостоверная проба (транспорт, окно гейт-заглушки #1160):
+            // сталл-проход строки откладывается громко — эскалация и
+            // запись каунтеров по ненадёжному вердикту недопустимы (#1281)
             Err(e) => {
                 tracing::warn!(
                     event = "stall.activity_err",
                     number = task.number(),
                     error = %e,
-                    "stall_pass: last_activity_ms ошибка"
+                    "Сталл-проход отложен: проба активности исполнителя недостоверна"
                 );
-                0
+                return Ok(StallAct::ProbeFailed);
             }
         };
         if silence < STALL_SOFT_SILENCE_MS {
@@ -934,6 +968,22 @@ impl TickUseCase {
             .map(|(st, ms, c)| (Some(st), ms, c))
             .unwrap_or((None, 0, 0));
         if prev_status != Some(task.status()) {
+            count = 0;
+        }
+        // Раунд из-под рестарта недействителен (инцидент 18.11 #1281):
+        // persisted каунтеры volume переживают пересоздание контейнера,
+        // эскалация по ним паркует живые сессии без единого доставленного
+        // в этом процессе пинга. Пинги, отправленные до boot_ms, текущим
+        // процессом не доставлялись — сброс персистится на носителе
+        // (иначе mark_stall_ping инкрементит stale-каунтер: эскалация
+        // после одного пинга, счётчик с чужими пингами).
+        if count > 0 && last_ping < self.boot_ms {
+            tracing::info!(
+                event = "stall.round_stale",
+                number = task.number(),
+                "Сталл-раунд пережил рестарт — сброс на носителе, свежий раунд пингов"
+            );
+            self.state.clear_stall(&board.board, task.number());
             count = 0;
         }
         let now = self.clock.now_ms();
@@ -964,12 +1014,43 @@ impl TickUseCase {
                 .stall_ping_round(board, task, slot, session, soft, silence, now)
                 .await;
         }
-        // два пинга исчерпаны, тишина продолжается — мяч владельцу
+        // Проба живости В МОМЕНТ эскалации (#1281, различение причин):
+        // вердикт должен быть достоверным, подпись — действенной.
+        // Unknown — проба недостоверна: отказ (повтор на следующем тике);
+        // Dead — сессия потеряна: парковка не выполняется, dead-детект
+        // wakeup-пути респавнит строку на следующем тике (ADR-107),
+        // класс «сессия потеряна» живёт в комменте респавн-петли.
+        match self
+            .sessions
+            .project(&board.project)
+            .liveness(session)
+            .await
+        {
+            Liveness::Alive => {}
+            Liveness::Unknown => {
+                tracing::warn!(
+                    event = "stall.escalation_probe_unknown",
+                    number = task.number(),
+                    "Эскалация отложена: проба живости недостоверна"
+                );
+                return Ok(StallAct::ProbeFailed);
+            }
+            Liveness::Dead => {
+                tracing::warn!(
+                    event = "stall.escalation_session_lost",
+                    number = task.number(),
+                    "Эскалация отменена: сессия потеряна — строку заберёт dead-детект"
+                );
+                return Ok(StallAct::None);
+            }
+        }
+        // пинги исчерпаны, сессия жива и молчит — мяч владельцу
         tracing::warn!(
             event = "stall.escalated",
             number = task.number(),
             silence_min = silence / 60_000,
-            "Сталл: сессия молчит после двух автопингов"
+            round_pings = count,
+            "Сталл: агент молчит при живой сессии после раунда автопингов"
         );
         self.board
             .set_status(&board.board, task.number(), Status::NeedsAttention)
@@ -978,8 +1059,9 @@ impl TickUseCase {
             .post_comment(
                 task.number(),
                 &format!(
-                    "⚠︎ Сталл-детект: stage-сессия `{}` молчит {} мин после двух \
-                     автопингов — агент не завершает статусную транзакцию. Строка в \
+                    "⚠︎ Сталл-детект: stage-сессия `{}` молчит {} мин при живой \
+                     сессии — агент не завершает статусную транзакцию (проба \
+                     исполнителя: жива; автопингов в раунде: {count}). Строка в \
                      Needs attention, разбор владельца.",
                     naming::slot_key(slot),
                     silence / 60_000

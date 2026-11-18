@@ -100,11 +100,13 @@ mod tests {
 
     #[test]
     fn canonical_carries_owner_model_map() {
+        // канон владельца 18.11 (#417): везде flash#high, ревьюверы —
+        // полный 5.3#high; карта = config.example verbatim (кросс-гвард)
         let m = SpawnModels::canonical();
         assert_eq!(
             m.for_agent(Agent::PlanReviewer),
             SpawnModel::parse("zai-coding-plan/glm-5.3#high").unwrap(),
-            "ревьюверы — полный 5.3#high (слово владельца 18.11, #417)"
+            "ревьюверы — полный 5.3#high (канон #417)"
         );
         assert_eq!(
             m.for_agent(Agent::Dreamer),
@@ -112,8 +114,7 @@ mod tests {
         );
         assert_eq!(
             m.for_agent(Agent::Tester),
-            SpawnModel::parse("zai-coding-plan/glm-5.3-flash#high").unwrap(),
-            "везде flash#high (слово владельца 18.11, #417)"
+            SpawnModel::parse("zai-coding-plan/glm-5.3-flash#high").unwrap()
         );
         assert_eq!(m.for_default(), m.for_agent(Agent::Developer));
     }

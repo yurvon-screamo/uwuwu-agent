@@ -1,0 +1,12 @@
+# On-boot разовый рестарт rathole-клиента opencode-туннеля (#1312).
+# Ребут ноды оставляет релей со стейл-маршрутом: клиент running, транспорт
+# мёртв. Рестарт через 3 мин после загрузки пробивает свежий handshake —
+# релей пересобирает маршрут. Установка на ноду-исполнителя: ранбук
+# «Подключение исполнителя через релей», шаг «On-boot refresh».
+[Unit]
+Description=Refresh rathole opencode tunnel after boot (one-shot)
+After=rathole-opencode.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl --user try-restart rathole-opencode.service
