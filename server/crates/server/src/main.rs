@@ -521,8 +521,17 @@ async fn run(
                 let clock = sweep_clock.clone();
                 Box::pin(async move {
                     let now_ms = clock.now_ms();
+                    // Дебаг-гейт одной строки (как у тика): UWUWU_ONLY_TASK
+                    // — клин действует только по ней; живая проба против
+                    // реального репо не запускает сотенную первую волну
+                    let only = std::env::var("UWUWU_ONLY_TASK")
+                        .ok()
+                        .and_then(|v| v.trim().parse::<u64>().ok());
                     for b in &boards {
-                        let tasks = board.read_board(&b.board).await?;
+                        let mut tasks = board.read_board(&b.board).await?;
+                        if let Some(n) = only {
+                            tasks.retain(|t| t.number() == n);
+                        }
                         uwuwu_usecase::sweeper::sweep_board(
                             board.as_ref(),
                             &b.board,
