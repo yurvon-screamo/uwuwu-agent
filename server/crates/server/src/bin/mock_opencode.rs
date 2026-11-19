@@ -22,6 +22,15 @@
 //!            busy по контракту сервера, #1231) — носитель busy-жертв
 //!            преемпшена CUP (#1259 e2e); abort снимает ход
 //!
+//! lost-ручки стенда (#1288, dev-ручки тестировщика):
+//!   MOCK_PROMPT_404_AFTER=N — после N успешных доставок все следующие
+//!     prompt → 404 при живом list (serve-рассинхрон инцидента #16:
+//!     «проба Alive, доставка отказывает») — десинк-ветка lost-контура;
+//!   POST /api/lost {"directory": dir} — сессии с этой directory в
+//!     классе lost: GET 200 (probe Alive), list скрывает, prompt/
+//!     switch_agent → 404 — lost-resurrection-ветка (юнит-класс T2
+//!     живьём); включается ПОСЛЕ успешного спавна.
+//!
 //! Env: MOCK_MODE (деф. plain), MOCK_PORT (8099), MOCK_STEP_MS (1500),
 //!      MOCK_MCP_URL (http://127.0.0.1:8090), MOCK_MCP_TOKEN («»),
 //!      MOCK_VERDICTS («plan:request_changes;result:request_changes;...») —
@@ -74,6 +83,17 @@ struct Store {
     sessions: Mutex<HashMap<String, MockSession>>,
     /// Сценарные вердикты ревью (MOCK_VERDICTS), расходуются по порядку.
     verdicts: Mutex<Vec<String>>,
+    /// lost-ручка стенда #1288 (динамическая, POST /api/lost): сессии с
+    /// этой directory в классе lost — GET 200 (probe Alive), list
+    /// скрывает, prompt/switch_agent → 404. Живой T2-стенд
+    /// lost-маршрутизации («сессии нет в списке, доставка отказывает»);
+    /// включается ПОСЛЕ успешного спавна — начальный промпт не задет.
+    lost_directory: Mutex<String>,
+    /// MOCK_PROMPT_404_AFTER: после N успешных доставок все следующие
+    /// prompt → 404 при живом list — serve-рассинхрон инцидента #16
+    /// (десинк-стенд lost-контура).
+    prompt_404_after: u64,
+    prompt_ok: AtomicU64,
 }
 
 fn now_ms() -> u64 {
@@ -214,6 +234,7 @@ async fn main() {
     let mcp_url = cfg("MOCK_MCP_URL", "http://127.0.0.1:8090");
     let mcp_token = cfg("MOCK_MCP_TOKEN", "");
     let port: u16 = cfg("MOCK_PORT", "8099").parse().unwrap_or(8099);
+    let prompt_404_after: u64 = cfg("MOCK_PROMPT_404_AFTER", "0").parse().unwrap_or(0);
 
     let store = Arc::new(Store {
         verdicts: Mutex::new(
@@ -223,11 +244,16 @@ async fn main() {
                 .map(str::to_string)
                 .collect(),
         ),
+        lost_directory: Mutex::new(String::new()),
+        prompt_404_after,
+        prompt_ok: AtomicU64::new(0),
         ..Store::default()
     });
     let verdicts_left = store.verdicts.lock().expect("verdicts").len();
     tracing::info!(event = "mock.started", %mode, port, mcp_url = %mcp_url,
-        verdicts_left, "mock-opencode up");
+        verdicts_left,
+        prompt_404_after = store.prompt_404_after,
+        "mock-opencode up");
     let counter = Arc::new(AtomicU64::new(1));
     // случайный префикс id: инстансы на стенде не должны делить id-пространство
     // (second source #1163 матчит сессии по id в union-скане — коллизия
@@ -327,6 +353,22 @@ async fn main() {
             post({
                 let store = store.clone();
                 move |Path(id): Path<String>| abort_session(store, id)
+            }),
+        )
+        .route(
+            // lost-ручка стенда #1288 (динамическая): {"directory": "<dir>"}
+            // переводит сессии с этой directory в класс lost (prompt/agent
+            // → 404, list скрывает, GET 200); пустая строка — сброс.
+            // Включается ПОСЛЕ успешного спавна — начальный промпт не задет.
+            "/api/lost",
+            post({
+                let store = store.clone();
+                move |Json(body): Json<Value>| async move {
+                    let dir = body["directory"].as_str().unwrap_or_default().to_string();
+                    tracing::warn!(event = "mock.lost_set", directory = %dir, "POST /lost");
+                    *store.lost_directory.lock().expect("lost") = dir.clone();
+                    (StatusCode::OK, Json(json!({ "data": { "lost": dir } }))).into_response()
+                }
             }),
         )
         .route(
@@ -440,12 +482,37 @@ fn gate_post_reject() -> Response {
 /// Пин агента слота (#1300, контракт opencode 2.3.2): 204, agent
 /// персистится в сессию — сталл-пинги сервера проходят на стенде как в
 /// живом opencode (404 = сессия умерла, честный Err на клиенте).
+/// lost-ручка #1288: сессия в классе lost по directory (GET 200, list
+/// скрывает, prompt/switch_agent → 404)
+fn session_is_lost(store: &Store, directory: &str) -> bool {
+    let lost = store.lost_directory.lock().expect("lost").clone();
+    !lost.is_empty() && directory == lost
+}
+
 async fn switch_agent(store: Arc<Store>, id: String, body: Value) -> StatusCode {
     let agent = body["agent"].as_str().unwrap_or_default().to_string();
-    tracing::info!(event = "mock.agent_switched", %id, %agent, "POST /session/:id/agent");
     let mut sessions = store.sessions.lock().expect("store");
     match sessions.get_mut(&id) {
         Some(s) => {
+            // lost-ручка #1288: пин агента слота — классифицированный путь
+            // доставки, lost-сессия отвечает 404 как prompt
+            if session_is_lost(&store, &s.directory) {
+                tracing::warn!(event = "mock.agent_lost", %id, "lost-directory ручка: switch_agent → 404");
+                return StatusCode::NOT_FOUND;
+            }
+            // AFTER-ручка (serve-рассинхрон #16): запись в сессию отклоняется
+            // ДО обновления активности — иначе успешный пин «оживляет» сессию
+            // и сталл-пинг замолкает (инцидент: доставка падала целиком,
+            // активность не двигалась, ретрай на каждом тике)
+            if store.prompt_404_after > 0 {
+                let n = store.prompt_ok.fetch_add(1, Ordering::SeqCst) + 1;
+                if n > store.prompt_404_after {
+                    tracing::warn!(event = "mock.agent_lost", %id, attempt = n,
+                        after = store.prompt_404_after, "AFTER-ручка: switch_agent → 404");
+                    return StatusCode::NOT_FOUND;
+                }
+            }
+            tracing::info!(event = "mock.agent_switched", %id, %agent, "POST /session/:id/agent");
             s.agent = agent;
             s.updated_ms = now_ms();
             StatusCode::NO_CONTENT
@@ -503,12 +570,17 @@ async fn list_sessions(store: Arc<Store>, q: Query<ListQuery>) -> Resp {
     let sessions = store.sessions.lock().expect("store");
     // мёртвые (удалённые) в списке не числятся — семантика реального
     // опенкода, на неё опирается busy-учёт CUP (#1231); list и GET
-    // согласованы (контракт second source #1163)
+    // согласованы (контракт second source #1163). lost-ручка #1288 —
+    // осознанное расхождение: сессия скрыта из list (union-скан не
+    // «знает» её), GET при этом отвечает 200 (probe Alive) — стенд
+    // lost-resurrection
+    let lost_dir = store.lost_directory.lock().expect("lost").clone();
     let mut list: Vec<Value> = sessions
         .values()
-        .filter(|s| !s.dead)
+        .filter(|s| !s.dead && (lost_dir.is_empty() || s.directory != lost_dir))
         .map(session_json)
         .collect();
+    drop(lost_dir);
     list.sort_by(|a, b| {
         a["id"]
             .as_str()
@@ -635,6 +707,22 @@ async fn prompt(
     let Some(session) = store.sessions.lock().expect("store").get(&id).cloned() else {
         return (StatusCode::NOT_FOUND, Json(json!({ "status": "404" })));
     };
+    // lost-ручки стенда #1288: отказ доставки до любых эффектов хода —
+    // сессия остаётся в store (GET 200 → probe Alive) и в списке (десинк)
+    // либо скрыта по directory (lost-resurrection). Нумерация попыток
+    // доставки общая: порог AFTER отсчитывает успешные доставки.
+    if session_is_lost(&store, &session.directory) {
+        tracing::warn!(event = "mock.prompt_lost", %id, "lost-directory ручка: prompt → 404");
+        return (StatusCode::NOT_FOUND, Json(json!({ "status": "404" })));
+    }
+    if store.prompt_404_after > 0 {
+        let n = store.prompt_ok.fetch_add(1, Ordering::SeqCst) + 1;
+        if n > store.prompt_404_after {
+            tracing::warn!(event = "mock.prompt_lost", %id, attempt = n,
+                after = store.prompt_404_after, "AFTER-ручка: prompt → 404");
+            return (StatusCode::NOT_FOUND, Json(json!({ "status": "404" })));
+        }
+    }
     tracing::info!(event = "mock.prompt", %id, len = text.len(), "POST /prompt");
     let mut sessions = store.sessions.lock().expect("store");
     if let Some(s) = sessions.get_mut(&id) {

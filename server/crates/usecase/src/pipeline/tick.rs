@@ -1,7 +1,7 @@
 //! Тик конвейера: чтение досок → домен решает → гейты → исполнение
 //! через порты. Оркестрация знает слова (логи/промпты) — домен нет.
 
-use super::actions::WakeAct;
+use super::actions::{LostAct, WakeAct};
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
 use crate::ports::{Clock, Liveness, PrGateway, TaskBoardRepo, TickStateStore};
@@ -91,6 +91,11 @@ pub struct TickOutcome {
     pub stall_flagged: usize,
     /// Строк, снятых с раунда капом ревью-раундов (#1311).
     pub review_flagged: usize,
+    /// Строк, запаркованных порогом потерянных доставок (#1288).
+    pub session_lost_flagged: usize,
+    /// Отложенные политикой (пик/CUP) respawn'ы потерянных сессий (#1288):
+    /// отдельно от будильников (\`wakeups_deferred\`).
+    pub lost_deferred: usize,
     /// Busy-сессии исполнителя по union-скану на старте тика (или
     /// статусный фолбэк-подсчёт при недоступности скана) — наблюдаемость
     /// единого капа (#1231).
@@ -133,6 +138,10 @@ enum StallAct {
 /// ADR-086); обработка остальных строк не останавливается — изоляция
 /// построчная (#1281).
 pub const PROBE_DEGRADE_MIN_ROWS: usize = 5;
+
+/// Порог потерянных доставок до парковки (#1288): тик ≈ 3–5 мин, три
+/// неудачи подряд ≈ 9–15 мин; один сбой не паркуем (урок #1281).
+pub const SESSION_LOST_ESCALATE_AFTER: u32 = 3;
 
 /// Оркестратор тика: порты внедряются извне (композиция в uwuwu-server).
 pub struct TickUseCase {
@@ -445,12 +454,14 @@ impl TickUseCase {
             deferred_peak = out.deferred_peak,
             wakeups = out.wakeups,
             wakeups_deferred = out.wakeups_deferred,
+            lost_deferred = out.lost_deferred,
             automerged = out.automerged,
             held_live = out.held_live,
             stall_pings = out.stall_pings,
             soft_pings = out.soft_pings,
             stall_flagged = out.stall_flagged,
             review_flagged = out.review_flagged,
+            session_lost_flagged = out.session_lost_flagged,
             observed = out.observed,
             spawns_allowed = out.spawns_allowed,
             enrich_skipped = out.enrich_skipped,
@@ -676,6 +687,10 @@ impl TickUseCase {
                                             self.log_action_failed(task_ref, e);
                                         } else {
                                             out.spawns_done += 1;
+                                            // свежая сессия в ячейке — счётчик
+                                            // прошлой сессии устарел (#1288)
+                                            self.state
+                                                .clear_lost_session(&board.board, task.number());
                                         }
                                     }
                                     Err(e) => {
@@ -840,10 +855,14 @@ impl TickUseCase {
                 out.wakeups += 1;
                 // доставленный ход занимает слот капа в этом же тике (#1231)
                 *active_now += 1;
+                // доставка прошла — серия потерянных доставок прервана (#1288)
+                self.state.clear_lost_session(&board.board, task.number());
             }
             Ok(WakeAct::Respawned) => {
                 out.spawns_done += 1;
                 *active_now += 1;
+                // новая сессия в ячейке — счётчик прошлой сессии устарел
+                self.state.clear_lost_session(&board.board, task.number());
             }
             Ok(WakeAct::Deferred) => out.wakeups_deferred += 1,
             Ok(WakeAct::Guarded) => out.held_live += 1,
@@ -851,14 +870,67 @@ impl TickUseCase {
             Ok(WakeAct::None) => match self.stall_pass(board, task).await {
                 Ok(StallAct::None) => {}
                 Ok(StallAct::Pinged) => out.stall_pings += 1,
-                Ok(StallAct::SoftPinged) => out.soft_pings += 1,
+                Ok(StallAct::SoftPinged) => {
+                    out.soft_pings += 1;
+                    // мягкий пинг доставлен — доставка в сессию работает (#1288)
+                    self.state.clear_lost_session(&board.board, task.number());
+                }
                 Ok(StallAct::Flagged) => out.stall_flagged += 1,
                 Ok(StallAct::ProbeFailed) => out.probe_failed += 1,
+                // обе Err-ветки — путь доставки: классифицированная потеря
+                // маршрутизируется, прочие отказы логируются как раньше (#1288)
                 Err(e) => {
-                    out.actions_failed += 1;
-                    self.log_action_failed(task, e);
+                    self.stage_delivery_err(board, plan, task, active_now, ctx, out, e)
+                        .await;
                 }
             },
+            Err(e) => {
+                self.stage_delivery_err(board, plan, task, active_now, ctx, out, e)
+                    .await;
+            }
+        }
+    }
+
+    /// Единая Err-рука путей доставки стадии (#1288): SessionNotFound —
+    /// dead-session класс, маршрутизация потери (`session_lost_pass`);
+    /// прочие отказы — как раньше (лог, ретрай следующим тиком).
+    #[allow(clippy::too_many_arguments)] // вердикт-проход: контекст строки+тики, прецедент stall_action
+    async fn stage_delivery_err(
+        &self,
+        board: &BoardPlan,
+        plan: &TickPlan,
+        task: &Task,
+        active_now: &mut usize,
+        ctx: &RowContext<'_>,
+        out: &mut TickOutcome,
+        e: UsecaseError,
+    ) {
+        if !matches!(e, UsecaseError::SessionNotFound(_)) {
+            out.actions_failed += 1;
+            self.log_action_failed(task, e);
+            return;
+        }
+        tracing::warn!(
+            event = "delivery.session_lost",
+            number = task.number(),
+            error = %e,
+            "Доставка в сессию стадии отклонена (dead-session) — маршрутизация потери"
+        );
+        match self
+            .session_lost_pass(board, plan, task, *active_now, ctx)
+            .await
+        {
+            Ok(LostAct::Respawned) => {
+                out.spawns_done += 1;
+                *active_now += 1;
+            }
+            Ok(LostAct::Escalated) => out.session_lost_flagged += 1,
+            Ok(LostAct::Guarded) => out.held_live += 1,
+            Ok(LostAct::GuardedBlind) => out.held_blind += 1,
+            Ok(LostAct::Deferred) => out.lost_deferred += 1,
+            // счётчик растёт внутри порога; либо луп-гвард сам эскалировал,
+            // либо анти-ре-энтри отказ — исход учтён другими механизмами
+            Ok(LostAct::Counted) => {}
             Err(e) => {
                 out.actions_failed += 1;
                 self.log_action_failed(task, e);
@@ -1241,7 +1313,7 @@ impl TickUseCase {
         Ok(StallAct::Pinged)
     }
 
-    fn log_action_failed(&self, task: &Task, e: UsecaseError) -> UsecaseError {
+    pub(crate) fn log_action_failed(&self, task: &Task, e: UsecaseError) -> UsecaseError {
         tracing::error!(event = "action.failed", number = task.number(), error = %e, "Action failed");
         e
     }

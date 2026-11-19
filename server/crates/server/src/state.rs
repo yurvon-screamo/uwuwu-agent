@@ -25,6 +25,10 @@ struct RowState {
     /// обнуляется записью нового статуса (см. mark_stall_ping).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stall: Option<(String, u64, u32)>,
+    /// Потерянные доставки (#1288): (статус раунда, счётчик подряд) —
+    /// смена статуса = новый раунд; успех доставки сбрасывает.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lost: Option<(String, u32)>,
 }
 
 /// Состояние бота (секция `bots`): вечная сессия + offset апдейтов ТГ.
@@ -278,6 +282,33 @@ impl TickStateStore for JsonStateStore {
         let mut guard = self.state.lock().expect("state lock");
         if let Some(row) = guard.rows.get_mut(&Self::key(board, number)) {
             row.stall = None;
+        }
+    }
+
+    fn lost_session(&self, board: &str, number: u64) -> Option<(Status, u32)> {
+        let guard = self.state.lock().expect("state lock");
+        guard
+            .rows
+            .get(&Self::key(board, number))
+            .and_then(|r| r.lost.as_ref())
+            .map(|(st, c)| (naming::parse_status(st), *c))
+    }
+
+    fn mark_lost_session(&self, board: &str, number: u64, status: Status) {
+        let mut guard = self.state.lock().expect("state lock");
+        let row = guard.rows.entry(Self::key(board, number)).or_default();
+        // счётчик растёт внутри раунда (одинаковый статус); смена статуса = 1
+        let count = match &row.lost {
+            Some((st, c)) if naming::parse_status(st) == status => *c + 1,
+            _ => 1,
+        };
+        row.lost = Some((naming::status_name(status).to_string(), count));
+    }
+
+    fn clear_lost_session(&self, board: &str, number: u64) {
+        let mut guard = self.state.lock().expect("state lock");
+        if let Some(row) = guard.rows.get_mut(&Self::key(board, number)) {
+            row.lost = None;
         }
     }
 
@@ -662,6 +693,38 @@ mod tests {
             "рестарт восстанавливает сессию бота"
         );
         assert_eq!(s.bot_offset("bot/x"), Some(42));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lost_counter_persists_across_restart_and_resets_on_status_change() {
+        // #1288: счётчик потерянных доставок — факт носителя (не процесса),
+        // персистентен: переживает рестарт сервера; статус-тегирование —
+        // смена статуса строки открывает новый раунд (счётчик с 1)
+        let dir = std::env::temp_dir().join(format!("uwuwu-state-lost-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        {
+            let s = store(path.clone());
+            TickStateStore::mark_lost_session(&s, "Задачи uwuwu", 7, Status::InProgress);
+            TickStateStore::mark_lost_session(&s, "Задачи uwuwu", 7, Status::InProgress);
+            TickStateStore::save(&s).unwrap();
+        }
+        let s = store(path.clone());
+        assert_eq!(
+            TickStateStore::lost_session(&s, "Задачи uwuwu", 7),
+            Some((Status::InProgress, 2)),
+            "рестарт восстанавливает счётчик потери (факт носителя)"
+        );
+        // смена статуса строки = новый раунд
+        TickStateStore::mark_lost_session(&s, "Задачи uwuwu", 7, Status::Design);
+        assert_eq!(
+            TickStateStore::lost_session(&s, "Задачи uwuwu", 7),
+            Some((Status::Design, 1))
+        );
+        // сброс: успешная доставка / парковка
+        TickStateStore::clear_lost_session(&s, "Задачи uwuwu", 7);
+        assert_eq!(TickStateStore::lost_session(&s, "Задачи uwuwu", 7), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 

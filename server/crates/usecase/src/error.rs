@@ -20,6 +20,10 @@ pub enum UsecaseError {
     /// Файл превышает потолок скачивания Bot API (20 MiB) — перманентный
     /// отказ `getFile`, ретрай бессмысленен (#1171).
     TelegramTooBig(String),
+    /// Исполнитель отказал в доставке: сессии нет или она недоставляема
+    /// (dead-session класс, #1288) — финальная, не временная: ретрай той
+    /// же сессии бессмысленен, маршрут — resurrection/парковка.
+    SessionNotFound(String),
     /// Blob-канал (#1292): отказ S3-носителя (сеть/статус) или ввода.
     Blob(String),
     /// Файл превышает потолок blob-канала (20 MiB, прецедент UC-06).
@@ -39,6 +43,7 @@ impl fmt::Display for UsecaseError {
             Self::State(m) => write!(f, "состояние: {m}"),
             Self::Telegram(m) => write!(f, "telegram: {m}"),
             Self::TelegramTooBig(m) => write!(f, "telegram too big: {m}"),
+            Self::SessionNotFound(m) => write!(f, "сессия не найдена (dead-session): {m}"),
             Self::Blob(m) => write!(f, "blob: {m}"),
             Self::BlobTooBig(m) => write!(f, "blob too big: {m}"),
             Self::BlobNotConfigured(m) => write!(f, "blob не сконфигурирован: {m}"),
