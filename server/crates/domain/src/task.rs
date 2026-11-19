@@ -82,7 +82,7 @@ impl Status {
                 | (S::ReviewPlan, S::Design | S::InProgress | S::NeedsAttention)
                 | (
                     S::InProgress,
-                    S::ReviewPlan | S::ReviewResult | S::NeedsAttention
+                    S::ReviewPlan | S::ReviewResult | S::Testing | S::NeedsAttention
                 )
                 | (
                     S::ReviewResult,
@@ -727,6 +727,8 @@ mod tests {
             (S::ReviewPlan, S::InProgress),
             (S::InProgress, S::ReviewPlan),
             (S::InProgress, S::ReviewResult),
+            // прямая отправка на тест (#1349): дев-агент из In Progress
+            (S::InProgress, S::Testing),
             (S::ReviewResult, S::Testing),
             (S::ReviewResult, S::InProgress),
             (S::Testing, S::UserReview),

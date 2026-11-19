@@ -215,6 +215,10 @@ struct FakeSessions {
     extra: Mutex<Vec<crate::ports::SessionInfo>>,
     /// Отказ prompt (сирота спавна #1163).
     prompt_fails: bool,
+    /// Сессии, доставка в которые отклоняется 404 (dead-session #1288).
+    prompt_lost: Mutex<Vec<String>>,
+    /// 404 на доставку в ЛЮБУЮ сессию (T2: свежие сессии респавна тоже).
+    prompt_lost_all: bool,
     /// Журнал удалений сессий (ассерты сирота-зачистки).
     deleted: Mutex<Vec<String>>,
     /// Сессии с недостоверной пробой активности (Err) — срез честности
@@ -259,6 +263,8 @@ impl FakeSessions {
             busy_ids: Mutex::default(),
             extra: Mutex::default(),
             prompt_fails: false,
+            prompt_lost: Mutex::default(),
+            prompt_lost_all: false,
             deleted: Mutex::default(),
             activity_fails_sessions: Mutex::default(),
             liveness_unknown: false,
@@ -326,6 +332,17 @@ impl AgentSessionGateway for FakeSessions {
         Ok(id)
     }
     async fn prompt(&self, session: &str, text: &str) -> UsecaseResult<()> {
+        let lost = self
+            .prompt_lost
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s == session);
+        if lost || self.prompt_lost_all {
+            return Err(UsecaseError::SessionNotFound(format!(
+                "prompt {session}: HTTP 404 Not Found (мок #1288)"
+            )));
+        }
         if self.prompt_fails {
             return Err(UsecaseError::Session("prompt недоступен (мок)".into()));
         }
@@ -503,6 +520,8 @@ struct MemStateInner {
     resets: Vec<(u64, Status)>,
     /// сталл-детект: (number, статус раунда, ms пинга)
     stalls: Vec<(u64, Status, u64)>,
+    /// потерянные доставки: (number, статус раунда) — счёт по журналу (#1288)
+    lost: Vec<(u64, Status)>,
     /// mark_spawn-журнал: (number, slot, ms) — кулдаун-сценарии (#1163)
     spawn_ms: Vec<(u64, Slot, u64)>,
     /// реестр серверных постов (own-тест self-эха #1204)
@@ -667,6 +686,22 @@ impl TickStateStore for MemState {
     }
     fn clear_stall(&self, _b: &str, n: u64) {
         self.0.lock().unwrap().stalls.retain(|(num, ..)| *num != n);
+    }
+    fn lost_session(&self, _b: &str, n: u64) -> Option<(Status, u32)> {
+        let g = self.0.lock().unwrap();
+        let last = g.lost.iter().rev().find(|(num, _)| *num == n)?;
+        let count = g
+            .lost
+            .iter()
+            .filter(|(num, st)| *num == n && st == &last.1)
+            .count() as u32;
+        Some((last.1, count))
+    }
+    fn mark_lost_session(&self, _b: &str, n: u64, status: Status) {
+        self.0.lock().unwrap().lost.push((n, status));
+    }
+    fn clear_lost_session(&self, _b: &str, n: u64) {
+        self.0.lock().unwrap().lost.retain(|(num, _)| *num != n);
     }
     fn analys_review_loop(&self, _b: &str, n: u64) -> Option<(Status, u32)> {
         self.0
@@ -868,6 +903,8 @@ fn peak_usecase(
         busy_ids: Mutex::default(),
         extra: Mutex::default(),
         prompt_fails: false,
+        prompt_lost: Mutex::default(),
+        prompt_lost_all: false,
         deleted: Mutex::default(),
         activity_fails_sessions: Mutex::default(),
         liveness_unknown: false,
@@ -1184,6 +1221,8 @@ fn wake_usecase(
         busy_ids: Mutex::default(),
         extra: Mutex::default(),
         prompt_fails: false,
+        prompt_lost: Mutex::default(),
+        prompt_lost_all: false,
         deleted: Mutex::default(),
         specs: Mutex::default(),
         live: Mutex::default(),
@@ -1430,6 +1469,9 @@ impl TaskBoardRepo for CommentBoard {
     async fn set_status(&self, _b: &str, _n: u64, _s: Status) -> UsecaseResult<()> {
         Ok(())
     }
+    async fn row_exists(&self, _b: &str, _n: u64) -> UsecaseResult<bool> {
+        Ok(false)
+    }
     async fn set_board_cells(
         &self,
         _b: &str,
@@ -1442,10 +1484,9 @@ impl TaskBoardRepo for CommentBoard {
     async fn row_status(&self, _b: &str, _n: u64) -> UsecaseResult<Option<Status>> {
         Ok(None)
     }
-    // доска фикстуры без строк: отсутствие row_status ⇒ строки нет
-    // (семантика #1236; мастерский #431 доложил метод не всем фикстурам —
-    // CI снят, тест-компил мастера не ловил)
-    async fn row_exists(&self, _board: &str, _n: u64) -> UsecaseResult<bool> {
+    // строк задач фейк не несёт — только комментарии (close на нём честно
+    // отвечает «не на досках»)
+    async fn row_exists(&self, _b: &str, _n: u64) -> UsecaseResult<bool> {
         Ok(false)
     }
     async fn set_session(&self, _b: &str, _n: u64, _slot: Slot, _s: &str) -> UsecaseResult<()> {
@@ -2573,6 +2614,8 @@ async fn dead_stage_and_candidate_hold_blind_when_list_unavailable() {
         busy_ids: Mutex::default(),
         extra: Mutex::default(),
         prompt_fails: false,
+        prompt_lost: Mutex::default(),
+        prompt_lost_all: false,
         deleted: Mutex::default(),
         activity_fails_sessions: Mutex::default(),
         liveness_unknown: false,
@@ -3242,6 +3285,8 @@ async fn undelivered_comment_is_not_marked_seen() {
             busy_ids: Mutex::default(),
             extra: Mutex::default(),
             prompt_fails: false,
+            prompt_lost: Mutex::default(),
+            prompt_lost_all: false,
             deleted: Mutex::default(),
             activity_fails_sessions: Mutex::default(),
             liveness_unknown: false,
@@ -3309,6 +3354,8 @@ async fn undelivered_comment_is_not_marked_seen() {
         busy_ids: Mutex::default(),
         extra: Mutex::default(),
         prompt_fails: false,
+        prompt_lost: Mutex::default(),
+        prompt_lost_all: false,
         deleted: Mutex::default(),
         activity_fails_sessions: Mutex::default(),
         liveness_unknown: false,
@@ -3386,6 +3433,8 @@ async fn multi_comment_tail_delivered_together() {
         busy_ids: Mutex::default(),
         extra: Mutex::default(),
         prompt_fails: false,
+        prompt_lost: Mutex::default(),
+        prompt_lost_all: false,
         deleted: Mutex::default(),
         activity_fails_sessions: Mutex::default(),
         liveness_unknown: false,
@@ -3454,6 +3503,8 @@ async fn inflight_comment_delivered_after_agent_reply() {
         activity_ms: Some(5000),
         idle_reply: true,
         prompt_fails: false,
+        prompt_lost: Mutex::default(),
+        prompt_lost_all: false,
         deleted: Mutex::default(),
         ..Default::default()
     });
@@ -3521,6 +3572,8 @@ async fn busy_session_not_pinged_early() {
         busy_ids: Mutex::default(),
         extra: Mutex::default(),
         prompt_fails: false,
+        prompt_lost: Mutex::default(),
+        prompt_lost_all: false,
         deleted: Mutex::default(),
         ..Default::default()
     });
@@ -3582,6 +3635,8 @@ async fn soft_ping_wakes_idle_session_without_transaction() {
         activity_ms: Some(100_000_000 - 16 * 60_000),
         idle_reply: true,
         prompt_fails: false,
+        prompt_lost: Mutex::default(),
+        prompt_lost_all: false,
         deleted: Mutex::default(),
         ..Default::default()
     });
@@ -4107,6 +4162,8 @@ async fn idle_sessions_do_not_hold_cup() {
     let sessions = Arc::new(FakeSessions {
         idle_reply: true,
         prompt_fails: false,
+        prompt_lost: Mutex::default(),
+        prompt_lost_all: false,
         deleted: Mutex::default(),
         ..Default::default()
     });
@@ -6296,6 +6353,8 @@ async fn orphan_deleted_when_prompt_fails() {
     // bootstrap-зачистке (#1163)
     let sessions = FakeSessions {
         prompt_fails: true,
+        prompt_lost: Mutex::default(),
+        prompt_lost_all: false,
         ..FakeSessions::new()
     };
     let (u, _, sessions, _) = usecase_with_sessions(
@@ -7161,4 +7220,262 @@ async fn named_executor_failure_is_isolated_from_healthy_peer() {
         vec!["1xgames".to_string()],
         "здоровый пир не попадает в отказ-список"
     );
+}
+
+// ===== Dead-session доставка: маршрутизация потери сессии (#1288) =====
+
+/// Часы с большим now_ms — тишина сессии ≥ сталл-порогов (сталл-ветка T5).
+struct LostClock;
+impl Clock for LostClock {
+    fn utc_minute(&self) -> UtcMinute {
+        UtcMinute {
+            minute_of_day: 100,
+            weekday: 3,
+        }
+    }
+    fn now_ms(&self) -> u64 {
+        20_000_000
+    }
+}
+
+/// Харнесс потерянной сессии: строка In Progress с дев-сессией в ячейке,
+/// настраиваемые комменты, мок исполнителя и часы.
+fn lost_usecase(
+    comments: Vec<CommentRef>,
+    sessions: FakeSessions,
+    clock: Arc<dyn Clock>,
+) -> (TickUseCase, Arc<FakeBoard>, Arc<FakeSessions>) {
+    let board = Arc::new(FakeBoard {
+        rows: vec![dev_task(16, "ses_dev_16")],
+        log: Mutex::default(),
+        comments,
+        fields_fails: false,
+        set_session_fails: false,
+        status_fails: AtomicBool::new(false),
+    });
+    let sessions = Arc::new(sessions);
+    let prs = Arc::new(FakePrs {
+        state: PrState::Missing,
+        merges: Mutex::default(),
+        probes: Mutex::default(),
+    });
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        prs,
+        clock,
+        state: Arc::new(MemState(Mutex::default())),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        boot_ms: 0,
+    };
+    (u, board, sessions)
+}
+
+/// Слепок «сессия в списке исполнителя» (десинк-класс: доставка 404 при
+/// живом списке). Пустые agent/directory — вне раскладки гарда спавна.
+fn listed_sighting(sessions: &FakeSessions, id: &str) {
+    sessions.live.lock().unwrap().push(LiveSighting {
+        id: id.into(),
+        agent: String::new(),
+        directory: String::new(),
+        outcome: String::new(),
+        updated_ms: 0,
+        total_tokens: 0,
+    });
+}
+
+/// Свежий foreign-коммент: wakeup-путь пытается доставить его каждый тик
+/// (seen не пишется при отклонённой доставке — ретрай бесконечен).
+fn foreign_comment() -> Vec<CommentRef> {
+    vec![CommentRef {
+        id: "c1".into(),
+        created_ms: 1999,
+        body: "чужой коммент: wakeup доставит".into(),
+    }]
+}
+
+fn parked(board: &FakeBoard) -> bool {
+    board
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l.contains("NeedsAttention"))
+}
+
+#[tokio::test]
+async fn lost_session_desync_counts_and_parks_after_threshold_via_wakeup() {
+    // T1 (#1288): сессия в списке исполнителя (десинк «в списке, но
+    // доставка 404»), wakeup-промпт отклонён — респавн запрещён анти-дублем;
+    // порог 3 неудач подряд → Needs attention
+    let sessions = FakeSessions::new();
+    sessions
+        .prompt_lost
+        .lock()
+        .unwrap()
+        .push("ses_dev_16".into());
+    listed_sighting(&sessions, "ses_dev_16");
+    let (u, board, sess) = lost_usecase(foreign_comment(), sessions, Arc::new(FixedClock));
+    // тики 1–2: счётчик растёт, статус не тронут, спавнов нет
+    for _ in 0..2 {
+        let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+        assert_eq!(out.session_lost_flagged, 0, "парковка раньше порога");
+        assert!(
+            sess.spawned.lock().unwrap().is_empty(),
+            "десинк: респавна нет"
+        );
+        assert!(!parked(&board), "до порога строка не паркуется");
+    }
+    // тик 3: порог достигнут — парковка с причиной
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.session_lost_flagged, 1, "парковка на пороге");
+    assert!(parked(&board), "строка в Needs attention после порога");
+    assert!(
+        sess.spawned.lock().unwrap().is_empty(),
+        "анти-дубль: сессия в списке — respawn запрещён"
+    );
+}
+
+#[tokio::test]
+async fn lost_session_resurrects_then_respawn_loop_guard_parks() {
+    // T2 (#1288, красный тест BDD): mock-исполнитель create → ok,
+    // prompt → 404. Сессии ячейки нет в списке (потеря подтверждена
+    // исполнителем) → resurrection каждый тик; свежие сессии тоже 404-ит
+    // (сирота-путь), попытки считает луп-гвард домена — на 5-м тике
+    // «Респавн-петля» → Needs attention
+    let mut sessions = FakeSessions::new();
+    sessions.prompt_lost_all = true;
+    let (u, board, sess) = lost_usecase(foreign_comment(), sessions, Arc::new(FixedClock));
+    // тик 1: resurrection предпринята (create ok, свежая сессия 404-ит —
+    // сирота-делит), завершённого спавна нет
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.spawns_done, 0, "спавн не завершается: промпт 404");
+    assert!(
+        !sess.spawned.lock().unwrap().is_empty(),
+        "resurrection предпринята: create прошёл"
+    );
+    assert!(
+        !sess.deleted.lock().unwrap().is_empty(),
+        "сирота-зачистка: недоставляемая свежая сессия гасится"
+    );
+    // тики 2–4: попытки продолжаются, парковки нет (луп-гвард ≤ 4)
+    for _ in 0..3 {
+        let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+        assert_eq!(
+            out.session_lost_flagged, 0,
+            "lost-счётчик не считает сироту-путь"
+        );
+        assert!(!parked(&board), "луп-гвард ещё не на потолке");
+    }
+    // тик 5: луп-гвард >4 — «Респавн-петля» → Needs attention
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert!(parked(&board), "луп-гвард респавнов паркует на 5-м тике");
+}
+
+#[tokio::test]
+async fn lost_session_desync_parks_via_stall_soft_ping() {
+    // T5 (#1288, сталл-ветка): без свежих foreign-комментов (wakeup молчит),
+    // idle-сессия, тишина ≥ soft-порога — мягкий сталл-пинг отклонён 404.
+    // Та же маршрутизация: счётчик → порог 3 → Needs attention
+    let mut sessions = FakeSessions::new();
+    sessions
+        .prompt_lost
+        .lock()
+        .unwrap()
+        .push("ses_dev_16".into());
+    sessions.activity_ms = Some(0);
+    sessions.idle_reply = true;
+    listed_sighting(&sessions, "ses_dev_16");
+    let (u, board, sess) = lost_usecase(Vec::new(), sessions, Arc::new(LostClock));
+    for _ in 0..2 {
+        let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+        assert_eq!(out.session_lost_flagged, 0, "парковка раньше порога");
+        assert!(
+            sess.spawned.lock().unwrap().is_empty(),
+            "десинк: респавна нет"
+        );
+    }
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert!(parked(&board), "сталл-ветка паркует по тому же порогу");
+}
+
+#[tokio::test]
+async fn transient_delivery_failure_still_retries_without_escalation() {
+    // T3 (#1288): временный отказ доставки (не 404) — ретрай как раньше:
+    // без эскалации и без respawn, серия попыток продолжается
+    let mut sessions = FakeSessions::new();
+    sessions.prompt_fails = true;
+    let (u, board, sess) = lost_usecase(foreign_comment(), sessions, Arc::new(FixedClock));
+    for _ in 0..4 {
+        let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+        assert_eq!(out.session_lost_flagged, 0, "временный отказ не паркует");
+        assert!(
+            sess.spawned.lock().unwrap().is_empty(),
+            "временный отказ не респавнит"
+        );
+        assert!(!parked(&board));
+    }
+    assert_eq!(
+        sess.switched.lock().unwrap().len(),
+        4,
+        "доставка ретраится каждым тиком как раньше (пин агента перед ходом)"
+    );
+}
+
+#[tokio::test]
+async fn busy_session_gets_no_delivery_and_is_never_counted_lost() {
+    // T4 (#1288): busy-сессия (ход в полёте) доставок не получает —
+    // свежая активность новее коммента, счётчик потери не заводится
+    let mut sessions = FakeSessions::new();
+    sessions.activity_ms = Some(5000);
+    sessions.busy_ids.lock().unwrap().push("ses_dev_16".into());
+    listed_sighting(&sessions, "ses_dev_16");
+    let (u, board, sess) = lost_usecase(foreign_comment(), sessions, Arc::new(FixedClock));
+    for _ in 0..3 {
+        let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+        assert_eq!(out.session_lost_flagged, 0);
+        assert!(!parked(&board));
+    }
+    assert!(
+        sess.prompts.lock().unwrap().is_empty(),
+        "busy-сессии доставок нет"
+    );
+}
+
+#[tokio::test]
+async fn dead_probe_with_fresh_404s_resurrects_once_per_tick_and_parks_on_fifth() {
+    // Ревью раунда 1 (#1288): проба Dead + 404 промптов свежих спавнов —
+    // отказ respawn_dead_stage в Dead-ветке не возвращается в
+    // маршрутизацию (анти-ре-энтри): одна resurrection-попытка за тик
+    // (bootstrap+рабочая); луп-гвард считает respawn-попытки — парковка
+    // после 5-й (тик 1 — kick_unfreeze, попытки с тика 2)
+    let mut sessions = FakeSessions::new();
+    sessions.prompt_lost_all = true;
+    sessions
+        .dead_sessions
+        .lock()
+        .unwrap()
+        .push("ses_dev_16".into());
+    let (u, board, sess) = lost_usecase(Vec::new(), sessions, Arc::new(FixedClock));
+    // тик 1: kick_unfreeze — мёртвая дев-сессия снимается (#397), plain
+    // spawn предпринят и отклонён 404
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.actions_failed, 1, "plain spawn тика 1 отклонён 404");
+    // тики 2–5: dead-respawn-попытки (ровно одна за тик), луп-гвард ≤ 4
+    for tick in 2..=5 {
+        let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+        assert_eq!(
+            out.session_lost_flagged, 0,
+            "не десинк-класс: сессии нет в списке"
+        );
+        assert_eq!(
+            sess.spawned.lock().unwrap().len(),
+            2 * tick,
+            "ровно одна попытка за тик (bootstrap+рабочая), без повторного входа"
+        );
+        assert!(!parked(&board), "луп-гвард ≤ 4 — парковки нет (тик {tick})");
+    }
+    // тик 6: пятая respawn-попытка — луп-гвард >4 → «Респавн-петля»
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert!(parked(&board), "луп-гвард паркует после 5 respawn-попыток");
 }
