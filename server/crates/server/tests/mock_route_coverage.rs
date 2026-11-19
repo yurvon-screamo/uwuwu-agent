@@ -124,6 +124,78 @@ fn client_route_literals_are_covered_by_mock_manifest() {
     );
 }
 
+// ---------- юниты парсера и канонизации ----------
+// Синтетические ветки, которых нет в живой фикстуре (реальный клиент их
+// не содержит): канонизационные срезы, экранированные кавычки, оборванный
+// литерал, непарный литерал без следующего Method, литерал внутри комментария.
+
+#[test]
+fn canonical_slices_query_api_and_normalizes_placeholders() {
+    // срез query
+    assert_eq!(canonical("/session?limit=50&order=desc"), "/session");
+    // срез /api (роутерная форма манифеста)
+    assert_eq!(
+        canonical("/api/session/{id}/prompt"),
+        "/session/{id}/prompt"
+    );
+    // фактическое поведение: strip_prefix("/api") жадный — «/apix» тоже
+    // срезается до «x/…». Пины не ослаблены: канонизация симметрична
+    // (обе стороны сравнения режутся одной функцией), путь не совпадёт
+    // с манифестом → громкий красный, не тихий пропуск
+    assert_eq!(canonical("/apix/session"), "x/session");
+    // плейсхолдеры {…} любой длины → {id}
+    assert_eq!(
+        canonical("/session/{sessionId}/agent"),
+        "/session/{id}/agent"
+    );
+    assert_eq!(canonical("/{PAGE_LIMIT}/x"), "/{id}/x");
+    // комбинация всего разом
+    assert_eq!(
+        canonical("/api/session/{session}/message?limit=1"),
+        "/session/{id}/message"
+    );
+    // без плейсхолдеров и без query — как есть
+    assert_eq!(canonical("/session"), "/session");
+}
+
+#[test]
+fn impl_part_cuts_at_first_cfg_test_marker() {
+    assert_eq!(impl_part("a\"/p\"b#[cfg(test)]\"/x\""), "a\"/p\"b");
+    // маркера нет — весь текст
+    assert_eq!(impl_part("a\"/p\""), "a\"/p\"");
+}
+
+#[test]
+fn closing_quote_skips_escaped_quotes_and_reports_unterminated() {
+    // экранированная кавычка внутри литерала не закрывает его
+    let src = "\"a\\\"b/\" tail";
+    assert_eq!(closing_quote(src.as_bytes(), 1), Some(6));
+    // оборванный литерал
+    assert_eq!(closing_quote("\"abc".as_bytes(), 1), None);
+}
+
+#[test]
+fn method_after_takes_nearest_method_or_none() {
+    let src = "\"/session\" reqwest::Method::POST .call(\"/x\") reqwest::Method::GET";
+    assert_eq!(method_after(src, 1).as_deref(), Some("POST"));
+    // Method после литерала нет вообще
+    assert_eq!(method_after("\"/lonely\"", 1), None);
+}
+
+#[test]
+fn leading_slash_literals_finds_literals_inside_comments_too() {
+    // парсер не понимает комментарии: литерал в комменте — «маршрутный»
+    // кандидата; тем самым посторонний литерал в комменте рвёт подмножество
+    // или канарейку громко, не уходит тихим пропуском
+    let found = leading_slash_literals("// \"/commented-path\" ok");
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].1, "/commented-path");
+    // экранированная кавычка не рвёт разбор
+    let found = leading_slash_literals("\"/a\\\"b\" x");
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].1, "/a\\\"b");
+}
+
 // ---------- пин 2: проб роутера ----------
 
 /// Спавн бинаря мока на свободном порту; Drop-гард убивает процесс.
