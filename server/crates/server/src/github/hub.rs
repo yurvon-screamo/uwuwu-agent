@@ -1503,6 +1503,24 @@ mod tests {
     }
 
     #[test]
+    fn is_rate_limited_matches_rest_transport_tag() {
+        // Pv2-транспорт ходит REST (#1236): verify-фоллбэк обязан узнавать
+        // тег «gh rest [rate_limited]» (SkippedRateLimited — ретраи не
+        // продолжаются), иначе rate-limit рёбра читались бы как Mismatch.
+        let rest_limited = UsecaseError::Board(
+            "gh rest [RATE_LIMITED]: /users/x/projectsV2/5/items: core quota".into(),
+        );
+        assert!(is_rate_limited(&rest_limited), "REST-тег — тот же класс");
+        let rest_permission = UsecaseError::Board(
+            "gh rest [PERMISSION]: /users/x/projectsV2: HTTP 403 (не rate limit)".into(),
+        );
+        assert!(
+            !is_rate_limited(&rest_permission),
+            "REST Permission — не rate limit"
+        );
+    }
+
+    #[test]
     fn ttl_cache_invalidate_drops_key_only() {
         let cache: TtlCache<u64> = TtlCache::new(std::time::Duration::from_secs(60));
         let now = std::time::Instant::now();
@@ -1539,6 +1557,53 @@ mod tests {
             Status::InProgress,
             "собственная запись видна из кэша сразу (read-your-writes #1235)"
         );
+    }
+
+    /// Регресс-пин бага тест-раунда #1236 (19.11, живой прогон): Pv2 REST
+    /// GET items/{id} (и list items) НЕ несёт single-select Status —
+    /// проверено живьём: PATCH-ответ значение возвращает, GET — никогда,
+    /// даже для строк, мутированных дни назад (асимметрия PATCH/GET).
+    /// Контракт: REST-рида носителя (row_status) обязана видеть Status
+    /// строки так же, как GraphQL-снапшот (эталон), — иначе гард edit()
+    /// за окном write-through (60с) отвечает «строки нет на доске» на
+    /// живую строку, и вердикт-переходы конвейера падают. Красный до
+    /// фикса носителя-риды, зелёный после.
+    #[test]
+    #[ignore] // живой прогон: GH_TOKEN + сеть; read-only — снапшот + row_status
+    fn live_row_status_reads_carrier_status_like_snapshot() {
+        let repo =
+            std::env::var("UWUWU_HUB_REPO").unwrap_or_else(|_| "yurvon-screamo/uwuwu-hub".into());
+        let token = std::env::var("GH_TOKEN").expect("GH_TOKEN");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let board = "Задачи uwuwu";
+            let hub = GitHubHub::new(repo, token);
+            let rows = hub
+                .read_board(board)
+                .await
+                .expect("снапшот-эталон (GraphQL)");
+            let (n, expected) = rows
+                .iter()
+                .map(|t| {
+                    (
+                        t.number(),
+                        uwuwu_usecase::status_name(t.status()).to_string(),
+                    )
+                })
+                .find(|(_, s)| !s.trim().is_empty())
+                .expect("на живой доске есть строка с непустым статусом");
+            let via_rest = hub
+                .row_status(board, n)
+                .await
+                .expect("рида носителя не должна падать");
+            assert_eq!(
+                via_rest.map(uwuwu_usecase::status_name),
+                Some(expected.as_str()),
+                "REST-рида носителя слепа к Status: строка #{n} на доске «{board}» \
+                 со статусом «{expected}» (GraphQL-эталон), row_status вернул {via_rest:?} \
+                 — гард edit() отклонит вердикт-переход живой строки"
+            );
+        });
     }
 
     #[test]
