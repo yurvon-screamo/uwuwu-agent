@@ -20,6 +20,8 @@ pub const MOCK_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/session/{id}/command"),
     ("POST", "/api/session/{id}/agent"),
     ("GET", "/api/session/{id}/message"),
+    ("POST", "/api/session/{id}/compact"),
+    ("GET", "/api/model"),
     ("GET", "/api/experimental/session/{id}/export"),
 ];
 

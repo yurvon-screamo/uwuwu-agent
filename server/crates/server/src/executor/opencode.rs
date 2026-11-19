@@ -4,6 +4,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::time::Duration;
+use uwuwu_domain::ModelRef;
 use uwuwu_usecase::{AgentSessionGateway, AssistantReply, Liveness, SessionInfo, SessionSpec};
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
@@ -11,6 +12,12 @@ pub struct OpencodeClient {
     base: String,
     password: String,
     http: reqwest::Client,
+    /// Кэш лимитов окна контекста из каталога моделей (#1221, ADR-082):
+    /// ключ `provider/id`. None кэшируется НАВСЕГДА — перманентное
+    /// отсутствие модели/лимита в каталоге; transient-сбой каталога
+    /// (Err) не кэшируется — ретрай следующим тиком (фиксация ревью
+    /// круга 1 ADR-082).
+    model_limits: std::sync::Mutex<std::collections::HashMap<String, Option<u64>>>,
 }
 
 /// Активность сообщения (ms): opencode 2.3 не несёт `time.updated` в
@@ -112,6 +119,31 @@ fn latest_meaningful_is_assistant(msgs: &[serde_json::Value]) -> bool {
         .unwrap_or(false)
 }
 
+/// Токены assistant-поворота (Session.Message.Assistant.tokens): сумма
+/// полей = занятость окна контекста, та же арифметика, что у TUI
+/// (ADR-082, живые пробы 2.2.6/2.3). input обязателен — user/compaction/
+/// служебные записи токенов не несут и отбрасываются формой.
+fn turn_tokens(msg: &serde_json::Value) -> Option<u64> {
+    let t = &msg["tokens"];
+    let input = t["input"].as_u64()?;
+    let sum = |field: &str| t[field].as_u64().unwrap_or(0);
+    Some(
+        input
+            + sum("output")
+            + sum("reasoning")
+            + t["cache"]["read"].as_u64().unwrap_or(0)
+            + t["cache"]["write"].as_u64().unwrap_or(0),
+    )
+}
+
+/// Токены свежайшего assistant-поворота desc-хвоста; None — содержательных
+/// поворотов нет (пустая/свежая сессия — компактировать нечего).
+fn newest_assistant_tokens(msgs: &[serde_json::Value]) -> Option<u64> {
+    msgs.iter()
+        .filter(|m| m["type"] == "assistant")
+        .find_map(turn_tokens)
+}
+
 /// HTTP-статус → liveness-вердикт (маппинг вынесен для тестов без сети).
 pub fn liveness_of_status(status: reqwest::StatusCode) -> Liveness {
     if status.is_success() {
@@ -173,6 +205,7 @@ impl OpencodeClient {
                 .timeout(Duration::from_secs(20))
                 .build()
                 .expect("reqwest client"),
+            model_limits: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -504,12 +537,149 @@ impl AgentSessionGateway for OpencodeClient {
             finish: msg["finish"].as_str().map(String::from),
         }))
     }
+
+    /// Занятость окна контекста (#1221): токены свежайшего assistant-
+    /// поворота против лимита модели из каталога исполнителя. Сбои
+    /// хвоста — Err; «не измерить» (нет поворотов / нет лимита) —
+    /// Ok(None), не стреляем.
+    async fn context_usage_pct(
+        &self,
+        session: &str,
+        model: &ModelRef,
+    ) -> UsecaseResult<Option<f64>> {
+        let (status, resp) = self
+            .call(
+                &format!("/session/{session}/message?limit=10&order=desc"),
+                reqwest::Method::GET,
+                None,
+            )
+            .await?;
+        Self::check(status, &format!("message tail {session}"))?;
+        let Some(tokens) = message_array(&resp).and_then(|m| newest_assistant_tokens(m)) else {
+            return Ok(None);
+        };
+        let Some(limit) = self.model_context_limit(model).await? else {
+            return Ok(None);
+        };
+        Ok(Some(tokens as f64 / limit as f64 * 100.0))
+    }
+
+    /// POST /session/:id/compact (#1221, ADR-082): durable admission —
+    /// результат (compaction-сообщение в хвосте) асинхронный, Ok —
+    /// заявка принята исполнителем.
+    async fn compact_session(&self, session: &str) -> UsecaseResult<()> {
+        let (status, _) = self
+            .call(
+                &format!("/session/{session}/compact"),
+                reqwest::Method::POST,
+                Some(serde_json::json!({})),
+            )
+            .await?;
+        Self::check(status, &format!("compact {session}"))
+    }
+}
+
+impl OpencodeClient {
+    /// Лимит окна контекста модели из каталога исполнителя GET /model
+    /// (клиент клеит /api — строгий pathname-тест стережёт двойной
+    /// префикс, живой урок ADR-082). Кэш per-client: Ok(None)
+    /// перманентного отсутствия кэшируется навсегда, Err (transport/
+    /// HTTP) — не кэшируется.
+    async fn model_context_limit(&self, model: &ModelRef) -> UsecaseResult<Option<u64>> {
+        let key = format!("{}/{}", model.provider(), model.id());
+        if let Some(cached) = self.model_limits.lock().expect("limits lock").get(&key) {
+            return Ok(*cached);
+        }
+        let (status, resp) = self.call("/model", reqwest::Method::GET, None).await?;
+        Self::check(status, "model catalog")?;
+        let empty = Vec::new();
+        let items = resp
+            .as_array()
+            .or_else(|| resp["data"].as_array())
+            .unwrap_or(&empty);
+        let mut resolved = None;
+        for item in items {
+            if item["providerID"] == json!(model.provider()) && item["modelID"] == json!(model.id())
+            {
+                resolved = item["limit"]["context"].as_u64().filter(|v| *v > 0);
+                break;
+            }
+        }
+        self.model_limits
+            .lock()
+            .expect("limits lock")
+            .insert(key, resolved);
+        Ok(resolved)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
     use uwuwu_domain::{Agent, AgentSlot, ModelRef};
+
+    /// Мульти-запросный стаб (#1221): canned-ответы по одному на
+    /// соединение, каждый (METHOD path) записывается — строгий pathname-
+    /// матч стережёт класс двойного /api-префикса (ADR-082, a67a8505).
+    fn stub_multi(responses: Vec<(&'static str, String)>) -> (String, Arc<Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let hits: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let queue = Arc::new(Mutex::new(responses));
+        let hits2 = hits.clone();
+        std::thread::spawn(move || loop {
+            let (status, body) = {
+                let mut q = queue.lock().expect("queue lock");
+                if q.is_empty() {
+                    return;
+                }
+                q.remove(0)
+            };
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut data = Vec::new();
+            let mut buf = [0u8; 2048];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => data.extend_from_slice(&buf[..n]),
+                }
+                if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let cl: usize = data[..pos]
+                        .split(|b| *b == b'\n')
+                        .find_map(|line| {
+                            String::from_utf8_lossy(line)
+                                .to_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse().ok())
+                        })
+                        .unwrap_or(0);
+                    if data.len() >= pos + 4 + cl {
+                        break;
+                    }
+                }
+            }
+            let request_line =
+                String::from_utf8_lossy(data.split(|b| *b == b'\n').next().unwrap_or(&[]))
+                    .to_string();
+            // версия HTTP отрезается: ассерты матчают METHOD path (строгий
+            // pathname — класс двойного /api-префикса)
+            let recorded = request_line
+                .trim_end()
+                .strip_suffix(" HTTP/1.1")
+                .unwrap_or_else(|| request_line.trim_end());
+            hits2.lock().expect("hits lock").push(recorded.to_string());
+            let resp = format!(
+                "{status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        });
+        (format!("http://127.0.0.1:{port}"), hits)
+    }
 
     fn spec(agent: AgentSlot, model: ModelRef, variant: Option<&str>) -> SessionSpec {
         SessionSpec {
@@ -950,5 +1120,169 @@ mod tests {
             res.is_err(),
             "HTML-заглушка не должна выглядеть как отсутствие активности: {res:?}"
         );
+    }
+
+    // ——— #1221: компакт-ручки клиента — pathname и семантика ———
+
+    fn assistant_msg(input: u64) -> serde_json::Value {
+        serde_json::json!({
+            "type": "assistant",
+            "tokens": {
+                "input": input, "output": 100, "reasoning": 10,
+                "cache": { "read": 50, "write": 5 }
+            },
+            "time": { "created": 1_000 }
+        })
+    }
+
+    fn catalog_entry(provider: &str, id: &str, context: u64) -> serde_json::Value {
+        serde_json::json!({
+            "providerID": provider, "modelID": id,
+            "limit": { "context": context }
+        })
+    }
+
+    fn client(base: &str) -> OpencodeClient {
+        OpencodeClient::new(base.to_string(), "p".into(), None)
+    }
+
+    #[tokio::test]
+    async fn compact_posts_native_endpoint_pathname() {
+        let (base, hits) = stub_multi(vec![("HTTP/1.1 200 OK", "{}".into())]);
+        client(&base)
+            .compact_session("ses1")
+            .await
+            .expect("compact");
+        assert_eq!(
+            hits.lock().expect("hits").as_slice(),
+            ["POST /api/session/ses1/compact"],
+            "нативный эндпоинт, одиночный /api-префикс (класс двойного — ADR-082)"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_http_error_is_err() {
+        let (base, hits) = stub_multi(vec![("HTTP/1.1 500 Internal Server Error", "{}".into())]);
+        assert!(client(&base).compact_session("ses1").await.is_err());
+        assert_eq!(hits.lock().expect("hits").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn context_usage_pct_from_tail_and_catalog() {
+        let tail = serde_json::json!([assistant_msg(900)]).to_string();
+        let catalog = serde_json::json!([catalog_entry("p", "m", 2000)]).to_string();
+        let (base, hits) = stub_multi(vec![
+            ("HTTP/1.1 200 OK", tail),
+            ("HTTP/1.1 200 OK", catalog),
+        ]);
+        let m = ModelRef::new("p", "m");
+        let pct = client(&base)
+            .context_usage_pct("s", &m)
+            .await
+            .expect("probe")
+            .expect("measured");
+        // (900+100+10+50+5)/2000 = 53.25%
+        assert!((pct - 53.25).abs() < 1e-9, "pct = {pct}");
+        assert_eq!(
+            hits.lock().expect("hits").as_slice(),
+            [
+                "GET /api/session/s/message?limit=10&order=desc",
+                "GET /api/model"
+            ],
+            "хвост затем каталог, оба с одиночным /api"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_assistant_turn_means_unmeasured_without_catalog_call() {
+        let tail = serde_json::json!([{
+            "type": "user", "time": { "created": 1_000 }
+        }])
+        .to_string();
+        let (base, hits) = stub_multi(vec![("HTTP/1.1 200 OK", tail)]);
+        let m = ModelRef::new("p", "m");
+        let got = client(&base)
+            .context_usage_pct("s", &m)
+            .await
+            .expect("probe");
+        assert_eq!(got, None);
+        assert_eq!(hits.lock().expect("hits").len(), 1, "каталог не нужен");
+    }
+
+    #[tokio::test]
+    async fn model_limit_cached_across_calls() {
+        let tail = serde_json::json!([assistant_msg(900)]).to_string();
+        let catalog = serde_json::json!([catalog_entry("p", "m", 2000)]).to_string();
+        let (base, hits) = stub_multi(vec![
+            ("HTTP/1.1 200 OK", tail.clone()),
+            ("HTTP/1.1 200 OK", catalog),
+            ("HTTP/1.1 200 OK", tail),
+        ]);
+        let m = ModelRef::new("p", "m");
+        let c = client(&base);
+        let first = c
+            .context_usage_pct("s", &m)
+            .await
+            .expect("probe")
+            .expect("measured");
+        let second = c
+            .context_usage_pct("s", &m)
+            .await
+            .expect("probe")
+            .expect("measured");
+        assert_eq!(first, second);
+        let h = hits.lock().expect("hits");
+        assert_eq!(
+            h.iter().filter(|l| l.ends_with("/model")).count(),
+            1,
+            "лимит берётся из кэша: /model ровно один раз"
+        );
+        assert_eq!(h.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn model_absence_cached_forever() {
+        // перманентное отсутствие модели в каталоге — Ok(None) кэшируется
+        // навсегда (фиксация ревью круга 1 ADR-082): повторные вызовы
+        // каталог не дёргают
+        let tail = serde_json::json!([assistant_msg(900)]).to_string();
+        let catalog = serde_json::json!([catalog_entry("other", "x", 1000)]).to_string();
+        let (base, hits) = stub_multi(vec![
+            ("HTTP/1.1 200 OK", tail.clone()),
+            ("HTTP/1.1 200 OK", catalog),
+            ("HTTP/1.1 200 OK", tail),
+        ]);
+        let m = ModelRef::new("p", "m");
+        let c = client(&base);
+        assert_eq!(c.context_usage_pct("s", &m).await.expect("probe"), None);
+        assert_eq!(c.context_usage_pct("s", &m).await.expect("probe"), None);
+        let h = hits.lock().expect("hits");
+        assert_eq!(h.iter().filter(|l| l.ends_with("/model")).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn model_catalog_transport_error_not_cached() {
+        // transient-сбой каталога — Err без кэша: следующий вызов
+        // ретраит /model (фиксация ревью круга 1 ADR-082)
+        let tail = serde_json::json!([assistant_msg(900)]).to_string();
+        let catalog = serde_json::json!([catalog_entry("p", "m", 2000)]).to_string();
+        let (base, hits) = stub_multi(vec![
+            ("HTTP/1.1 200 OK", tail.clone()),
+            ("HTTP/1.1 500 Internal Server Error", "{}".into()),
+            ("HTTP/1.1 200 OK", tail),
+            ("HTTP/1.1 200 OK", catalog),
+        ]);
+        let m = ModelRef::new("p", "m");
+        let c = client(&base);
+        assert!(
+            c.context_usage_pct("s", &m).await.is_err(),
+            "transient — Err"
+        );
+        assert!(
+            c.context_usage_pct("s", &m).await.expect("probe").is_some(),
+            "ретрай следующим вызовом"
+        );
+        let h = hits.lock().expect("hits");
+        assert_eq!(h.iter().filter(|l| l.ends_with("/model")).count(), 2);
     }
 }

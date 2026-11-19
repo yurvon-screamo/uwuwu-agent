@@ -58,6 +58,8 @@ struct MockSession {
     title: String,
     /// Директория сессии (location из create) — гард спавна (#1163).
     directory: String,
+    /// Модель сессии `provider/id` из create-тела — каталог /model (#1221).
+    model: String,
     updated_ms: u64,
     outcome: String,
     tokens_in: u64,
@@ -94,6 +96,9 @@ struct Store {
     /// (десинк-стенд lost-контура).
     prompt_404_after: u64,
     prompt_ok: AtomicU64,
+    /// Адмиссии нативного компакта (#1221): id сессий по порядку —
+    /// наблюдаемость e2e-фазы компакта.
+    compacts: Mutex<Vec<String>>,
 }
 
 fn now_ms() -> u64 {
@@ -338,6 +343,20 @@ async fn main() {
             }),
         )
         .route(
+            "/api/session/{id}/compact",
+            post({
+                let store = store.clone();
+                move |Path(id): Path<String>| compact_session(store, id)
+            }),
+        )
+        .route(
+            "/api/model",
+            get({
+                let store = store.clone();
+                move || model_catalog(store.clone())
+            }),
+        )
+        .route(
             // Стендовая ручка времени (аналог MOCK_VERDICTS/MOCK_PAGE_LIMIT):
             // сдвигает updated_ms сессии назад — idle-контуры (дример #1306,
             // IDLE_MS 30 мин) проверяются стендом без реальных минут ожидания.
@@ -531,6 +550,11 @@ async fn create_session(
 ) -> Resp {
     let n = counter.fetch_add(1, Ordering::SeqCst);
     let id = format!("ses_mock{n:04}{salt:08x}");
+    let model = format!(
+        "{}/{}",
+        body["model"]["providerID"].as_str().unwrap_or_default(),
+        body["model"]["id"].as_str().unwrap_or_default()
+    );
     let session = MockSession {
         id: id.clone(),
         agent: body["agent"].as_str().unwrap_or_default().to_string(),
@@ -539,6 +563,7 @@ async fn create_session(
             .as_str()
             .unwrap_or_default()
             .to_string(),
+        model,
         updated_ms: now_ms(),
         outcome: String::new(),
         tokens_in: 0,
@@ -673,6 +698,51 @@ async fn abort_session(store: Arc<Store>, id: String) -> Resp {
     }
 }
 
+/// POST /session/{id}/compact (#1221): нативный durable admission — мок
+/// принимает заявку (compaction-сообщение обновляет активность сессии)
+/// и записывает факт для e2e-наблюдаемости.
+async fn compact_session(store: Arc<Store>, id: String) -> Resp {
+    let mut sessions = store.sessions.lock().expect("store");
+    match sessions.get_mut(&id) {
+        Some(s) => {
+            s.updated_ms = now_ms();
+            store.compacts.lock().expect("compacts").push(id.clone());
+            tracing::info!(event = "mock.session_compacted", %id, "POST /session/{id}/compact");
+            (StatusCode::OK, Json(json!({})))
+        }
+        None => (StatusCode::NOT_FOUND, Json(json!({ "status": "404" }))),
+    }
+}
+
+/// GET /model (#1221): каталог моделей из живых сессий мока с общим
+/// лимитом окна MOCK_CONTEXT_LIMIT (деф. 100000) — компакт-проба
+/// матчит providerID+modelID против лимита.
+async fn model_catalog(store: Arc<Store>) -> Resp {
+    let limit: u64 = cfg("MOCK_CONTEXT_LIMIT", "100000")
+        .parse()
+        .unwrap_or(100_000);
+    let sessions = store.sessions.lock().expect("store");
+    let mut models: Vec<String> = sessions
+        .values()
+        .map(|s| s.model.clone())
+        .filter(|m| !m.is_empty())
+        .collect();
+    drop(sessions);
+    models.sort();
+    models.dedup();
+    let items: Vec<Value> = models
+        .iter()
+        .filter_map(|m| m.split_once('/'))
+        .map(|(p, i)| json!({ "providerID": p, "modelID": i, "limit": { "context": limit } }))
+        .collect();
+    tracing::info!(
+        event = "mock.model_catalog",
+        count = items.len(),
+        "GET /model"
+    );
+    (StatusCode::OK, Json(Value::Array(items)))
+}
+
 /// Стендовая ручка времени: updated_ms -= ms (сатаурирующий вычет).
 /// Дример-сценарии стенда: сессия «уснула» 31+ минут назад без реального
 /// ожидания; revival = свежий prompt + повторный age.
@@ -794,7 +864,28 @@ async fn prompt(
                 });
             }
         }
-        _ => {}
+        "busy" => {
+            // ход «висит» до abort — completion не нужен (#1259 e2e)
+        }
+        _ => {
+            // plain/idle/gate: ход завершается после step_ms — idle-марка
+            // снимает zombie-busy CUP-учёта, токены поворота кормят
+            // компакт-пробу занятости (#1221)
+            let store2 = store.clone();
+            let sid = id.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(step_ms)).await;
+                let mut sessions = store2.sessions.lock().expect("store");
+                if let Some(s) = sessions.get_mut(&sid) {
+                    s.busy = false;
+                    s.updated_ms = now_ms();
+                    s.idle_ms = now_ms();
+                    s.outcome = "succeeded".into();
+                    s.tokens_in = 900;
+                    s.tokens_out = 100;
+                }
+            });
+        }
     }
     (StatusCode::OK, Json(json!({ "data": { "id": id } })))
 }
@@ -1004,6 +1095,8 @@ fn turn_tail(turn_ms: u64) -> Value {
         "role": "assistant",
         "time": { "created": turn_ms + TRAP_MS, "updated": now },
         "finish": "stop",
+        "tokens": { "input": 1234, "output": 50, "reasoning": 0,
+                    "cache": { "read": 0, "write": 0 } },
         "content": [{ "type": "text", "text": FINAL_TEXT }],
     });
     json!([final_msg, step1, user])
@@ -1030,6 +1123,12 @@ async fn message_tail(store: Arc<Store>, id: String) -> Resp {
                 msg["time"]["created"] = json!(created_ms);
                 msg["time"]["completed"] = json!(created_ms);
                 msg["content"] = json!([{ "type": "text", "text": text }]);
+                // токены поворота (#1221): компакт-проба читает хвост как
+                // занятость окна контекста
+                msg["tokens"] = json!({
+                    "input": s.tokens_in, "output": s.tokens_out, "reasoning": 0,
+                    "cache": { "read": 0, "write": 0 }
+                });
             }
             (StatusCode::OK, Json(json!([msg])))
         }

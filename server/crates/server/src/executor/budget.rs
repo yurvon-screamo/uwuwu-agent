@@ -103,6 +103,21 @@ impl AgentSessionGateway for BudgetedSessions {
         self.inner.last_activity_ms(session).await
     }
 
+    /// Компакт-ручки (#1221): чтение занятости и адмиссия компакта —
+    /// не спавны, LLM-слот тарификации бюджета не касаются (прецедент
+    /// switch_agent/abort_session).
+    async fn context_usage_pct(
+        &self,
+        session: &str,
+        model: &uwuwu_domain::ModelRef,
+    ) -> UsecaseResult<Option<f64>> {
+        self.inner.context_usage_pct(session, model).await
+    }
+
+    async fn compact_session(&self, session: &str) -> UsecaseResult<()> {
+        self.inner.compact_session(session).await
+    }
+
     async fn last_assistant_reply(&self, session: &str) -> UsecaseResult<Option<AssistantReply>> {
         self.inner.last_assistant_reply(session).await
     }

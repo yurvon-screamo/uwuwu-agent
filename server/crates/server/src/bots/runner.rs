@@ -213,7 +213,8 @@ async fn run_turn(deps: &BotDeps, chat_id: i64, text: &str) -> UsecaseResult<()>
         .unwrap_or(0);
     deps.sessions.prompt(&session, &prompt_text).await?;
     if need_manual && deps.structural.agent.is_none() {
-        deps.state.set_bot_manual_hash(&deps.slug, manual_hash);
+        deps.state
+            .set_bot_manual_hash(&deps.slug, Some(manual_hash));
         if let Err(e) = deps.state.save() {
             tracing::warn!(event = "bot.state_save_failed", slug = %deps.slug, error = %e,
                 "Manual-hash не персистится — методичка уедет повторно после рестарта");
@@ -244,6 +245,12 @@ async fn ensure_session(deps: &BotDeps) -> UsecaseResult<String> {
             Liveness::Dead => {
                 tracing::warn!(event = "bot.session_dead", slug = %deps.slug, session = %s,
                     "Сессия не жива — пересоздание");
+                // Методичка вшита в мёртвую сессию (doc-режим) — свежая её
+                // не получит: сброс hash = дозаправка первым же промптом
+                // (#1221 тест-круг 1, тот же инвариант, что у компакта и
+                // recreate-ветки супервизора; персист — save() пути
+                // пересоздания ниже).
+                deps.state.set_bot_manual_hash(&deps.slug, None);
             }
         }
     }

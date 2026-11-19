@@ -5,11 +5,13 @@
 //! классификация апдейтов, сборка промпта; порты ТГ и bot-состояния.
 
 mod assets;
+mod compact;
 mod flow;
 mod ports;
 mod spec;
 
 pub use assets::normalize_asset_name;
+pub use compact::{compact_verdict, CompactFacts, CompactPolicy, CompactVerdict};
 pub use flow::{build_prompt, chunk_reply, classify_message, plan_action};
 pub use ports::{
     BotAssetStore, BotStateStore, Incoming, MediaKind, TelegramGateway, TgMedia, TgMessage,

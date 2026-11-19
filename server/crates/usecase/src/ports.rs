@@ -247,6 +247,27 @@ pub trait AgentSessionGateway: Send + Sync {
     fn spawn_allowed(&self) -> bool {
         true
     }
+    /// Занятость окна контекста сессии, % лимита модели исполнителя
+    /// (#1221, ADR-082): токены свежайшего assistant-поворота против
+    /// limit.context каталога моделей — `session.tokens` кумулятивен
+    /// и непригоден. Ok(None) — не измерить (assistant-поворотов нет /
+    /// модели нет в каталоге); Err — транспортный отказ (тик переживает
+    /// пропуском). Дефолт None — гейтвеи без ручки (фейки) не измеряют.
+    async fn context_usage_pct(
+        &self,
+        _session: &str,
+        _model: &ModelRef,
+    ) -> UsecaseResult<Option<f64>> {
+        Ok(None)
+    }
+    /// Нативный компакт сессии (#1221, ADR-082): POST /session/:id/compact —
+    /// durable admission («исполнится на ближайшей границе шага», сам будит
+    /// idle-луп сессии). Дефолт Ok(()) — фейки портов не переопределяют;
+    /// прод-гейтвеи (opencode, budget-обёртка) несут настоящую ручку
+    /// (прецедент abort_session).
+    async fn compact_session(&self, _session: &str) -> UsecaseResult<()> {
+        Ok(())
+    }
     /// ms последней активности сессии (последнее сообщение) или None.
     async fn last_activity_ms(&self, session: &str) -> UsecaseResult<Option<u64>>;
     /// Последний ассистентский ответ сессии (для ботов: ожидание реплая).
