@@ -23,6 +23,9 @@ use uwuwu_domain::{BranchName, Slot, Status, Task, TaskFields};
 struct GateBoard {
     statuses: Mutex<HashMap<u64, Status>>,
     writes: Mutex<Vec<(u64, Status)>>,
+    /// Ячейки снапшота для контрольного чтения edit (#1331): set_board_cells
+    /// пишет, read_issue отдаёт записанное (read-after-write фейка).
+    cells: Mutex<(Option<String>, Option<bool>)>,
 }
 
 impl GateBoard {
@@ -30,6 +33,7 @@ impl GateBoard {
         Self {
             statuses: Mutex::new(HashMap::from([(number, status)])),
             writes: Mutex::new(Vec::new()),
+            cells: Mutex::default(),
         }
     }
 
@@ -54,9 +58,10 @@ impl TaskBoardRepo for GateBoard {
         &self,
         _b: &str,
         _n: u64,
-        _p: Option<&str>,
-        _a: Option<bool>,
+        p: Option<&str>,
+        a: Option<bool>,
     ) -> UsecaseResult<()> {
+        *self.cells.lock().expect("gate board cells") = (p.map(str::to_string), a);
         Ok(())
     }
 
@@ -89,8 +94,22 @@ impl TaskBoardRepo for GateBoard {
     }
 
     async fn read_issue(&self, _b: &str, n: u64) -> UsecaseResult<IssueView> {
+        let mut task = Task::new(n, format!("строка {n}"), Status::Todo);
+        let (p, a) = self.cells.lock().expect("gate board cells").clone();
+        let priority = p
+            .as_deref()
+            .map(crate::naming::parse_priority)
+            .unwrap_or(uwuwu_domain::Priority::Empty);
+        task.apply_fields(TaskFields::new(
+            Default::default(),
+            uwuwu_domain::Vcs::Local,
+            priority,
+        ));
+        if let Some(a) = a {
+            task.set_automerge(a);
+        }
         Ok(IssueView {
-            task: Task::new(n, format!("строка {n}"), Status::Todo),
+            task,
             body: String::new(),
             comments: vec![],
         })

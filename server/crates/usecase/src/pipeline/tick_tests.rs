@@ -1412,19 +1412,104 @@ async fn unknown_activity_fails_open_and_delivers_tail() {
     );
 }
 
+/// Честная лента для comment-верификации (#1331): пост попадает в
+/// контрольное чтение; прочие носители — пусто.
+#[derive(Default)]
+struct CommentBoard {
+    comments: Mutex<Vec<CommentRef>>,
+}
+
+#[async_trait]
+impl TaskBoardRepo for CommentBoard {
+    async fn read_board(&self, _board: &str) -> UsecaseResult<Vec<Task>> {
+        Ok(Vec::new())
+    }
+    async fn set_status(&self, _b: &str, _n: u64, _s: Status) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn set_board_cells(
+        &self,
+        _b: &str,
+        _n: u64,
+        _p: Option<&str>,
+        _a: Option<bool>,
+    ) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn row_status(&self, _b: &str, _n: u64) -> UsecaseResult<Option<Status>> {
+        Ok(None)
+    }
+    async fn set_session(&self, _b: &str, _n: u64, _slot: Slot, _s: &str) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn set_branch(&self, _b: &str, _n: u64, _branch: &BranchName) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn clear_session(&self, _b: &str, _n: u64, _slot: Slot) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn post_comment(&self, _n: u64, body: &str) -> UsecaseResult<String> {
+        let mut c = self.comments.lock().unwrap();
+        let id = format!("fakec-{}", c.len() + 1);
+        c.push(CommentRef {
+            id: id.clone(),
+            created_ms: 0,
+            body: body.to_string(),
+        });
+        Ok(id)
+    }
+    async fn close_issue(&self, _n: u64) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn latest_comments(&self, _n: u64) -> UsecaseResult<Vec<CommentRef>> {
+        Ok(self.comments.lock().unwrap().clone())
+    }
+    async fn read_issue(&self, _b: &str, n: u64) -> UsecaseResult<crate::ports::IssueView> {
+        Ok(crate::ports::IssueView {
+            task: Task::new(n, String::new(), Status::Empty),
+            body: String::new(),
+            comments: vec![],
+        })
+    }
+    async fn issue_fields(&self, _n: u64) -> UsecaseResult<TaskFields> {
+        Ok(TaskFields::default())
+    }
+    async fn create_issue(
+        &self,
+        _b: &str,
+        _p: &str,
+        _title: &str,
+        _body: &str,
+    ) -> UsecaseResult<u64> {
+        Ok(1)
+    }
+    async fn rename_issue(&self, _n: u64, _t: &str) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn patch_cells(&self, _n: u64, _m: crate::ports::FmMutator) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn close_issue_ext(&self, _n: u64, _np: bool) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn archive_row(&self, _b: &str, _n: u64) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn issues_with_title(&self, _title: &str) -> UsecaseResult<Vec<u64>> {
+        Ok(Vec::new())
+    }
+    async fn replace_body(&self, _n: u64, _b: &str) -> UsecaseResult<()> {
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn mcp_comment_marks_registry_with_node_id() {
     // #1204 (Low-1 ревью): единственная точка маркировки — writer.comment()
     // кладёт node_id ответа поста в реестр; own-тест wake-пути режет эхо
-    // именно по этому id.
-    let board = Arc::new(FakeBoard {
-        rows: vec![],
-        log: Mutex::default(),
-        comments: Vec::default(),
-        fields_fails: false,
-        set_session_fails: false,
-        status_fails: AtomicBool::new(false),
-    });
+    // именно по этому id. Лента фейка честная (пост попадает в контрольное
+    // чтение #1331).
+    let board = Arc::new(CommentBoard::default());
     let state = Arc::new(MemState(Mutex::default()));
     let writer = crate::tasks::write::TaskWriteUseCase {
         board: board.clone(),
@@ -1436,7 +1521,7 @@ async fn mcp_comment_marks_registry_with_node_id() {
     use crate::tasks::write::TaskWriter;
     writer.comment(61, "мой отчёт", None).await.unwrap();
     assert!(
-        state.own_comment("posted-1"),
+        state.own_comment("fakec-1"),
         "MCP-пост промаркирован node_id ответа"
     );
 }
