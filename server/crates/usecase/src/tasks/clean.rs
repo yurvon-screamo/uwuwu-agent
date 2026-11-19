@@ -333,11 +333,7 @@ impl TaskCleanUseCase {
         let journal = self.journal(project, &board, &deleted);
         self.journals.put(&journal)?;
         for row in &deleted {
-            if let Err(e) = self
-                .clean
-                .remove_row(&board, row.number, row.item_id)
-                .await
-            {
+            if let Err(e) = self.clean.remove_row(&board, row.number, row.item_id).await {
                 return Err(UsecaseError::Board(format!(
                     "снос #{}: {e} — часть батча могла снестись; журнал {} \
                      (task_undo восстановит, идемпотентно)",
@@ -389,9 +385,11 @@ impl TaskCleanUseCase {
                 .restore_row(&found.board, row.number, row.status_raw.as_deref())
                 .await
             {
-                Ok(item_id) => {
-                    rows.push((row.number, row.title.clone(), UndoOutcome::Restored(item_id)))
-                }
+                Ok(item_id) => rows.push((
+                    row.number,
+                    row.title.clone(),
+                    UndoOutcome::Restored(item_id),
+                )),
                 Err(e) => rows.push((
                     row.number,
                     row.title.clone(),
@@ -480,7 +478,6 @@ fn is_trivial_body(body: &str, title: &str) -> bool {
         || clean == format!("## Постановка\n\n{title}").trim()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,10 +488,13 @@ mod tests {
     /// Фейк носителя: state под Mutex (async_trait требует Send/Sync),
     /// мутации между вызовами имитируют параллельного writer'а. События —
     /// лента сносов/восстановлений.
+    /// Состояние строки фейка: (item_id, status_raw, issue).
+    type FakeRow = (u64, Option<String>, FakeIssue);
+
     #[derive(Default)]
     struct FakeCarrier {
-        /// number → (item_id, status_raw, issue)
-        rows: Mutex<HashMap<u64, (u64, Option<String>, FakeIssue)>>,
+        /// number → строка
+        rows: Mutex<HashMap<u64, FakeRow>>,
         /// номера, чей fresh_issue отвечает 404 при живой привязке
         issue_404: Mutex<HashSet<u64>>,
         /// сбой пробы привязки (Divergent-ветка)
@@ -564,7 +564,11 @@ mod tests {
                 }))
         }
         async fn remove_row(&self, _board: &str, number: u64, item_id: u64) -> UsecaseResult<()> {
-            let stale = self.stale_items.lock().expect("fake stale").contains(&number);
+            let stale = self
+                .stale_items
+                .lock()
+                .expect("fake stale")
+                .contains(&number);
             let mut rows = self.rows.lock().expect("fake rows");
             match rows.get(&number) {
                 Some((id, _, _)) if *id == item_id && !stale => {
@@ -626,21 +630,27 @@ mod tests {
                 None => Ok(guard
                     .values()
                     .filter(|j| j.project == project)
-                    .next_back()
+                    // свежий — по created_ms (контракт store, не порядок ключей)
+                    .max_by(|a, b| {
+                        a.created_ms
+                            .cmp(&b.created_ms)
+                            .then_with(|| a.id.cmp(&b.id))
+                    })
                     .cloned()),
             }
         }
         fn ids(&self, project: &str) -> UsecaseResult<Vec<String>> {
-            let mut ids: Vec<String> = self
+            // свежие первыми — по created_ms (контракт store)
+            let mut by_age: Vec<(u64, String)> = self
                 .entries
                 .lock()
                 .expect("fake journals")
                 .values()
                 .filter(|j| j.project == project)
-                .map(|j| j.id.clone())
+                .map(|j| (j.created_ms, j.id.clone()))
                 .collect();
-            ids.reverse();
-            Ok(ids)
+            by_age.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+            Ok(by_age.into_iter().map(|(_, id)| id).collect())
         }
     }
 
@@ -720,8 +730,14 @@ mod tests {
             ],
             "дедуп 4,4 и вердикты по свежим пробам"
         );
-        assert!(journals.events.lock().expect("j").is_empty(), "dry-run без мутаций");
-        assert!(carrier.events.lock().expect("c").is_empty(), "dry-run без сносов");
+        assert!(
+            journals.events.lock().expect("j").is_empty(),
+            "dry-run без мутаций"
+        );
+        assert!(
+            carrier.events.lock().expect("c").is_empty(),
+            "dry-run без сносов"
+        );
         // status_raw и item_id доезжают для журнала
         assert_eq!(reports[0].status_raw.as_deref(), Some("Draft"));
         assert_eq!(reports[0].item_id, 1_001);
@@ -759,7 +775,10 @@ mod tests {
         assert!(err.to_string().contains("ack"), "текст: {err}");
         assert!(err.to_string().contains("#2"), "строка названа: {err}");
         assert!(carrier.events.lock().expect("c").is_empty(), "сносов нет");
-        assert!(journals.entries.lock().expect("j").is_empty(), "журнала нет");
+        assert!(
+            journals.entries.lock().expect("j").is_empty(),
+            "журнала нет"
+        );
     }
 
     #[tokio::test]
@@ -804,7 +823,11 @@ mod tests {
             vec!["remove:1", "remove:2", "remove:3"],
             "снесены все три в порядке номеров"
         );
-        assert_eq!(journals.entries.lock().expect("j").len(), 1, "один журнал на батч");
+        assert_eq!(
+            journals.entries.lock().expect("j").len(),
+            1,
+            "один журнал на батч"
+        );
     }
 
     // --- write-ahead журнал ---
@@ -852,13 +875,11 @@ mod tests {
             "журнал write-ahead сохранён"
         );
         // строка не снесена (remove отвергнут носителем)
-        assert!(
-            carrier
-                .fresh_binding("Задачи uwuwu", 1)
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(carrier
+            .fresh_binding("Задачи uwuwu", 1)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
@@ -897,7 +918,10 @@ mod tests {
         carrier.row(1, Some("Draft"), issue("draft", true, ""));
         carrier.row(2, Some("In Progress"), issue("live", true, "тело"));
         u.execute("uwuwu", &[1, 2], &[2]).await.unwrap();
-        assert_eq!(*carrier.events.lock().expect("c"), vec!["remove:1", "remove:2"]);
+        assert_eq!(
+            *carrier.events.lock().expect("c"),
+            vec!["remove:1", "remove:2"]
+        );
         // строку 1 владелец вернул вручную до undo — идемпотентный skip
         carrier.row(1, Some("Draft"), issue("draft", true, ""));
         let report = u.undo("uwuwu", None).await.unwrap();

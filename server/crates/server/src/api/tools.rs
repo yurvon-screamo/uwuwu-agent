@@ -525,7 +525,10 @@ impl ToolHub {
             None | Some(Value::Null) => Vec::new(),
             _ => arg_numbers(args, "ack")?,
         };
-        let confirm = args.get("confirm").and_then(|v| v.as_bool()).unwrap_or(false);
+        let confirm = args
+            .get("confirm")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         if !confirm {
             let reports = self
                 .clean
@@ -708,11 +711,7 @@ fn arg_numbers(args: &Value, key: &str) -> Result<Vec<u64>, String> {
         .filter(|v| !v.is_null())
         .map(|v| {
             v.as_u64()
-                .or_else(|| {
-                    v.as_str()
-                        .map(str::trim)
-                        .and_then(|s| s.parse().ok())
-                })
+                .or_else(|| v.as_str().map(str::trim).and_then(|s| s.parse().ok()))
                 .ok_or(format!("{key}: мусорный токен «{v}» — жду номер строки"))
         })
         .collect()
@@ -747,7 +746,10 @@ fn render_clean_plan(reports: &[uwuwu_usecase::CleanRowReport]) -> String {
     let mut out = String::from("dry-run чистки (мутаций нет):\n");
     for r in reports {
         match r.verdict {
-            CleanVerdict::NoRow => out.push_str(&format!("  #{:>6}  NoRow          — строки нет\n", r.number)),
+            CleanVerdict::NoRow => out.push_str(&format!(
+                "  #{:>6}  NoRow          — строки нет\n",
+                r.number
+            )),
             CleanVerdict::Divergent => out.push_str(&format!(
                 "  #{:>6}  Divergent      — {}; батч не исполняется\n",
                 r.number,
@@ -777,8 +779,13 @@ fn render_clean_plan(reports: &[uwuwu_usecase::CleanRowReport]) -> String {
             "\nне-Draft строки ({}): подтверждение владельца — номерами в ack (confirm=true исполняет снос)\n",
             live_or_dead.join(", ")
         ));
-    } else if reports.iter().any(|r| r.verdict == CleanVerdict::DraftSkeleton) {
-        out.push_str("\nDraft-пустышки: confirm=true снесёт их (журнал undo пишется автоматически)\n");
+    } else if reports
+        .iter()
+        .any(|r| r.verdict == CleanVerdict::DraftSkeleton)
+    {
+        out.push_str(
+            "\nDraft-пустышки: confirm=true снесёт их (журнал undo пишется автоматически)\n",
+        );
     }
     out
 }
@@ -821,15 +828,15 @@ fn render_undo(report: &uwuwu_usecase::UndoReport) -> String {
     let mut out = format!("undo журнала {}:\n", report.journal_id);
     for (number, title, outcome) in &report.rows {
         match outcome {
-            UndoOutcome::Restored(item_id) => {
-                out.push_str(&format!("  #{number:>6}  «{title}» — восстановлена (item {item_id})\n"))
-            }
-            UndoOutcome::AlreadyOnBoard => {
-                out.push_str(&format!("  #{number:>6}  «{title}» — уже на доске (skip)\n"))
-            }
-            UndoOutcome::Failed(reason) => {
-                out.push_str(&format!("  #{number:>6}  «{title}» — НЕ удалось: {reason}\n"))
-            }
+            UndoOutcome::Restored(item_id) => out.push_str(&format!(
+                "  #{number:>6}  «{title}» — восстановлена (item {item_id})\n"
+            )),
+            UndoOutcome::AlreadyOnBoard => out.push_str(&format!(
+                "  #{number:>6}  «{title}» — уже на доске (skip)\n"
+            )),
+            UndoOutcome::Failed(reason) => out.push_str(&format!(
+                "  #{number:>6}  «{title}» — НЕ удалось: {reason}\n"
+            )),
         }
     }
     out

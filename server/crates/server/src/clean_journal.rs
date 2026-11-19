@@ -86,21 +86,29 @@ impl CleanJournalStore for JsonCleanJournals {
                 .journals
                 .values()
                 .filter(|j| j.project == project)
-                .next_back()
+                // свежий — по created_ms, не по строке-ключу (BTreeMap-порядок
+                // id лексикографичен и со свежестью не связан); tie — max id
+                .max_by(|a, b| {
+                    a.created_ms
+                        .cmp(&b.created_ms)
+                        .then_with(|| a.id.cmp(&b.id))
+                })
                 .cloned()),
         }
     }
 
     fn ids(&self, project: &str) -> UsecaseResult<Vec<String>> {
         let guard = self.file.lock().expect("journal lock");
-        let mut ids: Vec<String> = guard
+        // свежие первыми — по created_ms (строковый порядок id не связан
+        // со свежестью: hash8-суффикс лексикографичен)
+        let mut by_age: Vec<(u64, String)> = guard
             .journals
             .values()
             .filter(|j| j.project == project)
-            .map(|j| j.id.clone())
+            .map(|j| (j.created_ms, j.id.clone()))
             .collect();
-        ids.reverse();
-        Ok(ids)
+        by_age.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        Ok(by_age.into_iter().map(|(_, id)| id).collect())
     }
 }
 
@@ -149,9 +157,14 @@ mod tests {
                 .id,
             "old-1"
         );
-        assert_eq!(CleanJournalStore::ids(&s, "uwuwu").unwrap(), vec!["fresh-2", "old-1"]);
+        assert_eq!(
+            CleanJournalStore::ids(&s, "uwuwu").unwrap(),
+            vec!["fresh-2", "old-1"]
+        );
         // чужой проект не отдаётся
-        assert!(CleanJournalStore::get(&s, "другой", None).unwrap().is_none());
+        assert!(CleanJournalStore::get(&s, "другой", None)
+            .unwrap()
+            .is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 

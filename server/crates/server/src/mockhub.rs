@@ -481,7 +481,7 @@ impl uwuwu_usecase::CleanBoardRepo for MemoryHub {
     ) -> UsecaseResult<Option<uwuwu_usecase::RowBinding>> {
         self.with_state(|state| {
             self.ensure_seed(state);
-            let on_board = state.tasks.get(&number).is_some()
+            let on_board = state.tasks.contains_key(&number)
                 && !state.archived.contains_key(&number)
                 && !state.removed.contains_key(&number)
                 && state

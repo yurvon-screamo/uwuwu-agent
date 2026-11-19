@@ -1182,7 +1182,11 @@ impl TaskBoardRepo for GitHubHub {
 /// стоят на этих пробах — недостоверная проба = Divergent = не трогать.
 #[async_trait]
 impl uwuwu_usecase::CleanBoardRepo for GitHubHub {
-    async fn fresh_binding(&self, board: &str, number: u64) -> UsecaseResult<Option<uwuwu_usecase::RowBinding>> {
+    async fn fresh_binding(
+        &self,
+        board: &str,
+        number: u64,
+    ) -> UsecaseResult<Option<uwuwu_usecase::RowBinding>> {
         Ok(self
             .pv2
             .fresh_item(board, number)

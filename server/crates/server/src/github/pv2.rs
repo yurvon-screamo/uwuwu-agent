@@ -354,7 +354,11 @@ impl Pv2Rest {
     /// и обновляет кэш — вердикты чистки (#1158) пробуют носитель, а не
     /// TTL-окно индекса. Параллельный writer между пробой и мутацией
     /// виден: id/статус свежего фетча, не кэша.
-    pub(crate) async fn fresh_item(&self, board: &str, number: u64) -> UsecaseResult<Option<Pv2Item>> {
+    pub(crate) async fn fresh_item(
+        &self,
+        board: &str,
+        number: u64,
+    ) -> UsecaseResult<Option<Pv2Item>> {
         let map = self.fetch_items(board).await?;
         let now = std::time::Instant::now();
         let arc = self.items.put(board, map, now);

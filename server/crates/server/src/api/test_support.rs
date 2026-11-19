@@ -138,21 +138,25 @@ impl uwuwu_usecase::CleanJournalStore for StubJournals {
             None => Ok(guard
                 .values()
                 .filter(|j| j.project == project)
-                .next_back()
+                .max_by(|a, b| {
+                    a.created_ms
+                        .cmp(&b.created_ms)
+                        .then_with(|| a.id.cmp(&b.id))
+                })
                 .cloned()),
         }
     }
     fn ids(&self, project: &str) -> UsecaseResult<Vec<String>> {
-        let mut ids: Vec<String> = self
+        let mut by_age: Vec<(u64, String)> = self
             .entries
             .lock()
             .expect("stub journals")
             .values()
             .filter(|j| j.project == project)
-            .map(|j| j.id.clone())
+            .map(|j| (j.created_ms, j.id.clone()))
             .collect();
-        ids.reverse();
-        Ok(ids)
+        by_age.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        Ok(by_age.into_iter().map(|(_, id)| id).collect())
     }
 }
 

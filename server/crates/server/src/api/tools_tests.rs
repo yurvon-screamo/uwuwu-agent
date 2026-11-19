@@ -1172,13 +1172,9 @@ async fn task_clean_execute_refuses_live_without_ack() {
     )
     .await
     .expect("живая создана");
-    let err = call(
-        &tools,
-        "task_clean",
-        json!({ "ids": [1], "confirm": true }),
-    )
-    .await
-    .expect_err("Live без ack — отказ всего батча");
+    let err = call(&tools, "task_clean", json!({ "ids": [1], "confirm": true }))
+        .await
+        .expect_err("Live без ack — отказ всего батча");
     assert!(err.contains("ack"), "{err}");
     let rows = memory.read_board("Задачи uwuwu").await.unwrap();
     assert_eq!(rows.len(), 1, "сноса нет");
@@ -1190,13 +1186,9 @@ async fn task_clean_execute_deletes_draft_and_undo_restores() {
     call(&tools, "task_create", json!({ "title": "пустышка" }))
         .await
         .expect("draft создана");
-    let out = call(
-        &tools,
-        "task_clean",
-        json!({ "ids": "1", "confirm": true }),
-    )
-    .await
-    .expect("снос draft");
+    let out = call(&tools, "task_clean", json!({ "ids": "1", "confirm": true }))
+        .await
+        .expect("снос draft");
     assert!(out.contains("снесено 1 строк"), "{out}");
     assert!(out.contains("журнал undo: uwuwu-"), "id журнала: {out}");
     assert!(
@@ -1222,13 +1214,9 @@ async fn task_clean_execute_with_ack_takes_live_row() {
     .await
     .expect("живая создана");
     // без ack — отказ; с ack — снос (журнал откатит)
-    call(
-        &tools,
-        "task_clean",
-        json!({ "ids": [1], "confirm": true }),
-    )
-    .await
-    .expect_err("без ack отказ");
+    call(&tools, "task_clean", json!({ "ids": [1], "confirm": true }))
+        .await
+        .expect_err("без ack отказ");
     let out = call(
         &tools,
         "task_clean",
@@ -1246,13 +1234,9 @@ async fn task_clean_execute_with_ack_takes_live_row() {
 #[tokio::test]
 async fn task_clean_garbage_ids_is_loud() {
     let (tools, _) = hub();
-    let err = call(
-        &tools,
-        "task_clean",
-        json!({ "ids": "1,два,3" }),
-    )
-    .await
-    .expect_err("мусорный токен — громкий отказ");
+    let err = call(&tools, "task_clean", json!({ "ids": "1,два,3" }))
+        .await
+        .expect_err("мусорный токен — громкий отказ");
     assert!(err.contains("мусорный"), "{err}");
     let err = call(&tools, "task_clean", json!({}))
         .await
