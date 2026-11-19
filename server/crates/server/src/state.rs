@@ -697,6 +697,38 @@ mod tests {
     }
 
     #[test]
+    fn lost_counter_persists_across_restart_and_resets_on_status_change() {
+        // #1288: счётчик потерянных доставок — факт носителя (не процесса),
+        // персистентен: переживает рестарт сервера; статус-тегирование —
+        // смена статуса строки открывает новый раунд (счётчик с 1)
+        let dir = std::env::temp_dir().join(format!("uwuwu-state-lost-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        {
+            let s = store(path.clone());
+            TickStateStore::mark_lost_session(&s, "Задачи uwuwu", 7, Status::InProgress);
+            TickStateStore::mark_lost_session(&s, "Задачи uwuwu", 7, Status::InProgress);
+            TickStateStore::save(&s).unwrap();
+        }
+        let s = store(path.clone());
+        assert_eq!(
+            TickStateStore::lost_session(&s, "Задачи uwuwu", 7),
+            Some((Status::InProgress, 2)),
+            "рестарт восстанавливает счётчик потери (факт носителя)"
+        );
+        // смена статуса строки = новый раунд
+        TickStateStore::mark_lost_session(&s, "Задачи uwuwu", 7, Status::Design);
+        assert_eq!(
+            TickStateStore::lost_session(&s, "Задачи uwuwu", 7),
+            Some((Status::Design, 1))
+        );
+        // сброс: успешная доставка / парковка
+        TickStateStore::clear_lost_session(&s, "Задачи uwuwu", 7);
+        assert_eq!(TickStateStore::lost_session(&s, "Задачи uwuwu", 7), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn own_comments_persist_across_restart() {
         // #1204: реестр серверных постов переживает рестарт — комменты,
         // опубликованные до перезапуска, остаются «своими»
