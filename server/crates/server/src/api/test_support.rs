@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use uwuwu_domain::{Slot, Status};
 use uwuwu_usecase::{
-    AgentSessionGateway, DreamerMark, Liveness, SessionInfo, SessionSpec, TaskView,
-    TaskWriteUseCase, TickStateStore, UsecaseResult, WikiRepo,
+    AgentSessionGateway, AppendDocOutcome, DreamerMark, Liveness, SessionInfo, SessionSpec,
+    TaskView, TaskWriteUseCase, TickStateStore, UsecaseResult, WikiRepo,
 };
 
 use crate::clock::SystemClock;
@@ -93,8 +93,11 @@ impl WikiRepo for StubWiki {
     async fn write_doc(&self, _: &str, _: &str, _: &str) -> UsecaseResult<()> {
         Ok(())
     }
-    async fn append_doc(&self, _: &str, _: &str, _: &str) -> UsecaseResult<()> {
-        Ok(())
+    async fn append_doc(&self, _: &str, _: &str, _: &str) -> UsecaseResult<AppendDocOutcome> {
+        Ok(AppendDocOutcome {
+            created: false,
+            lines: 0,
+        })
     }
 }
 

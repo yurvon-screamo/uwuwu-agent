@@ -8,6 +8,7 @@ use crate::error::UsecaseResult;
 use crate::pipeline::analyst::{AnalystBoard, AnalystUseCase};
 use crate::pipeline::analyst_review::AnalystReviewUseCase;
 use crate::pipeline::dreamer::DreamerUseCase;
+use crate::ports::AppendDocOutcome;
 use crate::ports::{
     AgentSessionGateway, AssistantReply, Clock, CommentRef, DreamerMark, IssueView, Liveness,
     SessionInfo, SessionSpec, TaskBoardRepo, TickStateStore, WikiRepo,
@@ -272,8 +273,11 @@ impl WikiRepo for CronWiki {
     async fn write_doc(&self, _s: &str, _c: &str, _m: &str) -> UsecaseResult<()> {
         Ok(())
     }
-    async fn append_doc(&self, _s: &str, _l: &str, _m: &str) -> UsecaseResult<()> {
-        Ok(())
+    async fn append_doc(&self, _s: &str, _l: &str, _m: &str) -> UsecaseResult<AppendDocOutcome> {
+        Ok(AppendDocOutcome {
+            created: false,
+            lines: 0,
+        })
     }
 }
 

@@ -47,6 +47,53 @@ async fn docs_append_requires_slug_and_line() {
     assert_eq!(err, "slug и line обязательны");
 }
 
+/// Гард append-семантики docs_append (#1353): дописывание сохраняет
+/// тело существующего дока (fm + контент), строка — в конец; ответ
+/// различает append и создание.
+#[tokio::test]
+async fn docs_append_keeps_body_of_existing_doc() {
+    let tools = hub();
+    let slug = "Experience/devops/Опыт (srv, #1248)";
+    call(
+        &tools,
+        "docs_write",
+        json!({ "slug": slug, "content": "строка A" }),
+    )
+    .await
+    .expect("write");
+    let answer = call(
+        &tools,
+        "docs_append",
+        json!({ "slug": slug, "line": "строка B" }),
+    )
+    .await
+    .expect("append");
+    assert!(
+        answer.contains("дописано") && answer.contains("строк в доке: 2"),
+        "ответ append без факта операции: {answer}"
+    );
+    let stored = call(&tools, "docs_read", json!({ "slug": slug }))
+        .await
+        .expect("read");
+    assert_eq!(stored, "строка A\nстрока B");
+}
+
+#[tokio::test]
+async fn docs_append_reports_creation_of_missing_doc() {
+    let tools = hub();
+    let answer = call(
+        &tools,
+        "docs_append",
+        json!({ "slug": "Scratch/new#doc", "line": "первая строка" }),
+    )
+    .await
+    .expect("append");
+    assert!(
+        answer.contains("создан"),
+        "создание не названо созданием: {answer}"
+    );
+}
+
 #[tokio::test]
 async fn docs_write_requires_slug_and_content() {
     let tools = hub();

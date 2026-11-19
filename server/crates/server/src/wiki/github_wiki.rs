@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use uwuwu_usecase::WikiRepo;
-use uwuwu_usecase::{UsecaseError, UsecaseResult};
+use uwuwu_usecase::{AppendDocOutcome, UsecaseError, UsecaseResult};
 
 pub struct GitHubWiki {
     repo: String,
@@ -217,7 +217,12 @@ impl WikiRepo for GitHubWiki {
             .await
     }
 
-    async fn append_doc(&self, slug: &str, line: &str, message: &str) -> UsecaseResult<()> {
+    async fn append_doc(
+        &self,
+        slug: &str,
+        line: &str,
+        message: &str,
+    ) -> UsecaseResult<AppendDocOutcome> {
         let Some(w) = &self.writer else {
             return Err(UsecaseError::Board("wiki write не сконфигурирован".into()));
         };
