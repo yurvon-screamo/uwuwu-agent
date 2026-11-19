@@ -481,12 +481,7 @@ impl ToolHub {
             receipt.body_size, receipt.body_hash
         );
         if !receipt.verified {
-            // деградированная квитанция (#1331): контрольное чтение носителя
-            // не состоялось — hash от отправленного, ретрай мутации запрещён
-            msg.push_str(
-                "; ⚠ доставка не подтверждена контрольным чтением (носитель не \
-                 прочитан) — ретрай мутации запрещён, сверь task_get",
-            );
+            msg.push_str(delivery_unverified_marker());
         }
         ok_text(msg)
     }
@@ -578,9 +573,17 @@ fn render_section_report(section: &str, report: &uwuwu_usecase::SectionEditRepor
         if report.verified {
             String::new()
         } else {
-            "; ⚠ доставка не подтверждена контрольным чтением (носитель не прочитан) — ретрай мутации запрещён, сверь task_get".to_string()
+            delivery_unverified_marker().to_string()
         }
     )
+}
+
+/// Маркер деградированной квитанции (#1331): контрольное чтение носителя
+/// не состоялось — hash/размер от отправленного, ретрай мутации запрещён.
+/// Единая точка текста для task_body и секционного отчёта.
+fn delivery_unverified_marker() -> &'static str {
+    "; ⚠ доставка не подтверждена контрольным чтением (носитель не прочитан) — \
+     ретрай мутации запрещён, сверь task_get"
 }
 
 fn ok_text(text: String) -> Result<Value, String> {

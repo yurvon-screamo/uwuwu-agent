@@ -463,6 +463,7 @@ impl TaskWriter for TaskWriteUseCase {
         let repo = self.board.clone();
         let needle = id.clone();
         match verify_carrier(
+            self.clock.as_ref(),
             move || {
                 let repo = repo.clone();
                 async move { repo.latest_comments(number).await }
@@ -527,6 +528,13 @@ impl TaskWriter for TaskWriteUseCase {
         // сам, #1151; fm-стек инцидента #1331)
         let clean = crate::fm_lite::strip(strip_task_get_header(body_md));
         let board = self.board_of(project);
+        // project вне конфига — громкий отказ (паритет task_body_section):
+        // мусорный project не пишет «мимо доски» молча (ревью #1331 Low)
+        if board.is_empty() {
+            return Err(UsecaseError::Board(format!(
+                "проект «{project}» вне конфига"
+            )));
+        }
         self.board.replace_body(number, clean).await?;
         // контрольное чтение носителя: квитанция = факт доставки (#1331)
         let repo = self.board.clone();
@@ -535,6 +543,7 @@ impl TaskWriter for TaskWriteUseCase {
         // future владеет копиями захваченного — ссылки из тела FnMut-
         // замыкания не ускользают (lifetime-гард компилятора)
         match verify_carrier(
+            self.clock.as_ref(),
             move || {
                 let repo = repo.clone();
                 let bd = bd.clone();
@@ -633,6 +642,7 @@ impl TaskWriter for TaskWriteUseCase {
 /// при неприменившейся записи — контрольное чтение ловит то, что эхо
 /// пропускает; сильнее на Issues API ничего нет (If-Match не поддерживается).
 const VERIFY_ATTEMPTS: usize = 3;
+const VERIFY_PAUSE_MS: u64 = 1000;
 
 enum Delivery<T> {
     /// Носитель прочитан и содержит ожидаемое — факт доставки.
@@ -647,19 +657,23 @@ enum Delivery<T> {
     Blind,
 }
 
-/// До VERIFY_ATTEMPTS попыток чтения носителя. Без пауз между попытками:
-/// аномальные окна носителя имеют минутный масштаб (секундная пауза их не
-/// покрывает — прецедент verify_status с паузой 1с обслуживает лаг Pv2-
-/// снапшота в адаптере, здесь чтения issue-поверхности REST).
-/// Последняя попытка решает исход: Ok-мимо — Stale, Err — Blind.
-async fn verify_carrier<T, Fut, F, M>(mut read: F, matches: M) -> Delivery<T>
+/// До VERIFY_ATTEMPTS попыток чтения носителя с паузой VERIFY_PAUSE_MS
+/// между ними (план-контракт 3×1с, прецедент verify_status): пауза
+/// смягчает ложные Stale-отказы на секундном лаге видимости носителя —
+/// минутные аномальные окна инцидента #1331 не покрываются ни паузой,
+/// ни ретраями, но и не осложняются ими. Последняя попытка решает исход:
+/// Ok-мимо — Stale, Err — Blind.
+async fn verify_carrier<T, Fut, F, M>(clock: &dyn Clock, mut read: F, matches: M) -> Delivery<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, UsecaseError>>,
     M: Fn(&T) -> bool,
 {
     let mut stale = false;
-    for _ in 0..VERIFY_ATTEMPTS {
+    for attempt in 0..VERIFY_ATTEMPTS {
+        if attempt > 0 {
+            clock.sleep_ms(VERIFY_PAUSE_MS);
+        }
         match read().await {
             Ok(v) if matches(&v) => return Delivery::Verified(v),
             Ok(_) => stale = true,
@@ -700,6 +714,7 @@ fn strip_task_get_header(md: &str) -> &str {
 
 /// Ожидания контрольного чтения edit: Some — значение менялось и должно
 /// присутствовать на носителе; None — не менялось и не сверяется.
+#[derive(Clone)]
 struct EditExpectations {
     title: Option<String>,
     branch: Option<String>,
@@ -711,7 +726,13 @@ struct EditExpectations {
 impl EditExpectations {
     fn is_empty(&self) -> bool {
         matches!(
-            (&self.title, &self.branch, &self.pr, &self.priority, self.automerge),
+            (
+                &self.title,
+                &self.branch,
+                &self.pr,
+                &self.priority,
+                self.automerge
+            ),
             (None, None, None, None, None)
         )
     }
@@ -764,8 +785,10 @@ impl TaskWriteUseCase {
         }
         let repo = self.board.clone();
         let bd = board.to_string();
-        let matches = move |v: &crate::ports::IssueView| want.mismatches(v).is_empty();
+        let matches_want = want.clone();
+        let matches = move |v: &crate::ports::IssueView| matches_want.mismatches(v).is_empty();
         match verify_carrier(
+            self.clock.as_ref(),
             move || {
                 let repo = repo.clone();
                 let bd = bd.clone();
@@ -777,6 +800,19 @@ impl TaskWriteUseCase {
         {
             Delivery::Verified(_) => Ok(()),
             Delivery::Stale => {
+                // перечень несошедших — контрольное перечитывание носителя:
+                // редкая ветка, точный текст громкой ошибки стоит чтения
+                let detail = match self.board.read_issue(board, number).await {
+                    Ok(view) => {
+                        let m = want.mismatches(&view);
+                        if m.is_empty() {
+                            String::new()
+                        } else {
+                            format!("не сошлись: {} — ", m.join(", "))
+                        }
+                    }
+                    Err(_) => String::new(),
+                };
                 tracing::error!(
                     event = "write.delivery_mismatch",
                     kind = "edit",
@@ -784,8 +820,8 @@ impl TaskWriteUseCase {
                     "Запись edit не подтвердилась контрольным чтением носителя"
                 );
                 Err(UsecaseError::Board(format!(
-                    "edit #{number}: запись не подтвердилась чтением носителя \
-                     (тайтл/ветка/PR/приоритет/automerge) — не ретраить слепо, сверь task_get"
+                    "edit #{number}: запись не подтвердилась чтением носителя ({detail}\
+                     тайтл/ветка/PR/приоритет/automerge) — не ретраить слепо, сверь task_get"
                 )))
             }
             Delivery::Blind => {
