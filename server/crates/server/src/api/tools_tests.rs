@@ -647,6 +647,12 @@ async fn fast_track_from_draft_and_todo() {
             clock: Arc::new(SystemClock),
             state: Arc::new(StubState),
         }),
+        clean: Arc::new(uwuwu_usecase::TaskCleanUseCase {
+            clean: memory.clone() as Arc<dyn uwuwu_usecase::CleanBoardRepo>,
+            journals: Arc::new(super::test_support::StubJournals::default()),
+            boards: vec![("uwuwu".to_string(), "Задачи uwuwu".to_string())],
+            clock: Arc::new(SystemClock),
+        }),
         wiki,
         sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(sessions)),
         search: Arc::new(SearchUseCase { semantic: None }),
@@ -1114,4 +1120,131 @@ async fn blob_put_over_limit_is_loud_through_dispatcher() {
     .expect_err("громкий отказ по лимиту");
     assert!(err.contains("blob too big"), "{err}");
     assert!(err.contains("прецедент UC-06"), "{err}");
+}
+
+// ===== Батч-снос #1158: поверхность MCP (dry-run/confirm/ack/undo) =====
+
+/// Живая задача с содержательным телом (вердикт Live — ack обязателен).
+fn live_body(title: &str) -> String {
+    format!("## Постановка\n\nСодержательное тело задачи «{title}».\n")
+}
+
+#[tokio::test]
+async fn task_clean_dry_run_verdicts_without_mutations() {
+    let (tools, memory) = hub();
+    // #1 — create без тела: скелет create → DraftSkeleton
+    call(&tools, "task_create", json!({ "title": "пустышка" }))
+        .await
+        .expect("draft создана");
+    // #2 — содержательное тело + close → Dead (не-Draft)
+    call(
+        &tools,
+        "task_create",
+        json!({ "title": "живая", "body": live_body("живая") }),
+    )
+    .await
+    .expect("живая создана");
+    call(
+        &tools,
+        "task_close",
+        json!({ "number": 2, "not_planned": true }),
+    )
+    .await
+    .expect("закрыта");
+    let out = call(&tools, "task_clean", json!({ "ids": "1,2" }))
+        .await
+        .expect("dry-run");
+    assert!(out.contains("DraftSkeleton"), "draft-вердикт: {out}");
+    assert!(out.contains("Dead"), "dead-вердикт: {out}");
+    assert!(out.contains("ack"), "подсказка про ack: {out}");
+    assert!(out.contains("мутаций нет"), "заголовок dry-run: {out}");
+    let rows = memory.read_board("Задачи uwuwu").await.unwrap();
+    assert_eq!(rows.len(), 2, "dry-run — ноль мутаций");
+}
+
+#[tokio::test]
+async fn task_clean_execute_refuses_live_without_ack() {
+    let (tools, memory) = hub();
+    call(
+        &tools,
+        "task_create",
+        json!({ "title": "живая", "body": live_body("живая") }),
+    )
+    .await
+    .expect("живая создана");
+    let err = call(&tools, "task_clean", json!({ "ids": [1], "confirm": true }))
+        .await
+        .expect_err("Live без ack — отказ всего батча");
+    assert!(err.contains("ack"), "{err}");
+    let rows = memory.read_board("Задачи uwuwu").await.unwrap();
+    assert_eq!(rows.len(), 1, "сноса нет");
+}
+
+#[tokio::test]
+async fn task_clean_execute_deletes_draft_and_undo_restores() {
+    let (tools, memory) = hub();
+    call(&tools, "task_create", json!({ "title": "пустышка" }))
+        .await
+        .expect("draft создана");
+    let out = call(&tools, "task_clean", json!({ "ids": "1", "confirm": true }))
+        .await
+        .expect("снос draft");
+    assert!(out.contains("снесено 1 строк"), "{out}");
+    assert!(out.contains("журнал undo: uwuwu-"), "id журнала: {out}");
+    assert!(
+        memory.read_board("Задачи uwuwu").await.unwrap().is_empty(),
+        "строка покинула доску"
+    );
+    // undo без journal — свежий журнал проекта
+    let out = call(&tools, "task_undo", json!({})).await.expect("undo");
+    assert!(out.contains("восстановлена"), "{out}");
+    let rows = memory.read_board("Задачи uwuwu").await.unwrap();
+    assert_eq!(rows.len(), 1, "строка вернулась");
+    assert_eq!(rows[0].number(), 1, "номер тот же (item пересоздан)");
+}
+
+#[tokio::test]
+async fn task_clean_execute_with_ack_takes_live_row() {
+    let (tools, memory) = hub();
+    call(
+        &tools,
+        "task_create",
+        json!({ "title": "живая", "body": live_body("живая") }),
+    )
+    .await
+    .expect("живая создана");
+    // без ack — отказ; с ack — снос (журнал откатит)
+    call(&tools, "task_clean", json!({ "ids": [1], "confirm": true }))
+        .await
+        .expect_err("без ack отказ");
+    let out = call(
+        &tools,
+        "task_clean",
+        json!({ "ids": [1], "confirm": true, "ack": [1] }),
+    )
+    .await
+    .expect("ack владельца — снос");
+    assert!(out.contains("снесено 1 строк"), "{out}");
+    assert!(
+        memory.read_board("Задачи uwuwu").await.unwrap().is_empty(),
+        "live-строка снесена по ack"
+    );
+}
+
+#[tokio::test]
+async fn task_clean_garbage_ids_is_loud() {
+    let (tools, _) = hub();
+    let err = call(&tools, "task_clean", json!({ "ids": "1,два,3" }))
+        .await
+        .expect_err("мусорный токен — громкий отказ");
+    assert!(err.contains("мусорный"), "{err}");
+    // null в массиве тоже громкий (ревью #1158 Low-1: батч не сужается молча)
+    let err = call(&tools, "task_clean", json!({ "ids": [1, null, 3] }))
+        .await
+        .expect_err("null-токен — громкий отказ");
+    assert!(err.contains("мусорный"), "{err}");
+    let err = call(&tools, "task_clean", json!({}))
+        .await
+        .expect_err("ids отсутствует");
+    assert!(err.contains("ids обязателен"), "{err}");
 }

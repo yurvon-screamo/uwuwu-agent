@@ -361,6 +361,57 @@ impl Pv2Rest {
         self.status_wt.invalidate(&format!("{board}#{number}"));
     }
 
+    /// Свежий индекс привязок доски (мимо кэша, кэш обновляется): ОДИН
+    /// полный фетч на вызов чистки — батч ест 1 индекс-фетч + N issue-проб,
+    /// не N фетчей (квотная дисциплина общего REST-бакета ADR-113,
+    /// ревью #1158 Common-1).
+    pub(crate) async fn fresh_index(&self, board: &str) -> UsecaseResult<HashMap<u64, Pv2Item>> {
+        let map = self.fetch_items(board).await?;
+        let now = std::time::Instant::now();
+        self.items.put(board, map.clone(), now);
+        Ok(map)
+    }
+
+    /// DELETE item (снос строки, #1158): 204 — снос принят GitHub.
+    /// Кэш-гигиена: номер уходит из живого индекса и write-through статуса
+    /// (read-лаг list items не должен показывать снесённую строку).
+    pub(crate) async fn delete_item(
+        &self,
+        board: &str,
+        number: u64,
+        item_id: u64,
+    ) -> UsecaseResult<()> {
+        let meta = self.meta(board).await?;
+        let owner = self.owner()?;
+        let resp = self
+            .rest(
+                reqwest::Method::DELETE,
+                &format!(
+                    "/users/{owner}/projectsV2/{}/items/{item_id}",
+                    meta.project_number
+                ),
+                None,
+            )
+            .await?;
+        if !resp.status.is_success() {
+            return Err(UsecaseError::Board(format!(
+                "delete item #{number} (item {item_id}): не применилось (HTTP {})",
+                resp.status
+            )));
+        }
+        // кэш-гигиена: строка уходит из живого индекса и write-through'а;
+        // пустого кэша не создаём — пустая карта «свежего индекса» морила
+        // бы читателей лишними рефэтчами (ревью #1158 Low-3)
+        let now = std::time::Instant::now();
+        if let Some(hit) = self.items.get(board, now) {
+            let mut map = (*hit).clone();
+            map.remove(&number);
+            self.items.put(board, map, now);
+        }
+        self.status_wt.invalidate(&format!("{board}#{number}"));
+        Ok(())
+    }
+
     /// POST add строки на доску (по issue number, node_id не нужен) +
     /// инкремент живого индекса. Возврат — numeric item id.
     pub(crate) async fn add_item(&self, board: &str, number: u64) -> UsecaseResult<u64> {

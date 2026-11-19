@@ -13,6 +13,8 @@ pub struct ToolHub {
     pub docs: Arc<DocsView>,
     pub person: Arc<PersonView>,
     pub writer: Arc<TaskWriteUseCase>,
+    /// Батч-снос строк доски (#1158): guard-вердикты + write-ahead undo.
+    pub clean: Arc<uwuwu_usecase::TaskCleanUseCase>,
     pub wiki: Arc<dyn uwuwu_usecase::WikiRepo>,
     /// Роутер «проект → executor»: session_export веером по исполнителям.
     pub sessions: Arc<uwuwu_usecase::SessionRouter>,
@@ -121,6 +123,42 @@ pub fn tool_descriptors() -> Value {
                 "number": integer("номер задачи"),
                 "project": string("проект; дефолт uwuwu"),
                 "not_planned": json!({"type":"boolean","description":"true — отказ/дубль, false — выполнено"})
+            }))
+        ),
+        tool(
+            "task_clean",
+            "Батч-снос строк доски с guard'ом (#1158): dry-run с вердиктами \
+             (Live/Dead/DraftSkeleton/NoRow/Divergent) — дефолт, ноль мутаций; \
+             confirm=true исполняет. Не-Draft строки (Live/Dead) требуют ack \
+             владельца — без него весь батч отклоняется; write-ahead журнал \
+             даёт undo (task_undo)",
+            object(json!({
+                "ids": json!({
+                    "description": "номера строк: csv «1,2,3» или массив integers",
+                    "oneOf": [
+                        { "type": "string" },
+                        { "type": "array", "items": { "type": "integer" } }
+                    ]
+                }),
+                "project": string("проект; дефолт uwuwu"),
+                "confirm": json!({"type":"boolean","description":"false/нет — dry-run (вердикты), true — снос"}),
+                "ack": json!({
+                    "description": "номера не-Draft строк (Live/Dead), подтверждённые \
+                                    владельцем: csv или массив integers",
+                    "oneOf": [
+                        { "type": "string" },
+                        { "type": "array", "items": { "type": "integer" } }
+                    ]
+                })
+            }))
+        ),
+        tool(
+            "task_undo",
+            "Откат сноса строк по undo-журналу (идемпотентно): recreate item + \
+             возврат статуса; без journal — свежий журнал проекта",
+            object(json!({
+                "project": string("проект; дефолт uwuwu"),
+                "journal": string("id журнала из task_clean; опционально — свежий")
             }))
         ),
         tool(
@@ -243,6 +281,8 @@ impl ToolHub {
             "task_claim" => self.task_claim(args).await,
             "task_comment" => self.task_comment(args).await,
             "task_close" => self.task_close(args).await,
+            "task_clean" => self.task_clean(&project, args).await,
+            "task_undo" => self.task_undo(&project, args).await,
             "task_body" => self.task_body(&project, args).await,
             "task_body_section" => self.task_body_section(&project, args).await,
             "blob_put" => self.blob_put(&project, args).await,
@@ -510,6 +550,43 @@ impl ToolHub {
         ok_text(format!("задача #{number} закрыта"))
     }
 
+    async fn task_clean(&self, project: &str, args: &Value) -> Result<Value, String> {
+        let numbers = arg_numbers(args, "ids")?;
+        let ack = match args.get("ack") {
+            None | Some(Value::Null) => Vec::new(),
+            _ => arg_numbers(args, "ack")?,
+        };
+        let confirm = args
+            .get("confirm")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !confirm {
+            let reports = self
+                .clean
+                .plan(project, &numbers)
+                .await
+                .map_err(|e| e.to_string())?;
+            ok_text(render_clean_plan(&reports))
+        } else {
+            let report = self
+                .clean
+                .execute(project, &numbers, &ack)
+                .await
+                .map_err(|e| e.to_string())?;
+            ok_text(render_clean_exec(project, &report))
+        }
+    }
+
+    async fn task_undo(&self, project: &str, args: &Value) -> Result<Value, String> {
+        let journal = str_arg(args, "journal");
+        let report = self
+            .clean
+            .undo(project, journal.as_deref())
+            .await
+            .map_err(|e| e.to_string())?;
+        ok_text(render_undo(&report))
+    }
+
     async fn task_body(&self, project: &str, args: &Value) -> Result<Value, String> {
         let number = need_number(args)?;
         let body = arg_str(args, "body");
@@ -648,6 +725,33 @@ fn optional_number(args: &Value) -> Result<Option<u64>, String> {
     }
 }
 
+/// Список номеров из аргумента: массив integers или csv-строка «1,2,3».
+/// Пустой/отсутствующий — Err (ids обязателен); ack — unwrap_or_default
+/// на стороне вызова. null и мусорный токен — громкий отказ (не тихий
+/// пропуск: батч не сужается молча, ревью #1158 Low-1).
+fn arg_numbers(args: &Value, key: &str) -> Result<Vec<u64>, String> {
+    let raw: Vec<Value> = match args.get(key) {
+        None | Some(Value::Null) => return Err(format!("{key} обязателен (номера строк)")),
+        Some(Value::Array(items)) => items.clone(),
+        Some(Value::String(csv)) => csv
+            .split(',')
+            .map(|tok| Value::String(tok.trim().to_string()))
+            .collect(),
+        Some(other) => {
+            return Err(format!(
+                "{key}: массив integers или csv-строка «1,2,3», получено: {other}"
+            ))
+        }
+    };
+    raw.iter()
+        .map(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().map(str::trim).and_then(|s| s.parse().ok()))
+                .ok_or(format!("{key}: мусорный токен «{v}» — жду номер строки"))
+        })
+        .collect()
+}
+
 /// Квитанция секционной правки для агента: исход + новое тело (хэш/размер).
 /// Компактно — полное тело не возвращается (сознательное сужение #1152:
 /// возврат больших тел убивал бы экономию секционного пути).
@@ -683,6 +787,108 @@ fn delivery_unverified_marker() -> &'static str {
 
 fn ok_text(text: String) -> Result<Value, String> {
     Ok(json!([{ "type": "text", "text": text }]))
+}
+
+/// Dry-run чистки: вердикты и подсказки, ноль мутаций.
+fn render_clean_plan(reports: &[uwuwu_usecase::CleanRowReport]) -> String {
+    use uwuwu_usecase::CleanVerdict;
+    let mut out = String::from("dry-run чистки (мутаций нет):\n");
+    for r in reports {
+        match r.verdict {
+            CleanVerdict::NoRow => out.push_str(&format!(
+                "  #{:>6}  NoRow          — строки нет\n",
+                r.number
+            )),
+            CleanVerdict::Divergent => out.push_str(&format!(
+                "  #{:>6}  Divergent      — {}; батч не исполняется\n",
+                r.number,
+                r.note.as_deref().unwrap_or("проба не состоялась")
+            )),
+            CleanVerdict::Live => out.push_str(&format!(
+                "  #{:>6}  Live           «{}» — защищена (не-Draft: нужен ack владельца)\n",
+                r.number, r.title
+            )),
+            CleanVerdict::Dead => out.push_str(&format!(
+                "  #{:>6}  Dead           «{}» — терминальная (снос с ack владельца)\n",
+                r.number, r.title
+            )),
+            CleanVerdict::DraftSkeleton => out.push_str(&format!(
+                "  #{:>6}  DraftSkeleton  «{}» — пустышка, снос с confirm\n",
+                r.number, r.title
+            )),
+        }
+    }
+    let live_or_dead: Vec<String> = reports
+        .iter()
+        .filter(|r| matches!(r.verdict, CleanVerdict::Live | CleanVerdict::Dead))
+        .map(|r| r.number.to_string())
+        .collect();
+    if !live_or_dead.is_empty() {
+        out.push_str(&format!(
+            "\nне-Draft строки ({}): подтверждение владельца — номерами в ack (confirm=true исполняет снос)\n",
+            live_or_dead.join(", ")
+        ));
+    } else if reports
+        .iter()
+        .any(|r| r.verdict == CleanVerdict::DraftSkeleton)
+    {
+        out.push_str(
+            "\nDraft-пустышки: confirm=true снесёт их (журнал undo пишется автоматически)\n",
+        );
+    }
+    out
+}
+
+/// Отчёт исполнения сноса.
+fn render_clean_exec(project: &str, report: &uwuwu_usecase::CleanExecReport) -> String {
+    let mut out = String::new();
+    if report.deleted.is_empty() {
+        out.push_str("сносить нечего (журнал не пишется):\n");
+    } else {
+        out.push_str(&format!(
+            "снесено {} строк; журнал undo: {} (откат — task_undo {{project: \"{project}\", journal: \"{}\"}})\n",
+            report.deleted.len(),
+            report.journal_id,
+            report.journal_id
+        ));
+    }
+    for r in &report.deleted {
+        out.push_str(&format!(
+            "  #{:>6}  {}  «{}» — снесена (item {})\n",
+            r.number,
+            r.verdict.label(),
+            r.title,
+            r.item_id
+        ));
+    }
+    for r in &report.skipped {
+        out.push_str(&format!(
+            "  #{:>6}  {}  — пропущена (строки нет)\n",
+            r.number,
+            r.verdict.label()
+        ));
+    }
+    out
+}
+
+/// Отчёт undo: карта «строка → исход», идемпотентные skip'и видны.
+fn render_undo(report: &uwuwu_usecase::UndoReport) -> String {
+    use uwuwu_usecase::UndoOutcome;
+    let mut out = format!("undo журнала {}:\n", report.journal_id);
+    for (number, title, outcome) in &report.rows {
+        match outcome {
+            UndoOutcome::Restored(item_id) => out.push_str(&format!(
+                "  #{number:>6}  «{title}» — восстановлена (item {item_id})\n"
+            )),
+            UndoOutcome::AlreadyOnBoard => out.push_str(&format!(
+                "  #{number:>6}  «{title}» — уже на доске (skip)\n"
+            )),
+            UndoOutcome::Failed(reason) => out.push_str(&format!(
+                "  #{number:>6}  «{title}» — НЕ удалось: {reason}\n"
+            )),
+        }
+    }
+    out
 }
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
@@ -722,6 +928,8 @@ mod tests {
             "task_edit",
             "task_comment",
             "task_close",
+            "task_clean",
+            "task_undo",
             "task_body",
             "task_body_section",
             "blob_put",
@@ -739,7 +947,7 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "нет инструмента {expected}");
         }
-        assert_eq!(names.len(), 21, "контракт поверхности: {names:?}");
+        assert_eq!(names.len(), 23, "контракт поверхности: {names:?}");
     }
 
     #[test]

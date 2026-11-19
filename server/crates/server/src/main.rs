@@ -6,6 +6,7 @@
 
 mod api;
 mod bots;
+mod clean_journal;
 mod clock;
 mod config;
 mod diag;
@@ -264,6 +265,10 @@ async fn run(
     ));
     let state_path = cfg.state_path(&config_path);
     let state = Arc::new(state::JsonStateStore::load(state_path, clock.clone()));
+    // undo-журнал чистки (#1158): файл рядом со state.json на volume
+    let clean_journals = Arc::new(clean_journal::JsonCleanJournals::load(
+        cfg.state_path(&config_path).with_file_name("undo.json"),
+    ));
     let spawn_models = Arc::new(match cfg.executor.models.as_ref() {
         Some(raw) => {
             let mut map = std::collections::HashMap::new();
@@ -383,6 +388,17 @@ async fn run(
             boards: boards_cfg.clone(),
             clock: clock.clone(),
             state: state.clone(),
+        }),
+        clean: Arc::new(uwuwu_usecase::TaskCleanUseCase {
+            // driver-независимо: gh-хаб и memory-хаб несут CleanBoardRepo
+            clean: match &memory_hub {
+                Some(mem) => mem.clone() as Arc<dyn uwuwu_usecase::CleanBoardRepo>,
+                None => github_hub.clone().expect("gh-хаб собран при driver=github")
+                    as Arc<dyn uwuwu_usecase::CleanBoardRepo>,
+            },
+            journals: clean_journals,
+            boards: boards_cfg.clone(),
+            clock: clock.clone(),
         }),
         wiki: wiki.clone(),
         sessions: sessions.clone(),
