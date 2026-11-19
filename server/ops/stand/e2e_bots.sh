@@ -156,6 +156,39 @@ CREATED_AFTER=$(grep -c '"event":"bot.session_created"' "$LOG_SRV" || true)
 [ "$CREATED_AFTER" -eq "$CREATED_BEFORE" ] || fail "после рестарта сессия пересоздана ($CREATED_BEFORE → $CREATED_AFTER)"
 say "рестарт: бот восстановлен, сессия переиспользована (созданий: $CREATED_AFTER)"
 
+# ---------- автокомпакт (#1221): пороги стенда (idle 0, pct 0) → нативный compact ----------
+say "ожидание bot.compacted…"
+for _ in $(seq 1 20); do
+  sleep 1
+  grep -q '"event":"bot.compacted"' "$LOG_SRV" && break
+done
+grep -q '"event":"bot.compacted"' "$LOG_SRV" || fail "компакт не admitted за 20с (лог: $LOG_SRV)"
+grep -q '"event":"mock.session_compacted"' "$LOG_MOCK" || fail "мок не принял POST /compact"
+say "компакт admitted: мок принял заявку"
+
+# коулдаун (1 мин): повторной адмиссии в окне нет
+sleep 15
+COMPACTS=$(grep -c '"event":"bot.compacted"' "$LOG_SRV" || true)
+[ "$COMPACTS" = "1" ] || fail "повторный компакт в коулдауне ($COMPACTS раз)"
+say "коулдаун: повторной адмиссии нет"
+
+# живость после компакта: бот отвечает на следующее сообщение владельца
+say "инжект сообщения после компакта…"
+curl -s -X POST "http://127.0.0.1:$PORT_TG/inject" -H 'Content-Type: application/json' \
+  -d '{"update_id":3,"chat_id":42,"username":"yurvon","text":"после компакта"}' >/dev/null
+POST_REPLY=""
+for _ in $(seq 1 40); do
+  sleep 1
+  POST_REPLY=$(curl -s "http://127.0.0.1:$PORT_TG/sent" | python3 -c "
+import json,sys
+sent=json.load(sys.stdin)['sent']
+hits=[m['text'] for m in sent if 'после компакта' in m['text']]
+print(hits[0] if hits else '')" 2>/dev/null)
+  [ -n "$POST_REPLY" ] && break
+done
+[ -n "$POST_REPLY" ] || fail "реплай после компакта не дошёл до ТГ (лог: $LOG_SRV)"
+say "живость после компакта: $POST_REPLY"
+
 # многосообщный ход (#1209): «turn probe» → фазы пробы → только финал в ТГ
 say "инжект turn probe (двухсообщный ход)…"
 curl -s -X POST "http://127.0.0.1:$PORT_TG/inject" -H 'Content-Type: application/json' \

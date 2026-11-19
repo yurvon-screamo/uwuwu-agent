@@ -21,6 +21,13 @@ url = "http://127.0.0.1:8099"
 cup = 7
 peak = { enabled = false, start_min = 0, end_min = 0 }
 
+# автокомпакт вечных сессий ботов (#1221): пороги стенда — нулевые idle/pct
+# (компакт стреляет при первой возможности), коулдаун 1 мин
+[compact]
+idle_min = 0
+min_context_pct = 0.0
+cooldown_min = 1
+
 [[project]]
 name = "uwuwu"
 board = "Задачи uwuwu"
