@@ -5,7 +5,7 @@
 use serde_json::{json, Value};
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
-use super::github_wiki::encode_path;
+use crate::wiki::encode_path;
 use uwuwu_usecase::AppendDocOutcome;
 
 pub struct GitWikiWriter {

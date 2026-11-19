@@ -529,10 +529,11 @@ impl uwuwu_usecase::WikiRepo for MemoryHub {
         self.with_state(|state| {
             let existed = state.docs.contains_key(slug);
             let entry = state.docs.entry(slug.to_string()).or_default();
-            if !entry.is_empty() {
+            if !entry.is_empty() && !entry.ends_with('\n') {
                 entry.push('\n');
             }
             entry.push_str(line);
+            entry.push('\n');
             Ok(AppendDocOutcome {
                 created: !existed,
                 lines: entry.lines().count(),

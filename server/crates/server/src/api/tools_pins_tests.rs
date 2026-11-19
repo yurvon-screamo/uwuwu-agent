@@ -75,7 +75,8 @@ async fn docs_append_keeps_body_of_existing_doc() {
     let stored = call(&tools, "docs_read", json!({ "slug": slug }))
         .await
         .expect("read");
-    assert_eq!(stored, "строка A\nстрока B");
+    // append_to нормализует EOF: итог всегда с завершающим переносом
+    assert_eq!(stored, "строка A\nстрока B\n");
 }
 
 #[tokio::test]
