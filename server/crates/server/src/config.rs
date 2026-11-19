@@ -48,8 +48,9 @@ pub struct ExecutorCfg {
 }
 
 /// Дополнительный именованный исполнитель ([[executors]]): подмножество
-/// полей дефолтного — spawn_model у именованных не вводится (модели —
-/// дефы агентов, #1154).
+/// полей дефолтного — карта моделей у именованных не вводится: модель
+/// кладётся сервером в тело спавна из карты `[executor.models]` /
+/// `canonical()` (#1154).
 #[derive(Debug, Clone, Deserialize)]
 pub struct NamedExecutorCfg {
     pub name: String,
