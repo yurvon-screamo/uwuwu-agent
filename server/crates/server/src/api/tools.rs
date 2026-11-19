@@ -20,6 +20,8 @@ pub struct ToolHub {
     pub crons: Arc<uwuwu_usecase::CronUseCase>,
     /// Blob-канал (#1292): вложения к задачам/докам через приватный S3.
     pub blobs: Arc<BlobUseCase>,
+    /// Реестр целей проекта (#1216): issues hub, лейблы goal + proj:<проект>.
+    pub goals: Arc<uwuwu_usecase::GoalsView>,
 }
 
 /// Дефолтный проект для инструментов без явного project.
@@ -62,7 +64,7 @@ pub fn tool_descriptors() -> Value {
         ),
         tool(
             "goal_list",
-            "Реестр долгосрочных целей проекта — читай перед работой над задачей",
+            "Реестр долгосрочных целей проекта: open issues hub-репо с лейблами goal + proj:<проект> — читай перед работой над задачей; работа против открытой цели против её направления — флаг владельцу",
             object(json!({ "project": string("имя проекта; дефолт uwuwu") }))
         ),
         tool(
@@ -317,16 +319,11 @@ impl ToolHub {
     }
 
     async fn goal_list(&self, project: &str) -> Result<Value, String> {
-        // Реестр целей проекта: док Projects/<proj>/Goals (тело правит
-        // владелец в UI; агент — читает перед работой над задачей)
-        let slug = format!("Projects/{project}/Goals");
-        match self.docs.read(&slug).await {
-            Ok(md) => ok_text(md),
-            Err(_) => ok_text(format!(
-                "реестр целей пуст: док {slug} не заведён \
-                 (цели ведёт владелец в UI)"
-            )),
-        }
+        // Реестр целей проекта: open issues hub-репо (лейблы goal +
+        // proj:<проект>; пишет владелец в UI, агент читает перед
+        // работой над задачей) — #1216
+        let md = self.goals.list(project).await.map_err(view_err)?;
+        ok_text(md)
     }
 
     async fn docs_append(&self, args: &Value) -> Result<Value, String> {

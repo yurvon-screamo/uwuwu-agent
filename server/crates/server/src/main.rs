@@ -303,6 +303,22 @@ async fn run(
         board.clone(),
         boards_cfg.clone(),
     ));
+    // Реестр целей (#1216): issues hub-репо, лейблы goal + proj:<проект>;
+    // memory-стенд отвечает «не заведены» (GoalsRepo мок-реализация).
+    let goals_repo: Arc<dyn uwuwu_usecase::GoalsRepo> = match &memory_hub {
+        Some(mem) => mem.clone(),
+        None => github_hub
+            .clone()
+            .expect("github hub построен вне memory-режима"),
+    };
+    let goals_view = Arc::new(uwuwu_usecase::GoalsView::new(
+        goals_repo,
+        boards_cfg.iter().map(|(p, _)| p.clone()).collect(),
+        format!(
+            "https://github.com/{}/issues?q=is%3Aissue+is%3Aopen+label%3Agoal+label%3Aproj%3A{{project}}",
+            cfg.hub.repo
+        ),
+    ));
     let wiki: Arc<dyn uwuwu_usecase::WikiRepo> = match &memory_hub {
         Some(mem) => mem.clone(),
         None => Arc::new(wiki::GitHubWiki::with_writer(
@@ -375,6 +391,7 @@ async fn run(
     let tool_hub = Arc::new(api::ToolHub {
         blobs: blobs_usecase,
         tasks: task_view,
+        goals: goals_view,
         docs: Arc::new(uwuwu_usecase::DocsView::new(wiki.clone())),
         person: Arc::new(uwuwu_usecase::PersonView::new(wiki.clone())),
         writer: Arc::new(uwuwu_usecase::TaskWriteUseCase {

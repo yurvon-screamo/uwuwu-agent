@@ -638,6 +638,11 @@ async fn fast_track_from_draft_and_todo() {
     let boards = vec![("uwuwu".to_string(), "Задачи uwuwu".to_string())];
     let tools = Arc::new(ToolHub {
         tasks: Arc::new(TaskView::new(board.clone(), boards.clone())),
+        goals: Arc::new(uwuwu_usecase::GoalsView::new(
+            memory.clone(),
+            vec!["uwuwu".to_string()],
+            "https://github.com/acme/hub/issues?q=label%3Aproj%3A{project}".into(),
+        )),
         docs: Arc::new(DocsView::new(wiki.clone())),
         person: Arc::new(PersonView::new(wiki.clone())),
         writer: Arc::new(TaskWriteUseCase {

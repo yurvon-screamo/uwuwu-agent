@@ -673,6 +673,14 @@ impl IssueFieldStore for MemoryHub {
     }
 }
 
+#[async_trait]
+impl uwuwu_usecase::GoalsRepo for MemoryHub {
+    /// E2E-стенд: целей нет — goal_list честно отвечает «не заведены».
+    async fn open_goals(&self, _project: &str) -> UsecaseResult<Vec<uwuwu_usecase::GoalIssue>> {
+        Ok(Vec::new())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Пины порта на MemoryHub (#1235): досочный фильтр row_status и
