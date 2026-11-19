@@ -4,6 +4,7 @@
 //! обоих тест-файлах (identical-code smell, раунд #1256).
 
 use async_trait::async_trait;
+use std::sync::Arc;
 use uwuwu_domain::{Slot, Status};
 use uwuwu_usecase::{
     AgentSessionGateway, DreamerMark, Liveness, SessionInfo, SessionSpec, TickStateStore,
@@ -12,6 +13,14 @@ use uwuwu_usecase::{
 
 /// Вики в пробах диспетчера не читается: доков нет.
 pub(crate) struct StubWiki;
+
+/// Blob-канал в пробах диспетчера: memory-стор (#1292) — полный путь
+/// place→presign без S3, как прод-контур, но без сети.
+pub(crate) fn blob_usecase() -> Arc<uwuwu_usecase::BlobUseCase> {
+    Arc::new(uwuwu_usecase::BlobUseCase::ready(Arc::new(
+        crate::s3::MemoryBlobStore::default(),
+    )))
+}
 
 #[async_trait]
 impl WikiRepo for StubWiki {

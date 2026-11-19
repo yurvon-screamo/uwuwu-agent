@@ -364,7 +364,7 @@ impl Config {
     }
 }
 
-fn non_empty_env(key: &str) -> Option<String> {
+pub(crate) fn non_empty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 

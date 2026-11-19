@@ -5,7 +5,7 @@
 //! тексты отказов и ответов, чтобы дрейф вернуть нечем. Пробы через живой
 //! диспетчер на MemoryHub — без GitHub, как в tools_tests.rs.
 
-use super::test_support::{StubSessions, StubState};
+use super::test_support::{blob_usecase, StubSessions, StubState};
 use super::tools::ToolHub;
 use crate::clock::SystemClock;
 use crate::mockhub::MemoryHub;
@@ -36,6 +36,7 @@ fn hub() -> Arc<ToolHub> {
         wiki,
         sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(sessions)),
         search: Arc::new(SearchUseCase { semantic: None }),
+        blobs: blob_usecase(),
         crons: Arc::new(uwuwu_usecase::CronUseCase {
             wiki: memory.clone(),
             sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(Arc::new(

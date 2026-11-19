@@ -21,6 +21,7 @@ mod gitea_tests;
 mod github;
 mod mockhub;
 mod prgate;
+mod s3;
 mod search;
 mod state;
 mod tg;
@@ -189,6 +190,31 @@ fn build_sessions(
     Ok((raw_default, router))
 }
 
+/// Blob-канал (#1292): приватный бакет Tigris через env UWUWU_S3_*.
+/// Частично заданы — тулы дают громкий отказ с перечнем недостающих
+/// (ADR-010); полностью заданы, но криво — fail-fast на старте
+/// (паттерн «конфиг задан криво — сервер не поднимается»).
+fn build_blob_usecase() -> Arc<uwuwu_usecase::BlobUseCase> {
+    let values: Vec<Option<String>> = s3::S3_ENV_NAMES
+        .iter()
+        .map(|name| config::non_empty_env(name))
+        .collect();
+    let missing: Vec<String> = s3::S3_ENV_NAMES
+        .iter()
+        .zip(&values)
+        .filter(|(_, value)| value.is_none())
+        .map(|(name, _)| (*name).to_string())
+        .collect();
+    if missing.is_empty() {
+        let value = |index: usize| values[index].as_deref().expect("проверено выше");
+        let store = s3::TigrisBlobStore::new(value(0), value(1), value(2), value(3), value(4))
+            .expect("blob-канал: env UWUWU_S3_* заданы, но конфиг кривой");
+        Arc::new(uwuwu_usecase::BlobUseCase::ready(Arc::new(store)))
+    } else {
+        Arc::new(uwuwu_usecase::BlobUseCase::missing(missing))
+    }
+}
+
 async fn run(
     cfg: Config,
     secrets: config::Secrets,
@@ -343,7 +369,11 @@ async fn run(
         semantic: semantic_backend.clone(),
     });
 
+    // Blob-канал (#1292): сборка из env — см. build_blob_usecase.
+    let blobs_usecase = build_blob_usecase();
+
     let tool_hub = Arc::new(api::ToolHub {
+        blobs: blobs_usecase,
         tasks: task_view,
         docs: Arc::new(uwuwu_usecase::DocsView::new(wiki.clone())),
         person: Arc::new(uwuwu_usecase::PersonView::new(wiki.clone())),
