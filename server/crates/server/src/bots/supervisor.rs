@@ -1,4 +1,4 @@
-//! Супервизор ботов: тик = скан `Projects/*/Боты/*.md` → диф с запущенными
+//! Супервизор ботов: тик = скан `bot/<имя>/README.md` (#1214) → диф с запущенными
 //! → spawn / stop / recreate-session / re-arm / hot. Мёртвая задача —
 //! рестарт с экспоненциальным бэкоффом (потолок ~30 мин, сброс после
 //! ~10 мин здоровой работы). Тик быстрый (wiki-скан) — живёт обычным
@@ -149,18 +149,26 @@ impl BotSupervisor {
         Ok(())
     }
 
-    /// Скан папки Боты: один list_docs, глобально — бот не требует
-    /// конфигурации [[project]] сервера.
+    /// Скан реестра /bot (#1214): один list_docs, бот-док —
+    /// `bot/<имя>/README.md` (читается по слагу-файлу); спека и ключи
+    /// state/раннтайма — короткий `bot/<имя>`. Бот не требует
+    /// конфигурации [[project]] сервера (workspace в fm).
     async fn scan(&self) -> UsecaseResult<Vec<(String, Result<BotSpec, String>)>> {
         let mut out = Vec::new();
-        for slug in self.wiki.list_docs("Projects").await? {
-            let segs: Vec<&str> = slug.split('/').collect();
-            if segs.len() != 4 || segs[2] != "Боты" {
+        for slug in self.wiki.list_docs("bot").await? {
+            let Some(rest) = slug.strip_prefix("bot/") else {
+                continue;
+            };
+            let Some(name) = rest.strip_suffix("/README") else {
+                continue;
+            };
+            if name.is_empty() || name.contains('/') {
                 continue;
             }
             if let Some(md) = self.wiki.read_doc(&slug).await? {
-                let spec = parse_bot_doc(&slug, &md);
-                out.push((slug, spec));
+                let bot_slug = format!("bot/{name}");
+                let spec = parse_bot_doc(&bot_slug, &md);
+                out.push((bot_slug, spec));
             }
         }
         Ok(out)

@@ -112,8 +112,8 @@ pub struct PersonView {
     wiki: Arc<dyn WikiRepo>,
 }
 
-/// Слаг персоны (канон: docs/Experience/person/PERSON.md).
-pub const PERSON_SLUG: &str = "Experience/person/PERSON";
+/// Слаг персоны (верхний уровень конфигурации, #1214: docs/person/README.md).
+pub const PERSON_SLUG: &str = "person/README";
 
 impl PersonView {
     pub fn new(wiki: Arc<dyn WikiRepo>) -> Self {

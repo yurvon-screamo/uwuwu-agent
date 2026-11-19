@@ -19,4 +19,11 @@ impl Clock for SystemClock {
     fn now_ms(&self) -> u64 {
         Utc::now().timestamp_millis() as u64
     }
+
+    /// Реальная пауза. Синхронная блокировка воркера до пары секунд
+    /// допустима: путь только в контрольных чтениях мутаций MCP
+    /// (редкий, отложенный случай), рантайм мульти-воркерный.
+    fn sleep_ms(&self, ms: u64) {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
 }

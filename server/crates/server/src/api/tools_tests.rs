@@ -664,7 +664,7 @@ async fn fast_track_from_draft_and_todo() {
             ))),
             clock: Arc::new(SystemClock),
             models: Arc::new(uwuwu_usecase::SpawnModels::canonical()),
-            checkout: String::new(),
+            projects: Default::default(),
             cup: 7,
         }),
     });

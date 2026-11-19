@@ -408,11 +408,11 @@ async fn run(
             sessions: sessions.clone(),
             clock: clock.clone(),
             models: spawn_models.clone(),
-            checkout: plan
+            projects: plan
                 .boards
-                .first()
-                .map(|b| b.checkout.clone())
-                .unwrap_or_default(),
+                .iter()
+                .map(|b| (b.project.clone(), b.checkout.clone()))
+                .collect(),
             cup: plan.policy.cup,
         }),
     });
@@ -444,27 +444,32 @@ async fn run(
             "observe: кроны/триаж/дример/семантика не исполняются"
         );
     }
-    for (project, _, checkout) in boards_info.iter() {
+    {
+        // Кроны: один глобальный sidecar — раскладка /cron (#1214):
+        // мастера cron/<имя>/README.md несут fm project, связка с
+        // [[project]] (роутинг executor + checkout) — карта из конфига
+        let projects_map: std::collections::HashMap<String, String> = boards_info
+            .iter()
+            .map(|(project, _, checkout)| (project.clone(), checkout.clone()))
+            .collect();
         let cron = Arc::new(uwuwu_usecase::CronUseCase {
             wiki: wiki.clone(),
             sessions: sessions.clone(),
             clock: clock.clone(),
             models: spawn_models.clone(),
-            checkout: checkout.clone(),
+            projects: projects_map,
             cup: plan.policy.cup,
         });
-        let project = project.clone();
 
         sidecars.push(Sidecar {
-            name: format!("cron:{project}"),
+            name: "cron".to_string(),
             tick: Box::new(move || {
                 let cron = cron.clone();
-                let project = project.clone();
                 Box::pin(async move {
                     if is_observe {
                         return Ok(());
                     }
-                    cron.tick(&project).await.map(|_| ())
+                    cron.tick().await.map(|_| ())
                 })
             }),
         });

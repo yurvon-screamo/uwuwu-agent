@@ -762,5 +762,77 @@ SRV_PID=""; MOCK_PID=""
 sleep 1
 say "фаза 10 ок: revival → wakeup той же сессии (1:1), без revival — тишина"
 
+say "фаза 11: phantom-записи носителя → громкий отказ MCP-мутации (#1331)"
+wait_srv() { # /health под bearer до готовности (≤20с)
+  for _ in $(seq 1 20); do
+    curl -s --max-time 2 -H "Authorization: Bearer $BEARER" \
+      "http://127.0.0.1:$PORT_SRV/health" | grep -q . && return 0
+    sleep 1
+  done
+  return 1
+}
+LOG_SRV_PHANTOM="$RUN_DIR/server-phantom.log"
+LOG_SRV_HONEST="$RUN_DIR/server-honest.log"
+# ветка фантома: носитель отвечает успехом и ничего не записывает —
+# контрольное чтение юзкейса обязано превращать «успех» в громкий отказ
+UWUWU_SERVER_CONFIG=$CONFIG UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
+  UWUWU_SERVER_MODE=observe \
+  UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
+  UWUWU_MOCK_SEED="$SEED_N:Analys" UWUWU_MOCK_PHANTOM_WRITES=1 RUST_LOG=info \
+  "$BIN_SRV" >"$LOG_SRV_PHANTOM" 2>&1 &
+SRV_PID=$!
+wait_srv || fail "фантом-сервер не поднялся (health тишина)"
+sleep 1
+CREATED=$(mcp task_create '{"title":"t: phantom probe","body":"## Постановка\n\nprobe-1331\n","priority":"low","automerge":true}')
+PH_N=$(printf '%s' "$CREATED" | python3 -c "
+import json,sys
+t = json.load(sys.stdin)['result']['content'][0]['text']
+print(t.split('#')[1].split(' ')[0])") || fail "create на фантом-стенде не отдал номер: $CREATED"
+BODY_RESP=$(mcp task_body "{\"number\":$PH_N,\"body\":\"## Постановка\n\nфантомное тело\n\"}")
+printf '%s' "$BODY_RESP" | grep -q '"isError":true' \
+  || fail "task_body на фантоме не отказал: $BODY_RESP"
+printf '%s' "$BODY_RESP" | grep -q 'не подтвердилась' \
+  || fail "текст отказа body без вердикта контрольного чтения: $BODY_RESP"
+COMMENT_RESP=$(mcp task_comment "{\"number\":$PH_N,\"text\":\"probe-1331\"}")
+printf '%s' "$COMMENT_RESP" | grep -q '"isError":true' \
+  || fail "task_comment на фантоме не отказал: $COMMENT_RESP"
+printf '%s' "$COMMENT_RESP" | grep -q 'не подтвердился' \
+  || fail "текст отказа comment без вердикта контрольного чтения: $COMMENT_RESP"
+EDIT_RESP=$(mcp task_edit "{\"number\":$PH_N,\"branch\":\"work/task-1331\"}")
+printf '%s' "$EDIT_RESP" | grep -q '"isError":true' \
+  || fail "task_edit(branch) на фантоме не отказал: $EDIT_RESP"
+printf '%s' "$EDIT_RESP" | grep -q 'не подтвердилась' \
+  || fail "текст отказа edit без вердикта контрольного чтения: $EDIT_RESP"
+CARRIER=$(mcp task_get "{\"number\":$PH_N}")
+printf '%s' "$CARRIER" | grep -q 'фантомное тело' \
+  && fail "фантомная запись попала в носитель: $CARRIER"
+kill "$SRV_PID" 2>/dev/null || true; wait "$SRV_PID" 2>/dev/null || true; SRV_PID=""
+sleep 1
+say "phantom-ветка ок: body/comment/edit громко отказали, носитель чист"
+# ветка честного носителя: тот же юзкейс без флага — успех без маркера
+UWUWU_SERVER_CONFIG=$CONFIG UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
+  UWUWU_SERVER_MODE=observe \
+  UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
+  UWUWU_MOCK_SEED="$SEED_N:Analys" RUST_LOG=info \
+  "$BIN_SRV" >"$LOG_SRV_HONEST" 2>&1 &
+SRV_PID=$!
+wait_srv || fail "честный сервер не поднялся (health тишина)"
+sleep 1
+CREATED=$(mcp task_create '{"title":"t: honest probe","body":"## Постановка\n\nprobe-1331\n","priority":"low","automerge":true}')
+H_N=$(printf '%s' "$CREATED" | python3 -c "
+import json,sys
+t = json.load(sys.stdin)['result']['content'][0]['text']
+print(t.split('#')[1].split(' ')[0])") || fail "create на честном стенде не отдал номер: $CREATED"
+HONEST=$(mcp task_body "{\"number\":$H_N,\"body\":\"## Постановка\n\nчестное тело\n\"}")
+printf '%s' "$HONEST" | grep -q 'заменено' || fail "task_body на честном носителе отказал: $HONEST"
+printf '%s' "$HONEST" | grep -q 'не подтверждена' \
+  && fail "честная запись получила маркер непроверенности: $HONEST"
+HONEST_C=$(mcp task_comment "{\"number\":$H_N,\"text\":\"probe-ok\"}")
+printf '%s' "$HONEST_C" | grep -q 'коммент отправлен' \
+  || fail "task_comment на честном носителе отказал: $HONEST_C"
+kill "$SRV_PID" 2>/dev/null || true; wait "$SRV_PID" 2>/dev/null || true; SRV_PID=""
+sleep 1
+say "фаза 11 ок: фантом → громкий отказ, честный носитель → успех без маркера"
 
-say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + мульти-экзекьютор + гард #1163 + self-эхо + слепой hold #1263 + преемпшен CUP #1259 + клин #1293 + дример #1306); логи: $RUN_DIR"
+
+say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + мульти-экзекьютор + гард #1163 + self-эхо + слепой hold #1263 + преемпшен CUP #1259 + клин #1293 + дример #1306 + phantom-квитанции #1331); логи: $RUN_DIR"

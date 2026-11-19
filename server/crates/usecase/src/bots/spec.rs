@@ -71,7 +71,7 @@ greeting: Привет!\nenabled: false\n---\n\n## Методичка\nсозд�
 
     #[test]
     fn parses_full_doc() {
-        let s = parse_bot_doc("Projects/uwuwu/Боты/помощник", DOC).unwrap();
+        let s = parse_bot_doc("bot/помощник", DOC).unwrap();
         assert_eq!(s.title, "Помощник");
         assert_eq!(s.model.provider, "zai-coding-plan");
         assert_eq!(s.model.id, "glm-5.3-flash");
@@ -87,7 +87,7 @@ greeting: Привет!\nenabled: false\n---\n\n## Методичка\nсозд�
     #[test]
     fn defaults_and_variantless_model() {
         let md = "---\nmodel: p/id\ntoken_env: TOK\nworkspace: /w\n---\nтело";
-        let s = parse_bot_doc("Projects/x/Боты/имя", md).unwrap();
+        let s = parse_bot_doc("bot/имя", md).unwrap();
         assert_eq!(s.title, "имя", "дефолт тайтла — имя дока");
         assert!(s.enabled, "дефолт enabled");
         assert_eq!(s.model.variant, None);
