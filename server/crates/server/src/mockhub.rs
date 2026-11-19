@@ -30,6 +30,9 @@ struct HubState {
     /// number → архивация строки (клин холодного ящика #1293):
     /// архивная строка покидает read_board, но задачи/тела живут
     archived: HashMap<u64, bool>,
+    /// number → снос item'а (батч-чистка #1158): строка снята с доски
+    /// (undo-журнал сервера возвращает — restore_row)
+    removed: HashMap<u64, bool>,
     counter: u64,
     /// Слэг → markdown (вики стенда; seed UWUWU_MOCK_DOCS — JSON-карта).
     docs: HashMap<String, String>,
@@ -194,8 +197,10 @@ impl TaskBoardRepo for MemoryHub {
                 .tasks
                 .values()
                 // архивная строка покидает снапшот (клин #1293) — как
-                // NOT_ARCHIVED-дефолт GitHub items
+                // NOT_ARCHIVED-дефолт GitHub items; снесённая (#1158) — тем же
+                // свойством: item'а на доске нет
                 .filter(|t| !state.archived.contains_key(&t.number()))
+                .filter(|t| !state.removed.contains_key(&t.number()))
                 .filter(|t| match state.board_tags.get(&t.number()) {
                     Some(tag) => tag == board,
                     None => true,
@@ -462,6 +467,89 @@ impl TaskBoardRepo for MemoryHub {
 
     async fn latest_comments(&self, number: u64) -> UsecaseResult<Vec<CommentRef>> {
         self.with_state(|state| Ok(state.comments.get(&number).cloned().unwrap_or_default()))
+    }
+}
+
+/// Чистка доски (#1158) на стенде: item-id проксируется номером задачи,
+/// снос = метка `removed` (строка покидает read_board), undo снимает метку.
+#[async_trait]
+impl uwuwu_usecase::CleanBoardRepo for MemoryHub {
+    async fn fresh_binding(
+        &self,
+        board: &str,
+        number: u64,
+    ) -> UsecaseResult<Option<uwuwu_usecase::RowBinding>> {
+        self.with_state(|state| {
+            self.ensure_seed(state);
+            let on_board = state.tasks.get(&number).is_some()
+                && !state.archived.contains_key(&number)
+                && !state.removed.contains_key(&number)
+                && state
+                    .board_tags
+                    .get(&number)
+                    .map(|t| t == board)
+                    .unwrap_or(true);
+            if !on_board {
+                return Ok(None);
+            }
+            let status_raw = state
+                .tasks
+                .get(&number)
+                .map(|t| uwuwu_usecase::status_name(t.status()))
+                .filter(|name| !name.is_empty())
+                .map(str::to_string);
+            Ok(Some(uwuwu_usecase::RowBinding {
+                item_id: number,
+                status_raw,
+            }))
+        })
+    }
+
+    async fn fresh_issue(&self, number: u64) -> UsecaseResult<Option<uwuwu_usecase::IssueProbe>> {
+        self.with_state(|state| {
+            self.ensure_seed(state);
+            Ok(state.tasks.get(&number).map(|t| uwuwu_usecase::IssueProbe {
+                title: t.title().to_string(),
+                // state issue — носитель `closed` (close_issue_ext), не статус
+                // колонки: статусная модель доски и state issue независимы
+                open: !state.closed.contains_key(&number),
+                body: state.bodies.get(&number).cloned().unwrap_or_default(),
+            }))
+        })
+    }
+
+    async fn remove_row(&self, _board: &str, number: u64, item_id: u64) -> UsecaseResult<()> {
+        self.with_state(|state| {
+            // item-id прокси = номер: чужой id — 404-ветка прод-носителя
+            if item_id != number || !state.tasks.contains_key(&number) {
+                return Err(UsecaseError::Board(format!(
+                    "delete item #{number} (item {item_id}): не применилось (HTTP 404)"
+                )));
+            }
+            state.removed.insert(number, true);
+            Ok(())
+        })
+    }
+
+    async fn restore_row(
+        &self,
+        _board: &str,
+        number: u64,
+        status_raw: Option<&str>,
+    ) -> UsecaseResult<u64> {
+        self.with_state(|state| {
+            if !state.tasks.contains_key(&number) {
+                return Err(UsecaseError::Board(format!("mockhub: #{number} нет")));
+            }
+            state.removed.remove(&number);
+            if let Some(raw) = status_raw.filter(|s| !s.trim().is_empty()) {
+                let status = uwuwu_usecase::parse_status(raw);
+                if let Some(task) = state.tasks.get_mut(&number) {
+                    let _ = task.transition(status);
+                }
+            }
+            Ok(number)
+        })
     }
 }
 
