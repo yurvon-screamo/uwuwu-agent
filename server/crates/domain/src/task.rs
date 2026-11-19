@@ -329,7 +329,8 @@ impl PrUrl {
         &self.0
     }
 
-    /// Грубая PR-форма URL: хвост пути `/pull/<n>`, хвостовой `/` допустим,
+    /// Грубая PR-форма URL: хвост пути `/pull/<n>` или `/pulls/<n>`
+    /// (GitHub/GHE и Gitea/Forgejo семейства), хвостовой `/` допустим,
     /// хост не важен. Домен отвечает только «это вообще PR-форма?»; вендор
     /// и строгость (literal github.com, чужие сущности по числовым
     /// сегментам) — адаптер в своём parse_pr_url (#1155). Query/fragment и
@@ -343,7 +344,7 @@ impl PrUrl {
         let Some((head, tail)) = path.rsplit_once('/') else {
             return false;
         };
-        if !head.ends_with("/pull") {
+        if !head.ends_with("/pull") && !head.ends_with("/pulls") {
             return false;
         }
         !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit())
@@ -358,6 +359,10 @@ pub struct Task {
     status: Status,
     priority: Priority,
     automerge: bool,
+    /// Дата закрытия issue (unix ms): None — issue открыт либо носитель
+    /// дату не сообщает. Клин холодного ящика (#1293) отбирает
+    /// терминальные строки по возрасту закрытия.
+    closed_at: Option<u64>,
     fields: TaskFields,
 }
 
@@ -369,6 +374,7 @@ impl Task {
             status,
             priority: Priority::Empty,
             automerge: false,
+            closed_at: None,
             fields: TaskFields::default(),
         }
     }
@@ -430,6 +436,30 @@ impl Task {
     /// Управление автомержем (владелец/триаж).
     pub fn set_automerge(&mut self, on: bool) {
         self.automerge = on;
+    }
+
+    /// Дата закрытия issue (unix ms): None — открыт либо не сообщена.
+    pub fn closed_at(&self) -> Option<u64> {
+        self.closed_at
+    }
+
+    /// Запись даты закрытия с носителя (парсер снапшота).
+    pub fn set_closed_at(&mut self, ms: u64) {
+        self.closed_at = Some(ms);
+    }
+
+    /// Кандидат клина холодного ящика (#1293): строка терминальна
+    /// (конвейер закончился) и issue закрыт строго старше `age_days`
+    /// суток. Дата закрытия = доказательство закрытого issue; строка
+    /// без даты — пропуск, консервативно.
+    pub fn is_sweep_candidate(&self, now_ms: u64, age_days: u32) -> bool {
+        if !self.status.is_terminal() {
+            return false;
+        }
+        let Some(closed) = self.closed_at else {
+            return false;
+        };
+        now_ms.saturating_sub(closed) > u64::from(age_days) * 86_400_000
     }
 
     /// Заявка сессии (claim): терминальная строка не принимает заявок —
@@ -604,8 +634,9 @@ mod tests {
         assert!(!pull("https://github.com/o/r/wiki/a"));
         assert!(!pull("https://github.com/o/r/issues/1279"));
         assert!(!pull("https://github.com/o/r/blob/main/docs/x.md"));
-        // чужой вендор: Gitea /pulls/ — не форма (#1269 — его вендор-парс)
-        assert!(!pull("https://git.l4a.ru/o/r/pulls/7"));
+        // #1269: Gitea /pulls/<n> — вторая грубая форма (Gitea/Forgejo
+        // семейство): гейт пускает, вендор-разбор — в адаптере
+        assert!(pull("https://git.l4a.ru/o/r/pulls/7"), "#1269: Gitea-форма");
         // мусорные хвосты: строгий слой их отвергнет — гейт не пускает
         assert!(!pull("https://github.com/o/r/pull/"), "пустой номер");
         assert!(!pull("https://github.com/o/r/pull/abc"), "нецифровой номер");
@@ -851,5 +882,43 @@ mod tests {
             Priority::Empty,
         ));
         assert_eq!(t.priority(), Priority::High);
+    }
+
+    const DAY_MS: u64 = 86_400_000;
+
+    #[test]
+    fn sweep_candidate_strictly_older_than_n_days() {
+        // Граница «строго старше N суток» (#1293): ровно N суток — ещё нет,
+        // N суток + миллисекунда — да
+        let now = 1_800_000_000_000;
+        let mut done = task(Status::Done);
+        done.set_closed_at(now - 7 * DAY_MS);
+        assert!(!done.is_sweep_candidate(now, 7), "ровно 7 суток — свежая");
+        done.set_closed_at(now - (7 * DAY_MS + 1));
+        assert!(
+            done.is_sweep_candidate(now, 7),
+            "чуть старше 7 суток — кандидат"
+        );
+    }
+
+    #[test]
+    fn sweep_candidate_requires_terminal_status_and_date() {
+        let now = 1_800_000_000_000;
+        let old = now - 30 * DAY_MS;
+        // Активная/нетерминальная строка — не кандидат даже при закрытом issue
+        let mut active = task(Status::UserReview);
+        active.set_closed_at(old);
+        assert!(!active.is_sweep_candidate(now, 7));
+        // Терминальная без даты закрытия (древний Deleted, рассинхрон) — пропуск
+        let deleted = task(Status::Deleted);
+        assert!(!deleted.is_sweep_candidate(now, 7));
+        // Терминальная с датой — кандидат
+        let mut done = task(Status::Done);
+        done.set_closed_at(old);
+        assert!(done.is_sweep_candidate(now, 7));
+        // Deleted с датой — тоже (мягкое удаление уходит в архив так же)
+        let mut soft = task(Status::Deleted);
+        soft.set_closed_at(old);
+        assert!(soft.is_sweep_candidate(now, 7));
     }
 }

@@ -308,6 +308,17 @@ async fn main() {
             }),
         )
         .route(
+            // Стендовая ручка времени (аналог MOCK_VERDICTS/MOCK_PAGE_LIMIT):
+            // сдвигает updated_ms сессии назад — idle-контуры (дример #1306,
+            // IDLE_MS 30 мин) проверяются стендом без реальных минут ожидания.
+            // Контракта реального опенкода нет — только e2e-фазы.
+            "/api/session/{id}/age",
+            post({
+                let store = store.clone();
+                move |Path(id): Path<String>, Json(body): Json<Value>| age_session(store, id, body)
+            }),
+        )
+        .route(
             "/api/session/{id}/interrupt",
             post({
                 let store = store.clone();
@@ -581,6 +592,27 @@ async fn abort_session(store: Arc<Store>, id: String) -> Resp {
             s.busy = false;
             s.reply = Some((now_ms(), "ход остановлен (abort)".into()));
             (StatusCode::OK, Json(json!({ "interrupted": true })))
+        }
+        None => (StatusCode::NOT_FOUND, Json(json!({ "status": "404" }))),
+    }
+}
+
+/// Стендовая ручка времени: updated_ms -= ms (сатаурирующий вычет).
+/// Дример-сценарии стенда: сессия «уснула» 31+ минут назад без реального
+/// ожидания; revival = свежий prompt + повторный age.
+async fn age_session(store: Arc<Store>, id: String, body: Value) -> Resp {
+    let ms = body["ms"].as_u64().unwrap_or(0);
+    let mut sessions = store.sessions.lock().expect("store");
+    match sessions.get_mut(&id) {
+        Some(s) => {
+            s.updated_ms = s.updated_ms.saturating_sub(ms);
+            let updated = s.updated_ms;
+            tracing::info!(event = "mock.session_aged", %id, by_ms = ms, updated,
+                "POST /session/{id}/age");
+            (
+                StatusCode::OK,
+                Json(json!({ "data": { "id": id, "updated": updated } })),
+            )
         }
         None => (StatusCode::NOT_FOUND, Json(json!({ "status": "404" }))),
     }

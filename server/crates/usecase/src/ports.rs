@@ -89,6 +89,27 @@ pub trait TaskBoardRepo: Send + Sync {
     async fn patch_cells(&self, number: u64, mutate: FmMutator) -> UsecaseResult<()>;
     /// Закрытие с причиной (completed|not_planned).
     async fn close_issue_ext(&self, number: u64, not_planned: bool) -> UsecaseResult<()>;
+    /// Архивировать строку доски (терминальную — клин холодного ящика
+    /// #1293): Projects v2 убирает её из items (снапшот сжимается),
+    /// строка остаётся доступной через unarchive. Реализация НЕ обязана
+    /// инвалидинировать снапшот на каждую строку — волна архиваций
+    /// держит кеш живым (построчный ре-фетч полного снимка выжег бы
+    /// бюджет первой волной); свежий срез даёт invalidate_snapshot.
+    async fn archive_row(&self, board: &str, number: u64) -> UsecaseResult<()>;
+    /// Сброс снапшота доски: реализация с кешем забывает срез —
+    /// следующий read_board читает носитель. Клин зовёт один раз на
+    /// волну (финал), не на каждую строку. Дефолт — no-op (носители
+    /// без кеша).
+    fn invalidate_snapshot(&self, _board: &str) {}
+    /// Остаток GraphQL-бюджета носителя (точек): None — носитель не
+    /// сообщает, бюджет-гайд клина пропускает.
+    fn gql_budget_remaining(&self) -> Option<u64> {
+        None
+    }
+    /// Номера issues репо с точно этим тайтлом (включая закрытые):
+    /// dup_check create против холодного ящика (#1293) — тайтл уникален
+    /// на доске и после архивации старых строк.
+    async fn issues_with_title(&self, title: &str) -> UsecaseResult<Vec<u64>>;
     /// Полная замена тела issue (как записано; fm-шапка стрипается на
     /// границе юзкейса — тела без fm, поля нативные).
     async fn replace_body(&self, number: u64, body_md: &str) -> UsecaseResult<()>;
@@ -247,6 +268,10 @@ pub struct SessionInfo {
 pub enum PrState {
     /// PR не найден ни по ячейке, ни по ветке.
     Missing,
+    /// PR-URL задан в PR-форме, но вендор хоста гейтвеем не управляется
+    /// (чужой GHE-хост, Gitea-инстанс без токена, API-отказ инстанса):
+    /// строка ждёт владельца в Review — не bounce (#1269).
+    Foreign,
     /// GitHub считает (mergeable=null / чеки бегут): вердикт следующего тика.
     Pending,
     Open {
@@ -301,6 +326,19 @@ pub trait IssueIndexSource: Send + Sync {
     async fn recent_issues(&self, limit: usize) -> UsecaseResult<Vec<IssueDigest>>;
 }
 
+/// Метка дример-обработки сессии (#1306, инвариант 1:1 — ADR-005):
+/// watermark вместо вечного маркера — revival (активность выше позиции)
+/// снова делает сессию кандидатом.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DreamerMark {
+    /// Прогон дримера покрывал активность сессии до этой метки
+    /// (ms последнего обновления источника на момент прогона).
+    UpTo(u64),
+    /// Не источник опыта (боты): никогда не дримить.
+    Forever,
+}
+
 /// Персистентное состояние тика (wakeup-дедуп, дример-инвариант).
 pub trait TickStateStore: Send + Sync {
     fn last_comment_id(&self, board: &str, number: u64) -> Option<String>;
@@ -309,9 +347,15 @@ pub trait TickStateStore: Send + Sync {
     fn last_seen_status(&self, board: &str, number: u64) -> Option<Status>;
     fn set_last_seen_status(&self, board: &str, number: u64, status: Status);
     fn set_last_comment_id(&self, board: &str, number: u64, id: &str);
-    /// Дример уже отработал сессию (1 рабочая = 1 дример).
-    fn dreamer_done(&self, session: &str) -> bool;
-    fn mark_dreamer_done(&self, session: &str);
+    /// Метка дример-обработки: None — сессия ещё не дримлена.
+    fn dreamer_mark(&self, session: &str) -> Option<DreamerMark>;
+    fn mark_dreamer(&self, session: &str, mark: DreamerMark);
+    /// Связка «исходная → её дример-сессия» (инвариант 1:1 — ADR-005).
+    fn dreamer_session(&self, source: &str) -> Option<String>;
+    fn link_dreamer_session(&self, source: &str, dreamer: &str);
+    /// Гигиена: метки и линки сессий, которых нет в живом union-скане,
+    /// сносятся (рост state ограничен живыми сессиями, #1306).
+    fn prune_dreamer(&self, live: &std::collections::HashSet<String>);
     /// Дример: спавнов за сутки (day_key = дата JST) — дневной кап.
     fn dreamer_day_spawns(&self, day_key: &str) -> u32;
     fn mark_dreamer_spawn(&self, day_key: &str);

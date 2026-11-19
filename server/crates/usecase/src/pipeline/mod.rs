@@ -6,6 +6,9 @@ pub mod analyst_review;
 pub mod dreamer;
 pub mod executor;
 pub mod incident;
+pub mod sweeper;
+#[cfg(test)]
+mod sweeper_tests;
 pub mod tick;
 #[cfg(test)]
 pub(crate) mod tick_tests;

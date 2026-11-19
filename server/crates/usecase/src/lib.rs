@@ -29,6 +29,7 @@ pub use naming::{
     agent_name, parse_agent, parse_priority, parse_status, parse_task_type, priority_name,
     schedule_label, slot_key, status_name, task_type_name, F_AUTOMERGE, F_PRIORITY, TASK_TYPES,
 };
+pub use pipeline::sweeper;
 pub use pipeline::{
     executor::ExecutorLoudness, executor::EXECUTOR_UNAVAILABLE_COOLDOWN_MS,
     executor::EXECUTOR_UNAVAILABLE_THRESHOLD, executor::EXECUTOR_UNAVAILABLE_WINDOW_MS,
@@ -38,7 +39,7 @@ pub use pipeline::{
     TickUseCase,
 };
 pub use ports::{
-    AgentSessionGateway, AssistantReply, Clock, CommentRef, FmMutator, IssueDigest,
+    AgentSessionGateway, AssistantReply, Clock, CommentRef, DreamerMark, FmMutator, IssueDigest,
     IssueFieldStore, IssueIndexSource, IssueView, Liveness, PrGateway, PrState, SessionInfo,
     SessionSpec, TaskBoardRepo, TickStateStore, WikiRepo,
 };

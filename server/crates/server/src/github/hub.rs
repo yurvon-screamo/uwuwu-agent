@@ -25,7 +25,7 @@ pub struct GitHubHub {
     /// TTL-кеш снапшотов досок (#1243): мутации одного тика шарят снимок —
     /// без кеша каждый set_status тянул полную доску пагинацией и выжигал
     /// GraphQL-бюджет (инцидент 17.11: конвейер fail-loop до reset окна).
-    snap_cache: TtlCache<Vec<Task>>,
+    snap_cache: TtlCache<(Vec<Task>, BoardMeta)>,
     /// TTL-кеш статусов строк: board_status — самый горячий GraphQL-путь
     /// (task_get/MCP), 60 сек свежести не разрывают консистентность ходов.
     status_cache: TtlCache<String>,
@@ -43,11 +43,13 @@ const QUERY: &str = r#"
     repository(owner:$owner, name:$name){
       projectsV2(first:20, query:$board){
         nodes{
-          title
+          id title
+          field(name:"Status"){ ...on ProjectV2SingleSelectField{ id options{ id name } } }
           items(first:100, after:$after){
             pageInfo{ hasNextPage endCursor }
             nodes{
-              content{ __typename ...on Issue{ number title state } }
+              id
+              content{ __typename ...on Issue{ number title state closedAt } }
               fieldValues(first:30){
                 nodes{ __typename
                   ...on ProjectV2ItemFieldSingleSelectValue{
@@ -144,6 +146,16 @@ fn gh_tagged(fail: &crate::gherr::GhFail) -> UsecaseError {
 fn is_rate_limited(e: &UsecaseError) -> bool {
     let text = e.to_string().to_lowercase();
     text.contains("gh graphql [rate_limited]") || text.contains("gh rest [rate_limited]")
+}
+
+#[derive(Default, Clone)]
+struct BoardMeta {
+    project_id: String,
+    status_field_id: String,
+    options: std::collections::HashMap<String, String>,
+    /// issue number → GraphQL node id строки (PVTI_): путь данных
+    /// archive_row (#1293) — мутационная мета снапшота.
+    items: std::collections::HashMap<u64, String>,
 }
 
 impl GitHubHub {
@@ -280,7 +292,7 @@ impl GitHubHub {
     /// TTL-кеш (#1243): тик и его мутации шарят один снимок. Строка,
     /// добавленная на доску младше TTL, может не иметь item-id в мете —
     /// мутация по ней ошибётся и самолечится следующим тиком (свежий снимок).
-    async fn snapshot(&self, board: &str) -> UsecaseResult<Arc<Vec<Task>>> {
+    async fn snapshot(&self, board: &str) -> UsecaseResult<Arc<(Vec<Task>, BoardMeta)>> {
         let now = std::time::Instant::now();
         if let Some(hit) = self.snap_cache.get(board, now) {
             return Ok(hit);
@@ -302,14 +314,12 @@ impl GitHubHub {
         Ok(arc)
     }
 
-    /// Полное чтение доски пагинацией (мимо кеша). Рид-минимум QUERY:
-    /// мутационная мета (project id, Status-опции, item node id) ушла
-    /// в Pv2Rest — REST-поверхности нужны numeric id, а не GraphQL
-    /// node-id (#1236).
-    async fn snapshot_fetch(&self, board: &str) -> UsecaseResult<Vec<Task>> {
+    /// Полное чтение доски пагинацией (мимо кеша).
+    async fn snapshot_fetch(&self, board: &str) -> UsecaseResult<(Vec<Task>, BoardMeta)> {
         let (owner, name) = self.repo.split_once('/').ok_or_else(|| {
             UsecaseError::Board(format!("repo в форме owner/name: {}", self.repo))
         })?;
+        let mut meta = BoardMeta::default();
         let mut rows: Vec<Task> = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_PAGES {
@@ -338,12 +348,31 @@ impl GitHubHub {
                         nodes.len()
                     ))
                 })?;
+            if meta.project_id.is_empty() {
+                meta.project_id = project["id"].as_str().unwrap_or_default().to_string();
+                meta.status_field_id = project["field"]["id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(options) = project["field"]["options"].as_array() {
+                    for o in options {
+                        if let (Some(id), Some(n)) = (o["id"].as_str(), o["name"].as_str()) {
+                            meta.options.insert(n.to_string(), id.to_string());
+                        }
+                    }
+                }
+                if meta.project_id.is_empty() {
+                    return Err(UsecaseError::Board(format!(
+                        "доска «{board}»: нет project id"
+                    )));
+                }
+            }
             let items = &project["items"];
             if let Some(page) = items["nodes"].as_array() {
-                rows.extend(parse_page(page));
+                rows.extend(parse_page(page, &mut meta));
             }
             if items["pageInfo"]["hasNextPage"].as_bool() != Some(true) {
-                return Ok(rows);
+                return Ok((rows, meta));
             }
             cursor = items["pageInfo"]["endCursor"].as_str().map(String::from);
         }
@@ -419,11 +448,11 @@ impl GitHubHub {
         let Some(hit) = self.snap_cache.get(board, now) else {
             return;
         };
-        let mut rows = hit.as_ref().clone();
+        let (mut rows, meta) = hit.as_ref().clone();
         for task in rows.iter_mut().filter(|t| t.number() == number) {
             task.override_status(status);
         }
-        self.snap_cache.put(board, rows, now);
+        self.snap_cache.put(board, (rows, meta), now);
     }
 
     /// Write-through статусного кэша строки (task_get читает отсюда).
@@ -453,7 +482,7 @@ impl GitHubHub {
         let Some(hit) = self.snap_cache.get(board, now) else {
             return; // снимка нет — нечего гигиенить, фетч увидит поля
         };
-        let mut rows = hit.as_ref().clone();
+        let (mut rows, meta) = hit.as_ref().clone();
         let row_present = rows.iter_mut().any(|t| t.number() == number);
         if !row_present {
             // окно create: снимок мог закешироваться без полей — сброс,
@@ -469,7 +498,7 @@ impl GitHubHub {
                 task.set_automerge(a);
             }
         }
-        self.snap_cache.put(board, rows, now);
+        self.snap_cache.put(board, (rows, meta), now);
     }
 
     /// Контрольное чтение после мутации статуса (семья #1213): ответ
@@ -580,7 +609,7 @@ impl GitHubHub {
     }
 }
 
-fn parse_page(items: &[Value]) -> Vec<Task> {
+fn parse_page(items: &[Value], meta: &mut BoardMeta) -> Vec<Task> {
     items
         .iter()
         .filter_map(|item| {
@@ -599,8 +628,16 @@ fn parse_page(items: &[Value]) -> Vec<Task> {
                 uwuwu_usecase::parse_status(&v.status)
             };
             let mut task = Task::new(number, title, status);
+            // Дата закрытия issue — вход клина холодного ящика (#1293)
+            if let Some(raw) = issue["closedAt"].as_str() {
+                if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(raw) {
+                    task.set_closed_at(ts.timestamp_millis() as u64);
+                }
+            }
             task.set_priority(uwuwu_usecase::parse_priority(&v.priority));
             task.set_automerge(v.automerge);
+            meta.items
+                .insert(number, item["id"].as_str().unwrap_or_default().to_string());
             Some(task)
         })
         .collect()
@@ -704,7 +741,7 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
 #[async_trait]
 impl TaskBoardRepo for GitHubHub {
     async fn read_board(&self, board: &str) -> UsecaseResult<Vec<Task>> {
-        Ok((*self.snapshot(board).await?).clone())
+        Ok(self.snapshot(board).await?.0.clone())
     }
 
     async fn set_status(&self, board: &str, number: u64, status: Status) -> UsecaseResult<()> {
@@ -995,6 +1032,72 @@ impl TaskBoardRepo for GitHubHub {
         Ok(())
     }
 
+    async fn archive_row(&self, board: &str, number: u64) -> UsecaseResult<()> {
+        // item id — из меты снапшота: archiveProjectV2Item ест itemId
+        let snap = self.snapshot(board).await?;
+        let item = snap.1.items.get(&number).cloned().ok_or_else(|| {
+            UsecaseError::Board(format!("строка #{number} не на доске «{board}»"))
+        })?;
+        let project_id = snap.1.project_id.clone();
+        let mutation = r#"
+          mutation($p:ID!,$i:ID!){
+            archiveProjectV2Item(input:{projectId:$p, itemId:$i}){ item{ id isArchived } }
+          }"#;
+        let data = self
+            .gql(mutation, json!({ "p": project_id, "i": item }))
+            .await?;
+        // payload-поле — item (не projectV2Item; живая проба #1293 поймала)
+        let archived = data["archiveProjectV2Item"]["item"]["isArchived"].as_bool();
+        if archived != Some(true) {
+            return Err(UsecaseError::Board(format!(
+                "archive #{number}: false-success (isArchived={:?})",
+                archived
+            )));
+        }
+        // Снапшот здесь НЕ инвалидируется: item id из кеша валиден всю
+        // волну, а построчный ре-фетч (полный снимок — сотни поинтов на
+        // каждую архивацию) выжег бы бюджет первой волной — High-1 ревью
+        // #1293. Свежий срез даёт invalidate_snapshot на финале волны.
+        Ok(())
+    }
+
+    fn gql_budget_remaining(&self) -> Option<u64> {
+        Some(self.last_rate_limit.read().expect("rl lock").as_ref()?.0)
+    }
+
+    fn invalidate_snapshot(&self, board: &str) {
+        self.invalidate_snapshot(board)
+    }
+
+    async fn issues_with_title(&self, title: &str) -> UsecaseResult<Vec<u64>> {
+        // REST search — вне GraphQL-бюджета (#1293, dup_check create);
+        // поиск фразой + клиентский фильтр точного равенства тайтла.
+        // percent-encode — реюз вики-энкодера (без новой зависимости,
+        // канон github_wiki::encode_path)
+        let query = format!("repo:{} in:title \"{}\"", self.repo, title.replace('"', ""));
+        let (status, body) = self
+            .rest(
+                reqwest::Method::GET,
+                &format!(
+                    "/search/issues?q={}&per_page=100",
+                    crate::wiki::encode_path(&query)
+                ),
+                None,
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(UsecaseError::Board(format!("issue search: HTTP {status}")));
+        }
+        let Some(items) = body["items"].as_array() else {
+            return Ok(Vec::new());
+        };
+        Ok(items
+            .iter()
+            .filter(|i| i["title"].as_str() == Some(title))
+            .filter_map(|i| i["number"].as_u64())
+            .collect())
+    }
+
     async fn replace_body(&self, number: u64, body_md: &str) -> UsecaseResult<()> {
         let (status, resp) = self
             .rest(
@@ -1110,7 +1213,8 @@ mod tests {
                                        "name": "high", "value": "high", "optionId": "IFSSO_x" } },
             ]}
         });
-        let task = &parse_page(&[item])[0];
+        let mut meta = BoardMeta::default();
+        let task = &parse_page(&[item], &mut meta)[0];
         assert_eq!(task.priority(), Priority::High);
 
         let policy = SpawnPolicy {
@@ -1139,7 +1243,7 @@ mod tests {
         let hub = GitHubHub::new("o/r".into(), "t".into());
         let now = std::time::Instant::now();
         let rows = vec![Task::new(number, "строка".into(), Status::Analys)];
-        hub.snap_cache.put(board, rows, now);
+        hub.snap_cache.put(board, (rows, BoardMeta::default()), now);
         hub.write_through_status(board, number, status);
         hub.write_through_status_cache(number, status);
         hub
@@ -1155,7 +1259,7 @@ mod tests {
             .get("B", std::time::Instant::now())
             .expect("снапшот жив");
         assert_eq!(
-            snap.iter().find(|t| t.number() == 7).unwrap().status(),
+            snap.0.iter().find(|t| t.number() == 7).unwrap().status(),
             Status::InProgress
         );
         assert_eq!(
@@ -1216,7 +1320,10 @@ mod tests {
         let hub = GitHubHub::new("o/r".into(), "t".into());
         hub.snap_cache.put(
             "B",
-            vec![Task::new(7, "строка".into(), Status::Analys)],
+            (
+                vec![Task::new(7, "строка".into(), Status::Analys)],
+                BoardMeta::default(),
+            ),
             std::time::Instant::now(),
         );
         hub.settle_board_cells("B", 7, Some("high"), Some(true));
@@ -1225,6 +1332,7 @@ mod tests {
             .get("B", std::time::Instant::now())
             .expect("снапшот жив");
         let t = snap
+            .0
             .iter()
             .find(|t| t.number() == 7)
             .expect("строка в снапшоте");
@@ -1239,7 +1347,10 @@ mod tests {
         let hub = GitHubHub::new("o/r".into(), "t".into());
         hub.snap_cache.put(
             "B",
-            vec![Task::new(8, "другая строка".into(), Status::Analys)],
+            (
+                vec![Task::new(8, "другая строка".into(), Status::Analys)],
+                BoardMeta::default(),
+            ),
             std::time::Instant::now(),
         );
         hub.settle_board_cells("B", 7, Some("high"), None);
@@ -1417,14 +1528,14 @@ mod tests {
         let hub = GitHubHub::new("o/r".into(), "t".into());
         let now = std::time::Instant::now();
         let rows = vec![Task::new(7, "строка".into(), Status::Analys)];
-        hub.snap_cache.put("B", rows, now);
+        hub.snap_cache.put("B", (rows, BoardMeta::default()), now);
         hub.write_through_status("B", 7, Status::InProgress);
         let snap = hub
             .snap_cache
             .get("B", std::time::Instant::now())
             .expect("write-through сохраняет ключ");
         assert_eq!(
-            snap.iter().find(|t| t.number() == 7).unwrap().status(),
+            snap.0.iter().find(|t| t.number() == 7).unwrap().status(),
             Status::InProgress,
             "собственная запись видна из кэша сразу (read-your-writes #1235)"
         );
@@ -1449,19 +1560,19 @@ mod tests {
         let hub = GitHubHub::new("o/r".into(), "t".into());
         let now = std::time::Instant::now();
         let rows = vec![Task::new(8, "другая строка".into(), Status::Todo)];
-        hub.snap_cache.put("B", rows, now);
+        hub.snap_cache.put("B", (rows, BoardMeta::default()), now);
         hub.write_through_status("B", 7, Status::InProgress);
         let snap = hub
             .snap_cache
             .get("B", std::time::Instant::now())
             .expect("ключ снапшота жив");
-        assert_eq!(snap.len(), 1, "мусор в снапшот не добавлен");
+        assert_eq!(snap.0.len(), 1, "мусор в снапшот не добавлен");
         assert_eq!(
-            snap.first().map(|t| t.number()).unwrap_or_default(),
+            snap.0.first().map(|t| t.number()).unwrap_or_default(),
             8,
             "чужие строки не тронуты"
         );
-        assert_eq!(snap.first().map(|t| t.status()), Some(Status::Todo));
+        assert_eq!(snap.0.first().map(|t| t.status()), Some(Status::Todo));
     }
 
     #[test]
@@ -1669,8 +1780,35 @@ mod tests {
             "content": { "__typename": "Issue", "number": 7, "title": "t", "state": "closed" },
             "fieldValues": { "nodes": [] }
         })];
-        let rows = parse_page(&items);
+        let mut meta = BoardMeta::default();
+        let rows = parse_page(&items, &mut meta);
         assert_eq!(rows[0].status(), Status::Done);
+        assert_eq!(meta.items.get(&7).map(String::as_str), Some("IT_x"));
+    }
+
+    #[test]
+    fn parse_page_carries_closed_at() {
+        // #1293: closedAt с носителя доезжает до агрегата — вход клина
+        let mut meta = BoardMeta::default();
+        let items = vec![json!({
+            "id": "IT_c",
+            "content": {
+                "__typename": "Issue", "number": 9, "title": "t", "state": "closed",
+                "closedAt": "2026-11-10T00:00:00Z"
+            },
+            "fieldValues": { "nodes": [] }
+        })];
+        let rows = parse_page(&items, &mut meta);
+        assert_eq!(rows[0].closed_at(), Some(1_794_268_800_000));
+        // открытый issue — даты нет
+        let mut meta2 = BoardMeta::default();
+        let open = vec![json!({
+            "id": "IT_o",
+            "content": { "__typename": "Issue", "number": 10, "title": "t", "state": "open", "closedAt": null },
+            "fieldValues": { "nodes": [] }
+        })];
+        let rows2 = parse_page(&open, &mut meta2);
+        assert_eq!(rows2[0].closed_at(), None);
     }
 }
 

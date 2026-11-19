@@ -70,7 +70,7 @@ pub struct BotSupervisor {
     state: Arc<dyn BotStateStore>,
     /// Приёмник ассетов ботов: media-файлы владельца → URL в hub (#1171).
     assets: Arc<dyn BotAssetStore>,
-    /// dreamer_done-маркировка бот-сессий (дример их не подбирает).
+    /// бот-сессии → DreamerMark::Forever (дример их не подбирает, runner.rs).
     tick_state: Arc<dyn TickStateStore>,
     clock: Arc<dyn Clock>,
     make_tg: TgFactory,

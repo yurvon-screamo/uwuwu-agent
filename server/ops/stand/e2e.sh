@@ -17,6 +17,12 @@
 #   фаза 6 (слепой hold #1263): исполнитель недоступен — спавн держится
 #     (spawn.held_blind_scan, спавнов 0), после возврата исполнителя
 #     спавн происходит.
+#   фаза 7 (gate-заглушка #1160), фаза 8 (преемпшен CUP #1259),
+#   фаза 9 (клин холодного ящика #1293): observe логирует кандидатов,
+#     live архивирует; kill-switch без sweep_days.
+#   фаза 10 (дример #1306): revival отдрименной сессии → wakeup ТОЙ ЖЕ
+#     дример-сессии (ADR-005 1:1), без revival — тишина; watermark+линк
+#     в state.json.
 #
 # Запуск: server/ops/stand/e2e.sh   (из каталога server; cargo build сам)
 # Выход: 0 — ок; 1 — провал с диагнозом. Логи/state/config — mktemp-рандир
@@ -474,14 +480,14 @@ EOF
 rm -f "$STATE"
 LOG_SRV_PRE="$RUN_DIR/server-preempt.log"
 MOCK_MODE=busy MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=1500 \
-  "$BIN_DIR/mock_opencode" >"$LOG_MOCK" 2>&1 &
+  "$BIN_MOCK" >"$LOG_MOCK" 2>&1 &
 MOCK_PID=$!
 sleep 1
 UWUWU_SERVER_CONFIG=$CONFIG_PREEMPT UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
   UWUWU_SERVER_MODE=live \
   UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
   UWUWU_MOCK_SEED="2046:In Progress:High;2048:In Progress:High" \
-  RUST_LOG=info "$BIN_DIR/uwuwu-server" >"$LOG_SRV_PRE" 2>&1 &
+  RUST_LOG=info "$BIN_SRV" >"$LOG_SRV_PRE" 2>&1 &
 SRV_PID=$!
 # тики до HeldCup: жертва 2046 спавнится и busy (не отвечает), кандидат
 # 2048 held — high-жертва не гасится (can_preempt false) → cup.preempt.no_victim
@@ -522,4 +528,239 @@ wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
 SRV_PID=""; MOCK_PID=""
 say "фаза 8 ок: понижение приоритета отдало слот (2046 abort+delete, 2048 заспавнен)"
 
-say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + мульти-экзекьютор + гард #1163 + self-эхо + слепой hold #1263 + преемпшен CUP #1259); логи: $RUN_DIR"
+say "фаза 9: клин холодного ящика #1293 — observe логирует кандидатов, live архивирует"
+CONFIG_SWEEP="$RUN_DIR/config.sweep.toml"
+cat > "$CONFIG_SWEEP" <<EOF
+mode = "live"
+poll_sec = 10
+sweep_days = 7
+port = $PORT_SRV
+
+[hub]
+repo = "yurvon-screamo/uwuwu-hub"
+driver = "memory"
+
+[executor]
+name = "local-mock"
+url = "http://127.0.0.1:$PORT_MOCK"
+
+[policy]
+cup = 1
+peak = { enabled = false, start_min = 0, end_min = 0 }
+
+[[project]]
+name = "uwuwu"
+board = "Задачи uwuwu"
+repo = "yurvon-screamo/uwuwu-agent"
+checkout = "/home/yurvon/uwuwu-agent"
+env_root = "/home/yurvon/agents-env"
+EOF
+# 2049 закрыта 14 суток назад (кандидат), 2050 — сутки назад (свежая);
+# done-сиды не занимают слоты CUP — мок-исполнитель не нужен живым ходам,
+# но sidecar sweeper дергает только хаб (без исполнителя)
+rm -f "$STATE"
+LOG_SRV_SWEEP="$RUN_DIR/server-sweep.log"
+MOCK_MODE=idle MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=100 \
+  "$BIN_MOCK" >"$LOG_MOCK" 2>&1 &
+MOCK_PID=$!
+sleep 1
+# 9a: observe — внутренний гейт клина: кандидаты в логе, строка на доске
+UWUWU_SERVER_CONFIG=$CONFIG_SWEEP UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
+  UWUWU_SERVER_MODE=observe \
+  UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
+  UWUWU_MOCK_SEED="Задачи uwuwu:2049:Done:low:14;Задачи uwuwu:2050:Done:low:1" \
+  RUST_LOG=info "$BIN_SRV" >"$LOG_SRV_SWEEP" 2>&1 &
+SRV_PID=$!
+SEEN=0
+while [ $SEEN -lt 10 ]; do
+  SEEN=$((SEEN + 1))
+  sleep 4
+  grep -q '"event":"sweep.observe"' "$LOG_SRV_SWEEP" && break
+done
+grep -q '"event":"sweep.observe"' "$LOG_SRV_SWEEP" \
+  || fail "observe-клин не показал кандидатов (внутренний гейт слепой)"
+mcp task_list '{"project":"uwuwu"}' | grep -q '2049' \
+  || fail "observe-клин мутировал: 2049 исчезла из task_list в observe"
+say "9a ок: observe показал кандидата и не мутировал"
+# 9b: live — архивация: 2049 уходит из снапшота, 2050 остаётся
+kill "$SRV_PID" 2>/dev/null || true
+wait "$SRV_PID" 2>/dev/null || true
+rm -f "$STATE"
+UWUWU_SERVER_CONFIG=$CONFIG_SWEEP UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
+  UWUWU_SERVER_MODE=live \
+  UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
+  UWUWU_MOCK_SEED="Задачи uwuwu:2049:Done:low:14;Задачи uwuwu:2050:Done:low:1" \
+  RUST_LOG=info "$BIN_SRV" >"$LOG_SRV_SWEEP" 2>&1 &
+SRV_PID=$!
+SEEN=0
+while [ $SEEN -lt 10 ]; do
+  SEEN=$((SEEN + 1))
+  sleep 4
+  grep -q '"event":"sweep.completed"' "$LOG_SRV_SWEEP" && break
+done
+grep -q '"event":"sweep.completed"' "$LOG_SRV_SWEEP" \
+  || fail "live-клин не отчитался проходом (sweep.completed нет за 40с)"
+SWEEP_LIST=$(mcp task_list '{"project":"uwuwu"}')
+echo "$SWEEP_LIST" | grep -q '2049' \
+  && fail "live-клин не сработал: 2049 осталась в task_list"
+echo "$SWEEP_LIST" | grep -q '2050' \
+  || fail "live-клин переложил свежую: 2050 исчезла из task_list"
+grep -q '"event":"sweep.failed"' "$LOG_SRV_SWEEP" \
+  && fail "sweep.failed в фазе 9 — архивация мок-хаба не удалась"
+# pid-scoped зачистка
+kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+SRV_PID=""; MOCK_PID=""
+say "фаза 9 ок: 2049 ушла в архив и из task_list, 2050 свежая осталась"
+
+say "фаза 9c: kill-switch — конфиг БЕЗ sweep_days (serde-дефолт 0): клина нет"
+CONFIG_NOSWEEP="$RUN_DIR/config.nosweep.toml"
+grep -v '^sweep_days' "$CONFIG_SWEEP" > "$CONFIG_NOSWEEP"
+rm -f "$STATE"
+LOG_SRV_NOSWEEP="$RUN_DIR/server-nosweep.log"
+MOCK_MODE=idle MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=100 \
+  "$BIN_MOCK" >"$LOG_MOCK" 2>&1 &
+MOCK_PID=$!
+sleep 1
+UWUWU_SERVER_CONFIG=$CONFIG_NOSWEEP UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
+  UWUWU_SERVER_MODE=live \
+  UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
+  UWUWU_MOCK_SEED="Задачи uwuwu:2051:Done:low:14" \
+  RUST_LOG=info "$BIN_SRV" >"$LOG_SRV_NOSWEEP" 2>&1 &
+SRV_PID=$!
+# 4 тика: sweep_days=0 обязан держать сайдкар выключенным структурно
+sleep 45
+grep -aq '"event":"sweep.' "$LOG_SRV_NOSWEEP" \
+  && fail "kill-switch сломан: sweep-события при sweep_days=0"
+NOSWEEP_LIST=$(mcp task_list '{"project":"uwuwu"}')
+echo "$NOSWEEP_LIST" | grep -q '2051' \
+  || fail "клин без конфига снёс строку 2051 (serde-дефолт 0 = агрессивный клин)"
+kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+SRV_PID=""; MOCK_PID=""
+say "фаза 9c ок: конфиг без sweep_days — sweeper структурно выключен, 2051 на доске"
+
+say "фаза 10: дример #1306 — revival отдрименной сессии даёт повторный прогон в ту же дример-сессию (ADR-005 1:1)"
+# Свой стек: свежий мок (agent — ходы завершаются с outcome+токенами),
+# свежий state. Время — стендовой ручкой /age (updated_ms -= ms): сессия
+# «уснула» 31+ минут назад без реального ожидания. Работа дримера видна
+# по событиям dreamer.spawned/dreamer.wakeup в логе сервера и state.json.
+kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+SRV_PID=""; MOCK_PID=""
+sleep 1
+rm -f "$STATE"
+LOG_SRV_DREAM="$RUN_DIR/server-dream.log"
+MOCK_MODE=agent MOCK_PORT=$PORT_MOCK MOCK_MCP_URL="http://127.0.0.1:$PORT_SRV" \
+  MOCK_MCP_TOKEN="$BEARER" MOCK_STEP_MS=300 \
+  "$BIN_MOCK" >"$LOG_MOCK" 2>&1 &
+MOCK_PID=$!
+sleep 1
+UWUWU_SERVER_CONFIG=$CONFIG UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
+  UWUWU_SERVER_MODE=live \
+  UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
+  RUST_LOG=info "$BIN_SRV" >"$LOG_SRV_DREAM" 2>&1 &
+SRV_PID=$!
+# юзер: рабочая сессия отработала (финал, токены > 0)
+WORK_RESP=$(curl -s --max-time 5 -X POST "http://127.0.0.1:$PORT_MOCK/api/session" \
+  -H 'Content-Type: application/json' -d '{"title":"dream-work-1306"}')
+WORK_ID=$(echo "$WORK_RESP" | python3 -c "
+import json,sys
+d = json.load(sys.stdin)
+row = d.get('data') or d
+print(row.get('id',''))")
+[ -n "$WORK_ID" ] || fail "мок не создал work-сессию: [$WORK_RESP]"
+curl -s --max-time 5 -X POST "http://127.0.0.1:$PORT_MOCK/api/session/$WORK_ID/prompt" \
+  -H 'Content-Type: application/json' -d '{"text":"поработал над задачей"}' >/dev/null
+sleep 1   # акт 300мс: outcome succeeded, токены
+# сессия уснула 31+ минут назад → дример обязан спавнить носителя
+curl -s --max-time 5 -X POST "http://127.0.0.1:$PORT_MOCK/api/session/$WORK_ID/age" \
+  -H 'Content-Type: application/json' -d '{"ms":1900000}' >/dev/null
+SEEN=0
+while [ $SEEN -lt 12 ]; do
+  SEEN=$((SEEN + 1))
+  sleep 5
+  grep -q '"event":"dreamer.spawned"' "$LOG_SRV_DREAM" && break
+done
+grep -q '"event":"dreamer.spawned"' "$LOG_SRV_DREAM" \
+  || fail "дример не спавнил носителя по уснувшей сессии (кандидат не найден?)"
+DREAM_ID=$(curl -s --max-time 5 "http://127.0.0.1:$PORT_MOCK/api/session" | python3 -c "
+import json,sys
+dreams = [s['id'] for s in json.load(sys.stdin) if s.get('agent') == 'dreamer']
+print(dreams[0] if dreams else '')")
+[ -n "$DREAM_ID" ] || fail "спавна нет на исполнителе (сессии agent=dreamer нет)"
+# сайдкар-мутации (метка/линк) сбрасываются save'ом СЛЕДУЮЩЕГО main-тика
+# (pre-existing паттерн, ревью #1306) — ждём флаш в файл, не читаем сразу
+STATE_OK=0
+for _ in $(seq 1 6); do
+  sleep 5
+  python3 - "$STATE" "$WORK_ID" "$DREAM_ID" <<'PY' 2>/dev/null && STATE_OK=1 && break
+import json, sys
+st = json.load(open(sys.argv[1]))
+work, dream = sys.argv[2], sys.argv[3]
+assert st["dreamer_links"].get(work) == dream, "линк ещё не слился"
+assert work in st["dreamer"], "watermark ещё не слился"
+PY
+done
+[ "$STATE_OK" -eq 1 ] || fail "state после первого дрима неверен (watermark/линк не записаны)"
+python3 - "$STATE" "$WORK_ID" "$DREAM_ID" <<'PY' || fail "state после первого дрима неверен"
+import json, sys
+st = json.load(open(sys.argv[1]))
+work, dream = sys.argv[2], sys.argv[3]
+assert st["dreamer_links"].get(work) == dream, f"линк 1:1 не записан: {st['dreamer_links']}"
+assert work in st["dreamer"], f"watermark не записан: {st['dreamer']}"
+print("[e2e] первый дрим: носитель заспавнен, watermark+линк в state")
+PY
+say "первый дрим ок: носитель $DREAM_ID, watermark+линк записаны"
+# revival: юзер дописывает в отдрименную сессию → снова уснула → wakeup
+curl -s --max-time 5 -X POST "http://127.0.0.1:$PORT_MOCK/api/session/$WORK_ID/prompt" \
+  -H 'Content-Type: application/json' -d '{"text":"дополнение после дрима"}' >/dev/null
+sleep 1
+curl -s --max-time 5 -X POST "http://127.0.0.1:$PORT_MOCK/api/session/$WORK_ID/age" \
+  -H 'Content-Type: application/json' -d '{"ms":1900000}' >/dev/null
+SEEN=0
+while [ $SEEN -lt 12 ]; do
+  SEEN=$((SEEN + 1))
+  sleep 5
+  grep -q '"event":"dreamer.wakeup"' "$LOG_SRV_DREAM" && break
+done
+grep -q '"event":"dreamer.wakeup"' "$LOG_SRV_DREAM" \
+  || fail "revival отдрименной сессии не дал повторного прогона (баг #1306 жив?)"
+SPAWNS=$(grep -c '"event":"dreamer.spawned"' "$LOG_SRV_DREAM" || true)
+[ "$SPAWNS" -eq 1 ] || fail "revival породил новый спавн (инвариант 1:1 сломан): $SPAWNS"
+SESSIONS=$(curl -s --max-time 5 "http://127.0.0.1:$PORT_MOCK/api/session" | python3 -c "
+import json,sys
+print(len(json.load(sys.stdin)))")
+[ "$SESSIONS" -eq 2 ] || fail "на исполнителе лишние сессии (новый носитель?): $SESSIONS"
+STATE_OK=0
+for _ in $(seq 1 6); do
+  sleep 5
+  python3 - "$STATE" "$WORK_ID" "$DREAM_ID" <<'PY' 2>/dev/null && STATE_OK=1 && break
+import json, sys
+st = json.load(open(sys.argv[1]))
+work, dream = sys.argv[2], sys.argv[3]
+assert st["dreamer_links"].get(work) == dream, "линк ещё не слился/перезаписан"
+PY
+done
+[ "$STATE_OK" -eq 1 ] || fail "state после revival неверен (линк перезаписан?)"
+python3 - "$STATE" "$WORK_ID" "$DREAM_ID" <<'PY' || fail "state после revival неверен"
+import json, sys
+st = json.load(open(sys.argv[1]))
+work, dream = sys.argv[2], sys.argv[3]
+assert st["dreamer_links"].get(work) == dream, f"линк перезаписан (не 1:1): {st['dreamer_links']}"
+print("[e2e] revival: wakeup той же дример-сессии, линк не менялся")
+PY
+# контроль зелёного фона: без revival — тишина на 2+ тиках
+sleep 25
+WAKEUPS=$(grep -c '"event":"dreamer.wakeup"' "$LOG_SRV_DREAM" || true)
+[ "$WAKEUPS" -eq 1 ] || fail "без revival дример не молчит (wakeup'ов: $WAKEUPS)"
+SPAWNS=$(grep -c '"event":"dreamer.spawned"' "$LOG_SRV_DREAM" || true)
+[ "$SPAWNS" -eq 1 ] || fail "без revival дример спавнит (спавнов: $SPAWNS)"
+kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+SRV_PID=""; MOCK_PID=""
+sleep 1
+say "фаза 10 ок: revival → wakeup той же сессии (1:1), без revival — тишина"
+
+
+say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + мульти-экзекьютор + гард #1163 + self-эхо + слепой hold #1263 + преемпшен CUP #1259 + клин #1293 + дример #1306); логи: $RUN_DIR"

@@ -6,11 +6,16 @@
 #   live    — полный конвейер: спавны, будильники, автодон
 mode = "observe"
 poll_sec = 180
+# клин холодного ящика (#1293): терминальные строки (Done/Deleted) старше
+# N суток уходят в архив Projects v2; 0 = выключен
+sweep_days = 7
 port = 8090
 
 [hub]
 repo = "yurvon-screamo/uwuwu-hub"
 # токен: env GH_TOKEN
+# Gitea-инстансы PR-гейта: env GITEA_TOKENS («host=token,host=token», #1269);
+# нет/пусто — Gitea-PR ждут владельца в Review (Foreign), деплой не ломается
 
 [executor]
 name = "kisa"
