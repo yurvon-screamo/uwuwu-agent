@@ -166,11 +166,28 @@ mod tests {
 
     #[test]
     fn memory_snapshot_reads_local_env() {
-        // Форма: в контейнере/на хосте procfs доступен; None допустим
-        // только при недоступности файлов (не мусорных значениях).
+        // Форма: в контейнере/на хосте procfs/cgroupfs доступны; None
+        // допустим только при недоступности файлов (не мусорных значениях).
+        // Гвардия на каждый путь: хост без cgroupfs-маунтов проверяет только
+        // Rss, контейнер/cgroup v2 — все четыре поля (пин проводки
+        // «путь → поле» среза B' #1294).
         let snap = memory_snapshot();
         if std::path::Path::new("/proc/self/smaps_rollup").exists() {
             assert!(snap.rss_kb.is_some(), "Rss парсится");
+            assert!(snap.rss_kb.unwrap_or(0) > 0, "Rss живого процесса > 0");
+        }
+        if std::path::Path::new("/sys/fs/cgroup/memory.stat").exists() {
+            assert!(
+                snap.cgroup_file_kb.is_some(),
+                "memory.stat file (page cache) парсится"
+            );
+            assert!(snap.cgroup_anon_kb.is_some(), "memory.stat anon парсится");
+        }
+        if std::path::Path::new("/sys/fs/cgroup/memory.current").exists() {
+            assert!(
+                snap.cgroup_current_kb.is_some(),
+                "memory.current парсится (байты → КБ)"
+            );
         }
     }
 
