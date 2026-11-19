@@ -1,37 +1,26 @@
 # uwuwu-agent
 
-Конфиги, агенты, плагины и скиллы опенкода + исходники uwuwu-server. Репозиторий — единственное место, где файлы существуют: живые конфиги (`~/.config/opencode`, `~/.agents`, `~/.claude/skills`) — симлинки сюда.
+Конфиги, агенты, плагины и скиллы opencode + исходники uwuwu-server. Репозиторий — единственный носитель файлов: живые конфиги `~/.config/opencode`, `~/.agents`, `~/.claude/skills` — симлинки сюда.
+
+Лицензия — MIT. Канбан и база знаний — в приватном репо [uwuwu-hub](https://github.com/yurvon-screamo/uwuwu-hub); правила работы конвейера — [AGENTS.md](AGENTS.md).
 
 ## Структура
 
-```
-opencodereview/ правила ревью
-agents/        агенты: developer, dreamer, plan-reviewer, code-quality-reviewer, tester; TASK-TEMPLATE.md — канон тел задач
-plugins/       goal-mode (судья целей), sticky-retry, ocv-v2-adapter (+ disabled/)
-skills/        скиллы (см. ниже)
-server/        uwuwu-server — единый сервер контура (hub#1133): конвейер + MCP + relay; Rust
-lib/           общие модули плагинов опенкода (qlty-review, screen-review, goal-lib)
-link.sh        установка симлинками
-opencode.json  главный конфиг опенкода (jsonc)
-cli.json       TUI-конфиг
-AGENTS.md      системные инструкции (глобальные)
-```
-
-> 14.11: демон-контур (factory/cron/triage/dreamer, cli-tools, tools,
-> scripts, deploy, TS-тесты) снесён — перепись на единый Rust-сервер
-> uwuwu-server (задача hub#1133). 15.11: сервер задеплоен (Railway,
-> observe→live), cli-крейт снесён (бэкап снесённого — ветки
-> `backup/pre-server-rewrite` и история git).
-
-## Скиллы (30)
-
-- **UI (2)**: architect-ui-ux (дизайн-стратегия + правила имплементации; бывшая пара architect/rules-ui слита) · stageshow (faux-UI макеты, анимации, bento — vendored, MIT, upstream benjitaylor/skills @ 299140f)
-- **Engineers (6)**: csharp · leptos · playwright · python · rust · typescript
-- **Workflows (3)**: flow-agents-md-writer · flow-audit · flow-code-documentation
-- **Office (4)**: docx · pdf · pptx · xlsx
-- **Rules (10)**: clean-code · git-commit · lib-usage · logging · performance · qlty · scalability · security · test-rule · text-writing
-- **Visual (1)**: visual-diagrams
-- **Integrations (4)**: bunny-cli · hf-cli · stitch · use-railway
+| Путь | Назначение |
+| ---- | ---------- |
+| `agents/` | Методички агентов конвейера: developer, plan-reviewer, code-quality-reviewer, tester, analyst, analyst-reviewer, dreamer. `TASK-TEMPLATE.md` — канон тел задач. |
+| `skills/` | Скиллы opencode: инженерные (rust, python, typescript, csharp, leptos, playwright), правила (чистый код, коммиты, тесты, безопасность, логирование, производительность, масштабируемость, qlty, проза), офисные форматы (docx, pdf, pptx, xlsx), UI-дизайн и faux-UI, визуализация, интеграции (Railway, Bunny, Hugging Face, Stitch). |
+| `plugins/` | Плагины opencode: `goal-mode` (судья целей), `qlty-review`, `screen-review`, `sticky-retry`. |
+| `lib/` | Общие TS-модули плагинов и их тесты (bun test). |
+| `commands/` | Слэш-команды opencode. |
+| `opencodereview/` | Правила машинного ревью кода. |
+| `server/` | **uwuwu-server** — единый сервер контура: канбан-конвейер, MCP API, relay к локальной Ollama. Rust-workspace: крейты `domain`, `usecase`, `server`. |
+| `server/ops/` | Операционные конфиги и скрипты: локальные конфиги памяти, примеры rathole, стенд. |
+| `opencode.json` | Главный конфиг opencode (JSONC). |
+| `cli.json` | Конфиг TUI opencode. |
+| `link.sh` | Идемпотентная привязка конфигов симлинками. |
+| `Dockerfile` | Relay-сервис Railway: туннель rathole между локальной Ollama и облаком. |
+| `AGENTS.md` | Системные инструкции агентов — глобальный контекст каждой сессии. |
 
 ## Установка
 
@@ -41,106 +30,33 @@ cd uwuwu-agent
 ./link.sh
 ```
 
-`link.sh` бэкапит существующие конфиги (`*.pre-link-*`) и создаёт симлинки. Повторный запуск безопасен. После — перезапустить opencode.
+Скрипт бэкапит существующие не-симлинки (`*.pre-link-*`) и создаёт симлинки. Повторный запуск безопасен. После установки перезапустите opencode.
+
+## uwuwu-server
+
+Единый сервер контура (перепись с локальных демонов, hub#1133): ведёт канбан-конвейер — статусные переходы, спавны агентов, автомерж, ревью-цепочки; раздаёт MCP-инструменты (`task_*`, `docs_*`, `search`, `person_show`, `goal_list`, `blob_*`); держит relay-туннель к локальной Ollama.
+
+Прод — Railway. Мерж в `master` с изменениями `server/**` деплоится автоматически через GitHub-интеграцию (watch `server/**`). Health-check — `GET /health`.
+
+Разработка:
+
+```bash
+cd server
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+Конфигурация — `server/config.toml`; образец с комментариями — `server/config.example.toml`.
+
+## CI
+
+`.github/workflows/ci.yml` — параллельные джобы (fmt / clippy+test / plugins / qlty) с path-фильтрами: правка доков не ждёт rust-компиляцию. Агрегатор «CI» — required check branch protection.
+
+Авто-триггеры сейчас отключены: биллинг GitHub Actions исчерпан (#1238/#1239), запуск — только вручную. Поэтому перед мержем гоняйте проверки локально. Активный автодеплой сервера — Railway GitHub-интеграция, отдельная deploy-джоба снята намеренно (двойной деплой).
 
 ## Hub-first
 
-Вся база знаний живёт в приватном репо **uwuwu-hub**: статьи опыта и проектные
-доки — docs/*.md, задачи — issues + Projects v2 канбаны. Доступ агентов —
-MCP-инструменты uwuwu-server (`task_get`/`docs_read`/`search`/…; endpoint
-`mcp.agent.uwuwu.net`).
+База знаний живёт в uwuwu-hub: `docs/` — статьи опыта и проектные доки, issues + Projects v2 — канбаны задач. Локальных клонов hub нет — агенты читают и пишут через MCP uwuwu-server.
 
-### Конвейер uwuwu (остановлен 14.11.2026 — перепись на uwuwu-server)
-
-Локальные демоны (factory/cron/triage/dreamer) остановлены и снесены из репо —
-контур переписывается в единый Rust-сервер `uwuwu-server` (Railway, MCP API):
-постановка и зафигсированные решения — задача hub#1133 (Design Spec), бэкап
-снесённого кода — ветка `backup/pre-server-rewrite`. Кроны меняют носитель на
-вики-папку `docs/Projects/<proj>/Кроны/` (решение по hub#1058); раскладка
-`cron/<имя>/README.md` в верхнем уровне конфигурации /cron /bot /person —
-hub#1214.
-
-Контракты, которые переживают перепись (канон поведения нового конвейера):
-
-- **Статусная модель и переходы** — глобальный AGENTS.md «Работа над задачей»
-  (Draft → Todo → Design → Ревью плана → In Progress → Ревью результата →
-  Тестирование → Review → Done; Needs attention, Вейт).
-- **Автомерж** (поле `Automerge`, legacy `Autodone` читается; дефолт `task
-  create` — on): вход в Review → сервер мержит PR, **строка остаётся в
-  Review** — Done всегда за владельцем; красный CI/конфликт/нет PR —
-  обратно в In Progress с комментом.
-- **Очередь CUP** (кап активных LLM-задач, деф. 7, глобально; приоритеты
-  high → medium → low) и **пик-окно GLM** (будни 06:00–10:00 UTC, off-выключатель):
-  спавны/будильники не-high откладываются до конца окна.
-- **Крон-грамматика**: cron-expr | `5m/2h/1d` | разовое `09:30 [01.12]`;
-  мастер в Вейте, файр только из Вейт, ран-карточка Todo, Done рана ставит
-  агент рана сам; остановка мастера — Done навсегда.
-- **Claim**: агент заявляет свою сессию в ячейку «Сессия dev» (`task claim`) —
-  конвейер уважает живую заявку, дубль не спавнит. Сессионные ячейки
-  (dev/ревью/тест) — привязка стадий к сессиям опенкода.
-- **Канон тел задач** — [agents/TASK-TEMPLATE.md](agents/TASK-TEMPLATE.md).
-
-### CI (GitHub Actions)
-
-`.github/workflows/ci.yml` — на каждый PR: cargo fmt --check, cargo clippy
---all-targets -- -D warnings, cargo test и qlty delta-check по конфигу репо
-(path-фильтры: джобы включаются только по затронутым областям). Зелёный CI —
-обязательное условие мержа (branch protection master, required check «CI»);
-ревьювер ручных прогонов не делает — опирается на CI-статусы. Локально то же
-самое: `cd server && cargo fmt --check && cargo clippy --all-targets -- -D
-warnings && cargo test`.
-
-### Кроны (uwuwu-cron — контур снесён, см. «Конвейер uwuwu»)
-
-Кроны унифицированы с задачами: крон = задача на доске «Задачи <Proj>» с
-расписанием (`--schedule`), мастер в Вейт, ран-карточка «⏰ …» в Todo, инвентарь
-`cron list`. Носитель в новом сервере — верхний уровень вики:
-`cron/<имя>/README.md`, конфигурация конвейера в /cron /bot /person
-(hub#1058, hub#1214); канон
-статусов крон-семьи и грамматика — в секции «Конвейер uwuwu» выше.
-
-### Триаж (uwuwu-triage — контур снесён, см. «Конвейер uwuwu»)
-
-Входная точка задач (TG-бот → триаж-агент → Draft/коммент) переезжает в
-uwuwu-server; ТГ-часть — hub#315. Канон валидации черновиков — глобальный
-AGENTS.md.
-
-### Дример (uwuwu-dreamer — контур снесён, см. «Конвейер uwuwu»)
-
-Пост-обработка сессий (инвариант 1 рабочая сессия = 1 дример-сессия) переезжает
-в uwuwu-server на REST-only чтение сессий (без opencode.db). Методичка агента —
-`agents/dreamer.md`.
-
-### CLI (снесён 15.11)
-
-Клиентская эпоха закрыта: uwuwu-cli (задачи/кроны/поиск/вики/персона поверх gh
-REST/GraphQL + git-клон хаба) полностью заменён uwuwu-server — те же операции
-живут MCP-инструментами сервера (см. серверный `tools`-реестр: task_*, docs_*,
-person_show, goal_list, search, cron_list). Источник — ветка
-`backup/pre-server-rewrite` и история git.
-
-Платформа — **uwuwu-hub** (с 13.11.2026; история носителей: закрытый
-предшественник → легаси-бекенд → hub). Сервер ходит в GitHub (REST/GraphQL),
-вики — git-клон uwuwu-hub.
-
-**Production**: приватное репо `yurvon-screamo/uwuwu-hub` (GitHub); сервер —
-Railway (`uwuwu-server` + `relay`-туннель Ollama), env — в сервисе Railway
-(GH_TOKEN, UWUWU_SERVER_BEARER, …).
-
-**Workspace structure**:
-
-- 📁 Experience — 33 subfolders by topic (cicd, rust, dotnet, llm-local, …), no direct docs
-- 📁 Projects — 7 project subfolders, each starting with a `<Proj> Project (README)` doc (description carrier for `projects`)
-- 📁 Daily — journal buckets (archive of the retired facts pipeline)
-
-**Tags** = bare slugs for multi-PC addressing (`axum`, `origa/topology`).
-Folders handle organization; tags are only for lookup.
-
-**Commands**:
-
-- `search` — universal: полнотекст по docs/** клона + доки по заголовкам + семантика локального эмбеддинг-индекса; `--limit/--threshold`
-- `read` — live doc read (слаг → docs/<slug>.md клона); markdown
-- `projects` — имена топ-папок вики (Experience/Projects/Daily)
-- `task` / `cron` / `body` — kanban tasks («Задачи <Proj>» = Projects v2, типизированные тела), кроны = задачи с расписанием (`--schedule`, мастера в **Вейт**) + `cron list`; диаграммы в телах — mermaid (GitHub рендерит нативно), see `skills/visual-diagrams`
-
-**Infrastructure**: GitHub (приватное репо uwuwu-hub) + локальный git-клон вики; gh-токен в env (`GH_TOKEN`).
+Ключевые доки конвейера: статусная модель, каналы (тело vs комменты), PR-механика и кроны — [AGENTS.md](AGENTS.md); канон тел задач — [agents/TASK-TEMPLATE.md](agents/TASK-TEMPLATE.md).
