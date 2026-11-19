@@ -3,7 +3,7 @@
 //! рендер штампов журнала — юзкейс/инфра (crons.rs, naming).
 
 use crate::agent::AgentSlot;
-/// Мастер крона: вики-док в Projects/<proj>/Кроны/ с валидным расписанием.
+/// Мастер крона: вики-док `cron/<имя>/README.md` с валидным расписанием.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CronMaster {
     pub slug: String,
@@ -11,6 +11,9 @@ pub struct CronMaster {
     pub schedule: Schedule,
     /// Агент рана: дефолтная сессия или роль конвейера.
     pub agent: AgentSlot,
+    /// fm `project` — ссылка на [[project]] конфига сервера: роутинг
+    /// executor и checkout крон-рана (#1214, плоская раскладка /cron).
+    pub project: String,
     /// Тело мастера (промпт рана).
     pub body: String,
 }

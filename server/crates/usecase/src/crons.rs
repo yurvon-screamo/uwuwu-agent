@@ -1,8 +1,8 @@
-//! Кроны на вики-носителе (#1058): мастер = docs/Projects/<proj>/Кроны/<имя>.md
-//! (fm: schedule + agent), журнал = Кроны/<имя>/Журнал.md. Демон дописывает
-//! строку запуска, ран-агент — сводку (MCP docs_append). Домен —
-//! uwuwu_domain::cron (Schedule/is_due); здесь грамматика строк носителя
-//! (parse_schedule_text) и IO.
+//! Кроны на вики-носителе (#1058, раскладка /cron — #1214): мастер =
+//! docs/cron/<имя>/README.md (fm: schedule + agent + project), журнал =
+//! cron/<имя>/Журнал.md. Демон дописывает строку запуска, ран-агент —
+//! сводку (MCP docs_append). Домен — uwuwu_domain::cron (Schedule/is_due);
+//! здесь грамматика строк носителя (parse_schedule_text) и IO.
 
 use crate::error::UsecaseResult;
 use crate::naming;
@@ -15,10 +15,9 @@ use uwuwu_domain::{
     JstTime, Schedule, ScheduleKind,
 };
 
-/// Слэг папки кронов проекта.
-pub fn crons_dir(project: &str) -> String {
-    format!("Projects/{project}/Кроны")
-}
+/// Верхний уровень конфигурации кронов (#1214): дети — подпапки кронов,
+/// мастер — `cron/<имя>/README.md`, журнал — `cron/<имя>/Журнал`.
+pub const CRON_DIR: &str = "cron";
 
 pub struct CronUseCase {
     pub wiki: Arc<dyn WikiRepo>,
@@ -26,7 +25,9 @@ pub struct CronUseCase {
     pub sessions: Arc<SessionRouter>,
     pub clock: Arc<dyn Clock>,
     pub models: Arc<SpawnModels>,
-    pub checkout: String,
+    /// Карта «project → checkout» из [[project]] конфига: крон связан
+    /// с проектом fm-полем `project` (плоская раскладка /cron, #1214).
+    pub projects: std::collections::HashMap<String, String>,
     /// Единый кап активных ходов исполнителя (policy.cup): файр при
     /// полном капе откладывается до свободного тика — журнальная строка
     /// не пишется, ран не считается состоявшимся (#1231).
@@ -40,20 +41,21 @@ pub struct FireOutcome {
 }
 
 impl CronUseCase {
-    /// Инвентарь мастеров проекта (прямые дети папки Кроны).
-    pub async fn masters(&self, project: &str) -> UsecaseResult<Vec<CronMaster>> {
-        let dir = crons_dir(project);
-        let mut out = Vec::new();
-        for (slug, md) in self.direct_children(&dir).await? {
-            if let Some(m) = parse_master(&slug, &md) {
-                out.push(m);
-            }
-        }
-        Ok(out)
+    /// Инвентарь мастеров; Some(project) — фильтр по fm `project`.
+    pub async fn masters(&self, project: Option<&str>) -> UsecaseResult<Vec<CronMaster>> {
+        let all = self.scan_masters().await?;
+        Ok(all
+            .into_iter()
+            .filter(|m| match project {
+                Some(p) => m.project == p,
+                None => true,
+            })
+            .collect())
     }
 
-    /// Один проход: мастера проекта, due → журнальная строка + спавн рана.
-    pub async fn tick(&self, project: &str) -> UsecaseResult<Vec<FireOutcome>> {
+    /// Один проход: мастера, due → журнальная строка + спавн рана.
+    /// Проект рана — fm `project` мастера (роутинг executor + checkout).
+    pub async fn tick(&self) -> UsecaseResult<Vec<FireOutcome>> {
         let mut fired = Vec::new();
         // CUP-гвард (#1231): крон-ран — запуск хода, ему нужен свободный
         // слот единого капа. Strict union (#1203): отказ скана — файр
@@ -72,15 +74,11 @@ impl CronUseCase {
                 return Ok(fired);
             }
         };
-        let dir = crons_dir(project);
-        // list_docs даёт пути от docs/ целиком: прямые дети = мастера,
-        // подпапки (журнал/ассеты) — нет
-        for (slug, md) in self.direct_children(&dir).await? {
-            let Some(master) = parse_master(&slug, &md) else {
-                continue;
-            };
-            let name = slug.rsplit('/').next().unwrap_or(&slug).to_string();
-            let journal = format!("{dir}/{name}/Журнал");
+        let masters = self.scan_masters().await?;
+        for master in masters {
+            let slug = master.slug.clone();
+            let name = cron_name(&slug).to_string();
+            let journal = format!("{CRON_DIR}/{name}/Журнал");
             let journal_md = self.wiki.read_doc(&journal).await?.unwrap_or_default();
             let now = self.clock.now_ms();
             // Инвариант DS: ран не закрылся = сигнал сбоя — последняя строка
@@ -110,6 +108,12 @@ impl CronUseCase {
                 );
                 continue;
             }
+            let Some(checkout) = self.projects.get(&master.project) else {
+                tracing::warn!(event = "cron.project_unknown", cron = %slug,
+                    project = %master.project,
+                    "fm project вне карты [[project]] — крон не файрится (skip+warn)");
+                continue;
+            };
             let stamp = jst_stamp(now);
             self.wiki
                 .append_doc(
@@ -118,21 +122,21 @@ impl CronUseCase {
                     &format!("cron: запуск {slug}"),
                 )
                 .await?;
-            let prompt = run_prompt(project, &master, &journal_md);
+            let prompt = run_prompt(&master.project, &master, &journal_md);
             let sm = match master.agent {
                 AgentSlot::Role(agent) => self.models.for_agent(agent),
                 AgentSlot::Default => self.models.for_default(),
             };
             let spec = SessionSpec {
                 custom_agent: None,
-                directory: self.checkout.clone(),
+                directory: checkout.clone(),
                 title: format!("⏰ {} · {}", master.title, stamp),
                 agent: master.agent,
                 model: sm.model,
                 variant: sm.variant,
                 bootstrap: false,
             };
-            let sessions = self.sessions.project(project);
+            let sessions = self.sessions.project(&master.project);
             let session = sessions.create_session(&spec).await?;
             sessions.prompt(&session, &prompt).await?;
             busy += 1; // файр этого тика занимает слот капа
@@ -142,16 +146,36 @@ impl CronUseCase {
         Ok(fired)
     }
 
-    /// Прямые дети папки: (слэг, markdown) без захода в подпапки.
-    async fn direct_children(&self, dir: &str) -> UsecaseResult<Vec<(String, String)>> {
-        let prefix = format!("{dir}/");
+    /// Мастера: `cron/<имя>/README.md` (имя без слэша). Прочие пути
+    /// папки (журналы, файлы вне README) — вне инвентаря; битый fm —
+    /// warn раз на тик (молчаливый пропуск прячет опечатку владельца).
+    async fn scan_masters(&self) -> UsecaseResult<Vec<CronMaster>> {
         let mut out = Vec::new();
-        for slug in self.wiki.list_docs(dir).await? {
-            if !slug.starts_with(&prefix) || slug[prefix.len()..].contains('/') {
+        for slug in self.master_slugs().await? {
+            let Some(md) = self.wiki.read_doc(&slug).await? else {
                 continue;
+            };
+            match parse_master(&slug, &md) {
+                Some(m) => out.push(m),
+                None => tracing::warn!(event = "cron.master_invalid", slug = %slug,
+                    "Мастер не парсится (fm project/schedule) — крон не файрится"),
             }
-            if let Some(md) = self.wiki.read_doc(&slug).await? {
-                out.push((slug, md));
+        }
+        Ok(out)
+    }
+
+    /// Слаги мастеров: `cron/<имя>/README`, имя без вложенных сегментов.
+    async fn master_slugs(&self) -> UsecaseResult<Vec<String>> {
+        let mut out = Vec::new();
+        for slug in self.wiki.list_docs(CRON_DIR).await? {
+            let Some(rest) = slug.strip_prefix(&format!("{CRON_DIR}/")) else {
+                continue;
+            };
+            let Some(name) = rest.strip_suffix("/README") else {
+                continue;
+            };
+            if !name.is_empty() && !name.contains('/') {
+                out.push(slug);
             }
         }
         Ok(out)
@@ -241,15 +265,31 @@ fn parse_cron_expr(raw: &str) -> Option<CronSchedule> {
     ))
 }
 
-/// Мастер: fm-поля title/schedule/agent + тело; расписание обязано парситься.
+/// Имя крона из слага мастера `cron/<имя>/README` — средний сегмент
+/// (не хвост: слаг кончается README).
+fn cron_name(slug: &str) -> &str {
+    slug.strip_prefix(CRON_DIR)
+        .and_then(|r| r.strip_prefix('/'))
+        .and_then(|r| r.strip_suffix("/README"))
+        .filter(|n| !n.is_empty() && !n.contains('/'))
+        .unwrap_or_else(|| slug.rsplit('/').next().unwrap_or(slug))
+}
+
+/// Мастер: fm-поля title/schedule/agent/project + тело; schedule и
+/// project обязательны (project связывает крон с [[project]] конфига).
 pub fn parse_master(slug: &str, md: &str) -> Option<CronMaster> {
     let fm = crate::fm_lite::parse(md);
     let schedule = parse_schedule_text(fm.get("schedule")?)?;
+    let project = fm.get("project")?.trim();
+    if project.is_empty() {
+        return None;
+    }
     Some(CronMaster {
         slug: slug.to_string(),
         title: fm.get("title").cloned().unwrap_or_else(|| slug.to_string()),
         schedule,
         agent: AgentSlot::of(fm.get("agent").and_then(|a| naming::parse_agent(a))),
+        project: project.to_string(),
         body: crate::fm_lite::strip(md).to_string(),
     })
 }
@@ -283,14 +323,14 @@ fn jst_stamp(ms: u64) -> String {
 
 fn run_prompt(project: &str, master: &CronMaster, journal: &str) -> String {
     let tail: Vec<&str> = journal.lines().rev().take(5).collect();
-    // slug мастера — полный путь от docs/: имя = хвост после последнего '/'
-    let name = master.slug.rsplit('/').next().unwrap_or(&master.slug);
+    // имя крона — средний сегмент слага мастера cron/<имя>/README
+    let name = cron_name(&master.slug);
     format!(
         "Крон-ран «{title}» (проект {project}).\n\n\
          ## Инструкция мастера\n\n{body}\n\n\
          ## Журнал (последние записи, сверху новые)\n\n{tail}\n\n\
          Выполни ран автономно. Сводку допиши в журнал:\n\
-         uwuwu_docs_append {{slug: \"Projects/{project}/Кроны/{name}/Журнал\", line: \"- <итог одной строкой>\"}}.\n\
+         uwuwu_docs_append {{slug: \"cron/{name}/Журнал\", line: \"- <итог одной строкой>\"}}.\n\
          Блокер — коммент в задачу-хвост не нужен; просто зафиксируй в журнале.",
         title = master.title,
         body = master.body,
@@ -305,13 +345,27 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
-    fn master_requires_valid_schedule() {
-        let md = "---\ntitle: Тест\nschedule: 5m\n---\n\nТело";
-        let m = parse_master("Projects/uwuwu/Кроны/x", md).unwrap();
+    fn master_requires_valid_schedule_and_project() {
+        let md = "---\ntitle: Тест\nschedule: 5m\nproject: uwuwu\n---\n\nТело";
+        let m = parse_master("cron/x/README", md).unwrap();
         assert_eq!(m.title, "Тест");
+        assert_eq!(m.project, "uwuwu");
         assert_eq!(m.agent, AgentSlot::Default);
 
-        let bad = "---\ntitle: Битый\nschedule: не-расписание\n---\n\nТело";
+        let no_project = "---\ntitle: Тест\nschedule: 5m\n---\n\nТело";
+        assert!(
+            parse_master("cron/x/README", no_project).is_none(),
+            "нет fm project — не мастер"
+        );
+        // fm_lite — голые значения (без YAML-кавычек): quoted-мусор
+        // пройдёт парс и отсеется в тике (project вне карты — skip+warn)
+        let empty_project = "---\nschedule: 5m\nproject:   \n---\n\nТело";
+        assert!(
+            parse_master("cron/x/README", empty_project).is_none(),
+            "пустой project — не мастер"
+        );
+
+        let bad = "---\ntitle: Битый\nschedule: не-расписание\nproject: uwuwu\n---\n\nТело";
         assert!(
             parse_master("x", bad).is_none(),
             "битое расписание — не мастер"
@@ -323,9 +377,24 @@ mod tests {
 
     #[test]
     fn master_agent_parsed() {
-        let md = "---\nschedule: 1h\nagent: dreamer\n---\n";
-        let m = parse_master("x", md).unwrap();
+        let md = "---\nschedule: 1h\nagent: dreamer\nproject: uwuwu\n---\n";
+        let m = parse_master("cron/x/README", md).unwrap();
         assert_eq!(m.agent, AgentSlot::Role(uwuwu_domain::Agent::Dreamer));
+    }
+
+    #[test]
+    fn run_prompt_points_to_flat_journal() {
+        let md = "---\ntitle: Тест\nschedule: 5m\nproject: uwuwu\n---\nТело";
+        let m = parse_master("cron/тест/README", md).unwrap();
+        let prompt = run_prompt("uwuwu", &m, "- журнал");
+        assert!(
+            prompt.contains(r#"slug: "cron/тест/Журнал""#),
+            "промпт рана ведёт на журнальный слаг новой раскладки: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Кроны"),
+            "старый путь из промпта изгнан: {prompt}"
+        );
     }
 
     #[test]
@@ -473,15 +542,18 @@ mod tests {
             sessions: Arc::new(SessionRouter::uniform(sessions)),
             clock: Arc::new(TicksClock),
             models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
-            checkout: "/tmp/checkout".into(),
+            projects: std::collections::HashMap::from([(
+                "uwuwu".to_string(),
+                "/tmp/checkout".to_string(),
+            )]),
             cup,
         }
     }
 
     fn master_wiki() -> Arc<MemWiki> {
         Arc::new(MemWiki(Mutex::new(std::collections::HashMap::from([(
-            "Projects/uwuwu/Кроны/тест".into(),
-            "---\ntitle: Тест\nschedule: 5m\n---\nТело".into(),
+            "cron/тест/README".into(),
+            "---\ntitle: Тест\nschedule: 5m\nproject: uwuwu\n---\nТело".into(),
         )]))))
     }
 
@@ -496,15 +568,11 @@ mod tests {
             spawned: Mutex::default(),
         });
         let u = cron_uc(wiki.clone(), sessions.clone(), 1);
-        let fired = u.tick("uwuwu").await.unwrap();
+        let fired = u.tick().await.unwrap();
         assert!(fired.is_empty(), "файр при полном капе отложен");
         assert!(sessions.spawned.lock().unwrap().is_empty(), "спавна нет");
         assert!(
-            !wiki
-                .0
-                .lock()
-                .unwrap()
-                .contains_key("Projects/uwuwu/Кроны/тест/Журнал"),
+            !wiki.0.lock().unwrap().contains_key("cron/тест/Журнал"),
             "журнальная строка не пишется — ран не состоялся"
         );
     }
@@ -557,10 +625,13 @@ mod tests {
             sessions: Arc::new(SessionRouter::uniform(sessions)),
             clock: Arc::new(TicksClock),
             models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
-            checkout: "/tmp/checkout".into(),
+            projects: std::collections::HashMap::from([(
+                "uwuwu".to_string(),
+                "/tmp/checkout".to_string(),
+            )]),
             cup: 7,
         };
-        let fired = u.tick("uwuwu").await.unwrap();
+        let fired = u.tick().await.unwrap();
         assert!(fired.is_empty(), "отказ скана — файр отложен");
     }
 
@@ -573,10 +644,10 @@ mod tests {
             spawned: Mutex::default(),
         });
         let u = cron_uc(wiki.clone(), sessions.clone(), 1);
-        let fired = u.tick("uwuwu").await.unwrap();
+        let fired = u.tick().await.unwrap();
         assert_eq!(fired.len(), 1, "файр при свободном слоте");
         assert_eq!(sessions.spawned.lock().unwrap().len(), 1);
-        let journal = wiki.0.lock().unwrap()["Projects/uwuwu/Кроны/тест/Журнал"].clone();
+        let journal = wiki.0.lock().unwrap()["cron/тест/Журнал"].clone();
         assert!(journal.contains("запуск (демон)"), "{journal}");
     }
 
@@ -587,10 +658,10 @@ mod tests {
         // без инкремента busy между файрами оба улетают (cap+1 ход).
         let mut docs = std::collections::HashMap::new();
         for (name, title) in [("тест-1", "Тест 1"), ("тест-2", "Тест 2")] {
-            let slug = format!("Projects/uwuwu/Кроны/{name}");
+            let slug = format!("cron/{name}/README");
             docs.insert(
                 slug,
-                format!("---\ntitle: {title}\nschedule: 5m\n---\nТело"),
+                format!("---\ntitle: {title}\nschedule: 5m\nproject: uwuwu\n---\nТело"),
             );
         }
         let wiki = Arc::new(MemWiki(Mutex::new(docs)));
@@ -599,8 +670,34 @@ mod tests {
             spawned: Mutex::default(),
         });
         let u = cron_uc(wiki, sessions.clone(), 1);
-        let fired = u.tick("uwuwu").await.unwrap();
+        let fired = u.tick().await.unwrap();
         assert_eq!(fired.len(), 1, "второй файр отложен занятым первым слотом");
         assert_eq!(sessions.spawned.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn masters_inventory_filter_and_journal_exclusion() {
+        // Инвентарь /cron: журнал рядом с README — не мастер; project —
+        // опциональный фильтр (cron_list без проекта — все кроны).
+        let mut docs = std::collections::HashMap::new();
+        for (name, project) in [("крон-а", "uwuwu"), ("крон-б", "origa")] {
+            docs.insert(
+                format!("cron/{name}/README"),
+                format!("---\ntitle: {name}\nschedule: 1h\nproject: {project}\n---\nТело"),
+            );
+        }
+        docs.insert("cron/крон-а/Журнал".into(), "- журнал".into());
+        docs.insert("cron/крон-а/скрин.png.txt".into(), "не-мастер".into());
+        let wiki = Arc::new(MemWiki(Mutex::new(docs)));
+        let sessions = Arc::new(MemSessions {
+            busy: 0.into(),
+            spawned: Mutex::default(),
+        });
+        let u = cron_uc(wiki, sessions, 1);
+        let all = u.masters(None).await.unwrap();
+        assert_eq!(all.len(), 2, "журнал и не-README — вне инвентаря");
+        let uwuwu_only = u.masters(Some("uwuwu")).await.unwrap();
+        assert_eq!(uwuwu_only.len(), 1);
+        assert_eq!(uwuwu_only[0].project, "uwuwu");
     }
 }

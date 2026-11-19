@@ -43,7 +43,7 @@ fn hub() -> Arc<ToolHub> {
             ))),
             clock: Arc::new(SystemClock),
             models: Arc::new(uwuwu_usecase::SpawnModels::canonical()),
-            checkout: String::new(),
+            projects: Default::default(),
             cup: 7,
         }),
     })
