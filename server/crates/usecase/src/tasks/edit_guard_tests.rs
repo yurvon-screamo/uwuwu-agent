@@ -332,6 +332,22 @@ async fn legal_transition_on_fresh_status_writes() {
 }
 
 #[tokio::test]
+async fn dev_sends_to_testing_from_in_progress() {
+    // Прямая отправка на тест (#1349): дев-агент из In Progress ставит
+    // «Тестирование» — легальное ребро канона, гард пропускает, запись
+    // происходит; до #1349 гард резал ребро отказом «вне канона».
+    let board = Arc::new(StaleBoard {
+        snapshot: vec![StaleBoard::task(11, Status::InProgress)],
+        carrier: vec![StaleBoard::task(11, Status::InProgress)],
+        writes: Mutex::new(vec![]),
+    });
+    edit_status(&board, 11, Status::Testing)
+        .await
+        .expect("ребро In Progress → Testing легально (прямая отправка на тест)");
+    assert_eq!(board.writes(), vec![(11, Status::Testing)]);
+}
+
+#[tokio::test]
 async fn row_status_absent_is_fail_closed() {
     // Строку сняли с доски: снапшот ещё знает её, носитель — нет.
     let board = Arc::new(StaleBoard {

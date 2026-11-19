@@ -333,11 +333,22 @@ impl ToolHub {
         require_args(args, &["slug", "line"])?;
         let slug = arg_str(args, "slug");
         let message = message_or(args, format!("append: {slug}"));
-        self.wiki
+        let outcome = self
+            .wiki
             .append_doc(&slug, &arg_str(args, "line"), &message)
             .await
             .map_err(|e| e.to_string())?;
-        ok_text(format!("дописано в «{slug}»"))
+        // честность ответа (#1353): append к существующему vs создание —
+        // разрушительный класс бага видно по ответу, а не только коммит-статом
+        let fact = if outcome.created {
+            format!("создан «{slug}»: файла не было, записана строка")
+        } else {
+            format!(
+                "дописано в «{slug}» — append к существующему, строк в доке: {}",
+                outcome.lines
+            )
+        };
+        ok_text(fact)
     }
 
     async fn docs_write(&self, args: &Value) -> Result<Value, String> {
