@@ -2076,7 +2076,7 @@ async fn doc_bot_with_manual(
     tg: &Arc<FakeTg>,
     token_env: &'static str,
 ) -> BotSupervisor {
-    wiki.set_doc(SLUG, &doc_md("p/m1", token_env, "методичка"));
+    wiki.set_doc(DOC_SLUG, &doc_md("p/m1", token_env, "методичка"));
     tg.inject(private_update(1, "yurvon", "привет"));
     let sup = supervisor(
         wiki.clone(),
@@ -2186,7 +2186,7 @@ async fn compact_agent_mode_never_injects_manual_prefix() {
     let tg = FakeTg::new(vec![]);
     // agent-режим: методичка в agents/<name>.md, тело дока игнорируется
     wiki.set_doc(
-        SLUG,
+        DOC_SLUG,
         "---\ntitle: Проба\nmodel: p/m1\ntoken_env: UWUWU_BOT_TOKEN_C4\n\
          owner: yurvon\nworkspace: /tmp/opencode\nagent: probe-agent\n---\n\nтело-методичка",
     );
@@ -2237,7 +2237,7 @@ async fn recreate_session_rearms_manual_for_new_session() {
         doc_bot_with_manual(&wiki, &sessions, &state, &clock, &tg, "UWUWU_BOT_TOKEN_C5").await;
     // структурная правка → RecreateSession: старая сессия (с вшитой
     // методичкой) забыта, hash должен сброситься
-    wiki.set_doc(SLUG, &doc_md("p/m2", "UWUWU_BOT_TOKEN_C5", "методичка"));
+    wiki.set_doc(DOC_SLUG, &doc_md("p/m2", "UWUWU_BOT_TOKEN_C5", "методичка"));
     sup.tick().await.unwrap();
     assert_eq!(
         state.bot_manual_hash(SLUG),
