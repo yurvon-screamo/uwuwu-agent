@@ -1238,6 +1238,11 @@ async fn task_clean_garbage_ids_is_loud() {
         .await
         .expect_err("мусорный токен — громкий отказ");
     assert!(err.contains("мусорный"), "{err}");
+    // null в массиве тоже громкий (ревью #1158 Low-1: батч не сужается молча)
+    let err = call(&tools, "task_clean", json!({ "ids": [1, null, 3] }))
+        .await
+        .expect_err("null-токен — громкий отказ");
+    assert!(err.contains("мусорный"), "{err}");
     let err = call(&tools, "task_clean", json!({}))
         .await
         .expect_err("ids отсутствует");

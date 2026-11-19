@@ -350,19 +350,15 @@ impl Pv2Rest {
         self.status_wt.invalidate(&format!("{board}#{number}"));
     }
 
-    /// Свежий элемент индекса НОСИТЕЛЯ (мимо кэша): list items рефетчится
-    /// и обновляет кэш — вердикты чистки (#1158) пробуют носитель, а не
-    /// TTL-окно индекса. Параллельный writer между пробой и мутацией
-    /// виден: id/статус свежего фетча, не кэша.
-    pub(crate) async fn fresh_item(
-        &self,
-        board: &str,
-        number: u64,
-    ) -> UsecaseResult<Option<Pv2Item>> {
+    /// Свежий индекс привязок доски (мимо кэша, кэш обновляется): ОДИН
+    /// полный фетч на вызов чистки — батч ест 1 индекс-фетч + N issue-проб,
+    /// не N фетчей (квотная дисциплина общего REST-бакета ADR-113,
+    /// ревью #1158 Common-1).
+    pub(crate) async fn fresh_index(&self, board: &str) -> UsecaseResult<HashMap<u64, Pv2Item>> {
         let map = self.fetch_items(board).await?;
         let now = std::time::Instant::now();
-        let arc = self.items.put(board, map, now);
-        Ok(arc.get(&number).cloned())
+        self.items.put(board, map.clone(), now);
+        Ok(map)
     }
 
     /// DELETE item (снос строки, #1158): 204 — снос принят GitHub.
@@ -392,14 +388,15 @@ impl Pv2Rest {
                 resp.status
             )));
         }
-        // кэш-гигиена: строка ушла — из живого индекса и write-through'а
+        // кэш-гигиена: строка уходит из живого индекса и write-through'а;
+        // пустого кэша не создаём — пустая карта «свежего индекса» морила
+        // бы читателей лишними рефэтчами (ревью #1158 Low-3)
         let now = std::time::Instant::now();
-        let mut map = match self.items.get(board, now) {
-            Some(hit) => (*hit).clone(),
-            None => HashMap::new(),
-        };
-        map.remove(&number);
-        self.items.put(board, map, now);
+        if let Some(hit) = self.items.get(board, now) {
+            let mut map = (*hit).clone();
+            map.remove(&number);
+            self.items.put(board, map, now);
+        }
         self.status_wt.invalidate(&format!("{board}#{number}"));
         Ok(())
     }

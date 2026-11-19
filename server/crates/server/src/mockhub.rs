@@ -474,34 +474,38 @@ impl TaskBoardRepo for MemoryHub {
 /// снос = метка `removed` (строка покидает read_board), undo снимает метку.
 #[async_trait]
 impl uwuwu_usecase::CleanBoardRepo for MemoryHub {
-    async fn fresh_binding(
+    async fn fresh_index(
         &self,
         board: &str,
-        number: u64,
-    ) -> UsecaseResult<Option<uwuwu_usecase::RowBinding>> {
+    ) -> UsecaseResult<HashMap<u64, uwuwu_usecase::RowBinding>> {
         self.with_state(|state| {
             self.ensure_seed(state);
-            let on_board = state.tasks.contains_key(&number)
-                && !state.archived.contains_key(&number)
-                && !state.removed.contains_key(&number)
-                && state
-                    .board_tags
-                    .get(&number)
-                    .map(|t| t == board)
-                    .unwrap_or(true);
-            if !on_board {
-                return Ok(None);
+            let mut map = HashMap::new();
+            for (number, task) in &state.tasks {
+                let on_board = !state.archived.contains_key(number)
+                    && !state.removed.contains_key(number)
+                    && state
+                        .board_tags
+                        .get(number)
+                        .map(|t| t == board)
+                        .unwrap_or(true);
+                if !on_board {
+                    continue;
+                }
+                let status_raw = uwuwu_usecase::status_name(task.status());
+                map.insert(
+                    *number,
+                    uwuwu_usecase::RowBinding {
+                        item_id: *number,
+                        status_raw: if status_raw.is_empty() {
+                            None
+                        } else {
+                            Some(status_raw.to_string())
+                        },
+                    },
+                );
             }
-            let status_raw = state
-                .tasks
-                .get(&number)
-                .map(|t| uwuwu_usecase::status_name(t.status()))
-                .filter(|name| !name.is_empty())
-                .map(str::to_string);
-            Ok(Some(uwuwu_usecase::RowBinding {
-                item_id: number,
-                status_raw,
-            }))
+            Ok(map)
         })
     }
 

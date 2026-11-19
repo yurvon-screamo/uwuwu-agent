@@ -133,10 +133,23 @@ pub fn tool_descriptors() -> Value {
              владельца — без него весь батч отклоняется; write-ahead журнал \
              даёт undo (task_undo)",
             object(json!({
-                "ids": string("номера строк через запятую"),
+                "ids": json!({
+                    "description": "номера строк: csv «1,2,3» или массив integers",
+                    "oneOf": [
+                        { "type": "string" },
+                        { "type": "array", "items": { "type": "integer" } }
+                    ]
+                }),
                 "project": string("проект; дефолт uwuwu"),
                 "confirm": json!({"type":"boolean","description":"false/нет — dry-run (вердикты), true — снос"}),
-                "ack": string("номера не-Draft строк (Live/Dead), подтверждённые владельцем, через запятую")
+                "ack": json!({
+                    "description": "номера не-Draft строк (Live/Dead), подтверждённые \
+                                    владельцем: csv или массив integers",
+                    "oneOf": [
+                        { "type": "string" },
+                        { "type": "array", "items": { "type": "integer" } }
+                    ]
+                })
             }))
         ),
         tool(
@@ -692,7 +705,8 @@ fn optional_number(args: &Value) -> Result<Option<u64>, String> {
 
 /// Список номеров из аргумента: массив integers или csv-строка «1,2,3».
 /// Пустой/отсутствующий — Err (ids обязателен); ack — unwrap_or_default
-/// на стороне вызова. Мусорный токен — громкий отказ (не тихий пропуск).
+/// на стороне вызова. null и мусорный токен — громкий отказ (не тихий
+/// пропуск: батч не сужается молча, ревью #1158 Low-1).
 fn arg_numbers(args: &Value, key: &str) -> Result<Vec<u64>, String> {
     let raw: Vec<Value> = match args.get(key) {
         None | Some(Value::Null) => return Err(format!("{key} обязателен (номера строк)")),
@@ -708,7 +722,6 @@ fn arg_numbers(args: &Value, key: &str) -> Result<Vec<u64>, String> {
         }
     };
     raw.iter()
-        .filter(|v| !v.is_null())
         .map(|v| {
             v.as_u64()
                 .or_else(|| v.as_str().map(str::trim).and_then(|s| s.parse().ok()))

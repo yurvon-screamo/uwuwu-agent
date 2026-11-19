@@ -26,10 +26,27 @@ pub struct JsonCleanJournals {
 
 impl JsonCleanJournals {
     pub fn load(path: PathBuf) -> Self {
-        let file: JournalFile = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default();
+        // повреждённый файл НЕ глотается молча (ревью #1158 Low-2):
+        // undo-журнал — safety-net сноса, тихая потеря истории недопустима;
+        // стартуем пустым с громкой строкой в логе (блокировать загрузку
+        // сервера битым журналом — худший исход для safety-net)
+        let file = match std::fs::read_to_string(&path) {
+            Ok(raw) => match serde_json::from_str::<JournalFile>(&raw) {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!(
+                        event = "clean_journal.corrupt",
+                        path = %path.display(),
+                        error = %e,
+                        "undo.json не парсится — undo-история чистки потеряна \
+                         (сносы до починки не откатываются), стартуем пустым"
+                    );
+                    JournalFile::default()
+                }
+            },
+            // нет файла — норма (первый запуск / ещё ни одной чистки)
+            Err(_) => JournalFile::default(),
+        };
         Self {
             path,
             file: std::sync::Mutex::new(file),
@@ -173,6 +190,31 @@ mod tests {
         let s = store(PathBuf::from("/nonexistent/uwuwu/undo.json"));
         assert!(CleanJournalStore::get(&s, "uwuwu", None).unwrap().is_none());
         assert!(CleanJournalStore::ids(&s, "uwuwu").unwrap().is_empty());
+    }
+
+    #[test]
+    fn corrupt_file_starts_empty_with_loud_warn() {
+        // ревью #1158 Low-2: повреждённый undo.json не глотается молча —
+        // громкий warn (safety-net сноса), сервер стартует пустым журналом
+        let dir = std::env::temp_dir().join(format!("uwuwu-undo-corrupt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("undo.json");
+        std::fs::write(&path, "{ это не json }").unwrap();
+        let s = store(path.clone());
+        assert!(
+            CleanJournalStore::get(&s, "uwuwu", None).unwrap().is_none(),
+            "повреждённый файл — пустой журнал"
+        );
+        // запись поверх битого файла работает (жизнь продолжается)
+        CleanJournalStore::put(&s, &journal("fresh", 100)).unwrap();
+        assert_eq!(
+            CleanJournalStore::get(&s, "uwuwu", None)
+                .unwrap()
+                .unwrap()
+                .id,
+            "fresh"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

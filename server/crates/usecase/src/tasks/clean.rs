@@ -17,6 +17,7 @@ use crate::error::{UsecaseError, UsecaseResult};
 use crate::ports::Clock;
 use crate::tasks::md_section::body_hash;
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Батч-кап чистки (свойство клина холодного ящика: 50/проход).
@@ -46,8 +47,12 @@ pub struct IssueProbe {
 /// защищает живые строки только на достоверных пробах.
 #[async_trait]
 pub trait CleanBoardRepo: Send + Sync {
-    /// Привязка строки к доске прямо сейчас: None — строки нет.
-    async fn fresh_binding(&self, board: &str, number: u64) -> UsecaseResult<Option<RowBinding>>;
+    /// Свежий индекс привязок доски: ОДИН полный фетч на вызов чистки
+    /// (план/исполнение/undo) — квотная дисциплина общего REST-бакета
+    /// ADR-113 (ревью #1158 Common-1): батч ест 1 индекс-фетч + N дешёвых
+    /// issue-проб, не N индекс-фетчей. Защита от stale-привязки —
+    /// DELETE по item_id → 404, не повторами фетча.
+    async fn fresh_index(&self, board: &str) -> UsecaseResult<HashMap<u64, RowBinding>>;
     /// Проба issue: None — не найден (404). Err — транспортный отказ.
     async fn fresh_issue(&self, number: u64) -> UsecaseResult<Option<IssueProbe>>;
     /// Снос строки (удаление item). Несостоявшееся удаление (404/лаг) —
@@ -212,14 +217,9 @@ impl TaskCleanUseCase {
         Ok(uniq)
     }
 
-    /// Проба одной строки: свежая привязка + свежий issue → вердикт.
-    async fn probe(&self, board: &str, number: u64) -> CleanRowReport {
-        let binding = match self.clean.fresh_binding(board, number).await {
-            Ok(b) => b,
-            Err(e) => {
-                return divergent(number, format!("проба привязки не состоялась: {e}"));
-            }
-        };
+    /// Проба одной строки по готовому индексу (фетч индекса — один на
+    /// вызов, выше): привязка → issue → вердикт.
+    async fn probe_row(&self, number: u64, binding: Option<&RowBinding>) -> CleanRowReport {
         let Some(binding) = binding else {
             return CleanRowReport {
                 number,
@@ -249,7 +249,7 @@ impl TaskCleanUseCase {
             number,
             title: issue.title,
             verdict,
-            status_raw: binding.status_raw.filter(|s| !s.trim().is_empty()),
+            status_raw: binding.status_raw.clone().filter(|s| !s.trim().is_empty()),
             item_id: binding.item_id,
             note: None,
         }
@@ -287,18 +287,21 @@ impl TaskCleanUseCase {
         Ok(())
     }
 
-    /// Dry-run: вердикты по свежим пробам, ноль мутаций.
+    /// Dry-run: вердикты по свежим пробам, ноль мутаций. Индекс доски —
+    /// один фетч на вызов (квотная дисциплина, ревью Common-1).
     pub async fn plan(&self, project: &str, numbers: &[u64]) -> UsecaseResult<Vec<CleanRowReport>> {
         let board = self.board_of(project)?;
         let numbers = Self::normalize(numbers)?;
+        let index = self.clean.fresh_index(&board).await?;
         let mut reports = Vec::with_capacity(numbers.len());
         for number in numbers {
-            reports.push(self.probe(&board, number).await);
+            reports.push(self.probe_row(number, index.get(&number)).await);
         }
         Ok(reports)
     }
 
     /// Исполнение сноса: self-probe → гейт → write-ahead журнал → DELETE.
+    /// Индекс — один фетч на вызов; stale-привязка ловится DELETE-404.
     pub async fn execute(
         &self,
         project: &str,
@@ -307,9 +310,10 @@ impl TaskCleanUseCase {
     ) -> UsecaseResult<CleanExecReport> {
         let board = self.board_of(project)?;
         let numbers = Self::normalize(numbers)?;
+        let index = self.clean.fresh_index(&board).await?;
         let mut reports = Vec::with_capacity(numbers.len());
         for number in numbers {
-            reports.push(self.probe(&board, number).await);
+            reports.push(self.probe_row(number, index.get(&number)).await);
         }
         Self::gate(&reports, ack)?;
         let mut deleted = Vec::new();
@@ -363,20 +367,12 @@ impl TaskCleanUseCase {
                 journal.unwrap_or("(свежий)")
             ))
         })?;
+        // индекс — один фетч на вызов (квотная дисциплина, ревью Common-1):
+        // отказ фетча громко валит весь undo, restore-сбои — per-row Failed
+        let index = self.clean.fresh_index(&found.board).await?;
         let mut rows = Vec::with_capacity(found.rows.len());
         for row in &found.rows {
-            let present = match self.clean.fresh_binding(&found.board, row.number).await {
-                Ok(b) => b.is_some(),
-                Err(e) => {
-                    rows.push((
-                        row.number,
-                        row.title.clone(),
-                        UndoOutcome::Failed(format!("проба привязки не состоялась: {e}")),
-                    ));
-                    continue;
-                }
-            };
-            if present {
+            if index.contains_key(&row.number) {
                 rows.push((row.number, row.title.clone(), UndoOutcome::AlreadyOnBoard));
                 continue;
             }
@@ -497,11 +493,15 @@ mod tests {
         rows: Mutex<HashMap<u64, FakeRow>>,
         /// номера, чей fresh_issue отвечает 404 при живой привязке
         issue_404: Mutex<HashSet<u64>>,
-        /// сбой пробы привязки (Divergent-ветка)
+        /// сбой фетча индекса (громкий отказ плана/undo)
         binding_err: Mutex<bool>,
+        /// сбой restore (per-row Failed в undo)
+        restore_err: Mutex<bool>,
         /// remove-идентичность не совпадает (параллельный writer пересоздал)
         stale_items: Mutex<HashSet<u64>>,
         events: Mutex<Vec<String>>,
+        /// счётчик полных фетчей индекса — пин квотной дисциплины (Common-1)
+        index_fetches: Mutex<usize>,
     }
 
     #[derive(Clone)]
@@ -530,23 +530,24 @@ mod tests {
 
     #[async_trait]
     impl CleanBoardRepo for FakeCarrier {
-        async fn fresh_binding(
-            &self,
-            _board: &str,
-            number: u64,
-        ) -> UsecaseResult<Option<RowBinding>> {
+        async fn fresh_index(&self, _board: &str) -> UsecaseResult<HashMap<u64, RowBinding>> {
             if *self.binding_err.lock().expect("fake err") {
                 return Err(UsecaseError::Board("pv2 rest 503 (мок)".into()));
             }
-            Ok(self
-                .rows
-                .lock()
-                .expect("fake rows")
-                .get(&number)
-                .map(|(id, st, _)| RowBinding {
-                    item_id: *id,
-                    status_raw: st.clone(),
-                }))
+            *self.index_fetches.lock().expect("fetches") += 1;
+            let rows = self.rows.lock().expect("fake rows");
+            Ok(rows
+                .iter()
+                .map(|(number, (_, st, _))| {
+                    (
+                        *number,
+                        RowBinding {
+                            item_id: 1_000 + number,
+                            status_raw: st.clone(),
+                        },
+                    )
+                })
+                .collect())
         }
         async fn fresh_issue(&self, number: u64) -> UsecaseResult<Option<IssueProbe>> {
             if self.issue_404.lock().expect("fake 404").contains(&number) {
@@ -589,6 +590,9 @@ mod tests {
             number: u64,
             status_raw: Option<&str>,
         ) -> UsecaseResult<u64> {
+            if *self.restore_err.lock().expect("fake restore") {
+                return Err(UsecaseError::Board("add item: HTTP 503 (мок)".into()));
+            }
             let mut rows = self.rows.lock().expect("fake rows");
             let restored = issue("восстановленный", true, "");
             rows.insert(
@@ -744,20 +748,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plan_probe_failure_is_divergent_with_note() {
+    async fn plan_index_failure_is_loud_whole_call() {
         let (u, carrier, _) = rig();
         carrier.row(9, Some("Draft"), issue("x", true, ""));
         *carrier.binding_err.lock().expect("err") = true;
-        let reports = u.plan("uwuwu", &[9]).await.unwrap();
-        assert_eq!(reports[0].verdict, CleanVerdict::Divergent);
+        let err = u
+            .plan("uwuwu", &[9])
+            .await
+            .expect_err("фетч индекса не состоялся — громкий отказ вызова");
         assert!(
-            reports[0]
-                .note
-                .as_deref()
-                .unwrap()
-                .contains("проба привязки"),
-            "деталь отказа в note: {:?}",
-            reports[0].note
+            err.to_string().contains("pv2 rest 503"),
+            "деталь транспорта в отказе: {err}"
+        );
+    }
+
+    /// Пин квотной дисциплины (ревью Common-1): план/исполнение/undo
+    /// тянут ОДИН полный фетч индекса на вызов, не по-строчные фетчи.
+    #[tokio::test]
+    async fn one_index_fetch_per_call() {
+        let (u, carrier, _) = rig();
+        carrier.row(1, Some("Draft"), issue("d1", true, ""));
+        carrier.row(2, Some("Done"), issue("d2", false, "тело"));
+        carrier.row(3, Some("In Progress"), issue("d3", true, "тело"));
+        u.plan("uwuwu", &[1, 2, 3]).await.unwrap();
+        assert_eq!(*carrier.index_fetches.lock().expect("f"), 1, "plan: 1 фетч");
+        u.execute("uwuwu", &[1, 2, 3], &[2, 3]).await.unwrap();
+        assert_eq!(
+            *carrier.index_fetches.lock().expect("f"),
+            2,
+            "execute: свой один фетч"
+        );
+        u.undo("uwuwu", None).await.unwrap();
+        assert_eq!(
+            *carrier.index_fetches.lock().expect("f"),
+            3,
+            "undo: свой один фетч"
         );
     }
 
@@ -876,10 +901,10 @@ mod tests {
         );
         // строка не снесена (remove отвергнут носителем)
         assert!(carrier
-            .fresh_binding("Задачи uwuwu", 1)
+            .fresh_index("Задачи uwuwu")
             .await
             .unwrap()
-            .is_some());
+            .contains_key(&1));
     }
 
     #[tokio::test]
@@ -937,11 +962,8 @@ mod tests {
             report.rows[1].2
         );
         // восстановленный статус вернулся из журнала
-        let binding = carrier
-            .fresh_binding("Задачи uwuwu", 2)
-            .await
-            .unwrap()
-            .unwrap();
+        let index = carrier.fresh_index("Задачи uwuwu").await.unwrap();
+        let binding = index.get(&2).expect("#2 на доске");
         assert_eq!(binding.status_raw.as_deref(), Some("In Progress"));
         // повторный undo — всё skip
         let again = u.undo("uwuwu", None).await.unwrap();
@@ -975,17 +997,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn undo_failure_is_loud_and_contained() {
+    async fn undo_restore_failure_is_loud_and_contained() {
+        let (u, carrier, _) = rig();
+        carrier.row(1, Some("Draft"), issue("d", true, ""));
+        carrier.row(2, Some("Draft"), issue("d2", true, ""));
+        u.execute("uwuwu", &[1, 2], &[]).await.unwrap();
+        // restore падает: носитель не принимает add — отчёт громкий,
+        // остальные строки восстановятся (пер-строчный контейнд)
+        *carrier.restore_err.lock().expect("restore") = true;
+        let report = u.undo("uwuwu", None).await.unwrap();
+        assert!(
+            report
+                .rows
+                .iter()
+                .all(|(_, _, o)| matches!(o, UndoOutcome::Failed(_))),
+            "restore сломан — все Failed: {:?}",
+            report.rows
+        );
+    }
+
+    #[tokio::test]
+    async fn undo_index_failure_is_loud_whole_call() {
         let (u, carrier, _) = rig();
         carrier.row(1, Some("Draft"), issue("d", true, ""));
         u.execute("uwuwu", &[1], &[]).await.unwrap();
-        // restore падает: носитель сломан
+        // фетч индекса не состоялся — undo громко падает целиком
+        // (fail-closed: не молча скипать строки в неизвестное состояние)
         *carrier.binding_err.lock().expect("err") = true;
-        let report = u.undo("uwuwu", None).await.unwrap();
-        assert!(
-            matches!(&report.rows[0].2, UndoOutcome::Failed(_)),
-            "отказ в отчёте"
-        );
+        let err = u
+            .undo("uwuwu", None)
+            .await
+            .expect_err("фетч индекса сломан — отказ вызова");
+        assert!(err.to_string().contains("pv2 rest 503"), "{err}");
     }
 
     // --- журнал: детерминированное имя ---

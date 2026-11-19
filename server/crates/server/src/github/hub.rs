@@ -7,6 +7,7 @@ use super::fields::{parse_field_values, Fields, IssueFields};
 use super::pv2::Pv2Rest;
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 use uwuwu_domain::{Status, Task};
 use uwuwu_usecase::{CommentRef, IssueView, TaskBoardRepo};
@@ -1182,19 +1183,25 @@ impl TaskBoardRepo for GitHubHub {
 /// стоят на этих пробах — недостоверная проба = Divergent = не трогать.
 #[async_trait]
 impl uwuwu_usecase::CleanBoardRepo for GitHubHub {
-    async fn fresh_binding(
+    async fn fresh_index(
         &self,
         board: &str,
-        number: u64,
-    ) -> UsecaseResult<Option<uwuwu_usecase::RowBinding>> {
+    ) -> UsecaseResult<HashMap<u64, uwuwu_usecase::RowBinding>> {
         Ok(self
             .pv2
-            .fresh_item(board, number)
+            .fresh_index(board)
             .await?
-            .map(|item| uwuwu_usecase::RowBinding {
-                item_id: item.id,
-                status_raw: item.status.filter(|s| !s.trim().is_empty()),
-            }))
+            .into_iter()
+            .map(|(number, item)| {
+                (
+                    number,
+                    uwuwu_usecase::RowBinding {
+                        item_id: item.id,
+                        status_raw: item.status.filter(|s| !s.trim().is_empty()),
+                    },
+                )
+            })
+            .collect())
     }
 
     async fn fresh_issue(&self, number: u64) -> UsecaseResult<Option<uwuwu_usecase::IssueProbe>> {
