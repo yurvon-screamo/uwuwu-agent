@@ -1442,6 +1442,12 @@ impl TaskBoardRepo for CommentBoard {
     async fn row_status(&self, _b: &str, _n: u64) -> UsecaseResult<Option<Status>> {
         Ok(None)
     }
+    // доска фикстуры без строк: отсутствие row_status ⇒ строки нет
+    // (семантика #1236; мастерский #431 доложил метод не всем фикстурам —
+    // CI снят, тест-компил мастера не ловил)
+    async fn row_exists(&self, _board: &str, _n: u64) -> UsecaseResult<bool> {
+        Ok(false)
+    }
     async fn set_session(&self, _b: &str, _n: u64, _slot: Slot, _s: &str) -> UsecaseResult<()> {
         Ok(())
     }
