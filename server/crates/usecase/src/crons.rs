@@ -6,7 +6,7 @@
 
 use crate::error::UsecaseResult;
 use crate::naming;
-use crate::ports::{Clock, SessionSpec, WikiRepo};
+use crate::ports::{AppendDocOutcome, Clock, SessionSpec, WikiRepo};
 use crate::router::SessionRouter;
 use crate::spawn_models::SpawnModels;
 use std::sync::Arc;
@@ -131,7 +131,8 @@ impl CronUseCase {
                 &format!("- {stamp} запуск (демон)"),
                 &format!("cron: запуск {slug}"),
             )
-            .await?;
+            .await
+            .map(|_: AppendDocOutcome| ())?;
         let prompt = run_prompt(&master.project, master, journal_md);
         let sm = match master.agent {
             AgentSlot::Role(agent) => self.models.for_agent(agent),
@@ -501,14 +502,22 @@ mod tests {
             self.0.lock().unwrap().insert(slug.into(), content.into());
             Ok(())
         }
-        async fn append_doc(&self, slug: &str, line: &str, _m: &str) -> UsecaseResult<()> {
+        async fn append_doc(
+            &self,
+            slug: &str,
+            line: &str,
+            _m: &str,
+        ) -> UsecaseResult<AppendDocOutcome> {
             self.0
                 .lock()
                 .unwrap()
                 .entry(slug.into())
                 .or_default()
                 .push_str(&format!("{line}\n"));
-            Ok(())
+            Ok(AppendDocOutcome {
+                created: false,
+                lines: 0,
+            })
         }
     }
 

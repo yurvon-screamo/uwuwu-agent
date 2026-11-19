@@ -5,6 +5,9 @@
 use serde_json::{json, Value};
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
+use crate::wiki::encode_path;
+use uwuwu_usecase::AppendDocOutcome;
+
 pub struct GitWikiWriter {
     repo: String,
     branch: String,
@@ -67,11 +70,7 @@ impl GitWikiWriter {
     /// Читает текущее содержимое файла (None — файла нет).
     pub async fn read(&self, path: &str) -> UsecaseResult<Option<String>> {
         let (status, body) = self
-            .call(
-                reqwest::Method::GET,
-                &format!("/repos/{}/contents/{}", self.repo, path),
-                None,
-            )
+            .call(reqwest::Method::GET, &contents_url(&self.repo, path), None)
             .await?;
         if status.as_u16() == 404 {
             return Ok(None);
@@ -175,21 +174,48 @@ impl GitWikiWriter {
         Ok(())
     }
 
-    /// Append строки в конец файла (создаёт при отсутствии).
-    pub async fn append_line(&self, path: &str, line: &str, message: &str) -> UsecaseResult<()> {
+    /// Append строки в конец файла (создаёт при отсутствии); возвращает
+    /// факт операции (#1353).
+    pub async fn append_line(
+        &self,
+        path: &str,
+        line: &str,
+        message: &str,
+    ) -> UsecaseResult<AppendDocOutcome> {
         let current = self.read(path).await?;
-        let next = match current {
-            Some(mut c) => {
-                if !c.ends_with('\n') {
-                    c.push('\n');
-                }
-                c.push_str(line);
+        let created = current.is_none();
+        let next = append_to(current, line);
+        self.commit_file(path, &next, message).await?;
+        Ok(AppendDocOutcome {
+            created,
+            lines: next.lines().count(),
+        })
+    }
+}
+
+/// Строка Contents-GET: путь percent-кодируется, чтобы `#`/`?` в имени
+/// файла не рвали URL (fragment/query-разделители). Чистая функция ради
+/// юнит-тестов (ADR-110: HTTP-моки не вводим); инцидент #1353: сырой
+/// путь с `#1248` урезался на `#` → 404 → append считал «файла нет» и
+/// перезаписывал док одной строкой (d33ba05c, +1/−23).
+fn contents_url(repo: &str, path: &str) -> String {
+    format!("/repos/{repo}/contents/{}", encode_path(path))
+}
+
+/// Append-конкатенация: тело дока сохраняется целиком, строка — в конец
+/// (гард «append не режет тело», инцидент #1353). Чистая функция —
+/// юнит-фикстура «док с fm и многострочным телом».
+fn append_to(current: Option<String>, line: &str) -> String {
+    match current {
+        Some(mut c) => {
+            if !c.ends_with('\n') {
                 c.push('\n');
-                c
             }
-            None => format!("{line}\n"),
-        };
-        self.commit_file(path, &next, message).await
+            c.push_str(line);
+            c.push('\n');
+            c
+        }
+        None => format!("{line}\n"),
     }
 }
 
@@ -238,6 +264,61 @@ pub fn base64_encode(data: &[u8]) -> String {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Красный тест инцидента #1353: `#`/`?` в пути файла — данные, не
+    /// fragment/query URL; сырой путь рвёт GET (404 → append-перезапись).
+    #[test]
+    fn contents_url_encodes_fragment_and_query_delimiters() {
+        let url = contents_url("o/r", "docs/Experience/Опыт (srv, #1248).md");
+        assert!(!url.contains('#'), "сырой # рвёт URL fragment'ом: {url}");
+        assert!(url.contains("%23"), "кодирование # отсутствует: {url}");
+        let url = contents_url("o/r", "docs/Experience/вопрос?с.md");
+        assert!(!url.contains('?'), "сырой ? уходит в query: {url}");
+        assert!(url.contains("%3F"), "кодирование ? отсутствует: {url}");
+    }
+
+    #[test]
+    fn contents_url_keeps_plain_ascii_path_unchanged() {
+        // аски-путь без спецсимволов — как есть; кириллица кодируется
+        // (%D0%96…) и GitHub декодирует её обратно в тот же файл
+        assert_eq!(
+            contents_url("o/r", "docs/cron/x/journal.md"),
+            "/repos/o/r/contents/docs/cron/x/journal.md"
+        );
+        assert!(contents_url("o/r", "docs/cron/x/Журнал.md").contains("%D0%96"));
+    }
+
+    /// Гард «append не режет тело» (#1353): fm и многострочное тело
+    /// сохраняются, строка дописывается в конец.
+    #[test]
+    fn append_keeps_fm_and_body() {
+        let doc = "---\ntitle: Опыт\ndate: 2026-11-19\n---\n\n# Опыт\n\n## Форензика\nтело\n";
+        let next = append_to(Some(doc.to_string()), "строка B");
+        assert!(next.starts_with("---\ntitle: Опыт"), "fm потерян: {next}");
+        assert!(next.contains("## Форензика\nтело"), "тело потеряно: {next}");
+        assert!(
+            next.ends_with("тело\nстрока B\n"),
+            "строка не в конце: {next}"
+        );
+    }
+
+    #[test]
+    fn append_creates_missing_file_as_single_line() {
+        assert_eq!(append_to(None, "строка B"), "строка B\n");
+    }
+
+    #[test]
+    fn append_joins_unterminated_tail_with_newline() {
+        assert_eq!(
+            append_to(Some("без переноса".into()), "B"),
+            "без переноса\nB\n"
+        );
+    }
 }
 
 #[cfg(test)]
