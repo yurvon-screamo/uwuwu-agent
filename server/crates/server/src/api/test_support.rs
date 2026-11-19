@@ -193,6 +193,11 @@ impl TickStateStore for StubState {
     }
     fn mark_stall_ping(&self, _: &str, _: u64, _: Status, _: u64) {}
     fn clear_stall(&self, _: &str, _: u64) {}
+    fn lost_session(&self, _: &str, _: u64) -> Option<(Status, u32)> {
+        None
+    }
+    fn mark_lost_session(&self, _: &str, _: u64, _: Status) {}
+    fn clear_lost_session(&self, _: &str, _: u64) {}
     fn spawn_loop(&self, _: &str, _: u64, _: Slot) -> Option<(Status, u32)> {
         None
     }

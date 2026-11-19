@@ -209,6 +209,11 @@ impl TickStateStore for NopState {
 
     fn mark_stall_ping(&self, _: &str, _: u64, _: Status, _: u64) {}
     fn clear_stall(&self, _: &str, _: u64) {}
+    fn lost_session(&self, _: &str, _: u64) -> Option<(Status, u32)> {
+        None
+    }
+    fn mark_lost_session(&self, _: &str, _: u64, _: Status) {}
+    fn clear_lost_session(&self, _: &str, _: u64) {}
 
     fn clear_spawn_ms(&self, _: &str, _: u64, _: Slot) {}
 
@@ -324,6 +329,22 @@ async fn legal_transition_on_fresh_status_writes() {
         .await
         .expect("ребро Analys → Review Analys легально");
     assert_eq!(board.writes(), vec![(11, Status::ReviewAnalys)]);
+}
+
+#[tokio::test]
+async fn dev_sends_to_testing_from_in_progress() {
+    // Прямая отправка на тест (#1349): дев-агент из In Progress ставит
+    // «Тестирование» — легальное ребро канона, гард пропускает, запись
+    // происходит; до #1349 гард резал ребро отказом «вне канона».
+    let board = Arc::new(StaleBoard {
+        snapshot: vec![StaleBoard::task(11, Status::InProgress)],
+        carrier: vec![StaleBoard::task(11, Status::InProgress)],
+        writes: Mutex::new(vec![]),
+    });
+    edit_status(&board, 11, Status::Testing)
+        .await
+        .expect("ребро In Progress → Testing легально (прямая отправка на тест)");
+    assert_eq!(board.writes(), vec![(11, Status::Testing)]);
 }
 
 #[tokio::test]

@@ -228,6 +228,22 @@ impl OpencodeClient {
             Err(UsecaseError::Session(format!("{what}: HTTP {status}")))
         }
     }
+
+    /// Классификация session-scoped доставки (#1288): 404/400 — dead-session
+    /// (та же карта статусов, что `liveness_of_status`), прочие неуспехи —
+    /// временный класс. Финальность видна в типе, текст несёт класс агенту
+    /// (gherr-стиль ADR-110).
+    fn check_session(status: reqwest::StatusCode, what: &str) -> UsecaseResult<()> {
+        if status.is_success() {
+            return Ok(());
+        }
+        let detail = format!("{what}: HTTP {status}");
+        if status.as_u16() == 404 || status.as_u16() == 400 {
+            Err(UsecaseError::SessionNotFound(detail))
+        } else {
+            Err(UsecaseError::Session(detail))
+        }
+    }
 }
 
 /// Тело POST /session из спека. Контракт моделей (#1154): модель —
@@ -285,7 +301,7 @@ impl AgentSessionGateway for OpencodeClient {
                 Some(json!({ "text": text })),
             )
             .await?;
-        Self::check(status, &format!("prompt {session}"))
+        Self::check_session(status, &format!("prompt {session}"))
     }
 
     /// Пин агента слота (#1300): `POST /session/:id/agent` — живая проба
@@ -298,9 +314,10 @@ impl AgentSessionGateway for OpencodeClient {
                 Some(json!({ "agent": uwuwu_usecase::agent_name(agent) })),
             )
             .await?;
-        // 404 = сессия умерла между liveness-пробой и пином — честный Err:
-        // seen не пишется, доставка повторится следующим тиком
-        Self::check(status, &format!("switch agent {session}"))
+        // 404 = сессия умерла между liveness-пробой и пином — честный
+        // классифицированный Err (#1288): seen не пишется, маршрутизация
+        // потери на тике
+        Self::check_session(status, &format!("switch agent {session}"))
     }
 
     async fn run_command(&self, session: &str, name: &str, args: &str) -> UsecaseResult<()> {
@@ -631,6 +648,28 @@ mod tests {
             liveness_of_status(reqwest::StatusCode::BAD_GATEWAY),
             Liveness::Unknown
         );
+    }
+
+    #[test]
+    fn session_scoped_delivery_classifies_dead_vs_transient() {
+        // #1288: 404/400 — финальный dead-session класс (карта liveness);
+        // прочие неуспехи — временный Session, ретрай легитимен
+        use uwuwu_usecase::UsecaseError;
+        assert!(OpencodeClient::check_session(reqwest::StatusCode::OK, "prompt s").is_ok());
+        let lost =
+            OpencodeClient::check_session(reqwest::StatusCode::NOT_FOUND, "prompt s").unwrap_err();
+        assert!(matches!(lost, UsecaseError::SessionNotFound(_)));
+        let lost400 = OpencodeClient::check_session(reqwest::StatusCode::BAD_REQUEST, "prompt s")
+            .unwrap_err();
+        assert!(matches!(lost400, UsecaseError::SessionNotFound(_)));
+        let transient = OpencodeClient::check_session(reqwest::StatusCode::BAD_GATEWAY, "prompt s")
+            .unwrap_err();
+        assert!(
+            matches!(transient, UsecaseError::Session(_)),
+            "не 404/400 — временный класс, не dead-session"
+        );
+        // класс виден агенту в тексте (gherr-стиль ADR-110)
+        assert!(lost.to_string().contains("dead-session"));
     }
 
     #[test]

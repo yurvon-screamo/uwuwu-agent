@@ -834,5 +834,132 @@ kill "$SRV_PID" 2>/dev/null || true; wait "$SRV_PID" 2>/dev/null || true; SRV_PI
 sleep 1
 say "фаза 11 ок: фантом → громкий отказ, честный носитель → успех без маркера"
 
+say "фаза 12: lost-сессия #1288 — десинк (доставка 404 при живом списке) → счётчик → Needs attention"
+# Стек фазы 11 вычищен её хвостом; свой state. AFTER=1: начальный
+# спавн-промпт успешен, вся дальнейшая доставка (пин агента + prompt)
+# → 404 при живом list — serve-рассинхрон инцидента #16 («проба Alive,
+# доставка отказывает»). Потеря по сталл-пути (age-ручка): инцидент #16
+# ретраил именно сталл-пинг (тик-интервал).
+kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+SRV_PID=""; MOCK_PID=""
+sleep 1
+rm -f "$STATE"
+LOG_SRV_LOST="$RUN_DIR/server-lost.log"
+MOCK_MODE=plain MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=1500 MOCK_PROMPT_404_AFTER=1 \
+  "$BIN_MOCK" >"$LOG_MOCK" 2>&1 &
+MOCK_PID=$!
+sleep 1
+UWUWU_SERVER_CONFIG=$CONFIG UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
+  UWUWU_SERVER_MODE=live \
+  UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
+  UWUWU_MOCK_SEED="$SEED_N:In Progress" RUST_LOG=info \
+  "$BIN_SRV" >"$LOG_SRV_LOST" 2>&1 &
+SRV_PID=$!
+SEEN=0
+while [ $SEEN -lt 12 ]; do
+  SEEN=$((SEEN + 1)); sleep 5
+  grep -q '"event":"spawn.done","number":'$SEED_N "$LOG_SRV_LOST" && break
+done
+grep -q '"event":"spawn.done","number":'$SEED_N "$LOG_SRV_LOST" \
+  || fail "спавна dev-сессии нет (стенд не поднялся): лог $LOG_SRV_LOST"
+# сессия «замерла» 31+ минут назад → сталл-пинг на каждом тике
+# (mark_stall_ping при Err не пишется) — доставка 404 раз за тик
+LOST_SESSION=$(grep -oE '"session":"ses_mock[0-9a-f]+"' "$LOG_SRV_LOST" | head -1 | cut -d'"' -f4)
+[ -n "$LOST_SESSION" ] || fail "session id спавна не найден в логе"
+curl -s --max-time 5 -X POST "http://127.0.0.1:$PORT_MOCK/api/session/$LOST_SESSION/age" \
+  -H 'Content-Type: application/json' -d '{"ms": 1900000}' >/dev/null
+# порог 3 подряд → lost.escalated
+SEEN=0
+while [ $SEEN -lt 18 ]; do
+  SEEN=$((SEEN + 1)); sleep 5
+  grep -q '"event":"lost.escalated"' "$LOG_SRV_LOST" && break
+done
+grep -q '"event":"lost.escalated"' "$LOG_SRV_LOST" \
+  || fail "нет lost.escalated за 90с (десинк-парковка не сработала)"
+S="$(task_status)"
+case "$S" in
+  *attention*|*Needs*) say "строка запаркована: $S" ;;
+  *) fail "строка не в Needs attention после lost.escalated: $S" ;;
+esac
+mcp task_get "{\"number\":$SEED_N}" | grep -q 'Сессия потеряна' \
+  || fail "нет коммента с причиной парковки на строке"
+# анти-дубль: respawn при живом списке запрещён — спавн ровно один
+SPAWNS=$(grep -c '"event":"spawn.done"' "$LOG_SRV_LOST" || true)
+[ "$SPAWNS" -eq 1 ] || fail "анти-дубль сломан: спавнов $SPAWNS (ожидается 1)"
+grep -q '"event":"delivery.session_lost"' "$LOG_SRV_LOST" \
+  || fail "нет события delivery.session_lost (классификация не работает)"
+# петля остановлена: после парковки новых lost-доставок нет
+sleep 21
+LOST_TOTAL=$(grep -c '"event":"delivery.session_lost"' "$LOG_SRV_LOST" || true)
+[ "$LOST_TOTAL" -le 4 ] || fail "ретрай-петля не остановлена после парковки: lost-доставок $LOST_TOTAL"
+kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+SRV_PID=""; MOCK_PID=""
+sleep 1
+say "фаза 12 ок: доставка 404 при живом списке — счётчик 3, парковка с причиной, respawn запрещён, петля остановлена"
 
-say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + мульти-экзекьютор + гард #1163 + self-эхо + слепой hold #1263 + преемпшен CUP #1259 + клин #1293 + дример #1306 + phantom-квитанции #1331); логи: $RUN_DIR"
+say "фаза 13: lost-resurrection #1288 — сессия скрыта из list, доставка 404 → respawn-петля"
+# lost-ручка (POST /api/lost, включается ПОСЛЕ спавна): сессия ячейки
+# скрыта из list, GET 200 (probe Alive), prompt/switch_agent → 404.
+# lost-рука видит «сессии нет в списке» → resurrection гвардами
+# Dead-ветки; 404 свежих спавнов — сирота-делит (анти-ре-энтри),
+# луп-гвард >4 паркует («Респавн-петля», юнит-класс T2 живьём).
+rm -f "$STATE"
+LOG_SRV_LRES="$RUN_DIR/server-lres.log"
+MOCK_MODE=plain MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=1500 \
+  "$BIN_MOCK" >"$LOG_MOCK" 2>&1 &
+MOCK_PID=$!
+sleep 1
+UWUWU_SERVER_CONFIG=$CONFIG UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
+  UWUWU_SERVER_MODE=live \
+  UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
+  UWUWU_MOCK_SEED="$SEED_N:In Progress" RUST_LOG=info \
+  "$BIN_SRV" >"$LOG_SRV_LRES" 2>&1 &
+SRV_PID=$!
+SEEN=0
+while [ $SEEN -lt 12 ]; do
+  SEEN=$((SEEN + 1)); sleep 5
+  grep -q '"event":"spawn.done","number":'$SEED_N "$LOG_SRV_LRES" && break
+done
+grep -q '"event":"spawn.done","number":'$SEED_N "$LOG_SRV_LRES" \
+  || fail "спавна нет в lost-resurrection-фазе: лог $LOG_SRV_LRES"
+curl -s --max-time 5 -X POST "http://127.0.0.1:$PORT_MOCK/api/lost" \
+  -H 'Content-Type: application/json' \
+  -d "{\"directory\": \"/home/yurvon/agents-env/$SEED_N\"}" >/dev/null
+LOST_SESSION=$(grep -oE '"session":"ses_mock[0-9a-f]+"' "$LOG_SRV_LRES" | head -1 | cut -d'"' -f4)
+curl -s --max-time 5 -X POST "http://127.0.0.1:$PORT_MOCK/api/session/$LOST_SESSION/age" \
+  -H 'Content-Type: application/json' -d '{"ms": 1900000}' >/dev/null
+SEEN=0
+while [ $SEEN -lt 24 ]; do
+  SEEN=$((SEEN + 1)); sleep 5
+  grep -q '"event":"respawn.loop_escalated"' "$LOG_SRV_LRES" && break
+done
+grep -q '"event":"respawn.loop_escalated"' "$LOG_SRV_LRES" \
+  || fail "нет respawn.loop_escalated за 120с (lost-resurrection не вошла в луп-гвард)"
+grep -q '"event":"delivery.session_lost"' "$LOG_SRV_LRES" \
+  || fail "нет delivery.session_lost (lost-рука не маршрутизировала?)"
+S="$(task_status)"
+case "$S" in
+  *attention*|*Needs*) say "луп-гвард запарковал: $S" ;;
+  *) fail "строка не в Needs attention после respawn-петли: $S" ;;
+esac
+mcp task_get "{\"number\":$SEED_N}" | grep -q 'Респавн-петля' \
+  || fail "нет коммента «Респавн-петля» на строке"
+# анти-ре-энтри: одна respawn-попытка за тик — create/delete пары чисты
+# (bootstrap+work пары + сироты; deleted = created - живые work-сессии)
+CREATED=$(grep -c '"event":"mock.session_created"' "$LOG_MOCK" || true)
+DELETED=$(grep -c '"event":"mock.session_deleted"' "$LOG_MOCK" || true)
+[ "$DELETED" -ge 4 ] || fail "сироты не делитятся (deleted: $DELETED)"
+[ "$CREATED" -eq "$((DELETED + 1))" ] \
+  || fail "рассинхрон create/delete: created=$CREATED deleted=$DELETED"
+DEADS=$(grep -c '"event":"wakeup.dead_session"' "$LOG_SRV_LRES" || true)
+[ "$DEADS" -ge 4 ] || fail "resurrection-попыток меньше порога: $DEADS"
+kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+SRV_PID=""; MOCK_PID=""
+sleep 1
+say "фаза 13 ок: lost-resurrection через lost-руку, луп-гвард парковал, сироты чисты, попытка одна за тик"
+
+
+say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + мульти-экзекьютор + гард #1163 + self-эхо + слепой hold #1263 + преемпшен CUP #1259 + клин #1293 + дример #1306 + phantom-квитанции #1331 + lost-сессия #1288: десинк-парковка + lost-resurrection); логи: $RUN_DIR"
