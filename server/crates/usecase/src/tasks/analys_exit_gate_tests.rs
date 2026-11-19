@@ -50,6 +50,10 @@ impl TaskBoardRepo for GateBoard {
         Ok(())
     }
 
+    async fn row_exists(&self, _b: &str, _n: u64) -> UsecaseResult<bool> {
+        Ok(true)
+    }
+
     async fn set_board_cells(
         &self,
         _b: &str,

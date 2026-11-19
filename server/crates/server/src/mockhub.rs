@@ -239,6 +239,19 @@ impl TaskBoardRepo for MemoryHub {
                 .map(|t| t.status()))
         })
     }
+    async fn row_exists(&self, board: &str, number: u64) -> UsecaseResult<bool> {
+        self.with_state(|state| {
+            self.ensure_seed(state);
+            Ok(state
+                .tasks
+                .get(&number)
+                .filter(|t| match state.board_tags.get(&t.number()) {
+                    Some(tag) => tag == board,
+                    None => true,
+                })
+                .is_some())
+        })
+    }
 
     async fn set_session(
         &self,
@@ -663,6 +676,45 @@ mod tests {
             .await
             .expect("чтение без тега");
         assert_eq!(any, Some(Status::InProgress));
+    }
+
+    #[tokio::test]
+    async fn row_exists_respects_board_tag_and_absent_rows() {
+        // Pv2-путь close() (#1236): поиск доски строки — предикат
+        // присутствия (строка без читаемого Status всё ещё строка),
+        // борд-уважение — как у row_status (#1235 Low-1), мисса — false.
+        let hub = MemoryHub::with_seeds(vec![SeedRow {
+            board: Some("Задачи uwuwu".into()),
+            number: 11,
+            status: Status::Analys,
+            priority: Priority::Empty,
+            days_closed: 0,
+        }]);
+        assert!(
+            hub.row_exists("Задачи uwuwu", 11)
+                .await
+                .expect("чтение своей доски"),
+            "строка своей доски — true"
+        );
+        assert!(
+            !hub.row_exists("Задачи origa", 11)
+                .await
+                .expect("чтение чужой доски"),
+            "номер другой доски — не наша строка"
+        );
+        assert!(
+            !hub.row_exists("Задачи uwuwu", 99).await.expect("мисса"),
+            "несуществующая строка — false"
+        );
+        // строка без тега видна на любой доске стенда (паритет row_status)
+        let hub_free = MemoryHub::with_seed(Some((7, Status::InProgress)));
+        assert!(
+            hub_free
+                .row_exists("какая-то доска", 7)
+                .await
+                .expect("чтение без тега"),
+            "строка без тега — на любой доске"
+        );
     }
 
     #[tokio::test]
