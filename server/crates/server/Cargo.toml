@@ -18,8 +18,10 @@ uwuwu-domain = { path = "../domain" }
 uwuwu-usecase = { path = "../usecase" }
 async-trait = { workspace = true }
 axum = { workspace = true }
+base64 = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
+rusty-s3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

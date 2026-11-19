@@ -424,10 +424,13 @@ impl TaskWriter for TaskWriteUseCase {
     async fn close(&self, number: u64, not_planned: bool) -> UsecaseResult<()> {
         // доска строки резолвится по всему конфигу (мультиборд, #1135):
         // вердикт аналитика «дубль/мусор → close» обязан работать на любой
-        // доске волны, не только на первой (пин живого прогона)
+        // доске волны, не только на первой (пин живого прогона).
+        // Поиск — row_exists (носитель), не read_board (#1236): close
+        // не тянет GraphQL-снапшот при исчерпанном GraphQL-бакете.
+        // Предикат присутствия строки, не читаемости статуса (ревью 1
+        // Common-2): строка без Status-поля/в лаге закрывается как прежде.
         for (_, board) in &self.boards {
-            let rows = self.board.read_board(board).await?;
-            if rows.iter().any(|t| t.number() == number) {
+            if self.board.row_exists(board, number).await? {
                 self.board.set_status(board, number, Status::Done).await?;
                 return self.board.close_issue_ext(number, not_planned).await;
             }
@@ -555,6 +558,10 @@ mod tests {
     impl TaskBoardRepo for FakeBoard {
         async fn row_status(&self, _board: &str, _number: u64) -> UsecaseResult<Option<Status>> {
             Ok(None)
+        }
+
+        async fn row_exists(&self, _board: &str, _number: u64) -> UsecaseResult<bool> {
+            Ok(false)
         }
 
         async fn read_board(&self, _board: &str) -> UsecaseResult<Vec<Task>> {

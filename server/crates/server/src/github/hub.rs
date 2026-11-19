@@ -4,6 +4,7 @@
 //! (fields.rs). Тело задачи — чистый контент.
 
 use super::fields::{parse_field_values, Fields, IssueFields};
+use super::pv2::Pv2Rest;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -15,6 +16,10 @@ pub struct GitHubHub {
     repo: String,
     token: String,
     http: reqwest::Client,
+    /// Pv2 REST-мутации статусов и их пре-чтения (#1236): развод
+    /// независимых GraphQL/REST бакетов — вердикт-статус не зависит
+    /// от GraphQL-квоты (инстанс 16.11: task_edit падал при живом REST).
+    pv2: Pv2Rest,
     /// Нативные поля issue (сессии/ветка/PR/тип).
     pub fields: Arc<IssueFields>,
     /// TTL-кеш снапшотов досок (#1243): мутации одного тика шарят снимок —
@@ -69,20 +74,20 @@ const MAX_PAGES: usize = 10;
 /// TTL-кеш значений по ключу (#1243): цена обращения к GitHub GraphQL
 /// высока (полный снимок доски — сотни поинтов), а данные между тиками
 /// меняются редко. `now` прокидывается для тестируемости.
-struct TtlCache<T> {
+pub(crate) struct TtlCache<T> {
     ttl: std::time::Duration,
     cells: std::sync::RwLock<std::collections::HashMap<String, (std::time::Instant, Arc<T>)>>,
 }
 
 impl<T> TtlCache<T> {
-    fn new(ttl: std::time::Duration) -> Self {
+    pub(crate) fn new(ttl: std::time::Duration) -> Self {
         Self {
             ttl,
             cells: std::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
-    fn get(&self, key: &str, now: std::time::Instant) -> Option<Arc<T>> {
+    pub(crate) fn get(&self, key: &str, now: std::time::Instant) -> Option<Arc<T>> {
         let guard = self.cells.read().expect("ttl cache lock");
         match guard.get(key) {
             Some((at, v)) if now.duration_since(*at) < self.ttl => Some(v.clone()),
@@ -90,7 +95,7 @@ impl<T> TtlCache<T> {
         }
     }
 
-    fn put(&self, key: &str, value: T, now: std::time::Instant) -> Arc<T> {
+    pub(crate) fn put(&self, key: &str, value: T, now: std::time::Instant) -> Arc<T> {
         let arc = Arc::new(value);
         self.cells
             .write()
@@ -100,7 +105,7 @@ impl<T> TtlCache<T> {
     }
 
     /// Точечный сброс ключа: мутация доски — read-your-writes (#1235).
-    fn invalidate(&self, key: &str) {
+    pub(crate) fn invalidate(&self, key: &str) {
         self.cells.write().expect("ttl cache lock").remove(key);
     }
 
@@ -136,12 +141,40 @@ fn gh_tagged(fail: &crate::gherr::GhFail) -> UsecaseError {
     UsecaseError::Board(format!("gh graphql [{kind}]: {fail}"))
 }
 
-/// Rate-limit отказ транспорта: только собственный тег gql-точки,
+/// Rate-limit отказ транспорта: только собственные теги gql/pv2-точек,
 /// не строковые эвристики по текстам GitHub.
 fn is_rate_limited(e: &UsecaseError) -> bool {
+    let text = e.to_string().to_lowercase();
+    text.contains("gh graphql [rate_limited]") || text.contains("gh rest [rate_limited]")
+}
+
+/// Транспортный флап gql-точки (обрыв соединения, усечение тела, не-JSON,
+/// 5xx): единый тег [TRANSPORT] в тексте отказа (#1330) — по паттерну
+/// gh_tagged/is_rate_limited, не строковые эвристики по текстам GitHub.
+fn gh_transport_tagged(detail: String) -> UsecaseError {
+    UsecaseError::Board(format!("gh graphql [TRANSPORT]: {detail}"))
+}
+
+/// Транспортный класс отказа gql-чтения: тег [TRANSPORT] — контракт;
+/// rate limit/permission и сырые не-тегированные тексты классом не считаются.
+fn is_transport_flap(e: &UsecaseError) -> bool {
     e.to_string()
         .to_lowercase()
-        .contains("gh graphql [rate_limited]")
+        .contains("gh graphql [transport]")
+}
+
+/// Политика короткого ретрая чтения (#1330): разовый транспортный флап —
+/// одна повторная попытка после паузы; rate limit/permission (ADR-110),
+/// graphql errors и исчерпание попыток — Err наверх как есть. Константы
+/// кода сознательно (прецедент #1281): всего 2 попытки, пауза 3 сек.
+const TRANSPORT_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_secs(3);
+const TRANSPORT_RETRY_ATTEMPTS: u32 = 2;
+
+fn retry_after_flap(e: &UsecaseError, attempt: u32) -> Option<std::time::Duration> {
+    if attempt >= TRANSPORT_RETRY_ATTEMPTS || !is_transport_flap(e) {
+        return None;
+    }
+    Some(TRANSPORT_RETRY_PAUSE)
 }
 
 #[derive(Default, Clone)]
@@ -149,13 +182,17 @@ struct BoardMeta {
     project_id: String,
     status_field_id: String,
     options: std::collections::HashMap<String, String>,
+    /// issue number → GraphQL node id строки (PVTI_): путь данных
+    /// archive_row (#1293) — мутационная мета снапшота.
     items: std::collections::HashMap<u64, String>,
 }
 
 impl GitHubHub {
     pub fn new(repo: String, token: String) -> Self {
+        let pv2 = Pv2Rest::new(repo.clone(), token.clone());
         Self {
             fields: Arc::new(IssueFields::new(repo.clone(), token.clone())),
+            pv2,
             repo,
             token,
             http: reqwest::Client::builder()
@@ -205,23 +242,26 @@ impl GitHubHub {
             .json(&json!({ "query": query, "variables": variables }))
             .send()
             .await
-            .map_err(|e| UsecaseError::Board(format!("graphql transport: {e}")))?;
+            .map_err(|e| gh_transport_tagged(format!("сбой соединения: {e}")))?;
         let status = resp.status();
         let headers = resp.headers().clone();
         let text = resp
             .text()
             .await
-            .map_err(|e| UsecaseError::Board(format!("graphql body: {e}")))?;
+            .map_err(|e| gh_transport_tagged(format!("обрыв чтения ответа: {e}")))?;
         if let Some(fail) = crate::gherr::classify(status, &headers) {
             return Err(gh_tagged(&fail));
         }
         let body: Value = serde_json::from_str(&text)
-            .map_err(|e| UsecaseError::Board(format!("graphql не-JSON (HTTP {status}): {e}")))?;
+            .map_err(|e| gh_transport_tagged(format!("не-JSON (HTTP {status}): {e}")))?;
         if !status.is_success() {
-            return Err(UsecaseError::Board(format!(
-                "gh api {status}: {}",
-                trunc(&text)
-            )));
+            // 5xx — транспортный класс (#1330: 502/503/504 с валидным телом
+            // ретраятся наравне с обрывами); прочие не-успехи — как раньше
+            return Err(if status.is_server_error() {
+                gh_transport_tagged(format!("HTTP {status}: {}", trunc(&text)))
+            } else {
+                UsecaseError::Board(format!("gh api {status}: {}", trunc(&text)))
+            });
         }
         if let Some(errors) = body.get("errors") {
             // rate limit: детект — одна точка gherr (оба формата GitHub:
@@ -243,6 +283,31 @@ impl GitHubHub {
         body.get("data")
             .cloned()
             .ok_or_else(|| UsecaseError::Board("graphql: нет data".into()))
+    }
+
+    /// Чтение gql с коротким ретраем (#1330): разовый транспортный флап
+    /// (502/обрыв/усечение) не роняет тик. Только идемпотентные чтения —
+    /// мутации зовут gql() напрямую: 502 после успешного применения =
+    /// риск двойного применения. Rate limit/permission не ретраятся
+    /// (ADR-110: немедленный громкий Err), gql_block не задет.
+    async fn gql_retrying(&self, query: &str, variables: Value) -> UsecaseResult<Value> {
+        match self.gql(query, variables.clone()).await {
+            Ok(data) => Ok(data),
+            Err(first) => match retry_after_flap(&first, 1) {
+                None => Err(first),
+                Some(pause) => {
+                    tracing::warn!(
+                        event = "gql.transport_retry",
+                        pause_secs = pause.as_secs(),
+                        error = %first,
+                        "транспортный флап gql-чтения — короткий ретрай (#1330)"
+                    );
+                    tokio::time::sleep(pause).await;
+                    // вторая попытка — последняя: её Err наверх как есть
+                    self.gql(query, variables).await
+                }
+            },
+        }
     }
 
     async fn rest(
@@ -316,7 +381,7 @@ impl GitHubHub {
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_PAGES {
             let data = self
-                .gql(
+                .gql_retrying(
                     QUERY,
                     json!({ "owner": owner, "name": name, "board": board, "after": cursor }),
                 )
@@ -405,7 +470,7 @@ impl GitHubHub {
             .split_once('/')
             .ok_or_else(|| UsecaseError::Board(format!("repo: {}", self.repo)))?;
         let data = self
-            .gql(
+            .gql_retrying(
                 q,
                 json!({ "owner": owner, "name": name, "n": number as i64 }),
             )
@@ -424,56 +489,9 @@ impl GitHubHub {
         Ok(String::new())
     }
 
-    /// Статусный value строки КОНКРЕТНОЙ доски (project-фильтр по тайтлу):
-    /// None — строки нет на этой доске; Some("") — есть, но Status не задан.
-    /// Против board_status_fetch, который берёт Status первой попавшейся
-    /// привязки (#1235 Low-1).
-    async fn carrier_status(&self, board: &str, number: u64) -> UsecaseResult<Option<String>> {
-        let q = r#"
-          query($owner:String!,$name:String!,$n:Int!){
-            repository(owner:$owner,name:$name){
-              issue(number:$n){
-                projectItems(first:10){
-                  nodes{
-                    project{ title }
-                    fieldValues(first:20){ nodes{
-                      __typename ...on ProjectV2ItemFieldSingleSelectValue{
-                        name field{ ...on ProjectV2FieldCommon{ name } } } } }
-                  }
-                }
-              }
-            }
-          }"#;
-        let (owner, name) = self
-            .repo
-            .split_once('/')
-            .ok_or_else(|| UsecaseError::Board(format!("repo: {}", self.repo)))?;
-        let data = self
-            .gql(
-                q,
-                json!({ "owner": owner, "name": name, "n": number as i64 }),
-            )
-            .await?;
-        let Some(items) = data["repository"]["issue"]["projectItems"]["nodes"].as_array() else {
-            return Ok(None);
-        };
-        for item in items {
-            if item["project"]["title"].as_str() != Some(board) {
-                continue;
-            }
-            let Some(vals) = item["fieldValues"]["nodes"].as_array() else {
-                return Ok(Some(String::new()));
-            };
-            for v in vals {
-                if v["field"]["name"].as_str() == Some("Status") {
-                    return Ok(Some(v["name"].as_str().unwrap_or_default().to_string()));
-                }
-            }
-            return Ok(Some(String::new()));
-        }
-        Ok(None)
-    }
-
+    /// Статусный value строки КОНКРЕТНОЙ доски читает Pv2Rest
+    /// (pv2::read_status — гард-семантика с write-through); прежний
+    /// GraphQL carrier_status снён с переводом гард-пути на REST (#1236).
     /// Сброс снимка доски: мутация могла изменить строки/мету (#1235).
     fn invalidate_snapshot(&self, board: &str) {
         self.snap_cache.invalidate(board);
@@ -540,17 +558,28 @@ impl GitHubHub {
         self.snap_cache.put(board, (rows, meta), now);
     }
 
-    /// Контрольное чтение после мутации статуса (семья #1213): до 3
-    /// попыток с паузой 1 с. Rate limit — ретраи не продолжаются
-    /// (мутация принята GitHub); сетевой сбой и рассогласование —
-    /// полный цикл, дальше громкий отказ.
-    async fn verify_status(&self, number: u64, expected: Status) -> VerifyOutcome {
+    /// Контрольное чтение после мутации статуса (семья #1213): ответ
+    /// мутации с искомым значением — быстрый путь без доп. запросов;
+    /// иначе до 3 чтений НОСИТЕЛЯ (мимо write-through — иначе verify
+    /// самоподтверждался бы собственной записью) с паузой 1 с.
+    /// Rate limit — ретраи не продолжаются (мутация принята GitHub);
+    /// сетевой сбой и рассогласование — полный цикл, дальше громкий отказ.
+    async fn verify_status(
+        &self,
+        board: &str,
+        number: u64,
+        expected: Status,
+        confirmed: Option<String>,
+    ) -> VerifyOutcome {
+        if confirmed.as_deref() == Some(uwuwu_usecase::status_name(expected)) {
+            return VerifyOutcome::Ok;
+        }
         for attempt in 0..3 {
             if attempt > 0 {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
-            match self.board_status_fetch(number).await {
-                Ok(fetched) if uwuwu_usecase::parse_status(&fetched) == expected => {
+            match self.pv2.fetch_status(board, number).await {
+                Ok(Some(raw)) if uwuwu_usecase::parse_status(&raw) == expected => {
                     return VerifyOutcome::Ok;
                 }
                 Err(e) if is_rate_limited(&e) => return VerifyOutcome::SkippedRateLimited,
@@ -584,6 +613,9 @@ impl GitHubHub {
             VerifyOutcome::Mismatch => {
                 self.invalidate_snapshot(board);
                 self.status_cache.invalidate(&number.to_string());
+                // write-through Pv2Rest — тот же инвариант: возможно-ложное
+                // значение не доживает TTL-окно (ревью 1 Common-3)
+                self.pv2.invalidate_status(board, number);
                 return Err(UsecaseError::Board(format!(
                     "статус #{number}: запись «{}» не подтвердилась чтением — \
                      GitHub отдаёт лаг или мутация не применилась; не ретраить слепо",
@@ -770,70 +802,50 @@ impl TaskBoardRepo for GitHubHub {
     }
 
     async fn set_status(&self, board: &str, number: u64, status: Status) -> UsecaseResult<()> {
-        let snap = self.snapshot(board).await?;
-        // last-known статус строки на момент мутации — для ребра в логах
-        // (Low-2 код-ревью #1235; значение со снапшота, может быть стэйл)
-        let from = snap
-            .0
-            .iter()
-            .find(|t| t.number() == number)
-            .map(|t| uwuwu_usecase::status_name(t.status()).to_string());
-        let option = snap
-            .1
-            .options
-            .get(uwuwu_usecase::status_name(status))
-            .cloned()
-            .ok_or_else(|| {
-                UsecaseError::Board(format!(
-                    "Status-опция «{}» не найдена",
-                    uwuwu_usecase::status_name(status)
-                ))
-            })?;
-        let item = snap.1.items.get(&number).cloned().ok_or_else(|| {
-            UsecaseError::Board(format!("строка #{number} не на доске «{board}»"))
-        })?;
-        let mutation = r#"
-          mutation($p:ID!,$i:ID!,$f:ID!,$o:String!){
-            updateProjectV2ItemFieldValue(input:{
-              projectId:$p, itemId:$i, fieldId:$f, value:{singleSelectOptionId:$o}
-            }){ projectV2Item{ id } }
-          }"#;
-        let (project_id, status_field_id) =
-            (snap.1.project_id.clone(), snap.1.status_field_id.clone());
-        self.gql(
-            mutation,
-            json!({ "p": project_id, "i": item, "f": status_field_id, "o": option }),
-        )
-        .await?;
-        // read-your-writes (#1235): собственная запись обслуживается кэшем,
-        // а не refetch'ем — read-лаг Projects v2 минутного масштаба не виден.
+        let name = uwuwu_usecase::status_name(status);
+        // last-known статус строки — для ребра в логах (Low-2 код-ревью
+        // #1235); источник — локальный статусный кеш, GraphQL не тратим
+        let from = self
+            .status_cache
+            .get(&number.to_string(), std::time::Instant::now())
+            .map(|raw| raw.as_str().to_string());
+        // мутация — REST ProjectsV2 (#1236); write-through Pv2Rest
+        // обслуживает повторный гард в окне read-лага носителя
+        let confirmed = self.pv2.set_status(board, number, name).await?;
+        // read-your-writes (#1235): собственная запись обслуживается кэшами,
+        // read-лаг Projects v2 минутного масштаба не виден.
         self.write_through_status(board, number, status);
         self.write_through_status_cache(number, status);
-        // verify-after-write (семья #1213): мутация либо подтверждена
-        // чтением, либо громкая ошибка с откатом write-through.
-        let outcome = self.verify_status(number, status).await;
+        // verify-after-write (семья #1213): ответ мутации — быстрый путь,
+        // иначе до 3 чтений носителя; rate limit — ретраи не продолжаются.
+        let outcome = self.verify_status(board, number, status, confirmed).await;
         self.settle_write_through(board, number, outcome, status)?;
         tracing::info!(
             event = "board.set_status",
             board,
             number,
             from = from.as_deref().unwrap_or("—"),
-            to = %uwuwu_usecase::status_name(status),
-            "Статус строки обновлён и подтверждён чтением (from — last-known со снапшота)"
+            to = %name,
+            "Статус строки обновлён и подтверждён чтением (from — last-known из кеша)"
         );
         Ok(())
     }
 
     async fn row_status(&self, board: &str, number: u64) -> UsecaseResult<Option<Status>> {
-        // project-фильтр: номер на чужой доске — не наша строка (Low-1
-        // код-ревью #1235), а не «статус этой доски»
-        match self.carrier_status(board, number).await? {
+        // Pv2 REST (#1236): гард канона edit() больше не зависит от
+        // GraphQL-бакета; project-фильтр — индекс этой доски (прочая
+        // привязка строки — не наша строка, Low-1 код-ревью #1235)
+        match self.pv2.read_status(board, number).await? {
             // Status-значения на носителе нет (строка не на доске /
-            // поле не задано); непустое непарсящееся — Some(Empty)
+            // поле не задано / read-лаг); непустое непарсящееся — Some(Empty)
             None => Ok(None),
             Some(raw) if raw.trim().is_empty() => Ok(None),
             Some(raw) => Ok(Some(uwuwu_usecase::parse_status(&raw))),
         }
+    }
+
+    async fn row_exists(&self, board: &str, number: u64) -> UsecaseResult<bool> {
+        Ok(self.pv2.item_id(board, number).await?.is_some())
     }
 
     async fn set_session(
@@ -1012,8 +1024,7 @@ impl TaskBoardRepo for GitHubHub {
         if number == 0 {
             return Err(UsecaseError::Board("create issue: нет номера".into()));
         }
-        let node_id = resp["node_id"].as_str().unwrap_or_default().to_string();
-        self.add_to_board(board, number, &node_id).await?;
+        self.add_to_board(board, number).await?;
         Ok(number)
     }
 
@@ -1173,38 +1184,14 @@ impl GitHubHub {
         self.fields.load(number).await
     }
 
-    async fn add_to_board(&self, board: &str, number: u64, node_id: &str) -> UsecaseResult<()> {
-        let snap = self.snapshot(board).await?;
-        let (project_id, status_field_id, analys) = (
-            snap.1.project_id.clone(),
-            snap.1.status_field_id.clone(),
-            snap.1.options.get("Analys").cloned(),
-        );
-        let mutation = r#"
-          mutation($p:ID!,$c:ID!){ addProjectV2ItemById(input:{projectId:$p, contentId:$c}){
-            item{ id } } }"#;
-        let added = self
-            .gql(mutation, json!({ "p": project_id, "c": node_id }))
-            .await?;
-        let item = added["addProjectV2ItemById"]["item"]["id"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        if item.is_empty() {
-            return Err(UsecaseError::Board(format!("add #{number}: нет item id")));
-        }
-        // create-дефолт Analys (#1135): опция ставится по имени колонки;
-        // колонки нет — строка остаётся без статуса (rollout плана)
-        if let Some(analys) = analys {
-            let set = r#"
-              mutation($p:ID!,$i:ID!,$f:ID!,$o:String!){
-                updateProjectV2ItemFieldValue(input:{projectId:$p,itemId:$i,fieldId:$f,
-                  value:{singleSelectOptionId:$o}}){ projectV2Item{ id } } }"#;
-            self.gql(
-                set,
-                json!({ "p": project_id, "i": item, "f": status_field_id, "o": analys }),
-            )
-            .await?;
+    async fn add_to_board(&self, board: &str, number: u64) -> UsecaseResult<()> {
+        // add + дефолт Analys (#1135) — REST ProjectsV2 (#1236): POST
+        // принимает owner/repo/number, GraphQL node_id issue не нужен;
+        // опция ставится по имени колонки; колонки нет — строка остаётся
+        // без статуса (rollout плана)
+        self.pv2.add_item(board, number).await?;
+        if self.pv2.meta(board).await?.options.contains_key("Analys") {
+            self.pv2.set_status(board, number, "Analys").await?;
         }
         self.invalidate_snapshot(board);
         Ok(())
@@ -1573,6 +1560,82 @@ mod tests {
     }
 
     #[test]
+    fn is_rate_limited_matches_rest_transport_tag() {
+        // Pv2-транспорт ходит REST (#1236): verify-фоллбэк обязан узнавать
+        // тег «gh rest [rate_limited]» (SkippedRateLimited — ретраи не
+        // продолжаются), иначе rate-limit рёбра читались бы как Mismatch.
+        let rest_limited = UsecaseError::Board(
+            "gh rest [RATE_LIMITED]: /users/x/projectsV2/5/items: core quota".into(),
+        );
+        assert!(is_rate_limited(&rest_limited), "REST-тег — тот же класс");
+        let rest_permission = UsecaseError::Board(
+            "gh rest [PERMISSION]: /users/x/projectsV2: HTTP 403 (не rate limit)".into(),
+        );
+        assert!(
+            !is_rate_limited(&rest_permission),
+            "REST Permission — не rate limit"
+        );
+    }
+
+    #[test]
+    fn is_transport_flap_matches_only_owned_tag() {
+        // (#1330) транспортный тег — контракт детектора: чужие классы
+        // (rate limit/permission) и легаси-сырые тексты классом не считаются
+        let transport = gh_transport_tagged("не-JSON (HTTP 502 Bad Gateway): eof".into());
+        assert!(is_transport_flap(&transport));
+        let limited = UsecaseError::Board(
+            "gh graphql [RATE_LIMITED]: GitHub rate limit (core): квота исчерпана".into(),
+        );
+        assert!(
+            !is_transport_flap(&limited),
+            "rate limit — не транспортный класс"
+        );
+        let permission = UsecaseError::Board(
+            "gh graphql [PERMISSION]: HTTP 403 (не rate limit): проверь GH_TOKEN/права токена"
+                .into(),
+        );
+        assert!(
+            !is_transport_flap(&permission),
+            "permission — не транспортный класс"
+        );
+        let legacy = UsecaseError::Board("graphql не-JSON (HTTP 502): eof".into());
+        assert!(
+            !is_transport_flap(&legacy),
+            "сырой текст без тега — не транспортный класс"
+        );
+    }
+
+    #[test]
+    fn transport_retry_policy_retries_once_on_flap_only() {
+        // (#1330) разовый транспортный флап → одна повторная попытка после
+        // паузы; rate limit/permission/graphql errors — без ретрая (ADR-110)
+        let flap = gh_transport_tagged("не-JSON (HTTP 502): eof".into());
+        assert_eq!(
+            retry_after_flap(&flap, 1),
+            Some(std::time::Duration::from_secs(3)),
+            "флап на первой попытке → пауза перед повтором"
+        );
+        assert_eq!(
+            retry_after_flap(&flap, 2),
+            None,
+            "флап на второй попытке → исчерпание, Err наверх как есть"
+        );
+        let limited = UsecaseError::Board("gh graphql [RATE_LIMITED]: бэкофф ещё 4 мин".into());
+        let permission = UsecaseError::Board(
+            "gh graphql [PERMISSION]: HTTP 403 (не rate limit): проверь GH_TOKEN/права токена"
+                .into(),
+        );
+        let graphql_errors = UsecaseError::Board("graphql errors: NOT_FOUND".into());
+        for error in [&limited, &permission, &graphql_errors] {
+            assert_eq!(
+                retry_after_flap(error, 1),
+                None,
+                "чужой класс — немедленный громкий Err без ретрая"
+            );
+        }
+    }
+
+    #[test]
     fn ttl_cache_invalidate_drops_key_only() {
         let cache: TtlCache<u64> = TtlCache::new(std::time::Duration::from_secs(60));
         let now = std::time::Instant::now();
@@ -1611,6 +1674,53 @@ mod tests {
         );
     }
 
+    /// Регресс-пин бага тест-раунда #1236 (19.11, живой прогон): Pv2 REST
+    /// GET items/{id} (и list items) НЕ несёт single-select Status —
+    /// проверено живьём: PATCH-ответ значение возвращает, GET — никогда,
+    /// даже для строк, мутированных дни назад (асимметрия PATCH/GET).
+    /// Контракт: REST-рида носителя (row_status) обязана видеть Status
+    /// строки так же, как GraphQL-снапшот (эталон), — иначе гард edit()
+    /// за окном write-through (60с) отвечает «строки нет на доске» на
+    /// живую строку, и вердикт-переходы конвейера падают. Красный до
+    /// фикса носителя-риды, зелёный после.
+    #[test]
+    #[ignore] // живой прогон: GH_TOKEN + сеть; read-only — снапшот + row_status
+    fn live_row_status_reads_carrier_status_like_snapshot() {
+        let repo =
+            std::env::var("UWUWU_HUB_REPO").unwrap_or_else(|_| "yurvon-screamo/uwuwu-hub".into());
+        let token = std::env::var("GH_TOKEN").expect("GH_TOKEN");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let board = "Задачи uwuwu";
+            let hub = GitHubHub::new(repo, token);
+            let rows = hub
+                .read_board(board)
+                .await
+                .expect("снапшот-эталон (GraphQL)");
+            let (n, expected) = rows
+                .iter()
+                .map(|t| {
+                    (
+                        t.number(),
+                        uwuwu_usecase::status_name(t.status()).to_string(),
+                    )
+                })
+                .find(|(_, s)| !s.trim().is_empty())
+                .expect("на живой доске есть строка с непустым статусом");
+            let via_rest = hub
+                .row_status(board, n)
+                .await
+                .expect("рида носителя не должна падать");
+            assert_eq!(
+                via_rest.map(uwuwu_usecase::status_name),
+                Some(expected.as_str()),
+                "REST-рида носителя слепа к Status: строка #{n} на доске «{board}» \
+                 со статусом «{expected}» (GraphQL-эталон), row_status вернул {via_rest:?} \
+                 — гард edit() отклонит вердикт-переход живой строки"
+            );
+        });
+    }
+
     #[test]
     fn write_through_status_without_snapshot_is_noop() {
         let hub = GitHubHub::new("o/r".into(), "t".into());
@@ -1637,8 +1747,12 @@ mod tests {
             .get("B", std::time::Instant::now())
             .expect("ключ снапшота жив");
         assert_eq!(snap.0.len(), 1, "мусор в снапшот не добавлен");
-        assert_eq!(snap.0[0].number(), 8, "чужие строки не тронуты");
-        assert_eq!(snap.0[0].status(), Status::Todo);
+        assert_eq!(
+            snap.0.first().map(|t| t.number()).unwrap_or_default(),
+            8,
+            "чужие строки не тронуты"
+        );
+        assert_eq!(snap.0.first().map(|t| t.status()), Some(Status::Todo));
     }
 
     #[test]
@@ -1841,12 +1955,12 @@ mod tests {
 
     #[test]
     fn parse_page_marks_closed_done() {
-        let mut meta = BoardMeta::default();
         let items = vec![json!({
             "id": "IT_x",
             "content": { "__typename": "Issue", "number": 7, "title": "t", "state": "closed" },
             "fieldValues": { "nodes": [] }
         })];
+        let mut meta = BoardMeta::default();
         let rows = parse_page(&items, &mut meta);
         assert_eq!(rows[0].status(), Status::Done);
         assert_eq!(meta.items.get(&7).map(String::as_str), Some("IT_x"));

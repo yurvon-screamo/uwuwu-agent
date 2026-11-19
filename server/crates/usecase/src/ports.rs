@@ -23,6 +23,10 @@ pub trait TaskBoardRepo: Send + Sync {
     /// None — Status-значения на носителе нет (строки нет на доске /
     /// поле не задано); Some(Empty) — значение носителя непарсящееся.
     async fn row_status(&self, board: &str, number: u64) -> UsecaseResult<Option<Status>>;
+    /// Предикат присутствия строки на доске — независим от читаемости
+    /// Status (строка без поля/в read-лаге всё ещё строка; close-поиск
+    /// доски #1236).
+    async fn row_exists(&self, board: &str, number: u64) -> UsecaseResult<bool>;
     /// Заявка сессии в слот (claim/спавн-привязка).
     async fn set_session(
         &self,

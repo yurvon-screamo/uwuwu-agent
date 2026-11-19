@@ -178,6 +178,9 @@ impl TaskBoardRepo for RowsBoard {
     async fn row_status(&self, _b: &str, _n: u64) -> UsecaseResult<Option<Status>> {
         Ok(None)
     }
+    async fn row_exists(&self, _b: &str, n: u64) -> UsecaseResult<bool> {
+        Ok(self.rows.iter().any(|t| t.number() == n))
+    }
     async fn set_session(&self, _b: &str, _n: u64, _s: Slot, _sess: &str) -> UsecaseResult<()> {
         Ok(())
     }

@@ -20,6 +20,14 @@ pub enum UsecaseError {
     /// Файл превышает потолок скачивания Bot API (20 MiB) — перманентный
     /// отказ `getFile`, ретрай бессмысленен (#1171).
     TelegramTooBig(String),
+    /// Blob-канал (#1292): отказ S3-носителя (сеть/статус) или ввода.
+    Blob(String),
+    /// Файл превышает потолок blob-канала (20 MiB, прецедент UC-06).
+    BlobTooBig(String),
+    /// Blob-канал не сконфигурирован: не заданы env `UWUWU_S3_*` (#1292).
+    BlobNotConfigured(String),
+    /// Дедуп-ключ blob не прошёл доменный гард `BlobKey` (#1292).
+    BlobBadKey(String),
 }
 
 impl fmt::Display for UsecaseError {
@@ -31,6 +39,10 @@ impl fmt::Display for UsecaseError {
             Self::State(m) => write!(f, "состояние: {m}"),
             Self::Telegram(m) => write!(f, "telegram: {m}"),
             Self::TelegramTooBig(m) => write!(f, "telegram too big: {m}"),
+            Self::Blob(m) => write!(f, "blob: {m}"),
+            Self::BlobTooBig(m) => write!(f, "blob too big: {m}"),
+            Self::BlobNotConfigured(m) => write!(f, "blob не сконфигурирован: {m}"),
+            Self::BlobBadKey(m) => write!(f, "blob bad key: {m}"),
         }
     }
 }

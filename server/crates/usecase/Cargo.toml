@@ -13,6 +13,7 @@ description = "Юзкейсы uwuwu: оркестрация агрегатами
 uwuwu-domain = { path = "../domain" }
 async-trait = { workspace = true }
 serde = { workspace = true }
+sha2 = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

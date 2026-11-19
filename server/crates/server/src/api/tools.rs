@@ -1,9 +1,12 @@
 //! Реестр MCP-инструментов: дескрипторы + диспетчер. Тонкие обёртки
 //! юзкейсов (views) — никакой бизнес-логики в presentation.
 
+use base64::Engine as _;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use uwuwu_usecase::{DocsView, PersonView, TaskView, TaskWriteUseCase, TaskWriter};
+use uwuwu_usecase::{
+    BlobPlace, BlobUseCase, DocsView, PersonView, TaskView, TaskWriteUseCase, TaskWriter,
+};
 
 pub struct ToolHub {
     pub tasks: Arc<TaskView>,
@@ -15,6 +18,8 @@ pub struct ToolHub {
     pub sessions: Arc<uwuwu_usecase::SessionRouter>,
     pub search: Arc<uwuwu_usecase::SearchUseCase>,
     pub crons: Arc<uwuwu_usecase::CronUseCase>,
+    /// Blob-канал (#1292): вложения к задачам/докам через приватный S3.
+    pub blobs: Arc<BlobUseCase>,
 }
 
 /// Дефолтный проект для инструментов без явного project.
@@ -183,6 +188,26 @@ pub fn tool_descriptors() -> Value {
                                     task_get или прошлая квитанция); обязателен")
             }))
         ),
+        tool(
+            "blob_put",
+            "Положить файл в приватный blob-бакет (Tigris) — вложение к \
+             задаче/доку: ключ + presigned-ссылка (TTL 7 суток; истёкшая \
+             переподписывается blob_get по ключу)",
+            object(json!({
+                "filename": string("имя файла с расширением — content-type \
+                                   берётся из него"),
+                "data_base64": string("содержимое файла base64; лимит 20 MiB"),
+                "number": integer("номер задачи: ключ blobs/<project>/<number>/…; \
+                                  без него — сегмент misc"),
+                "project": string("проект; дефолт uwuwu")
+            }))
+        ),
+        tool(
+            "blob_get",
+            "Свежая presigned-ссылка на ранее положенный blob по ключу \
+             (переподпись истёкшей; существование объекта не проверяется)",
+            object(json!({ "key": string("ключ из blob_put (blobs/…)") }))
+        ),
     ])
 }
 
@@ -220,6 +245,8 @@ impl ToolHub {
             "task_close" => self.task_close(args).await,
             "task_body" => self.task_body(args).await,
             "task_body_section" => self.task_body_section(&project, args).await,
+            "blob_put" => self.blob_put(&project, args).await,
+            "blob_get" => self.blob_get(args).await,
             other => Err(format!("unknown tool: {other}")),
         }
     }
@@ -507,6 +534,44 @@ impl ToolHub {
             .map_err(|e| e.to_string())?;
         ok_text(render_section_report(&section, &report))
     }
+
+    async fn blob_put(&self, project: &str, args: &Value) -> Result<Value, String> {
+        require_args(args, &["filename", "data_base64"])?;
+        let filename = arg_str(args, "filename");
+        let data_base64 = arg_str(args, "data_base64");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data_base64.trim())
+            .map_err(|e| format!("data_base64 не декодируется: {e}"))?;
+        let number = optional_number(args)?;
+        let target = BlobPlace {
+            project: project.to_string(),
+            task: number,
+            filename,
+        };
+        let receipt = self
+            .blobs
+            .place(&target, &bytes)
+            .await
+            .map_err(|e| e.to_string())?;
+        ok_text(format!(
+            "ключ: {}\nссылка (TTL 7 суток): {}\n{}; {} байт",
+            receipt.key, receipt.url, receipt.content_type, receipt.size
+        ))
+    }
+
+    async fn blob_get(&self, args: &Value) -> Result<Value, String> {
+        let raw = arg_str(args, "key");
+        if raw.trim().is_empty() {
+            return Err("key обязателен".into());
+        }
+        let key = uwuwu_domain::BlobKey::parse(raw.trim())
+            .ok_or("ключ должен иметь форму blobs/<project>/<task|misc>/<sha8>-<имя>")?;
+        let url = self.blobs.fresh_url(&key).map_err(|e| e.to_string())?;
+        ok_text(format!(
+            "ссылка (TTL 7 суток): {url}\n(существование объекта не проверяется — \
+             подпись локальна; замену ссылки в носителе делай текстовыми тулами)"
+        ))
+    }
 }
 
 fn view_err(e: uwuwu_usecase::ViewError) -> String {
@@ -554,6 +619,18 @@ fn need_number(args: &Value) -> Result<u64, String> {
                 .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
         })
         .ok_or("number обязателен (число)".to_string())
+}
+
+/// Опциональный number: отсутствует/null → None, мусор — громкий отказ.
+fn optional_number(args: &Value) -> Result<Option<u64>, String> {
+    match args.get("number") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            .map(Some)
+            .ok_or("number обязан быть числом".to_string()),
+    }
 }
 
 /// Квитанция секционной правки для агента: исход + новое тело (хэш/размер).
@@ -618,6 +695,8 @@ mod tests {
             "task_close",
             "task_body",
             "task_body_section",
+            "blob_put",
+            "blob_get",
             "docs_ls",
             "docs_read",
             "docs_write",
@@ -631,7 +710,7 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "нет инструмента {expected}");
         }
-        assert_eq!(names.len(), 19, "контракт поверхности: {names:?}");
+        assert_eq!(names.len(), 21, "контракт поверхности: {names:?}");
     }
 
     #[test]

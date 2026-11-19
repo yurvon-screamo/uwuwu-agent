@@ -21,6 +21,7 @@ mod gitea_tests;
 mod github;
 mod mockhub;
 mod prgate;
+mod s3;
 mod search;
 mod state;
 mod tg;
@@ -189,6 +190,31 @@ fn build_sessions(
     Ok((raw_default, router))
 }
 
+/// Blob-канал (#1292): приватный бакет Tigris через env UWUWU_S3_*.
+/// Частично заданы — тулы дают громкий отказ с перечнем недостающих
+/// (ADR-010); кривые значения — громкая ошибка старта через Result
+/// (конвенция бута main → BootError, без panic в бут-пути).
+fn build_blob_usecase() -> Result<Arc<uwuwu_usecase::BlobUseCase>, String> {
+    let missing: Vec<String> = s3::S3_ENV_NAMES
+        .iter()
+        .filter(|name| config::non_empty_env(name).is_none())
+        .map(|name| (*name).to_string())
+        .collect();
+    if !missing.is_empty() {
+        return Ok(Arc::new(uwuwu_usecase::BlobUseCase::missing(missing)));
+    }
+    let config = s3::TigrisConfig {
+        // Все пять проверены выше — env не меняется в рантайме.
+        endpoint: config::non_empty_env("UWUWU_S3_ENDPOINT").unwrap_or_default(),
+        region: config::non_empty_env("UWUWU_S3_REGION").unwrap_or_default(),
+        bucket: config::non_empty_env("UWUWU_S3_BUCKET").unwrap_or_default(),
+        access_key: config::non_empty_env("UWUWU_S3_ACCESS_KEY").unwrap_or_default(),
+        secret: config::non_empty_env("UWUWU_S3_SECRET").unwrap_or_default(),
+    };
+    let store = s3::TigrisBlobStore::new(config)?;
+    Ok(Arc::new(uwuwu_usecase::BlobUseCase::ready(Arc::new(store))))
+}
+
 async fn run(
     cfg: Config,
     secrets: config::Secrets,
@@ -343,7 +369,11 @@ async fn run(
         semantic: semantic_backend.clone(),
     });
 
+    // Blob-канал (#1292): сборка из env — см. build_blob_usecase.
+    let blobs_usecase = build_blob_usecase()?;
+
     let tool_hub = Arc::new(api::ToolHub {
+        blobs: blobs_usecase,
         tasks: task_view,
         docs: Arc::new(uwuwu_usecase::DocsView::new(wiki.clone())),
         person: Arc::new(uwuwu_usecase::PersonView::new(wiki.clone())),
