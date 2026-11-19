@@ -220,7 +220,7 @@ impl BotAssetStore for FakeAssets {
         if self.fail.load(Ordering::SeqCst) {
             return Err(UsecaseError::Board("fake assets: put refused".into()));
         }
-        let url = format!("memory://assets/bots/{bot}/asset");
+        let url = format!("memory://docs/bot/{bot}/asset");
         self.puts.lock().expect("assets lock").push((
             url.clone(),
             kind,
@@ -520,7 +520,9 @@ impl Clock for FakeClock {
 
 // ---------- хелперы ----------
 
-const SLUG: &str = "Projects/uwuwu/Боты/проба";
+const SLUG: &str = "bot/проба";
+/// Слаг дока в FakeWiki: скан супервизора читает bot/<имя>/README.md (#1214).
+const DOC_SLUG: &str = "bot/проба/README";
 
 // ---------- ловушка tracing-событий (#1275) ----------
 
@@ -1179,7 +1181,7 @@ async fn fresh_bot_session_marked_forever_for_dreamer() {
 
 #[tokio::test]
 async fn doc_created_spawns_bot_and_survives_ticks() {
-    let wiki = FakeWiki::with_doc(SLUG, &doc_md("p/m", "UWUWU_BOT_TOKEN_T1", "м"));
+    let wiki = FakeWiki::with_doc(DOC_SLUG, &doc_md("p/m", "UWUWU_BOT_TOKEN_T1", "м"));
     let sessions = FakeSessions::new();
     let state = Arc::new(FakeState::default());
     let clock = FakeClock::at(10_000);
@@ -1208,7 +1210,7 @@ async fn doc_created_spawns_bot_and_survives_ticks() {
 
 #[tokio::test]
 async fn doc_removed_stops_bot_keeps_session() {
-    let wiki = FakeWiki::with_doc(SLUG, &doc_md("p/m", "UWUWU_BOT_TOKEN_T2", "м"));
+    let wiki = FakeWiki::with_doc(DOC_SLUG, &doc_md("p/m", "UWUWU_BOT_TOKEN_T2", "м"));
     let sessions = FakeSessions::new();
     let state = Arc::new(FakeState::default());
     let clock = FakeClock::at(10_000);
@@ -1227,7 +1229,7 @@ async fn doc_removed_stops_bot_keeps_session() {
         2000,
     )
     .await;
-    wiki.docs.lock().expect("lock").remove(SLUG); // снос дока
+    wiki.docs.lock().expect("lock").remove(DOC_SLUG); // снос дока
     sup.tick().await.unwrap();
     assert!(!sup.is_running(SLUG), "бот погашен");
     assert!(
@@ -1238,7 +1240,7 @@ async fn doc_removed_stops_bot_keeps_session() {
 
 #[tokio::test]
 async fn model_change_recreates_session_memory_reset() {
-    let wiki = FakeWiki::with_doc(SLUG, &doc_md("p/m1", "UWUWU_BOT_TOKEN_T3", "м"));
+    let wiki = FakeWiki::with_doc(DOC_SLUG, &doc_md("p/m1", "UWUWU_BOT_TOKEN_T3", "м"));
     let sessions = FakeSessions::new();
     let state = Arc::new(FakeState::default());
     let clock = FakeClock::at(10_000);
@@ -1254,7 +1256,7 @@ async fn model_change_recreates_session_memory_reset() {
     sup.tick().await.unwrap();
     wait_until(|| state.bot_session(SLUG).is_some(), 2000).await;
     let old_session = state.bot_session(SLUG).unwrap();
-    wiki.set_doc(SLUG, &doc_md("p/m2", "UWUWU_BOT_TOKEN_T3", "м"));
+    wiki.set_doc(DOC_SLUG, &doc_md("p/m2", "UWUWU_BOT_TOKEN_T3", "м"));
     sup.tick().await.unwrap();
     tg.inject(private_update(2, "yurvon", "второе")); // сессия ленивая — создаётся на сообщении
     let ok = wait_until(
@@ -1275,7 +1277,7 @@ async fn model_change_recreates_session_memory_reset() {
 
 #[tokio::test]
 async fn token_env_change_rearms_keeps_session() {
-    let wiki = FakeWiki::with_doc(SLUG, &doc_md("p/m", "UWUWU_BOT_TOKEN_T4A", "м"));
+    let wiki = FakeWiki::with_doc(DOC_SLUG, &doc_md("p/m", "UWUWU_BOT_TOKEN_T4A", "м"));
     let sessions = FakeSessions::new();
     let state = Arc::new(FakeState::default());
     let clock = FakeClock::at(10_000);
@@ -1294,7 +1296,7 @@ async fn token_env_change_rearms_keeps_session() {
     sup.tick().await.unwrap();
     wait_until(|| state.bot_session(SLUG).is_some(), 2000).await;
     let session = state.bot_session(SLUG).unwrap();
-    wiki.set_doc(SLUG, &doc_md("p/m", "UWUWU_BOT_TOKEN_T4B", "м"));
+    wiki.set_doc(DOC_SLUG, &doc_md("p/m", "UWUWU_BOT_TOKEN_T4B", "м"));
     sup.tick().await.unwrap();
     tg.inject(private_update(2, "yurvon", "второе")); // новая задача получит сообщение
     let ok = wait_until(
@@ -1324,7 +1326,7 @@ async fn token_env_change_rearms_keeps_session() {
 #[tokio::test]
 async fn manual_edit_is_hot_without_restart() {
     let wiki = FakeWiki::with_doc(
-        SLUG,
+        DOC_SLUG,
         &doc_md("p/m", "UWUWU_BOT_TOKEN_T5", "старая методичка"),
     );
     let sessions = FakeSessions::new();
@@ -1345,7 +1347,7 @@ async fn manual_edit_is_hot_without_restart() {
     wait_until(|| !sessions.created.lock().expect("lock").is_empty(), 2000).await;
     let created_before = sessions.created.lock().expect("lock").len();
     wiki.set_doc(
-        SLUG,
+        DOC_SLUG,
         &doc_md("p/m", "UWUWU_BOT_TOKEN_T5", "новая методичка"),
     );
     sup.tick().await.unwrap();
@@ -1371,7 +1373,7 @@ async fn manual_edit_is_hot_without_restart() {
 
 #[tokio::test]
 async fn supervisor_restart_restores_bots_with_memory() {
-    let wiki = FakeWiki::with_doc(SLUG, &doc_md("p/m", "UWUWU_BOT_TOKEN_T6", "м"));
+    let wiki = FakeWiki::with_doc(DOC_SLUG, &doc_md("p/m", "UWUWU_BOT_TOKEN_T6", "м"));
     let sessions = FakeSessions::new();
     let state = Arc::new(FakeState::default());
     let clock = FakeClock::at(10_000);
@@ -1410,7 +1412,7 @@ async fn supervisor_restart_restores_bots_with_memory() {
 
 #[tokio::test]
 async fn missing_token_does_not_spawn() {
-    let wiki = FakeWiki::with_doc(SLUG, &doc_md("p/m", "UWUWU_BOT_TOKEN_T7_MISSING", "м"));
+    let wiki = FakeWiki::with_doc(DOC_SLUG, &doc_md("p/m", "UWUWU_BOT_TOKEN_T7_MISSING", "м"));
     let sessions = FakeSessions::new();
     let state = Arc::new(FakeState::default());
     let clock = FakeClock::at(10_000);
@@ -1432,7 +1434,7 @@ async fn missing_token_does_not_spawn() {
 
 #[tokio::test]
 async fn dead_task_restarts_with_backoff() {
-    let wiki = FakeWiki::with_doc(SLUG, &doc_md("p/m", "UWUWU_BOT_TOKEN_T8", "м"));
+    let wiki = FakeWiki::with_doc(DOC_SLUG, &doc_md("p/m", "UWUWU_BOT_TOKEN_T8", "м"));
     let sessions = FakeSessions::new();
     let state = Arc::new(FakeState::default());
     let clock = FakeClock::at(10_000);
@@ -1465,7 +1467,7 @@ async fn dead_task_restarts_with_backoff() {
 
 #[tokio::test]
 async fn broken_spec_fails_loudly_without_spawn() {
-    let wiki = FakeWiki::with_doc(SLUG, "---\ntitle: битый\n---\nтело без model");
+    let wiki = FakeWiki::with_doc(DOC_SLUG, "---\ntitle: битый\n---\nтело без model");
     let sessions = FakeSessions::new();
     let state = Arc::new(FakeState::default());
     let clock = FakeClock::at(10_000);
@@ -1645,7 +1647,7 @@ async fn manual_hash_save_failure_is_logged() {
 /// бы её, и смена model/workspace к ней не применялась бы).
 #[tokio::test]
 async fn recreate_session_save_failure_is_logged() {
-    let wiki = FakeWiki::with_doc(SLUG, &doc_md("p/m1", "UWUWU_BOT_TOKEN_T9", "м"));
+    let wiki = FakeWiki::with_doc(DOC_SLUG, &doc_md("p/m1", "UWUWU_BOT_TOKEN_T9", "м"));
     let sessions = FakeSessions::new();
     let state = Arc::new(FakeState::default());
     let clock = FakeClock::at(10_000);
@@ -1660,7 +1662,7 @@ async fn recreate_session_save_failure_is_logged() {
     ));
     sup.tick().await.unwrap(); // спавн бота (сессия ленивая — state не пишет)
     state.fail_save.store(true, Ordering::SeqCst);
-    wiki.set_doc(SLUG, &doc_md("p/m2", "UWUWU_BOT_TOKEN_T9", "м"));
+    wiki.set_doc(DOC_SLUG, &doc_md("p/m2", "UWUWU_BOT_TOKEN_T9", "м"));
     let (_guard, records) = trap_events();
     sup.tick().await.unwrap(); // RecreateSession: set_bot_session(None) + save() → Err
     let rec = records.lock().expect("trap lock");
