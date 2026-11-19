@@ -218,7 +218,7 @@ impl ToolHub {
             "task_claim" => self.task_claim(args).await,
             "task_comment" => self.task_comment(args).await,
             "task_close" => self.task_close(args).await,
-            "task_body" => self.task_body(args).await,
+            "task_body" => self.task_body(&project, args).await,
             "task_body_section" => self.task_body_section(&project, args).await,
             other => Err(format!("unknown tool: {other}")),
         }
@@ -465,7 +465,7 @@ impl ToolHub {
         ok_text(format!("задача #{number} закрыта"))
     }
 
-    async fn task_body(&self, args: &Value) -> Result<Value, String> {
+    async fn task_body(&self, project: &str, args: &Value) -> Result<Value, String> {
         let number = need_number(args)?;
         let body = arg_str(args, "body");
         if body.trim().is_empty() {
@@ -473,13 +473,22 @@ impl ToolHub {
         }
         let receipt = self
             .writer
-            .set_body(number, &body)
+            .set_body(project, number, &body)
             .await
             .map_err(|e| e.to_string())?;
-        ok_text(format!(
+        let mut msg = format!(
             "тело #{number} заменено; {} байт; body_hash: {}",
             receipt.body_size, receipt.body_hash
-        ))
+        );
+        if !receipt.verified {
+            // деградированная квитанция (#1331): контрольное чтение носителя
+            // не состоялось — hash от отправленного, ретрай мутации запрещён
+            msg.push_str(
+                "; ⚠ доставка не подтверждена контрольным чтением (носитель не \
+                 прочитан) — ретрай мутации запрещён, сверь task_get",
+            );
+        }
+        ok_text(msg)
     }
 
     async fn task_body_section(&self, project: &str, args: &Value) -> Result<Value, String> {
@@ -563,8 +572,14 @@ fn render_section_report(section: &str, report: &uwuwu_usecase::SectionEditRepor
         verdict.push_str(&format!(" (дублей снят ×{})", report.duplicates_removed));
     }
     format!(
-        "{verdict}; тело {} байт; body_hash: {}",
-        report.body_size, report.body_hash
+        "{verdict}; тело {} байт; body_hash: {}{}",
+        report.body_size,
+        report.body_hash,
+        if report.verified {
+            String::new()
+        } else {
+            "; ⚠ доставка не подтверждена контрольным чтением (носитель не прочитан) — ретрай мутации запрещён, сверь task_get".to_string()
+        }
     )
 }
 
