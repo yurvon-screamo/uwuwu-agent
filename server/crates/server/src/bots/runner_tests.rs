@@ -7,9 +7,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::sleep;
-use uwuwu_domain::{BotModel, Slot, Status};
+use uwuwu_domain::{BotModel, ModelRef, Slot, Status};
 use uwuwu_usecase::bots::{
-    BotAssetStore, BotStateStore, MediaKind, TelegramGateway, TgMedia, TgMessage, TgUpdate,
+    BotAssetStore, BotStateStore, CompactPolicy, MediaKind, TelegramGateway, TgMedia, TgMessage,
+    TgUpdate,
 };
 use uwuwu_usecase::{
     AgentSessionGateway, AppendDocOutcome, AssistantReply, Clock, DreamerMark, Liveness,
@@ -258,6 +259,19 @@ struct FakeSessions {
     script: Mutex<Vec<AssistantReply>>,
     script_pos: AtomicUsize,
     auto_reply: AtomicBool,
+    /// Активность сессий для компакт-проб (#1221): id → ms; нет записи —
+    /// Ok(None) «не подтверждён».
+    activity: Mutex<HashMap<String, Option<u64>>>,
+    /// Занятость окна для context_usage_pct (#1221): id → %; нет записи —
+    /// Ok(None) «не измерено».
+    usage: Mutex<HashMap<String, Option<f64>>>,
+    /// busy-флаг сессий для list_sessions (#1221).
+    busy_map: Mutex<HashMap<String, bool>>,
+    /// Журнал адмиссий компакта (#1221).
+    compacts: Mutex<Vec<String>>,
+    /// Сценарии отказов проб (#1221): скан / активность.
+    list_err: AtomicBool,
+    activity_err: AtomicBool,
 }
 
 impl FakeSessions {
@@ -273,6 +287,12 @@ impl FakeSessions {
             script: Mutex::new(Vec::new()),
             script_pos: AtomicUsize::new(0),
             auto_reply: AtomicBool::new(true),
+            activity: Mutex::new(HashMap::new()),
+            usage: Mutex::new(HashMap::new()),
+            busy_map: Mutex::new(HashMap::new()),
+            compacts: Mutex::new(Vec::new()),
+            list_err: AtomicBool::new(false),
+            activity_err: AtomicBool::new(false),
         })
     }
     fn set_liveness(&self, session: &str, l: Liveness) {
@@ -283,6 +303,28 @@ impl FakeSessions {
     }
     fn prompts_snapshot(&self) -> Vec<(String, String)> {
         self.prompts.lock().expect("sessions lock").clone()
+    }
+    // ——— компакт-ручки (#1221) ———
+    fn set_activity(&self, session: &str, ms: Option<u64>) {
+        self.activity
+            .lock()
+            .expect("sessions lock")
+            .insert(session.to_string(), ms);
+    }
+    fn set_usage(&self, session: &str, pct: Option<f64>) {
+        self.usage
+            .lock()
+            .expect("sessions lock")
+            .insert(session.to_string(), pct);
+    }
+    fn set_busy(&self, session: &str, busy: bool) {
+        self.busy_map
+            .lock()
+            .expect("sessions lock")
+            .insert(session.to_string(), busy);
+    }
+    fn compacts_snapshot(&self) -> Vec<String> {
+        self.compacts.lock().expect("sessions lock").clone()
     }
 }
 
@@ -339,8 +381,40 @@ impl AgentSessionGateway for FakeSessions {
     async fn delete_session(&self, _s: &str) -> UsecaseResult<()> {
         Ok(())
     }
-    async fn last_activity_ms(&self, _s: &str) -> UsecaseResult<Option<u64>> {
-        Ok(None)
+    async fn last_activity_ms(&self, s: &str) -> UsecaseResult<Option<u64>> {
+        if self.activity_err.load(Ordering::SeqCst) {
+            return Err(UsecaseError::Session(
+                "fake: проба активности не удалась".into(),
+            ));
+        }
+        Ok(self
+            .activity
+            .lock()
+            .expect("sessions lock")
+            .get(s)
+            .copied()
+            .flatten())
+    }
+    /// Компакт-ручки (#1221): занятость из map-сценария, адмиссии в журнал.
+    async fn context_usage_pct(
+        &self,
+        session: &str,
+        _model: &ModelRef,
+    ) -> UsecaseResult<Option<f64>> {
+        Ok(self
+            .usage
+            .lock()
+            .expect("sessions lock")
+            .get(session)
+            .copied()
+            .flatten())
+    }
+    async fn compact_session(&self, session: &str) -> UsecaseResult<()> {
+        self.compacts
+            .lock()
+            .expect("sessions lock")
+            .push(session.to_string());
+        Ok(())
     }
     async fn last_assistant_reply(&self, _s: &str) -> UsecaseResult<Option<AssistantReply>> {
         {
@@ -354,7 +428,22 @@ impl AgentSessionGateway for FakeSessions {
         Ok(self.reply.lock().expect("sessions lock").clone())
     }
     async fn list_sessions(&self) -> UsecaseResult<Vec<SessionInfo>> {
-        Ok(vec![])
+        if self.list_err.load(Ordering::SeqCst) {
+            return Err(UsecaseError::Session("fake: union-скан не удался".into()));
+        }
+        let busy = self.busy_map.lock().expect("sessions lock").clone();
+        Ok(busy
+            .into_iter()
+            .map(|(id, b)| SessionInfo {
+                id,
+                agent: String::new(),
+                directory: String::new(),
+                updated_ms: 0,
+                outcome: String::new(),
+                total_tokens: 0,
+                busy: b,
+            })
+            .collect())
     }
     async fn export_session(&self, _s: &str) -> UsecaseResult<String> {
         Ok(String::new())
@@ -362,7 +451,7 @@ impl AgentSessionGateway for FakeSessions {
 }
 
 /// slug → (session, offset) — пара состояния бота.
-type BotRow = (Option<String>, Option<u64>, Option<u64>);
+type BotRow = (Option<String>, Option<u64>, Option<u64>, Option<u64>);
 
 #[derive(Default)]
 struct FakeState {
@@ -403,10 +492,23 @@ impl BotStateStore for FakeState {
             .get(slug)
             .and_then(|r| r.2)
     }
-    fn set_bot_manual_hash(&self, slug: &str, hash: u64) {
+    fn set_bot_manual_hash(&self, slug: &str, hash: Option<u64>) {
         let mut rows = self.rows.lock().expect("state lock");
         let e = rows.entry(slug.to_string()).or_default();
-        e.2 = Some(hash);
+        e.2 = hash;
+    }
+    fn bot_compact_ms(&self, slug: &str) -> u64 {
+        self.rows
+            .lock()
+            .expect("state lock")
+            .get(slug)
+            .and_then(|r| r.3)
+            .unwrap_or(0)
+    }
+    fn set_bot_compact_ms(&self, slug: &str, ms: u64) {
+        let mut rows = self.rows.lock().expect("state lock");
+        let e = rows.entry(slug.to_string()).or_default();
+        e.3 = Some(ms);
     }
     fn save(&self) -> UsecaseResult<()> {
         if self.fail_save.load(Ordering::SeqCst) {
@@ -1952,4 +2054,266 @@ async fn file_at_exact_binary_limit_is_accepted() {
     );
     assert_eq!(assets.snapshot().len(), 1);
     assert!(!sessions.prompts_snapshot().is_empty());
+}
+
+// ---------- #1221: автокомпакт вечных сессий ----------
+
+fn compact_policy(idle_ms: u64, pct: f64, cooldown_ms: u64) -> CompactPolicy {
+    CompactPolicy {
+        idle_ms,
+        min_context_pct: pct,
+        cooldown_ms,
+    }
+}
+
+/// Бот с живой doc-сессией и вшитой методичкой: тик спавна + сообщение
+/// владельца (сессия создаётся лениво), к моменту возврата hash записан.
+async fn doc_bot_with_manual(
+    wiki: &Arc<FakeWiki>,
+    sessions: &Arc<FakeSessions>,
+    state: &Arc<FakeState>,
+    clock: &Arc<FakeClock>,
+    tg: &Arc<FakeTg>,
+    token_env: &'static str,
+) -> BotSupervisor {
+    wiki.set_doc(SLUG, &doc_md("p/m1", token_env, "методичка"));
+    tg.inject(private_update(1, "yurvon", "привет"));
+    let sup = supervisor(
+        wiki.clone(),
+        sessions.clone(),
+        state.clone(),
+        clock.clone(),
+        tg.clone(),
+        vec![(token_env, "tok")],
+    );
+    sup.tick().await.unwrap();
+    wait_until(|| state.bot_session(SLUG).is_some(), 2000).await;
+    wait_until(|| state.bot_manual_hash(SLUG).is_some(), 2000).await;
+    sup
+}
+
+#[tokio::test]
+async fn compact_fires_once_per_cooldown_and_rearms_manual() {
+    let wiki = Arc::new(FakeWiki::default());
+    let sessions = FakeSessions::new();
+    let state = Arc::new(FakeState::default());
+    let clock = FakeClock::at(10_000_000);
+    let tg = FakeTg::new(vec![]);
+    let mut sup =
+        doc_bot_with_manual(&wiki, &sessions, &state, &clock, &tg, "UWUWU_BOT_TOKEN_C1").await;
+    sup.compact = Some(compact_policy(300_000, 40.0, 60_000));
+    let session = state.bot_session(SLUG).unwrap();
+    // факты: idle 400с ≥ 300с, занятость 50% ≥ 40%
+    sessions.set_activity(&session, Some(clock.now_ms() - 400_000));
+    sessions.set_usage(&session, Some(50.0));
+    sup.tick().await.unwrap();
+    assert_eq!(
+        sessions.compacts_snapshot(),
+        vec![session.clone()],
+        "ровно одна адмиссия"
+    );
+    assert_eq!(state.bot_compact_ms(SLUG), clock.now_ms(), "метка ДО POST");
+    assert_eq!(
+        state.bot_manual_hash(SLUG),
+        None,
+        "doc-режим: hash сброшен — методичка дозаправится"
+    );
+    // коулдаун: повторный тик молчит
+    sup.tick().await.unwrap();
+    assert_eq!(sessions.compacts_snapshot().len(), 1, "коулдаун держит");
+    // дозаправка: следующий промпт несёт методичку префиксом
+    tg.inject(private_update(2, "yurvon", "второе"));
+    wait_until(|| sessions.prompts_snapshot().len() == 2, 2000).await;
+    let prompts = sessions.prompts_snapshot();
+    assert!(
+        prompts[1].1.starts_with("Методичка бота"),
+        "после компакта методичка вернулась в промпт"
+    );
+}
+
+#[tokio::test]
+async fn compact_skips_busy_session() {
+    let wiki = Arc::new(FakeWiki::default());
+    let sessions = FakeSessions::new();
+    let state = Arc::new(FakeState::default());
+    let clock = FakeClock::at(10_000_000);
+    let tg = FakeTg::new(vec![]);
+    let mut sup =
+        doc_bot_with_manual(&wiki, &sessions, &state, &clock, &tg, "UWUWU_BOT_TOKEN_C2").await;
+    sup.compact = Some(compact_policy(300_000, 40.0, 60_000));
+    let session = state.bot_session(SLUG).unwrap();
+    sessions.set_activity(&session, Some(clock.now_ms() - 400_000));
+    sessions.set_usage(&session, Some(90.0));
+    sessions.set_busy(&session, true);
+    sup.tick().await.unwrap();
+    assert!(
+        sessions.compacts_snapshot().is_empty(),
+        "busy-сессия не стреляет"
+    );
+    assert_eq!(state.bot_compact_ms(SLUG), 0, "метка не ставилась");
+    assert!(
+        state.bot_manual_hash(SLUG).is_some(),
+        "hash методички не тронут"
+    );
+}
+
+#[tokio::test]
+async fn compact_skips_below_usage_threshold() {
+    let wiki = Arc::new(FakeWiki::default());
+    let sessions = FakeSessions::new();
+    let state = Arc::new(FakeState::default());
+    let clock = FakeClock::at(10_000_000);
+    let tg = FakeTg::new(vec![]);
+    let mut sup =
+        doc_bot_with_manual(&wiki, &sessions, &state, &clock, &tg, "UWUWU_BOT_TOKEN_C3").await;
+    sup.compact = Some(compact_policy(300_000, 40.0, 60_000));
+    let session = state.bot_session(SLUG).unwrap();
+    sessions.set_activity(&session, Some(clock.now_ms() - 400_000));
+    sessions.set_usage(&session, Some(39.0));
+    sup.tick().await.unwrap();
+    assert!(
+        sessions.compacts_snapshot().is_empty(),
+        "занятость ниже порога — мимо"
+    );
+}
+
+#[tokio::test]
+async fn compact_agent_mode_never_injects_manual_prefix() {
+    let wiki = Arc::new(FakeWiki::default());
+    let sessions = FakeSessions::new();
+    let state = Arc::new(FakeState::default());
+    let clock = FakeClock::at(10_000_000);
+    let tg = FakeTg::new(vec![]);
+    // agent-режим: методичка в agents/<name>.md, тело дока игнорируется
+    wiki.set_doc(
+        SLUG,
+        "---\ntitle: Проба\nmodel: p/m1\ntoken_env: UWUWU_BOT_TOKEN_C4\n\
+         owner: yurvon\nworkspace: /tmp/opencode\nagent: probe-agent\n---\n\nтело-методичка",
+    );
+    tg.inject(private_update(1, "yurvon", "привет"));
+    let mut sup = supervisor(
+        wiki.clone(),
+        sessions.clone(),
+        state.clone(),
+        clock.clone(),
+        tg.clone(),
+        vec![("UWUWU_BOT_TOKEN_C4", "tok")],
+    );
+    sup.compact = Some(compact_policy(300_000, 40.0, 60_000));
+    let sup = Arc::new(sup);
+    sup.tick().await.unwrap();
+    wait_until(|| state.bot_session(SLUG).is_some(), 2000).await;
+    let session = state.bot_session(SLUG).unwrap();
+    wait_until(|| !sessions.prompts_snapshot().is_empty(), 2000).await;
+    assert!(
+        !sessions.prompts_snapshot()[0]
+            .1
+            .starts_with("Методичка бота"),
+        "agent-режим: промпты не несут методичку"
+    );
+    sessions.set_activity(&session, Some(clock.now_ms() - 400_000));
+    sessions.set_usage(&session, Some(50.0));
+    sup.tick().await.unwrap();
+    assert_eq!(sessions.compacts_snapshot(), vec![session.clone()]);
+    // после компакта промпт остаётся чистым текстом (сброса hash нет)
+    tg.inject(private_update(2, "yurvon", "второе"));
+    wait_until(|| sessions.prompts_snapshot().len() == 2, 2000).await;
+    assert!(
+        !sessions.prompts_snapshot()[1]
+            .1
+            .starts_with("Методичка бота"),
+        "agent-режим: дозаправка не нужна — методичка не суммаризуется"
+    );
+}
+
+#[tokio::test]
+async fn recreate_session_rearms_manual_for_new_session() {
+    let wiki = Arc::new(FakeWiki::default());
+    let sessions = FakeSessions::new();
+    let state = Arc::new(FakeState::default());
+    let clock = FakeClock::at(10_000_000);
+    let tg = FakeTg::new(vec![]);
+    let sup =
+        doc_bot_with_manual(&wiki, &sessions, &state, &clock, &tg, "UWUWU_BOT_TOKEN_C5").await;
+    // структурная правка → RecreateSession: старая сессия (с вшитой
+    // методичкой) забыта, hash должен сброситься
+    wiki.set_doc(SLUG, &doc_md("p/m2", "UWUWU_BOT_TOKEN_C5", "методичка"));
+    sup.tick().await.unwrap();
+    assert_eq!(
+        state.bot_manual_hash(SLUG),
+        None,
+        "recreate сбрасывает hash — регресс потери методички (#1221)"
+    );
+    // новая сессия получает методичку первым же промптом
+    tg.inject(private_update(2, "yurvon", "после recreate"));
+    wait_until(|| state.bot_session(SLUG).is_some(), 2000).await;
+    wait_until(|| sessions.prompts_snapshot().len() == 2, 2000).await;
+    let prompts = sessions.prompts_snapshot();
+    assert!(
+        prompts[1].1.starts_with("Методичка бота"),
+        "свежая сессия без методички — пересоздание её теряло"
+    );
+}
+
+#[tokio::test]
+async fn compact_scan_failure_skips_whole_pass() {
+    let wiki = Arc::new(FakeWiki::default());
+    let sessions = FakeSessions::new();
+    let state = Arc::new(FakeState::default());
+    let clock = FakeClock::at(10_000_000);
+    let tg = FakeTg::new(vec![]);
+    let mut sup =
+        doc_bot_with_manual(&wiki, &sessions, &state, &clock, &tg, "UWUWU_BOT_TOKEN_C6").await;
+    sup.compact = Some(compact_policy(300_000, 40.0, 60_000));
+    let session = state.bot_session(SLUG).unwrap();
+    sessions.set_activity(&session, Some(clock.now_ms() - 400_000));
+    sessions.set_usage(&session, Some(50.0));
+    sessions.list_err.store(true, Ordering::SeqCst);
+    sup.tick().await.unwrap();
+    assert!(
+        sessions.compacts_snapshot().is_empty(),
+        "отказ union-скана — проход пропущен, адмиссий нет"
+    );
+    assert_eq!(state.bot_compact_ms(SLUG), 0);
+}
+
+#[tokio::test]
+async fn compact_probe_failure_ends_pass_without_admission() {
+    let wiki = Arc::new(FakeWiki::default());
+    let sessions = FakeSessions::new();
+    let state = Arc::new(FakeState::default());
+    let clock = FakeClock::at(10_000_000);
+    let tg = FakeTg::new(vec![]);
+    let mut sup =
+        doc_bot_with_manual(&wiki, &sessions, &state, &clock, &tg, "UWUWU_BOT_TOKEN_C7").await;
+    sup.compact = Some(compact_policy(300_000, 40.0, 60_000));
+    let session = state.bot_session(SLUG).unwrap();
+    sessions.set_usage(&session, Some(50.0));
+    sessions.activity_err.store(true, Ordering::SeqCst);
+    sup.tick().await.unwrap();
+    assert!(
+        sessions.compacts_snapshot().is_empty(),
+        "отказ пробы активности — проход завершён без адмиссии"
+    );
+    assert_eq!(state.bot_compact_ms(SLUG), 0);
+}
+
+#[tokio::test]
+async fn compact_policy_absent_is_off() {
+    let wiki = Arc::new(FakeWiki::default());
+    let sessions = FakeSessions::new();
+    let state = Arc::new(FakeState::default());
+    let clock = FakeClock::at(10_000_000);
+    let tg = FakeTg::new(vec![]);
+    // supervisor() не задаёт compact — механика off даже при готовых фактах
+    let sup =
+        doc_bot_with_manual(&wiki, &sessions, &state, &clock, &tg, "UWUWU_BOT_TOKEN_C8").await;
+    let session = state.bot_session(SLUG).unwrap();
+    sessions.set_activity(&session, Some(clock.now_ms() - 400_000));
+    sessions.set_usage(&session, Some(90.0));
+    sup.tick().await.unwrap();
+    assert!(
+        sessions.compacts_snapshot().is_empty(),
+        "нет секции [compact] — no-op"
+    );
 }

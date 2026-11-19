@@ -80,6 +80,36 @@ pub struct NotifyCfg {
     pub tg_chat_id: i64,
 }
 
+/// Автокомпакт вечных сессий ботов (#1221, ADR-082): нативный compact
+/// по idle-политике в тике супервизора. Секция отсутствует — механика
+/// off (safe default, откат = снять секцию); пороги-дефолты — числа
+/// владельца из постановки ADR-082 (05.11: «при 4 часов неактивности
+/// и 40%+ контекста», коулдаун 1ч).
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompactCfg {
+    /// Неактивность ≥ этого числа минут (ms-порог — 60_000×).
+    #[serde(default = "default_compact_idle_min")]
+    pub idle_min: u64,
+    /// Занятость окна контекста ≥ этого % лимита модели.
+    #[serde(default = "default_compact_min_context_pct")]
+    pub min_context_pct: f64,
+    /// Не чаще раза в это число минут (адмиссия — метка state ДО POST).
+    #[serde(default = "default_compact_cooldown_min")]
+    pub cooldown_min: u64,
+}
+
+fn default_compact_idle_min() -> u64 {
+    240
+}
+
+fn default_compact_min_context_pct() -> f64 {
+    40.0
+}
+
+fn default_compact_cooldown_min() -> u64 {
+    60
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProjectCfg {
     pub name: String,
@@ -118,6 +148,9 @@ pub struct Config {
     /// ТГ-сигнализация инцидентов сталл-детекта (#1281); нет секции — off.
     #[serde(default)]
     pub notify: Option<NotifyCfg>,
+    /// Автокомпакт вечных сессий ботов (#1221); нет секции — off.
+    #[serde(default)]
+    pub compact: Option<CompactCfg>,
 }
 
 fn default_poll() -> u64 {

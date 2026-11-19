@@ -542,7 +542,7 @@ async fn run(
         // через raw-гейтвей дефолтного исполнителя (вне спавн-бюджета/CUP;
         // маршрутизация ботов по executor — вне скоупа #1203)
         let bot_sessions: Arc<dyn uwuwu_usecase::AgentSessionGateway> = raw_default.clone();
-        let bot_supervisor = Arc::new(bots::BotSupervisor::new(
+        let mut bot_supervisor = bots::BotSupervisor::new(
             wiki.clone(),
             bot_sessions,
             state.clone(),
@@ -553,7 +553,19 @@ async fn run(
                 Arc::new(tg::TelegramClient::new(token.to_string()))
                     as Arc<dyn uwuwu_usecase::bots::TelegramGateway>
             }),
-        ));
+        );
+        // Автокомпакт вечных сессий (#1221): секция [compact] конфига;
+        // отсутствует — off (safe default). Пороги — ms-арифметика поверх
+        // минутных полей секции.
+        bot_supervisor.compact = cfg
+            .compact
+            .clone()
+            .map(|c| uwuwu_usecase::bots::CompactPolicy {
+                idle_ms: c.idle_min * 60_000,
+                min_context_pct: c.min_context_pct,
+                cooldown_ms: c.cooldown_min * 60_000,
+            });
+        let bot_supervisor = Arc::new(bot_supervisor);
         sidecars.push(Sidecar {
             name: "bots".into(),
             tick: Box::new(move || {
