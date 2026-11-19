@@ -1,5 +1,6 @@
 // plugins/screen-review.ts — тул screen_review для OpenCode: ревью скринов
-// через локальную decision-модель d1-omni (ollama /v1/systemone). Тонкая
+// через decision-модель Gemini Decision 1 (Google Decisions API; миграция с
+// локальной d1-omni #1362 — чистая замена, решение владельца 19.11). Тонкая
 // регистрация — вся логика в ../lib/screen-review (тестируется отдельно).
 // Ниша: скринер/прицел для девелопера (самопроверка экрана до PR),
 // тестировщика (первичный обход скринов) и ревьювера (структурная проверка
@@ -34,12 +35,12 @@ export default Plugin.define({
       editor.namespace({
         name: "screen",
         description:
-          "Ревью скринов через локальную decision-модель d1-omni (ollama /v1/systemone): чек-лист качества — вероятности и severity по каждому пункту. Скринер/прицел, не судья.",
+          "Ревью скринов через decision-модель Gemini Decision 1 (Google Decisions API): чек-лист качества — вероятности и severity по каждому пункту. Скринер/прицел, не судья.",
       })
       editor.add({
         name: "review",
         description:
-          "Прогнать скрины через чек-лист качества (дефолт ui-slop: двойная рамка, карточка-в-карточке, выравнивание, налезания/обрезка, контраст + главный дефект + severity). Один вызов модели на скрин — вердикты атрибутированы к скрину. Возвращает markdown-отчёт: таблица вероятностей с флагами P>threshold (дефолт 0.6) и сводка «куда смотреть». Честные границы: модель пропускает часть реальных косяков — флаги это прицел, финальное суждение за тобой (своими глазами/руками).",
+          "Прогнать скрины через чек-лист качества (дефолт ui-slop: двойная рамка, карточка-в-карточке, выравнивание, налезания/обрезка, контраст + главный дефект + severity). Один вызов модели на скрин — вердикты атрибутированы к скрину. Возвращает markdown-отчёт: таблица вероятностей с флагами P>threshold (дефолт 0.6) и сводка «куда смотреть». Честные границы: модель пропускает часть реальных косяков — флаги это прицел, финальное суждение за тобой (своими глазами/руками). Ограничения вопросов: id [A-Za-z0-9_-]{1,64}; criteria обязательны у choice (map 2–255 опций) и score (массив уровней).",
         input: {
           type: "object",
           properties: {
@@ -47,7 +48,7 @@ export default Plugin.define({
               type: "array",
               items: { type: "string" },
               description:
-                "Абсолютные пути к файлам скринов (PNG/JPEG) на машине сервера opencode (cwd тула — сервер, не сессия агента). Минимум один.",
+                "Абсолютные пути к файлам скринов (PNG/JPEG/WebP) на машине сервера opencode (cwd тула — сервер, не сессия агента). Минимум один.",
             },
             state: {
               type: "string",
@@ -60,7 +61,7 @@ export default Plugin.define({
             questions: {
               type: "object",
               description:
-                "Разовые вопросы вместо встроенного чек-листа: map id → {type: noul|choice|score, instructions, criteria?}. criteria у choice — объект label→описание, у score — массив уровней 2–10 от меньшего к большему. Одновременный checklist и questions — ошибка.",
+                "Разовые вопросы вместо встроенного чек-листа: map id → {type: noul|choice|score, instructions, criteria?}. id — [A-Za-z0-9_-]{1,64}. criteria у choice — объект label→описание (2–255 опций, обязателен), у score — массив уровней 2–10 от меньшего к большему (обязателен), у noul — опционально {true_description, false_description}. Одновременный checklist и questions — ошибка.",
               additionalProperties: {
                 type: "object",
                 properties: {
@@ -82,7 +83,7 @@ export default Plugin.define({
         options: { namespace: "screen", codemode: true },
         execute: async (input, context) => {
           const i = input as ReviewToolInput
-          await context.progress({ status: `screen_review: ${i.images.length} скрин(ов) через d1-omni` })
+          await context.progress({ status: `screen_review: ${i.images.length} скрин(ов) через gemini-decision-1` })
           try {
             const req: ScreenReviewInput = {
               images: i.images,
