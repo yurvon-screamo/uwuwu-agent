@@ -5,49 +5,19 @@
 //! тексты отказов и ответов, чтобы дрейф вернуть нечем. Пробы через живой
 //! диспетчер на MemoryHub — без GitHub, как в tools_tests.rs.
 
-use super::test_support::{blob_usecase, StubSessions, StubState};
+use super::test_support::{blob_usecase, tool_hub};
 use super::tools::ToolHub;
-use crate::clock::SystemClock;
-use crate::mockhub::MemoryHub;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use uwuwu_usecase::{
-    AgentSessionGateway, SearchUseCase, TaskBoardRepo, TaskView, TaskWriteUseCase, WikiRepo,
-};
 
-/// ToolHub на MemoryHub (доска+вики+поля) и стабе сессий.
+/// ToolHub фабрики test_support: MemoryHub как вики (docs_* армы пинов
+/// читают живой носитель) + memory-blob.
 fn hub() -> Arc<ToolHub> {
-    let memory = Arc::new(MemoryHub::from_env());
-    let board: Arc<dyn TaskBoardRepo> = memory.clone();
-    let wiki: Arc<dyn WikiRepo> = memory.clone();
-    let sessions: Arc<dyn AgentSessionGateway> = Arc::new(StubSessions);
-    let boards = vec![("uwuwu".to_string(), "Задачи uwuwu".to_string())];
-    Arc::new(ToolHub {
-        tasks: Arc::new(TaskView::new(board.clone(), boards.clone())),
-        docs: Arc::new(uwuwu_usecase::DocsView::new(wiki.clone())),
-        person: Arc::new(uwuwu_usecase::PersonView::new(wiki.clone())),
-        writer: Arc::new(TaskWriteUseCase {
-            board: board.clone(),
-            fields: memory.clone(),
-            boards,
-            clock: Arc::new(SystemClock),
-            state: Arc::new(StubState),
-        }),
-        wiki,
-        sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(sessions)),
-        search: Arc::new(SearchUseCase { semantic: None }),
-        blobs: blob_usecase(),
-        crons: Arc::new(uwuwu_usecase::CronUseCase {
-            wiki: memory.clone(),
-            sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(Arc::new(
-                StubSessions,
-            ))),
-            clock: Arc::new(SystemClock),
-            models: Arc::new(uwuwu_usecase::SpawnModels::canonical()),
-            checkout: String::new(),
-            cup: 7,
-        }),
-    })
+    let (tools, _memory) = tool_hub(
+        Arc::new(crate::mockhub::MemoryHub::from_env()),
+        blob_usecase(),
+    );
+    tools
 }
 
 /// Живой вызов диспетчера: Ok — текст контента, Err — текст отказа.

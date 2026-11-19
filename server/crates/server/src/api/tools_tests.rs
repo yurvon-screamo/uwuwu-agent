@@ -3,55 +3,22 @@
 //! happy-path, freshness-отказ, append, твин-гард, пин-h3 (кейс #1046),
 //! квитанция полного task_body. Мок-hub — в памяти, без GitHub.
 
-use super::test_support::{blob_usecase, StubSessions, StubState, StubWiki};
+use super::test_support::{
+    blob_usecase, blob_usecase_missing, tool_hub, StubSessions, StubState, StubWiki,
+};
 use super::tools::{tool_descriptors, ToolHub};
 use crate::clock::SystemClock;
 use crate::mockhub::MemoryHub;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use uwuwu_usecase::{
-    DocsView, IssueFieldStore, PersonView, SearchUseCase, TaskBoardRepo, TaskView,
-    TaskWriteUseCase, WikiRepo,
+    DocsView, PersonView, SearchUseCase, TaskBoardRepo, TaskView, TaskWriteUseCase,
 };
 
-/// Фикстура поверхности: ToolHub целиком на MemoryHub + стабах вики/сессий.
-/// Возвращает тот же hub, что сидит в писателе — тело читается напрямую.
+/// Фикстура поверхности: ToolHub фабрики test_support (StubWiki-вики,
+/// memory-blob) — тело читается напрямую через вернувшийся MemoryHub.
 fn hub() -> (Arc<ToolHub>, Arc<MemoryHub>) {
-    let memory = Arc::new(MemoryHub::from_env());
-    let board: Arc<dyn TaskBoardRepo> = memory.clone();
-    let fields: Arc<dyn IssueFieldStore> = memory.clone();
-    let wiki: Arc<dyn WikiRepo> = Arc::new(StubWiki);
-    let sessions = Arc::new(uwuwu_usecase::SessionRouter::uniform(Arc::new(
-        StubSessions,
-    )));
-    let boards = vec![("uwuwu".to_string(), "Задачи uwuwu".to_string())];
-    let tools = Arc::new(ToolHub {
-        tasks: Arc::new(TaskView::new(board.clone(), boards.clone())),
-        docs: Arc::new(DocsView::new(wiki.clone())),
-        person: Arc::new(PersonView::new(wiki.clone())),
-        writer: Arc::new(TaskWriteUseCase {
-            board: board.clone(),
-            fields,
-            boards,
-            clock: Arc::new(SystemClock),
-            state: Arc::new(StubState),
-        }),
-        wiki,
-        sessions,
-        search: Arc::new(SearchUseCase { semantic: None }),
-        blobs: blob_usecase(),
-        crons: Arc::new(uwuwu_usecase::CronUseCase {
-            wiki: Arc::new(StubWiki),
-            sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(Arc::new(
-                StubSessions,
-            ))),
-            clock: Arc::new(SystemClock),
-            models: Arc::new(uwuwu_usecase::SpawnModels::canonical()),
-            checkout: String::new(),
-            cup: 7,
-        }),
-    });
-    (tools, memory)
+    tool_hub(Arc::new(StubWiki), blob_usecase())
 }
 
 async fn call(tools: &ToolHub, name: &str, args: Value) -> Result<String, String> {
@@ -1107,44 +1074,11 @@ async fn blob_get_rejects_malformed_key() {
 #[tokio::test]
 async fn blob_tools_fail_loud_without_env() {
     // Отдельный hub с несконфигурированным каналом: отказ — перечень env,
-    // не тихая слепота (ADR-010).
-    let memory = Arc::new(MemoryHub::from_env());
-    let board: Arc<dyn TaskBoardRepo> = memory.clone();
-    let wiki: Arc<dyn WikiRepo> = Arc::new(StubWiki);
-    let tools = Arc::new(ToolHub {
-        tasks: Arc::new(TaskView::new(
-            board.clone(),
-            vec![("uwuwu".to_string(), "Задачи uwuwu".to_string())],
-        )),
-        docs: Arc::new(DocsView::new(wiki.clone())),
-        person: Arc::new(PersonView::new(wiki.clone())),
-        writer: Arc::new(TaskWriteUseCase {
-            board: board.clone(),
-            fields: memory,
-            boards: vec![("uwuwu".to_string(), "Задачи uwuwu".to_string())],
-            clock: Arc::new(SystemClock),
-            state: Arc::new(StubState),
-        }),
-        wiki,
-        sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(Arc::new(
-            StubSessions,
-        ))),
-        search: Arc::new(SearchUseCase { semantic: None }),
-        blobs: Arc::new(uwuwu_usecase::BlobUseCase::missing(vec![
-            "UWUWU_S3_ENDPOINT".to_string(),
-            "UWUWU_S3_BUCKET".to_string(),
-        ])),
-        crons: Arc::new(uwuwu_usecase::CronUseCase {
-            wiki: Arc::new(StubWiki),
-            sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(Arc::new(
-                StubSessions,
-            ))),
-            clock: Arc::new(SystemClock),
-            models: Arc::new(uwuwu_usecase::SpawnModels::canonical()),
-            checkout: String::new(),
-            cup: 7,
-        }),
-    });
+    // не тихая слепота (ADR-010). Фабрика с missing-бэкендом.
+    let (tools, _memory) = tool_hub(
+        Arc::new(StubWiki),
+        blob_usecase_missing(&["UWUWU_S3_ENDPOINT", "UWUWU_S3_BUCKET"]),
+    );
     let err = call(
         &tools,
         "blob_put",

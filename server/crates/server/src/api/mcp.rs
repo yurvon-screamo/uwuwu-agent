@@ -133,49 +133,14 @@ fn json_error(id: Option<Value>, code: i64, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::test_support::{blob_usecase, StubSessions, StubState, StubWiki};
-    use crate::clock::SystemClock;
-    use crate::mockhub::MemoryHub;
+    use crate::api::test_support::{blob_usecase, tool_hub, StubWiki};
     use tower::ServiceExt;
-    use uwuwu_usecase::{SearchUseCase, TaskBoardRepo, TaskView, TaskWriteUseCase, WikiRepo};
 
     fn app() -> Router {
-        let memory = Arc::new(MemoryHub::from_env());
-        let board: Arc<dyn TaskBoardRepo> = memory.clone();
-        let wiki: Arc<dyn WikiRepo> = Arc::new(StubWiki);
+        let (tools, _memory) = tool_hub(Arc::new(StubWiki), blob_usecase());
         let state = Arc::new(McpState {
             bearer: Arc::new("test-bearer".to_string()),
-            tools: Arc::new(ToolHub {
-                tasks: Arc::new(TaskView::new(
-                    board.clone(),
-                    vec![("uwuwu".to_string(), "Задачи uwuwu".to_string())],
-                )),
-                docs: Arc::new(uwuwu_usecase::DocsView::new(wiki.clone())),
-                person: Arc::new(uwuwu_usecase::PersonView::new(wiki)),
-                writer: Arc::new(TaskWriteUseCase {
-                    board,
-                    fields: memory,
-                    boards: vec![("uwuwu".to_string(), "Задачи uwuwu".to_string())],
-                    clock: Arc::new(SystemClock),
-                    state: Arc::new(StubState),
-                }),
-                wiki: Arc::new(StubWiki),
-                sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(Arc::new(
-                    StubSessions,
-                ))),
-                search: Arc::new(SearchUseCase { semantic: None }),
-                blobs: blob_usecase(),
-                crons: Arc::new(uwuwu_usecase::CronUseCase {
-                    wiki: Arc::new(StubWiki),
-                    sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(Arc::new(
-                        StubSessions,
-                    ))),
-                    clock: Arc::new(SystemClock),
-                    models: Arc::new(uwuwu_usecase::SpawnModels::canonical()),
-                    checkout: String::new(),
-                    cup: 7,
-                }),
-            }),
+            tools,
         });
         router(state)
     }

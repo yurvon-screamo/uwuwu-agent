@@ -192,27 +192,27 @@ fn build_sessions(
 
 /// Blob-канал (#1292): приватный бакет Tigris через env UWUWU_S3_*.
 /// Частично заданы — тулы дают громкий отказ с перечнем недостающих
-/// (ADR-010); полностью заданы, но криво — fail-fast на старте
-/// (паттерн «конфиг задан криво — сервер не поднимается»).
-fn build_blob_usecase() -> Arc<uwuwu_usecase::BlobUseCase> {
-    let values: Vec<Option<String>> = s3::S3_ENV_NAMES
-        .iter()
-        .map(|name| config::non_empty_env(name))
-        .collect();
+/// (ADR-010); кривые значения — громкая ошибка старта через Result
+/// (конвенция бута main → BootError, без panic в бут-пути).
+fn build_blob_usecase() -> Result<Arc<uwuwu_usecase::BlobUseCase>, String> {
     let missing: Vec<String> = s3::S3_ENV_NAMES
         .iter()
-        .zip(&values)
-        .filter(|(_, value)| value.is_none())
-        .map(|(name, _)| (*name).to_string())
+        .filter(|name| config::non_empty_env(name).is_none())
+        .map(|name| (*name).to_string())
         .collect();
-    if missing.is_empty() {
-        let value = |index: usize| values[index].as_deref().expect("проверено выше");
-        let store = s3::TigrisBlobStore::new(value(0), value(1), value(2), value(3), value(4))
-            .expect("blob-канал: env UWUWU_S3_* заданы, но конфиг кривой");
-        Arc::new(uwuwu_usecase::BlobUseCase::ready(Arc::new(store)))
-    } else {
-        Arc::new(uwuwu_usecase::BlobUseCase::missing(missing))
+    if !missing.is_empty() {
+        return Ok(Arc::new(uwuwu_usecase::BlobUseCase::missing(missing)));
     }
+    let config = s3::TigrisConfig {
+        // Все пять проверены выше — env не меняется в рантайме.
+        endpoint: config::non_empty_env("UWUWU_S3_ENDPOINT").unwrap_or_default(),
+        region: config::non_empty_env("UWUWU_S3_REGION").unwrap_or_default(),
+        bucket: config::non_empty_env("UWUWU_S3_BUCKET").unwrap_or_default(),
+        access_key: config::non_empty_env("UWUWU_S3_ACCESS_KEY").unwrap_or_default(),
+        secret: config::non_empty_env("UWUWU_S3_SECRET").unwrap_or_default(),
+    };
+    let store = s3::TigrisBlobStore::new(config)?;
+    Ok(Arc::new(uwuwu_usecase::BlobUseCase::ready(Arc::new(store))))
 }
 
 async fn run(
@@ -370,7 +370,7 @@ async fn run(
     });
 
     // Blob-канал (#1292): сборка из env — см. build_blob_usecase.
-    let blobs_usecase = build_blob_usecase();
+    let blobs_usecase = build_blob_usecase()?;
 
     let tool_hub = Arc::new(api::ToolHub {
         blobs: blobs_usecase,

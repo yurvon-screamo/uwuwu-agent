@@ -26,6 +26,16 @@ pub const S3_ENV_NAMES: [&str; 5] = [
     "UWUWU_S3_SECRET",
 ];
 
+/// Значения env blob-канала: именованная сборка вместо позиционных
+/// аргументов (ревью #1292 — перестановка позиций молча меняет семантику).
+pub struct TigrisConfig {
+    pub endpoint: String,
+    pub region: String,
+    pub bucket: String,
+    pub access_key: String,
+    pub secret: String,
+}
+
 /// Прод-носитель: приватный бакет Tigris (ACL private). Анонимные
 /// GET/HEAD/List = 403; доступ только по presigned-подписи.
 #[derive(Debug)]
@@ -37,27 +47,23 @@ pub struct TigrisBlobStore {
 
 impl TigrisBlobStore {
     /// Сборка из env-значений. Кривой endpoint/bucket — громкая ошибка:
-    /// вызывающий (main) падает на старте, не обслуживая слепые тулы.
-    pub fn new(
-        endpoint: &str,
-        region: &str,
-        bucket_name: &str,
-        access_key: &str,
-        secret_key: &str,
-    ) -> Result<Self, String> {
-        let endpoint = endpoint
+    /// вызывающий распространяет её через Result бута (конвенция main),
+    /// сервер не поднимается, но не паникует.
+    pub fn new(config: TigrisConfig) -> Result<Self, String> {
+        let endpoint = config
+            .endpoint
             .parse()
             .map_err(|e| format!("UWUWU_S3_ENDPOINT: {e}"))?;
         let bucket = Bucket::new(
             endpoint,
             UrlStyle::VirtualHost,
-            bucket_name.to_string(),
-            region.to_string(),
+            config.bucket,
+            config.region,
         )
         .map_err(|e| format!("UWUWU_S3_BUCKET: {e}"))?;
         Ok(Self {
             bucket,
-            credentials: Credentials::new(access_key.to_string(), secret_key.to_string()),
+            credentials: Credentials::new(config.access_key, config.secret),
             client: reqwest::Client::new(),
         })
     }
@@ -132,20 +138,26 @@ mod tests {
     use super::*;
 
     fn fake_store() -> TigrisBlobStore {
-        TigrisBlobStore::new(
-            "https://t3.storageapi.dev",
-            "auto",
-            "uwuwu-blobs",
-            "tid_key",
-            "tid_secret",
-        )
+        TigrisBlobStore::new(TigrisConfig {
+            endpoint: "https://t3.storageapi.dev".to_string(),
+            region: "auto".to_string(),
+            bucket: "uwuwu-blobs".to_string(),
+            access_key: "tid_key".to_string(),
+            secret: "tid_secret".to_string(),
+        })
         .expect("конфиг валиден")
     }
 
     #[test]
     fn new_rejects_invalid_endpoint_loudly() {
-        let err = TigrisBlobStore::new("not-a-url", "auto", "b", "k", "s")
-            .expect_err("громкий отказ конфига");
+        let err = TigrisBlobStore::new(TigrisConfig {
+            endpoint: "not-a-url".to_string(),
+            region: "auto".to_string(),
+            bucket: "b".to_string(),
+            access_key: "k".to_string(),
+            secret: "s".to_string(),
+        })
+        .expect_err("громкий отказ конфига");
         assert!(err.contains("UWUWU_S3_ENDPOINT"), "{err}");
     }
 
