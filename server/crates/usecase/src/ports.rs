@@ -367,6 +367,11 @@ pub trait TickStateStore: Send + Sync {
     /// счёт с единицы (инцидент 18.11 #1281: локального сброса мало,
     /// mark_stall_ping инкрементит stale-каунтер).
     fn clear_stall(&self, board: &str, number: u64);
+    /// Потерянные доставки строки (#1288): (статус раунда, счётчик подряд).
+    /// Смена статуса строки = новый раунд; успех доставки сбрасывает.
+    fn lost_session(&self, board: &str, number: u64) -> Option<(Status, u32)>;
+    fn mark_lost_session(&self, board: &str, number: u64, status: Status);
+    fn clear_lost_session(&self, board: &str, number: u64);
     /// Новый раунд слота (fresh-eyes): кулдаун прошлого раунда не переносится.
     fn clear_spawn_ms(&self, board: &str, number: u64, slot: Slot);
     /// Аналитика (#1135, замена триажа): кулдауны волн/ревью и цикл-гвард.

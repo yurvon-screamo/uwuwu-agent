@@ -25,6 +25,10 @@ struct RowState {
     /// обнуляется записью нового статуса (см. mark_stall_ping).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stall: Option<(String, u64, u32)>,
+    /// Потерянные доставки (#1288): (статус раунда, счётчик подряд) —
+    /// смена статуса = новый раунд; успех доставки сбрасывает.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lost: Option<(String, u32)>,
 }
 
 /// Состояние бота (секция `bots`): вечная сессия + offset апдейтов ТГ.
@@ -244,6 +248,33 @@ impl TickStateStore for JsonStateStore {
         let mut guard = self.state.lock().expect("state lock");
         if let Some(row) = guard.rows.get_mut(&Self::key(board, number)) {
             row.stall = None;
+        }
+    }
+
+    fn lost_session(&self, board: &str, number: u64) -> Option<(Status, u32)> {
+        let guard = self.state.lock().expect("state lock");
+        guard
+            .rows
+            .get(&Self::key(board, number))
+            .and_then(|r| r.lost.as_ref())
+            .map(|(st, c)| (naming::parse_status(st), *c))
+    }
+
+    fn mark_lost_session(&self, board: &str, number: u64, status: Status) {
+        let mut guard = self.state.lock().expect("state lock");
+        let row = guard.rows.entry(Self::key(board, number)).or_default();
+        // счётчик растёт внутри раунда (одинаковый статус); смена статуса = 1
+        let count = match &row.lost {
+            Some((st, c)) if naming::parse_status(st) == status => *c + 1,
+            _ => 1,
+        };
+        row.lost = Some((naming::status_name(status).to_string(), count));
+    }
+
+    fn clear_lost_session(&self, board: &str, number: u64) {
+        let mut guard = self.state.lock().expect("state lock");
+        if let Some(row) = guard.rows.get_mut(&Self::key(board, number)) {
+            row.lost = None;
         }
     }
 

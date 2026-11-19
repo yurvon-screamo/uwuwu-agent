@@ -3,7 +3,9 @@
 
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
-use crate::pipeline::tick::{BoardPlan, RowContext, SpawnHold, TickUseCase};
+use crate::pipeline::tick::{
+    BoardPlan, RowContext, SpawnHold, TickPlan, TickUseCase, SESSION_LOST_ESCALATE_AFTER,
+};
 use crate::ports::{CommentRef, Liveness, SessionSpec};
 use crate::router::Gateway;
 use uwuwu_domain::{
@@ -26,6 +28,24 @@ pub enum WakeAct {
     GuardedBlind,
     /// Нечего будить: тишина, коммент уже отработан или луп-эскалация.
     None,
+}
+
+/// Итог маршрутизации потерянной сессии (#1288).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LostAct {
+    /// Resurrection удалась — новая сессия в ячейке.
+    Respawned,
+    /// Порог потерянных доставок достигнут — Needs attention.
+    Escalated,
+    /// Гвард держит respawn: живая сестра в env строки.
+    Guarded,
+    /// Список исполнителя недоступен — hold без зрения (#1263).
+    GuardedBlind,
+    /// Пик/CUP держит respawn — ретрай следующим тиком.
+    Deferred,
+    /// Десинк-счётчик растёт внутри порога; либо луп-гвард сам
+    /// эскалировал / внутренний отказ — исход учтён без outcome-счётчика.
+    Counted,
 }
 
 impl TickUseCase {
@@ -446,6 +466,146 @@ impl TickUseCase {
             return Err(e);
         }
         Ok(true)
+    }
+
+    /// Маршрутизация потерянной сессии стадии (#1288): классифицированный
+    /// SessionNotFound доставки приходит из обеих Err-веток
+    /// observe_stage_session. Руки: сессия в списке исполнителя (десинк) —
+    /// счётчик и парковка, респавн запрещён анти-дублем (список — источник
+    /// истины гарда спавна, #1163/#1263); сессии нет в списке —
+    /// resurrection гвардами Dead-ветки (env-гард → пик/CUP →
+    /// respawn_dead_stage с луп-гвардом). Отказы респавна обрабатываются
+    /// внутри (анти-ре-энтри: повторного входа в маршрутизацию в том же
+    /// тике нет).
+    pub(crate) async fn session_lost_pass(
+        &self,
+        board: &BoardPlan,
+        plan: &TickPlan,
+        task: &Task,
+        global_active: usize,
+        ctx: &RowContext<'_>,
+    ) -> UsecaseResult<LostAct> {
+        // обе Err-ветки — stage-пути со слотом и сессией в ячейке;
+        // раскладка вне контракта — no-op исход (исход учтён логом Err)
+        let Some(slot) = task.stage_slot() else {
+            return Ok(LostAct::Counted);
+        };
+        let Some(session) = task.session_of(slot) else {
+            return Ok(LostAct::Counted);
+        };
+        let Some(sightings) = ctx.sightings else {
+            tracing::info!(
+                event = "lost.held_blind_scan",
+                number = task.number(),
+                slot = naming::slot_key(slot),
+                "Сессия потеряна, список исполнителя недоступен — держим без зрения (#1263)"
+            );
+            return Ok(LostAct::GuardedBlind);
+        };
+        if sighting_known(sightings, session) {
+            return self.session_lost_desync(board, task, slot).await;
+        }
+        // resurrection-рука: исполнитель сам подтвердил отсутствие сессии
+        if matches!(
+            self.spawn_hold(ctx, board, task, slot, self.clock.now_ms()),
+            Some(SpawnHold::Live)
+        ) {
+            tracing::warn!(
+                event = "lost.held_live_session",
+                number = task.number(),
+                slot = naming::slot_key(slot),
+                "Респавн потерянной сессии держится: живая сестра в env строки"
+            );
+            return Ok(LostAct::Guarded);
+        }
+        let spawn = Action::Spawn { slot };
+        if gate(
+            task,
+            &spawn,
+            plan.policy,
+            global_active,
+            self.clock.utc_minute(),
+        ) != Gate::Allowed
+        {
+            tracing::info!(
+                event = "lost.held_by_policy",
+                number = task.number(),
+                "Respawn потерянной сессии held: пик/CUP"
+            );
+            return Ok(LostAct::Deferred);
+        }
+        match self.respawn_dead_stage(board, task, slot, session).await {
+            Ok(true) => {
+                // resurrection удалась — серия потерянных доставок прервана
+                self.state.clear_lost_session(&board.board, task.number());
+                Ok(LostAct::Respawned)
+            }
+            // луп-гвард эскалировал сам (Needs attention) — исход учтён им
+            Ok(false) => Ok(LostAct::Counted),
+            // анти-ре-энтри: отказ респавна не возвращается в маршрутизацию
+            Err(e) => {
+                self.log_action_failed(task, e);
+                Ok(LostAct::Counted)
+            }
+        }
+    }
+
+    /// Десинк-рука: исполнитель числит сессию живой, но доставку
+    /// отклоняет (класс serve-рассинхрона/шторма 13.11). Респавн
+    /// запрещён анти-дублем; счётчик потерянных доставок
+    /// (статус-тегированный) до порога → Needs attention с причиной.
+    async fn session_lost_desync(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        slot: Slot,
+    ) -> UsecaseResult<LostAct> {
+        let (prev_status, count) = self
+            .state
+            .lost_session(&board.board, task.number())
+            .map(|(st, c)| (Some(st), c))
+            .unwrap_or((None, 0));
+        let count = if prev_status.as_ref() == Some(&task.status()) {
+            count
+        } else {
+            0
+        };
+        let next = count + 1;
+        self.state
+            .mark_lost_session(&board.board, task.number(), task.status());
+        if next < SESSION_LOST_ESCALATE_AFTER {
+            tracing::warn!(
+                event = "lost.desync_counted",
+                number = task.number(),
+                slot = naming::slot_key(slot),
+                count = next,
+                "Доставка 404 при живом списке исполнителя — счётчик потери"
+            );
+            return Ok(LostAct::Counted);
+        }
+        tracing::warn!(
+            event = "lost.escalated",
+            number = task.number(),
+            slot = naming::slot_key(slot),
+            "Сессия потеряна: доставка 404 при живом списке — порог неудач"
+        );
+        self.board
+            .set_status(&board.board, task.number(), Status::NeedsAttention)
+            .await?;
+        self.board
+            .post_comment(
+                task.number(),
+                &format!(
+                    "⚠︎ Сессия потеряна: доставка в сессию стадии `{}` отклоняется \
+                     исполнителем (404) при живом списке сессий — порог \
+                     {SESSION_LOST_ESCALATE_AFTER} неудач. Строка в Needs attention, \
+                     разбор владельца.",
+                    naming::slot_key(slot)
+                ),
+            )
+            .await?;
+        self.state.clear_lost_session(&board.board, task.number());
+        Ok(LostAct::Escalated)
     }
 
     /// Автомерж (#1232): проба PR → мерж (строка остаётся в Review — Done
