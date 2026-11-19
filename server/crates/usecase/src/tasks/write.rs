@@ -1478,6 +1478,9 @@ mod tests {
     }
 
     /// edit с полями: ветка записана, носитель её не видит — громко.
+    /// Пин на вычисленный перечень («не сошлись: ветка») — регресс к
+    /// статичному тексту без контрольного перечитывания ловится здесь
+    /// (раунд 2 ревью #1331: вербикт-подстроки — живая практика репо).
     #[tokio::test]
     async fn phantom_edit_fields_are_loud() {
         let u = writecase_carrier(Arc::new(FakeFields::default()), true, false);
@@ -1492,9 +1495,11 @@ mod tests {
             )
             .await
             .expect_err("фантомный edit — громкий отказ");
+        let text = err.to_string();
+        assert!(text.contains("не подтвердилась"), "текст отказа: {text}");
         assert!(
-            err.to_string().contains("не подтвердилась"),
-            "текст отказа: {err}"
+            text.contains("не сошлись: ветка"),
+            "перечень несошедших ключей вычислен, не статичен: {text}"
         );
     }
 
