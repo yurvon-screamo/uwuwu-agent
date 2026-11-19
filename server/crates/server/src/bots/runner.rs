@@ -245,6 +245,12 @@ async fn ensure_session(deps: &BotDeps) -> UsecaseResult<String> {
             Liveness::Dead => {
                 tracing::warn!(event = "bot.session_dead", slug = %deps.slug, session = %s,
                     "Сессия не жива — пересоздание");
+                // Методичка вшита в мёртвую сессию (doc-режим) — свежая её
+                // не получит: сброс hash = дозаправка первым же промптом
+                // (#1221 тест-круг 1, тот же инвариант, что у компакта и
+                // recreate-ветки супервизора; персист — save() пути
+                // пересоздания ниже).
+                deps.state.set_bot_manual_hash(&deps.slug, None);
             }
         }
     }

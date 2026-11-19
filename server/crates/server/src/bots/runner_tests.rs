@@ -2280,19 +2280,21 @@ async fn dead_session_recreate_by_runner_rearms_manual() {
     let state = Arc::new(FakeState::default());
     let clock = FakeClock::at(10_000_000);
     let tg = FakeTg::new(vec![]);
-    let sup =
-        doc_bot_with_manual(&wiki, &sessions, &state, &clock, &tg, "UWUWU_BOT_TOKEN_DEAD").await;
+    doc_bot_with_manual(
+        &wiki,
+        &sessions,
+        &state,
+        &clock,
+        &tg,
+        "UWUWU_BOT_TOKEN_DEAD",
+    )
+    .await;
     let old = state.bot_session(SLUG).unwrap();
     // исполнитель потерял сессию (рестарт opencode)
     sessions.set_liveness(&old, Liveness::Dead);
     tg.inject(private_update(2, "yurvon", "после рестарта исполнителя"));
     wait_until(
-        || {
-            state
-                .bot_session(SLUG)
-                .map(|s| s != old)
-                .unwrap_or(false)
-        },
+        || state.bot_session(SLUG).map(|s| s != old).unwrap_or(false),
         2000,
     )
     .await;
