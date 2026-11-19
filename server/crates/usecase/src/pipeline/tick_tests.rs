@@ -1469,9 +1469,6 @@ impl TaskBoardRepo for CommentBoard {
     async fn set_status(&self, _b: &str, _n: u64, _s: Status) -> UsecaseResult<()> {
         Ok(())
     }
-    async fn row_exists(&self, _b: &str, _n: u64) -> UsecaseResult<bool> {
-        Ok(false)
-    }
     async fn set_board_cells(
         &self,
         _b: &str,

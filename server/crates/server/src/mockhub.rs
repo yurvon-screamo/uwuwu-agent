@@ -6,9 +6,9 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use uwuwu_domain::{Priority, Slot, Status, Task, TaskFields};
+use uwuwu_usecase::{AppendDocOutcome, UsecaseError, UsecaseResult};
 use uwuwu_usecase::{CommentRef, IssueView};
 use uwuwu_usecase::{IssueFieldStore, TaskBoardRepo};
-use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 /// Состояние мок-хаба: строки «доски» (все имена досок → один стенд).
 #[derive(Default)]
@@ -612,14 +612,24 @@ impl uwuwu_usecase::WikiRepo for MemoryHub {
         })
     }
 
-    async fn append_doc(&self, slug: &str, line: &str, _message: &str) -> UsecaseResult<()> {
+    async fn append_doc(
+        &self,
+        slug: &str,
+        line: &str,
+        _message: &str,
+    ) -> UsecaseResult<AppendDocOutcome> {
         self.with_state(|state| {
+            let existed = state.docs.contains_key(slug);
             let entry = state.docs.entry(slug.to_string()).or_default();
-            if !entry.is_empty() {
+            if !entry.is_empty() && !entry.ends_with('\n') {
                 entry.push('\n');
             }
             entry.push_str(line);
-            Ok(())
+            entry.push('\n');
+            Ok(AppendDocOutcome {
+                created: !existed,
+                lines: entry.lines().count(),
+            })
         })
     }
 }

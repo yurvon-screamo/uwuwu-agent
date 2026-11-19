@@ -12,8 +12,8 @@ use uwuwu_usecase::bots::{
     BotAssetStore, BotStateStore, MediaKind, TelegramGateway, TgMedia, TgMessage, TgUpdate,
 };
 use uwuwu_usecase::{
-    AgentSessionGateway, AssistantReply, Clock, DreamerMark, Liveness, SessionInfo, SessionSpec,
-    TickStateStore, UsecaseError, UsecaseResult, WikiRepo,
+    AgentSessionGateway, AppendDocOutcome, AssistantReply, Clock, DreamerMark, Liveness,
+    SessionInfo, SessionSpec, TickStateStore, UsecaseError, UsecaseResult, WikiRepo,
 };
 
 use super::runner::{process_message, spawn_bot_task, BotDeps, BotStructural};
@@ -70,12 +70,20 @@ impl WikiRepo for FakeWiki {
             .insert(slug.into(), content.into());
         Ok(())
     }
-    async fn append_doc(&self, slug: &str, line: &str, _m: &str) -> UsecaseResult<()> {
+    async fn append_doc(
+        &self,
+        slug: &str,
+        line: &str,
+        _m: &str,
+    ) -> UsecaseResult<AppendDocOutcome> {
         let mut docs = self.docs.lock().expect("wiki lock");
         let e = docs.entry(slug.into()).or_default();
         e.push('\n');
         e.push_str(line);
-        Ok(())
+        Ok(AppendDocOutcome {
+            created: false,
+            lines: e.lines().count(),
+        })
     }
 }
 
