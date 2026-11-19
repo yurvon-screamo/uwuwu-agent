@@ -88,7 +88,9 @@ struct StateFile {
 
 /// Переезд носителя ботов (#1214): ключи старой раскладки
 /// `Projects/<proj>/Боты/<имя>` → `bot/<имя>`. Существующий новый
-/// ключ приоритетен — свежие записи не перетираются.
+/// ключ приоритетен — свежие записи не перетираются; коллизия двух
+/// легаси-ключей с одинаковым именем бота — громкий warn (тихий дроп
+/// строки состояния прячет потерю сессии/offset).
 fn migrate_bot_keys(bots: &mut BTreeMap<String, BotRow>) {
     let legacy: Vec<String> = bots
         .keys()
@@ -103,7 +105,13 @@ fn migrate_bot_keys(bots: &mut BTreeMap<String, BotRow>) {
             continue;
         };
         let name = key.rsplit('/').next().unwrap_or_default();
-        bots.entry(format!("bot/{name}")).or_insert(row);
+        let new = format!("bot/{name}");
+        if bots.contains_key(&new) {
+            tracing::warn!(event = "state.bot_key_collision", from = %key, to = %new,
+                "Коллизия легаси-ключей ботов — запись старого ключа отброшена (новый приоритетен)");
+            continue;
+        }
+        bots.insert(new, row);
     }
 }
 

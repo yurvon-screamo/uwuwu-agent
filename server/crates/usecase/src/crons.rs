@@ -112,8 +112,9 @@ impl CronUseCase {
     }
 
     /// Файр одного мастера: журнальная строка + спавн рана на его
-    /// проект-исполнителе. None — спавн не удался (журнал уже пометил
-    /// запуск; рестарт расписание повторит).
+    /// проект-исполнителе. None — спавн не удался (create/prompt Err):
+    /// журнал уже пометил запуск, stale-детект поднимет сигнал через 2ч,
+    /// остальные мастера тика продолжаются.
     async fn fire_run(
         &self,
         master: &CronMaster,
@@ -146,8 +147,21 @@ impl CronUseCase {
             bootstrap: false,
         };
         let sessions = self.sessions.project(&master.project);
-        let session = sessions.create_session(&spec).await?;
-        sessions.prompt(&session, &prompt).await?;
+        let session = match sessions.create_session(&spec).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(event = "cron.fire_failed", cron = %slug,
+                    project = %master.project, error = %e,
+                    "Спавн крон-рана не удался — остальные мастера тика продолжаются");
+                return Ok(None);
+            }
+        };
+        if let Err(e) = sessions.prompt(&session, &prompt).await {
+            tracing::warn!(event = "cron.fire_failed", cron = %slug,
+                session = %session, error = %e,
+                "Промпт крон-рана не доставлен — остальные мастера тика продолжаются");
+            return Ok(None);
+        }
         tracing::info!(event = "cron.fired", cron = %slug, session = %session, "Cron fired");
         Ok(Some(FireOutcome { slug, session }))
     }
@@ -514,10 +528,17 @@ mod tests {
     struct MemSessions {
         busy: std::sync::atomic::AtomicUsize,
         spawned: Mutex<Vec<String>>,
+        /// true — create_session всегда Err (изоляция файра, ревью #1214).
+        fail_create: std::sync::atomic::AtomicBool,
     }
     #[async_trait::async_trait]
     impl crate::ports::AgentSessionGateway for MemSessions {
         async fn create_session(&self, _spec: &crate::ports::SessionSpec) -> UsecaseResult<String> {
+            if self.fail_create.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::error::UsecaseError::Session(
+                    "исполнитель недоступен".into(),
+                ));
+            }
             let id = format!("ses_{}", self.spawned.lock().unwrap().len() + 1);
             self.spawned.lock().unwrap().push(id.clone());
             Ok(id)
@@ -591,6 +612,7 @@ mod tests {
         let sessions = Arc::new(MemSessions {
             busy: 1.into(),
             spawned: Mutex::default(),
+            fail_create: false.into(),
         });
         let u = cron_uc(wiki.clone(), sessions.clone(), 1);
         let fired = u.tick().await.unwrap();
@@ -667,6 +689,7 @@ mod tests {
         let sessions = Arc::new(MemSessions {
             busy: 0.into(),
             spawned: Mutex::default(),
+            fail_create: false.into(),
         });
         let u = cron_uc(wiki.clone(), sessions.clone(), 1);
         let fired = u.tick().await.unwrap();
@@ -693,11 +716,42 @@ mod tests {
         let sessions = Arc::new(MemSessions {
             busy: 0.into(),
             spawned: Mutex::default(),
+            fail_create: false.into(),
         });
         let u = cron_uc(wiki, sessions.clone(), 1);
         let fired = u.tick().await.unwrap();
         assert_eq!(fired.len(), 1, "второй файр отложен занятым первым слотом");
         assert_eq!(sessions.spawned.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn spawn_failure_isolates_single_cron() {
+        // Ревью #1214: сбой спавна одного мастера не обрывает тик —
+        // остальные мастера файрятся при свободных слотах. Журнальная
+        // строка у несостоявшегося рана уже стоит (append до спавна) —
+        // stale-детект поднимет сигнал; Outcome в тик не попадает.
+        let mut docs = std::collections::HashMap::new();
+        for (name, title) in [("тест-1", "Тест 1"), ("тест-2", "Тест 2")] {
+            let slug = format!("cron/{name}/README");
+            docs.insert(
+                slug,
+                format!("---\ntitle: {title}\nschedule: 5m\nproject: uwuwu\n---\nТело"),
+            );
+        }
+        let wiki = Arc::new(MemWiki(Mutex::new(docs)));
+        let sessions = Arc::new(MemSessions {
+            busy: 0.into(),
+            spawned: Mutex::default(),
+            fail_create: true.into(),
+        });
+        let u = cron_uc(wiki.clone(), sessions, 7);
+        let fired = u.tick().await.unwrap();
+        assert!(fired.is_empty(), "спавны не удались — outcome нет");
+        let w = wiki.0.lock().unwrap();
+        assert!(
+            w.contains_key("cron/тест-1/Журнал") && w.contains_key("cron/тест-2/Журнал"),
+            "журнальные строки у обоих мастеров стоят — тик дошёл до обоих"
+        );
     }
 
     #[tokio::test]
@@ -717,6 +771,7 @@ mod tests {
         let sessions = Arc::new(MemSessions {
             busy: 0.into(),
             spawned: Mutex::default(),
+            fail_create: false.into(),
         });
         let u = cron_uc(wiki, sessions, 1);
         let all = u.masters(None).await.unwrap();
