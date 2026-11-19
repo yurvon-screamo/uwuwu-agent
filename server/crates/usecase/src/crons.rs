@@ -767,6 +767,13 @@ mod tests {
         }
         docs.insert("cron/крон-а/Журнал".into(), "- журнал".into());
         docs.insert("cron/крон-а/скрин.png.txt".into(), "не-мастер".into());
+        // Мастер — только README внутри подпапки (#1214, план): loose-файл
+        // на верхнем уровне cron/ и вложенный сегмент — вне инвентаря.
+        docs.insert("cron/заметка.md".into(), "не подпапка".into());
+        docs.insert(
+            "cron/а/б/README".into(),
+            "---\nschedule: 1h\nproject: uwuwu\n---".into(),
+        );
         let wiki = Arc::new(MemWiki(Mutex::new(docs)));
         let sessions = Arc::new(MemSessions {
             busy: 0.into(),
@@ -775,7 +782,11 @@ mod tests {
         });
         let u = cron_uc(wiki, sessions, 1);
         let all = u.masters(None).await.unwrap();
-        assert_eq!(all.len(), 2, "журнал и не-README — вне инвентаря");
+        assert_eq!(
+            all.len(),
+            2,
+            "журнал, не-README и вложенные пути — вне инвентаря"
+        );
         let uwuwu_only = u.masters(Some("uwuwu")).await.unwrap();
         assert_eq!(uwuwu_only.len(), 1);
         assert_eq!(uwuwu_only[0].project, "uwuwu");
