@@ -1092,3 +1092,26 @@ async fn blob_tools_fail_loud_without_env() {
         "{err}"
     );
 }
+
+#[tokio::test]
+async fn blob_put_over_limit_is_loud_through_dispatcher() {
+    // Лимит 20 MiB через живой диспетчер: base64-конверт декодируется на
+    // границе, отказ юзкейса доходит агенту как текст ошибки (тестировщик
+    // #1292 — диспетчерский слой поверх юзкейс-теста place()).
+    let (tools, _memory) = hub();
+    let big = vec![b'a'; uwuwu_usecase::BLOB_MAX_BYTES + 1];
+    let err = call(
+        &tools,
+        "blob_put",
+        json!({
+            "project": "uwuwu",
+            "number": 1292,
+            "filename": "big.bin",
+            "data_base64": base64_of(&big),
+        }),
+    )
+    .await
+    .expect_err("громкий отказ по лимиту");
+    assert!(err.contains("blob too big"), "{err}");
+    assert!(err.contains("прецедент UC-06"), "{err}");
+}
