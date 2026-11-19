@@ -93,6 +93,9 @@ pub struct TickOutcome {
     pub review_flagged: usize,
     /// Строк, запаркованных порогом потерянных доставок (#1288).
     pub session_lost_flagged: usize,
+    /// Отложенные политикой (пик/CUP) respawn'ы потерянных сессий (#1288):
+    /// отдельно от будильников (\`wakeups_deferred\`).
+    pub lost_deferred: usize,
     /// Busy-сессии исполнителя по union-скану на старте тика (или
     /// статусный фолбэк-подсчёт при недоступности скана) — наблюдаемость
     /// единого капа (#1231).
@@ -451,6 +454,7 @@ impl TickUseCase {
             deferred_peak = out.deferred_peak,
             wakeups = out.wakeups,
             wakeups_deferred = out.wakeups_deferred,
+            lost_deferred = out.lost_deferred,
             automerged = out.automerged,
             held_live = out.held_live,
             stall_pings = out.stall_pings,
@@ -923,7 +927,7 @@ impl TickUseCase {
             Ok(LostAct::Escalated) => out.session_lost_flagged += 1,
             Ok(LostAct::Guarded) => out.held_live += 1,
             Ok(LostAct::GuardedBlind) => out.held_blind += 1,
-            Ok(LostAct::Deferred) => out.wakeups_deferred += 1,
+            Ok(LostAct::Deferred) => out.lost_deferred += 1,
             // счётчик растёт внутри порога; либо луп-гвард сам эскалировал,
             // либо анти-ре-энтри отказ — исход учтён другими механизмами
             Ok(LostAct::Counted) => {}

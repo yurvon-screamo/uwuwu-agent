@@ -241,14 +241,20 @@ impl TickUseCase {
                     );
                     return Ok(WakeAct::Deferred);
                 }
-                let spawned = self.respawn_dead_stage(board, task, slot, session).await?;
-                // луп-гвард эскалировал (Needs attention, без спавна) —
-                // счётчик запусков не трогаем, сталл-пасс мягко откажется
-                return Ok(if spawned {
-                    WakeAct::Respawned
-                } else {
-                    WakeAct::None
-                });
+                match self.respawn_dead_stage(board, task, slot, session).await {
+                    Ok(true) => return Ok(WakeAct::Respawned),
+                    // луп-гвард эскалировал (Needs attention, без спавна) —
+                    // счётчик запусков не трогаем, сталл-пасс мягко откажется
+                    Ok(false) => return Ok(WakeAct::None),
+                    // анти-ре-энтри (#1288): отказ респавна — включая
+                    // SessionNotFound сирота-пути (404 промпта свежей
+                    // сессии) — не возвращается в маршрутизацию потери;
+                    // лог и ретрай следующим тиком
+                    Err(e) => {
+                        self.log_action_failed(task, e);
+                        return Ok(WakeAct::None);
+                    }
+                }
             }
         }
         let comments = self.board.latest_comments(task.number()).await?;

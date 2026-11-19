@@ -7436,3 +7436,41 @@ async fn busy_session_gets_no_delivery_and_is_never_counted_lost() {
         "busy-сессии доставок нет"
     );
 }
+
+#[tokio::test]
+async fn dead_probe_with_fresh_404s_resurrects_once_per_tick_and_parks_on_fifth() {
+    // Ревью раунда 1 (#1288): проба Dead + 404 промптов свежих спавнов —
+    // отказ respawn_dead_stage в Dead-ветке не возвращается в
+    // маршрутизацию (анти-ре-энтри): одна resurrection-попытка за тик
+    // (bootstrap+рабочая); луп-гвард считает respawn-попытки — парковка
+    // после 5-й (тик 1 — kick_unfreeze, попытки с тика 2)
+    let mut sessions = FakeSessions::new();
+    sessions.prompt_lost_all = true;
+    sessions
+        .dead_sessions
+        .lock()
+        .unwrap()
+        .push("ses_dev_16".into());
+    let (u, board, sess) = lost_usecase(Vec::new(), sessions, Arc::new(FixedClock));
+    // тик 1: kick_unfreeze — мёртвая дев-сессия снимается (#397), plain
+    // spawn предпринят и отклонён 404
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.actions_failed, 1, "plain spawn тика 1 отклонён 404");
+    // тики 2–5: dead-respawn-попытки (ровно одна за тик), луп-гвард ≤ 4
+    for tick in 2..=5 {
+        let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+        assert_eq!(
+            out.session_lost_flagged, 0,
+            "не десинк-класс: сессии нет в списке"
+        );
+        assert_eq!(
+            sess.spawned.lock().unwrap().len(),
+            2 * tick,
+            "ровно одна попытка за тик (bootstrap+рабочая), без повторного входа"
+        );
+        assert!(!parked(&board), "луп-гвард ≤ 4 — парковки нет (тик {tick})");
+    }
+    // тик 6: пятая respawn-попытка — луп-гвард >4 → «Респавн-петля»
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert!(parked(&board), "луп-гвард паркует после 5 respawn-попыток");
+}
