@@ -23,6 +23,14 @@ pub(crate) struct Pv2Meta {
     pub(crate) options: HashMap<String, String>,
 }
 
+/// Строка индекса: numeric item id + последнее прочитанное Status-значение
+/// носителя (из list items с fields-параметром).
+#[derive(Clone)]
+pub(crate) struct Pv2Item {
+    pub(crate) id: u64,
+    pub(crate) status: Option<String>,
+}
+
 /// Ответ REST: не-2xx отдаётся наверх со статусом — толерантные ветки
 /// (404 снесённой строки) разбирают сами (прецедент hub.rest/fields.rest);
 /// Err — только transport/gherr-классы (403/429).
@@ -41,9 +49,11 @@ pub(crate) struct Pv2Rest {
     /// TTL 10 мин: хирургия владельца над Status-полем доски
     /// восстанавливает мутации без рестарта сервера.
     meta: TtlCache<Pv2Meta>,
-    /// issue number → Pv2 item id: list items пагинацией; TTL и
+    /// issue number → Pv2 item (numeric id + Status-значение носителя):
+    /// list items пагинацией с fields=<Status field id> — GET items/{id}
+    /// single-select Status не отдаёт никогда (тест-раунд #1236); TTL и
     /// refresh-on-miss — строки добавляются/сносятся вне сервера.
-    items: TtlCache<HashMap<u64, u64>>,
+    items: TtlCache<HashMap<u64, Pv2Item>>,
     /// write-through статусов строк: read-лаг Projects v2 минутного
     /// масштаба (проба среза 0) — повторный гард edit() в TTL-окне
     /// читает собственную запись, а не стэйл носителя.
@@ -177,26 +187,39 @@ impl Pv2Rest {
         Ok(self.meta.put(board, meta, now))
     }
 
-    /// item id строки: живой кеш → рефреш индекса → мисса (не на доске).
-    pub(crate) async fn item_id(&self, board: &str, number: u64) -> UsecaseResult<Option<u64>> {
+    /// Строка индекса (id + Status носителя): живой кеш → рефреш → мисса
+    /// (не на доске).
+    pub(crate) async fn item_entry(
+        &self,
+        board: &str,
+        number: u64,
+    ) -> UsecaseResult<Option<Pv2Item>> {
         let now = std::time::Instant::now();
         if let Some(hit) = self.items.get(board, now) {
-            if let Some(id) = hit.get(&number) {
-                return Ok(Some(*id));
+            if let Some(item) = hit.get(&number) {
+                return Ok(Some(item.clone()));
             }
         }
         let map = self.fetch_items(board).await?;
         let arc = self.items.put(board, map, now);
-        Ok(arc.get(&number).copied())
+        Ok(arc.get(&number).cloned())
     }
 
-    async fn fetch_items(&self, board: &str) -> UsecaseResult<HashMap<u64, u64>> {
+    /// item id строки.
+    pub(crate) async fn item_id(&self, board: &str, number: u64) -> UsecaseResult<Option<u64>> {
+        Ok(self.item_entry(board, number).await?.map(|item| item.id))
+    }
+
+    async fn fetch_items(&self, board: &str) -> UsecaseResult<HashMap<u64, Pv2Item>> {
         let meta = self.meta(board).await?;
         let owner = self.owner()?;
         let mut map = HashMap::new();
+        // fields=<Status field id>: list items по умолчанию несёт только
+        // Title — Status-значения строк приходят только с этим параметром
+        // (тест-раунд #1236: GET items/{id} слеп к Status навсегда)
         let mut url = format!(
-            "/users/{owner}/projectsV2/{}/items?per_page=100",
-            meta.project_number
+            "/users/{owner}/projectsV2/{}/items?per_page=100&fields={}",
+            meta.project_number, meta.status_field_id
         );
         for _ in 0..ITEM_PAGES {
             let resp = self.rest(reqwest::Method::GET, &url, None).await?;
@@ -208,16 +231,16 @@ impl Pv2Rest {
             }
             if let Some(list) = resp.body.as_array() {
                 for item in list {
-                    if let Some((number, id)) = parse_item_entry(item) {
-                        map.insert(number, id);
+                    if let Some((number, id, status)) = parse_item_entry(item) {
+                        map.insert(number, Pv2Item { id, status });
                     }
                 }
             }
             match next_after(resp.link.as_deref()) {
                 Some(after) => {
                     url = format!(
-                        "/users/{owner}/projectsV2/{}/items?per_page=100&after={after}",
-                        meta.project_number
+                        "/users/{owner}/projectsV2/{}/items?per_page=100&fields={}&after={after}",
+                        meta.project_number, meta.status_field_id
                     );
                 }
                 // пагинация исчерпана — индекс полный
@@ -231,50 +254,39 @@ impl Pv2Rest {
         )))
     }
 
-    /// Чтение НОСИТЕЛЯ (GET item, мимо write-through — verify обязан
-    /// подтверждать GitHub, не собственную запись): None — строки нет
-    /// (мисса индекса или 404); Some("") — Status не читается (не задан
-    /// или read-лаг Projects v2, проба среза 0).
+    /// Чтение НОСИТЕЛЯ (item index с fields-Status, мимо write-through —
+    /// verify обязан подтверждать GitHub, не собственную запись):
+    /// None — строки нет (мисса индекса); Some("") — Status не читается
+    /// (не задан; GET items/{id} Status не отдаёт никогда — тест-раунд #1236).
     pub(crate) async fn fetch_status(
         &self,
         board: &str,
         number: u64,
     ) -> UsecaseResult<Option<String>> {
-        let meta = self.meta(board).await?;
-        let owner = self.owner()?;
-        let Some(item) = self.item_id(board, number).await? else {
+        let Some(item) = self.item_entry(board, number).await? else {
             return Ok(None);
         };
-        let resp = self
-            .rest(
-                reqwest::Method::GET,
-                &format!(
-                    "/users/{owner}/projectsV2/{}/items/{item}",
-                    meta.project_number
-                ),
-                None,
-            )
-            .await?;
-        if resp.status == reqwest::StatusCode::NOT_FOUND {
-            // индекс застал (строку снесли) — сброс, следующий рефреш;
-            // ветка жива: rest() отдаёт не-2xx наверх (ревью 1 Common-1)
-            self.items.invalidate(board);
-            return Ok(None);
-        }
-        if !resp.status.is_success() {
-            return Err(UsecaseError::Board(format!(
-                "строка #{number}: GET item HTTP {}",
-                resp.status
-            )));
-        }
-        Ok(Some(
-            parse_status_value(&resp.body["fields"]).unwrap_or_default(),
-        ))
+        let Some(status) = item.status else {
+            // частичный entry (create-инкремент до первого полного списка):
+            // id известен, статус не запрашивался — полный рефреш индекса,
+            // второй заход отвечает носителем (refresh-on-status-miss,
+            // живой сквозной фикса: без него гард слеп до TTL индекса)
+            let map = self.fetch_items(board).await?;
+            let now = std::time::Instant::now();
+            let arc = self.items.put(board, map, now);
+            return Ok(Some(
+                arc.get(&number)
+                    .and_then(|fresh| fresh.status.clone())
+                    .unwrap_or_default(),
+            ));
+        };
+        Ok(Some(status))
     }
 
     /// Raw-имя Status строки на доске для гарда: None — строки нет;
     /// Some("") — есть, но Status не читается (контракт прежнего
-    /// carrier_status). write-through обслуживает окно read-лага.
+    /// carrier_status). write-through обслуживает окно read-лага
+    /// после PATCH (list носителя лагает минуты, GET item слеп).
     pub(crate) async fn read_status(
         &self,
         board: &str,
@@ -377,7 +389,7 @@ impl Pv2Rest {
             Some(hit) => (*hit).clone(),
             None => HashMap::new(),
         };
-        map.insert(number, id);
+        map.insert(number, Pv2Item { id, status: None });
         self.items.put(board, map, now);
         Ok(id)
     }

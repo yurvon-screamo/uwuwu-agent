@@ -89,6 +89,23 @@ fn item_entry_reads_live_list_shape() {
         "content_type": "Issue",
         "content": { "number": 1307 }
     });
-    assert_eq!(parse_item_entry(&item), Some((1307, 309546144)));
+    assert_eq!(parse_item_entry(&item), Some((1307, 309546144, None)));
     assert_eq!(parse_item_entry(&json!({ "id": 1 })), None);
+}
+
+/// fields-проба фикса (тест-раунд #1236): list items с fields=<Status
+/// field id> несёт Status-значение — value.name.raw.
+#[test]
+fn item_entry_reads_status_from_fields_param() {
+    let item = json!({
+        "id": 307117662,
+        "content": { "number": 1297 },
+        "fields": [
+            { "name": "Status", "value": { "id": "c207b79e", "name": { "html": "Done", "raw": "Done" }, "color": "RED" } }
+        ]
+    });
+    assert_eq!(
+        parse_item_entry(&item),
+        Some((1297, 307117662, Some("Done".into())))
+    );
 }

@@ -83,7 +83,12 @@ pub(crate) fn next_after(link: Option<&str>) -> Option<String> {
     None
 }
 
-/// Резолв numeric item id строки из элемента list items (number, id).
-pub(crate) fn parse_item_entry(item: &Value) -> Option<(u64, u64)> {
-    Some((item["content"]["number"].as_u64()?, item["id"].as_u64()?))
+/// Элемент list items (проба срез 0 + fields-проба фикса): numeric id,
+/// content.number, Status-значение из fields при `fields=<status field id>`
+/// (value.name.raw; None — поля нет: list без fields несёт только Title).
+pub(crate) fn parse_item_entry(item: &Value) -> Option<(u64, u64, Option<String>)> {
+    let number = item["content"]["number"].as_u64()?;
+    let id = item["id"].as_u64()?;
+    let status = parse_status_value(&item["fields"]);
+    Some((number, id, status))
 }
