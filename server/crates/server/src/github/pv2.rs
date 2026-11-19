@@ -61,8 +61,19 @@ pub(crate) struct Pv2Rest {
 }
 
 const ITEM_PAGES: usize = 10;
+/// TTL items-индекса доски (карта целиком: item_entry при TTL-смерти
+/// или миссе любого number заменяет её через fetch_items+put —
+/// до-записные статусы строк возвращаются лаг-фетчами носителя).
+/// Связка с STATUS_TTL — инвариант #1346, см. ниже.
 const ITEMS_TTL: std::time::Duration = std::time::Duration::from_secs(240);
-const STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Write-through статусов строк (read-лаг Projects v2 минутного
+/// масштаба — проба среза 0 #1236; инцидент #1345: гард в окне
+/// 60–240 с от записи читал до-записный статус из items-карты).
+/// Связка с ITEMS_TTL — инвариант #1346: STATUS_TTL покрывает
+/// максимум возраста items-карты, до-записное значение нашей строки
+/// не просачивается в гард-чтение, пока wt жив. Дрейф ниже ITEMS_TTL
+/// тихо открывает стейл-окно — живая проба приёмки #1346 его вернёт.
+const STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(240);
 const META_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 impl Pv2Rest {
@@ -394,3 +405,6 @@ impl Pv2Rest {
         Ok(id)
     }
 }
+
+#[cfg(test)]
+mod pv2_cache_tests;
