@@ -656,8 +656,8 @@ mod tests {
         // прочие неуспехи — временный Session, ретрай легитимен
         use uwuwu_usecase::UsecaseError;
         assert!(OpencodeClient::check_session(reqwest::StatusCode::OK, "prompt s").is_ok());
-        let lost = OpencodeClient::check_session(reqwest::StatusCode::NOT_FOUND, "prompt s")
-            .unwrap_err();
+        let lost =
+            OpencodeClient::check_session(reqwest::StatusCode::NOT_FOUND, "prompt s").unwrap_err();
         assert!(matches!(lost, UsecaseError::SessionNotFound(_)));
         let lost400 = OpencodeClient::check_session(reqwest::StatusCode::BAD_REQUEST, "prompt s")
             .unwrap_err();
