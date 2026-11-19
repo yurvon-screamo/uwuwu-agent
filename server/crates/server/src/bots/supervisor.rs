@@ -11,7 +11,9 @@ use uwuwu_usecase::bots::{
     compact_verdict, parse_bot_doc, plan_action, BotAssetStore, BotStateStore, CompactFacts,
     CompactPolicy, TelegramGateway,
 };
-use uwuwu_usecase::{AgentSessionGateway, Clock, TickStateStore, UsecaseResult, WikiRepo};
+use uwuwu_usecase::{
+    AgentSessionGateway, Clock, Liveness, TickStateStore, UsecaseResult, WikiRepo,
+};
 
 use super::runner::{spawn_bot_task, BotStructural, RETRY_PAUSE_MS};
 use super::BotLive;
@@ -157,11 +159,20 @@ impl BotSupervisor {
         Ok(())
     }
 
+    /// «Сессия потеряна исполнителем» (404-класс отказа пробы):
+    /// liveness-проба различает Dead от транспортного Unknown — пропуск
+    /// только по Dead, Unknown завершает проход (транспорт от гейта не
+    /// отличить — не долбим).
+    async fn session_gone(&self, session: &str) -> bool {
+        matches!(self.sessions.liveness(session).await, Liveness::Dead)
+    }
+
     /// Компакт-проход (#1221): по живым ботам с сессией — факты (busy/
     /// idle/занятость окна) → матрица вердикта → нативный compact
     /// admission в окне неактивности. Секция конфига отсутствует —
-    /// no-op. Отказ union-скана — проход пропущен; отказ пробы
-    /// сессии — проход тика завершён (не долбим упавший исполнитель).
+    /// no-op. Отказ union-скана — проход пропущен; транспортный отказ
+    /// пробы — проход тика завершён; потерянная сессия (404-класс) —
+    /// мимо одного бота, соседи продолжаются (ревью L1 #1221).
     async fn compact_pass(&self) {
         let Some(policy) = self.compact else { return };
         let scan = match self.sessions.list_sessions().await {
@@ -192,6 +203,16 @@ impl BotSupervisor {
             let idle_ms = match self.sessions.last_activity_ms(&session).await {
                 Ok(ms) => ms.map(|ms| now.saturating_sub(ms)),
                 Err(e) => {
+                    // 404-класс (сессия потеряна исполнителем) — мимо этого
+                    // бота, соседи продолжают (ревью L1 #1221); прочий
+                    // отказ (транспорт/гейт) — проход тика завершён, не
+                    // долбим упавший исполнитель.
+                    if self.session_gone(&session).await {
+                        tracing::warn!(event = "bot.compact_session_gone", slug = %slug,
+                            session = %session,
+                            "Сессия потеряна исполнителем — бот пропущен, соседи продолжаются");
+                        continue;
+                    }
                     tracing::warn!(event = "bot.compact_probe_failed", slug = %slug,
                         error = %e, "Проба активности не удалась — компакт-проход завершён");
                     return;
@@ -201,6 +222,12 @@ impl BotSupervisor {
             let usage_pct = match self.sessions.context_usage_pct(&session, &model).await {
                 Ok(u) => u,
                 Err(e) => {
+                    if self.session_gone(&session).await {
+                        tracing::warn!(event = "bot.compact_session_gone", slug = %slug,
+                            session = %session,
+                            "Сессия потеряна исполнителем — бот пропущен, соседи продолжаются");
+                        continue;
+                    }
                     tracing::warn!(event = "bot.compact_probe_failed", slug = %slug,
                         error = %e, "Проба занятости не удалась — компакт-проход завершён");
                     return;

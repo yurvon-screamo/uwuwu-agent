@@ -272,6 +272,9 @@ struct FakeSessions {
     /// Сценарии отказов проб (#1221): скан / активность.
     list_err: AtomicBool,
     activity_err: AtomicBool,
+    /// 404-класс пробы per-session (сессия потеряна исполнителем,
+    /// ревью L1 #1221): liveness таких — Dead.
+    activity_404: Mutex<std::collections::HashSet<String>>,
 }
 
 impl FakeSessions {
@@ -293,6 +296,7 @@ impl FakeSessions {
             compacts: Mutex::new(Vec::new()),
             list_err: AtomicBool::new(false),
             activity_err: AtomicBool::new(false),
+            activity_404: Mutex::new(std::collections::HashSet::new()),
         })
     }
     fn set_liveness(&self, session: &str, l: Liveness) {
@@ -325,6 +329,12 @@ impl FakeSessions {
     }
     fn compacts_snapshot(&self) -> Vec<String> {
         self.compacts.lock().expect("sessions lock").clone()
+    }
+    fn set_activity_404(&self, session: &str) {
+        self.activity_404
+            .lock()
+            .expect("sessions lock")
+            .insert(session.to_string());
     }
 }
 
@@ -386,6 +396,9 @@ impl AgentSessionGateway for FakeSessions {
             return Err(UsecaseError::Session(
                 "fake: проба активности не удалась".into(),
             ));
+        }
+        if self.activity_404.lock().expect("sessions lock").contains(s) {
+            return Err(UsecaseError::Session(format!("message tail {s}: HTTP 404")));
         }
         Ok(self
             .activity
@@ -2315,5 +2328,65 @@ async fn compact_policy_absent_is_off() {
     assert!(
         sessions.compacts_snapshot().is_empty(),
         "нет секции [compact] — no-op"
+    );
+}
+
+#[tokio::test]
+async fn compact_gone_session_skips_bot_and_neighbors_continue() {
+    // ревью L1 #1221: сессия одного бота потеряна исполнителем (404-класс
+    // пробы, liveness Dead) — компакт-проход пропускает этого бота,
+    // здоровые соседи стреляют как обычно
+    const SLUG_A: &str = "bot/проба-a";
+    const SLUG_B: &str = "bot/проба-b";
+    let wiki = Arc::new(FakeWiki::default());
+    let sessions = FakeSessions::new();
+    let state = Arc::new(FakeState::default());
+    let clock = FakeClock::at(10_000_000);
+    let tg = FakeTg::new(vec![]);
+    // FakeTg не удаляет апдейты: оба бот-таска увидят апдейт — обе сессии
+    wiki.set_doc(
+        "bot/проба-a/README",
+        &doc_md("p/m1", "UWUWU_BOT_TOKEN_CA", "методичка"),
+    );
+    wiki.set_doc(
+        "bot/проба-b/README",
+        &doc_md("p/m1", "UWUWU_BOT_TOKEN_CB", "методичка"),
+    );
+    tg.inject(private_update(1, "yurvon", "привет"));
+    let mut sup = supervisor(
+        wiki.clone(),
+        sessions.clone(),
+        state.clone(),
+        clock.clone(),
+        tg.clone(),
+        vec![("UWUWU_BOT_TOKEN_CA", "tok"), ("UWUWU_BOT_TOKEN_CB", "tok")],
+    );
+    sup.compact = Some(compact_policy(300_000, 40.0, 60_000));
+    let sup = Arc::new(sup);
+    sup.tick().await.unwrap();
+    wait_until(
+        || state.bot_session(SLUG_A).is_some() && state.bot_session(SLUG_B).is_some(),
+        4000,
+    )
+    .await;
+    let session_a = state.bot_session(SLUG_A).unwrap();
+    let session_b = state.bot_session(SLUG_B).unwrap();
+    // бот B: сессия потеряна исполнителем — 404-класс пробы, liveness Dead
+    sessions.set_activity_404(&session_b);
+    sessions.set_liveness(&session_b, Liveness::Dead);
+    // бот A: живые факты — компакт обязан состояться
+    sessions.set_activity(&session_a, Some(clock.now_ms() - 400_000));
+    sessions.set_usage(&session_a, Some(50.0));
+    sup.tick().await.unwrap();
+    assert_eq!(
+        sessions.compacts_snapshot(),
+        vec![session_a.clone()],
+        "потерянная сессия глушит только своего бота"
+    );
+    assert_eq!(state.bot_compact_ms(SLUG_B), 0, "боту B метка не ставилась");
+    assert_eq!(
+        state.bot_compact_ms(SLUG_A),
+        clock.now_ms(),
+        "здоровый сосед ужался"
     );
 }

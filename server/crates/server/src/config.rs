@@ -82,9 +82,9 @@ pub struct NotifyCfg {
 
 /// Автокомпакт вечных сессий ботов (#1221, ADR-082): нативный compact
 /// по idle-политике в тике супервизора. Секция отсутствует — механика
-/// off (safe default, откат = снять секцию); пороги-дефолты — числа
-/// владельца из постановки ADR-082 (05.11: «при 4 часов неактивности
-/// и 40%+ контекста», коулдаун 1ч).
+/// off (safe default, откат = снять секцию); провенанс дефолтов:
+/// idle 4ч и 40% — числа владельца (постановка 05.11 в ADR-082),
+/// коулдаун 1ч — реализация ADR-082 (ревью L3 #1221).
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompactCfg {
     /// Неактивность ≥ этого числа минут (ms-порог — 60_000×).
@@ -238,6 +238,16 @@ impl Config {
         }
         if !self.executor.url.starts_with("http") {
             return Err(ConfigError::Validation("executor.url не http(s)".into()));
+        }
+        // [compact] (#1221, ревью L4): нулевые пороги легальны (стенды),
+        // но nan/минус — конфиг-опечатка, меняющая семантику на «стрелять
+        // при каждом проходе» — громкий старт вместо тихой миссемантики.
+        if let Some(c) = &self.compact {
+            if !c.min_context_pct.is_finite() || c.min_context_pct < 0.0 {
+                return Err(ConfigError::Validation(
+                    "compact.min_context_pct обязан быть конечным и ≥ 0".into(),
+                ));
+            }
         }
         self.validate_executors()?;
         for p in &self.project {
@@ -588,6 +598,28 @@ mod tests {
         let cfg = toml::from_str::<Config>(&raw).expect("toml парсится");
         let err = cfg.validate().expect_err("дубль имени должен падать");
         assert!(err.to_string().contains("уже в конфиге"), "{err}");
+    }
+
+    #[test]
+    fn compact_nan_and_negative_context_pct_fail_loudly() {
+        // ревью L4 #1221: nan/минус — конфиг-опечатка, меняющая семантику
+        // на «стрелять при каждом проходе»; нулевые пороги легальны
+        for pct in ["nan", "-5.0"] {
+            let raw = format!(
+                "{}\n[compact]\nidle_min = 0\nmin_context_pct = {pct}\ncooldown_min = 1\n",
+                base_two_projects()
+            );
+            let cfg = toml::from_str::<Config>(&raw).expect("toml парсится");
+            let err = cfg.validate().expect_err("битый [compact] должен падать");
+            assert!(err.to_string().contains("min_context_pct"), "{err}");
+        }
+        // легальная секция проходит
+        let raw = format!(
+            "{}\n[compact]\nidle_min = 0\nmin_context_pct = 0.0\ncooldown_min = 1\n",
+            base_two_projects()
+        );
+        let cfg = toml::from_str::<Config>(&raw).expect("toml парсится");
+        cfg.validate().expect("нулевые пороги легальны");
     }
 
     #[test]
