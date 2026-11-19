@@ -5,6 +5,7 @@
 //! порты юзкейс-слоя.
 
 mod agent;
+mod blob;
 mod bot;
 mod budget;
 mod cron;
@@ -15,6 +16,7 @@ mod task;
 mod task_type;
 
 pub use agent::{Agent, AgentSlot, ModelRef, SpawnModel};
+pub use blob::BlobKey;
 pub use bot::{BotAction, BotModel, BotSpec};
 pub use budget::{BudgetVerdict, SpawnBudget};
 pub use cron::{

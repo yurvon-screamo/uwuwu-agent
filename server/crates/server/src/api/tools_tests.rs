@@ -3,54 +3,22 @@
 //! happy-path, freshness-отказ, append, твин-гард, пин-h3 (кейс #1046),
 //! квитанция полного task_body. Мок-hub — в памяти, без GitHub.
 
-use super::test_support::{StubSessions, StubState, StubWiki};
+use super::test_support::{
+    blob_usecase, blob_usecase_missing, tool_hub, StubSessions, StubState, StubWiki,
+};
 use super::tools::{tool_descriptors, ToolHub};
 use crate::clock::SystemClock;
 use crate::mockhub::MemoryHub;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use uwuwu_usecase::{
-    DocsView, IssueFieldStore, PersonView, SearchUseCase, TaskBoardRepo, TaskView,
-    TaskWriteUseCase, WikiRepo,
+    DocsView, PersonView, SearchUseCase, TaskBoardRepo, TaskView, TaskWriteUseCase,
 };
 
-/// Фикстура поверхности: ToolHub целиком на MemoryHub + стабах вики/сессий.
-/// Возвращает тот же hub, что сидит в писателе — тело читается напрямую.
+/// Фикстура поверхности: ToolHub фабрики test_support (StubWiki-вики,
+/// memory-blob) — тело читается напрямую через вернувшийся MemoryHub.
 fn hub() -> (Arc<ToolHub>, Arc<MemoryHub>) {
-    let memory = Arc::new(MemoryHub::from_env());
-    let board: Arc<dyn TaskBoardRepo> = memory.clone();
-    let fields: Arc<dyn IssueFieldStore> = memory.clone();
-    let wiki: Arc<dyn WikiRepo> = Arc::new(StubWiki);
-    let sessions = Arc::new(uwuwu_usecase::SessionRouter::uniform(Arc::new(
-        StubSessions,
-    )));
-    let boards = vec![("uwuwu".to_string(), "Задачи uwuwu".to_string())];
-    let tools = Arc::new(ToolHub {
-        tasks: Arc::new(TaskView::new(board.clone(), boards.clone())),
-        docs: Arc::new(DocsView::new(wiki.clone())),
-        person: Arc::new(PersonView::new(wiki.clone())),
-        writer: Arc::new(TaskWriteUseCase {
-            board: board.clone(),
-            fields,
-            boards,
-            clock: Arc::new(SystemClock),
-            state: Arc::new(StubState),
-        }),
-        wiki,
-        sessions,
-        search: Arc::new(SearchUseCase { semantic: None }),
-        crons: Arc::new(uwuwu_usecase::CronUseCase {
-            wiki: Arc::new(StubWiki),
-            sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(Arc::new(
-                StubSessions,
-            ))),
-            clock: Arc::new(SystemClock),
-            models: Arc::new(uwuwu_usecase::SpawnModels::canonical()),
-            checkout: String::new(),
-            cup: 7,
-        }),
-    });
-    (tools, memory)
+    tool_hub(Arc::new(StubWiki), blob_usecase())
 }
 
 async fn call(tools: &ToolHub, name: &str, args: Value) -> Result<String, String> {
@@ -682,6 +650,7 @@ async fn fast_track_from_draft_and_todo() {
         wiki,
         sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(sessions)),
         search: Arc::new(SearchUseCase { semantic: None }),
+        blobs: blob_usecase(),
         crons: Arc::new(uwuwu_usecase::CronUseCase {
             wiki: Arc::new(StubWiki),
             sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(Arc::new(
@@ -689,7 +658,7 @@ async fn fast_track_from_draft_and_todo() {
             ))),
             clock: Arc::new(SystemClock),
             models: Arc::new(uwuwu_usecase::SpawnModels::canonical()),
-            checkout: String::new(),
+            projects: Default::default(),
             cup: 7,
         }),
     });
@@ -1017,4 +986,132 @@ async fn automerge_cell_roundtrips_on_mock_carrier() {
         card.contains("automerge: false"),
         "edit off рендерится: {card}"
     );
+}
+
+// ——— blob-канал (#1292) — полный туловой контур поверх memory-стора ———
+
+fn base64_of(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+#[tokio::test]
+async fn blob_put_returns_key_and_url_get_resigns_by_key() {
+    let (tools, _memory) = hub();
+    let png = b"\x89PNG-fake-screenshot-bytes";
+
+    let put = call(
+        &tools,
+        "blob_put",
+        json!({
+            "filename": "скрин от МПНЧ.png",
+            "data_base64": base64_of(png),
+            "number": 1292
+        }),
+    )
+    .await
+    .expect("put ok");
+    let key = put
+        .lines()
+        .find_map(|l| l.strip_prefix("ключ: "))
+        .expect("ключ в квитанции");
+    assert!(key.starts_with("blobs/uwuwu/1292/"), "{put}");
+    assert!(key.ends_with("скрин от МПНЧ.png"), "имя сохранено: {put}");
+    assert!(put.contains("ссылка (TTL 7 суток): memory://"), "{put}");
+    assert!(put.contains("image/png"), "{put}");
+
+    let get = call(&tools, "blob_get", json!({ "key": key }))
+        .await
+        .expect("get ok");
+    assert!(
+        get.contains(&format!("ссылка (TTL 7 суток): memory://{key}")),
+        "{get}"
+    );
+    assert!(
+        get.contains("существование объекта не проверяется"),
+        "семантика L-1 в ответе: {get}"
+    );
+}
+
+#[tokio::test]
+async fn blob_put_without_number_goes_to_misc_segment() {
+    let (tools, _memory) = hub();
+    let put = call(
+        &tools,
+        "blob_put",
+        json!({ "filename": "runbook.svg", "data_base64": base64_of(b"<svg/>") }),
+    )
+    .await
+    .expect("put ok");
+    assert!(put.contains("ключ: blobs/uwuwu/misc/"), "{put}");
+    assert!(put.contains("image/svg+xml"), "{put}");
+}
+
+#[tokio::test]
+async fn blob_put_rejects_bad_base64_loudly() {
+    let (tools, _memory) = hub();
+    let err = call(
+        &tools,
+        "blob_put",
+        json!({ "filename": "a.png", "data_base64": "не-база64!!!" }),
+    )
+    .await
+    .expect_err("громкий отказ");
+    assert!(err.contains("data_base64"), "{err}");
+}
+
+#[tokio::test]
+async fn blob_get_rejects_malformed_key() {
+    let (tools, _memory) = hub();
+    for key in ["etc/passwd", "blobs//x", "blobs/a/../../x"] {
+        let err = call(&tools, "blob_get", json!({ "key": key }))
+            .await
+            .expect_err("громкий отказ");
+        assert!(err.contains("blobs/"), "{key}: {err}");
+    }
+}
+
+#[tokio::test]
+async fn blob_tools_fail_loud_without_env() {
+    // Отдельный hub с несконфигурированным каналом: отказ — перечень env,
+    // не тихая слепота (ADR-010). Фабрика с missing-бэкендом.
+    let (tools, _memory) = tool_hub(
+        Arc::new(StubWiki),
+        blob_usecase_missing(&["UWUWU_S3_ENDPOINT", "UWUWU_S3_BUCKET"]),
+    );
+    let err = call(
+        &tools,
+        "blob_put",
+        json!({ "filename": "a.png", "data_base64": base64_of(b"x") }),
+    )
+    .await
+    .expect_err("громкий отказ");
+    assert!(err.contains("blob не сконфигурирован"), "{err}");
+    assert!(
+        err.contains("UWUWU_S3_ENDPOINT") && err.contains("UWUWU_S3_BUCKET"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn blob_put_over_limit_is_loud_through_dispatcher() {
+    // Лимит 20 MiB через живой диспетчер: base64-конверт декодируется на
+    // границе, отказ юзкейса доходит агенту как текст ошибки (тестировщик
+    // #1292 — диспетчерский слой поверх юзкейс-теста place()).
+    let (tools, _memory) = hub();
+    let big = vec![b'a'; uwuwu_usecase::BLOB_MAX_BYTES + 1];
+    let err = call(
+        &tools,
+        "blob_put",
+        json!({
+            "project": "uwuwu",
+            "number": 1292,
+            "filename": "big.bin",
+            "data_base64": base64_of(&big),
+        }),
+    )
+    .await
+    .expect_err("громкий отказ по лимиту");
+    assert!(err.contains("blob too big"), "{err}");
+    assert!(err.contains("прецедент UC-06"), "{err}");
 }

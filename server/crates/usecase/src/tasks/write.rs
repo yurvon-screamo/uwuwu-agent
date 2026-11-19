@@ -4,7 +4,7 @@
 
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
-use crate::ports::{Clock, IssueFieldStore, TaskBoardRepo, TickStateStore};
+use crate::ports::{Clock, CommentRef, IssueFieldStore, TaskBoardRepo, TickStateStore};
 use crate::tasks::md_section;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -33,10 +33,14 @@ pub enum SectionAction {
 
 /// Квитанция записи тела: хэш и размер тела как записано (fm-граница
 /// применена). body_hash — токен свежести последующих секционных правок.
+/// Честная квитанция (#1331): verified=true — тело перечитано с носителя,
+/// hash/size от прочитанного; verified=false — носитель не прочитан
+/// (деградация контрольного чтения), hash/size от отправленного тела.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BodyWriteReceipt {
     pub body_hash: String,
     pub body_size: usize,
+    pub verified: bool,
 }
 
 /// Квитанция секционной правки (#1152): исход + тело после записи.
@@ -54,6 +58,8 @@ pub struct SectionEditReport {
     pub body_hash: String,
     /// размер тела после записи, байт.
     pub body_size: usize,
+    /// тело перечитано с носителя после записи (честная квитанция #1331).
+    pub verified: bool,
 }
 
 #[async_trait]
@@ -71,9 +77,16 @@ pub trait TaskWriter: Send + Sync {
     /// Закрытие: Status=Done + issue closed (reason: completed|not_planned).
     /// Доска строки резолвится по всему конфигу (мультиборд, #1135).
     async fn close(&self, number: u64, not_planned: bool) -> UsecaseResult<()>;
-    /// Полная замена тела (fm на границе стрипается — тела без fm, поля
-    /// нативные и от тела не зависят); возвращает квитанцию записанного.
-    async fn set_body(&self, number: u64, body_md: &str) -> UsecaseResult<BodyWriteReceipt>;
+    /// Полная замена тела (fm и дисплей-шапка task_get на границе
+    /// срезаются — тела без fm, поля нативные и от тела не зависят);
+    /// возвращает честную квитанцию: контрольное чтение носителя после
+    /// записи (#1331) — hash/size от прочитанного, либо verified=false.
+    async fn set_body(
+        &self,
+        project: &str,
+        number: u64,
+        body_md: &str,
+    ) -> UsecaseResult<BodyWriteReceipt>;
     /// Секционная правка тела (#1152): агент передаёт дельту секции, сервер
     /// собирает тело сам — большое тело не гоняется через контекст агента.
     /// Свежесть: base_hash (body_hash из fm task_get/квитанции) против
@@ -286,6 +299,13 @@ impl TaskWriter for TaskWriteUseCase {
         } else {
             Vec::new()
         };
+        // Ожидания контрольного чтения носителя (честная квитанция #1331):
+        // после всех записей один read_issue сверяет всё изменённое.
+        let mut want_title: Option<String> = None;
+        let mut want_branch: Option<String> = None;
+        let mut want_pr: Option<String> = None;
+        let mut want_priority: Option<String> = None;
+        let mut want_automerge: Option<bool> = None;
         if let Some(status) = patch.status {
             // канон переходов — домен: запрещённое ребро = громкая ошибка.
             // current — свежий статус носителя, не снапшот доски: стэйл-
@@ -369,6 +389,7 @@ impl TaskWriter for TaskWriteUseCase {
                 )));
             }
             self.board.rename_issue(number, title).await?;
+            want_title = Some(title.clone());
         }
         // ветка/PR — нативные поля issue (в снапшоте не живут)
         let mut field_patch: Vec<(&str, Option<String>)> = Vec::new();
@@ -377,11 +398,13 @@ impl TaskWriter for TaskWriteUseCase {
                 UsecaseError::Board(format!("ветка «{b}» не валидна (пробелы/глоб-символы)"))
             })?;
             field_patch.push(("Branch", Some(name.as_str().to_string())));
+            want_branch = Some(name.as_str().to_string());
         }
         if let Some(p) = &patch.pr {
             let url = uwuwu_domain::PrUrl::parse(p)
                 .ok_or_else(|| UsecaseError::Board(format!("PR «{p}» не http(s)-URL")))?;
             field_patch.push(("PR", Some(url.as_str().to_string())));
+            want_pr = Some(url.as_str().to_string());
         }
         if !field_patch.is_empty() {
             self.fields.store(number, &field_patch).await?;
@@ -393,8 +416,21 @@ impl TaskWriter for TaskWriteUseCase {
             self.board
                 .set_board_cells(&board, number, patch.priority.as_deref(), patch.automerge)
                 .await?;
+            want_priority = patch.priority.clone();
+            want_automerge = patch.automerge;
         }
-        Ok(())
+        self.verify_edit_delivery(
+            &board,
+            number,
+            EditExpectations {
+                title: want_title,
+                branch: want_branch,
+                pr: want_pr,
+                priority: want_priority,
+                automerge: want_automerge,
+            },
+        )
+        .await
     }
 
     async fn claim(&self, number: u64, session: &str, slot: Option<Slot>) -> UsecaseResult<()> {
@@ -411,23 +447,70 @@ impl TaskWriter for TaskWriteUseCase {
             None => text.to_string(),
         };
         let id = self.board.post_comment(number, &body).await?;
-        // Единственная точка маркировки реестра серверных постов (#1204):
-        // агентские комменты не будят держащую сессию. Фабричные посты
-        // (сталл-пинг, bounce, эскалация) идут мимо — всегда foreign.
-        // Пустой id — маркировки нет (fail-open: возможна разовая эхо-будка).
-        if !id.is_empty() {
-            self.state.mark_own_comment(&id, self.clock.now_ms());
+        // Пустой id — нестандартный ответ носителя: маркировка и
+        // контрольное чтение невозможны, fail-open (возможна разовая
+        // эхо-будка) — поведение маркировки сохранено (#1204).
+        if id.is_empty() {
+            tracing::warn!(
+                event = "write.delivery_unverified",
+                kind = "comment",
+                number,
+                "node_id пуст — верификация доставки невозможна (fail-open)"
+            );
+            return Ok(());
         }
-        Ok(())
+        // Контрольное чтение ленты: коммент присутствует = факт доставки.
+        let repo = self.board.clone();
+        let needle = id.clone();
+        match verify_carrier(
+            self.clock.as_ref(),
+            move || {
+                let repo = repo.clone();
+                async move { repo.latest_comments(number).await }
+            },
+            move |cs: &Vec<CommentRef>| cs.iter().any(|c| c.id == needle),
+        )
+        .await
+        {
+            Delivery::Verified(_) => {
+                self.state.mark_own_comment(&id, self.clock.now_ms());
+                Ok(())
+            }
+            Delivery::Stale => {
+                tracing::error!(
+                    event = "write.delivery_mismatch",
+                    kind = "comment",
+                    number,
+                    "Пост коммента не подтвердился чтением ленты носителя"
+                );
+                Err(UsecaseError::Board(format!(
+                    "коммент #{number}: пост не подтвердился чтением ленты носителя — \
+                     не ретраить слепо (риск дубля), сверь task_get"
+                )))
+            }
+            Delivery::Blind => {
+                tracing::warn!(
+                    event = "write.delivery_unverified",
+                    kind = "comment",
+                    number,
+                    "Чтение ленты носителя не удалось — мутация принята, маркировка сохранена"
+                );
+                self.state.mark_own_comment(&id, self.clock.now_ms());
+                Ok(())
+            }
+        }
     }
 
     async fn close(&self, number: u64, not_planned: bool) -> UsecaseResult<()> {
         // доска строки резолвится по всему конфигу (мультиборд, #1135):
         // вердикт аналитика «дубль/мусор → close» обязан работать на любой
-        // доске волны, не только на первой (пин живого прогона)
+        // доске волны, не только на первой (пин живого прогона).
+        // Поиск — row_exists (носитель), не read_board (#1236): close
+        // не тянет GraphQL-снапшот при исчерпанном GraphQL-бакете.
+        // Предикат присутствия строки, не читаемости статуса (ревью 1
+        // Common-2): строка без Status-поля/в лаге закрывается как прежде.
         for (_, board) in &self.boards {
-            let rows = self.board.read_board(board).await?;
-            if rows.iter().any(|t| t.number() == number) {
+            if self.board.row_exists(board, number).await? {
                 self.board.set_status(board, number, Status::Done).await?;
                 return self.board.close_issue_ext(number, not_planned).await;
             }
@@ -437,15 +520,73 @@ impl TaskWriter for TaskWriteUseCase {
         )))
     }
 
-    async fn set_body(&self, number: u64, body_md: &str) -> UsecaseResult<BodyWriteReceipt> {
-        // инвариант на границе: тело без fm (агенты могут копировать
-        // старый канон — сервер держит «fm снесён» сам, #1151)
-        let clean = crate::fm_lite::strip(body_md);
+    async fn set_body(
+        &self,
+        project: &str,
+        number: u64,
+        body_md: &str,
+    ) -> UsecaseResult<BodyWriteReceipt> {
+        // инвариант на границе: тело без fm и без дисплей-шапки task_get
+        // (агенты могут копировать старый канон — сервер держит «fm снесён»
+        // сам, #1151; fm-стек инцидента #1331)
+        let clean = crate::fm_lite::strip(strip_task_get_header(body_md));
+        let board = self.board_of(project);
+        // project вне конфига — громкий отказ (паритет task_body_section):
+        // мусорный project не пишет «мимо доски» молча (ревью #1331 Low)
+        if board.is_empty() {
+            return Err(UsecaseError::Board(format!(
+                "проект «{project}» вне конфига"
+            )));
+        }
         self.board.replace_body(number, clean).await?;
-        Ok(BodyWriteReceipt {
-            body_hash: md_section::body_hash(clean),
-            body_size: clean.len(),
-        })
+        // контрольное чтение носителя: квитанция = факт доставки (#1331)
+        let repo = self.board.clone();
+        let bd = board.clone();
+        let expected = clean.to_string();
+        // future владеет копиями захваченного — ссылки из тела FnMut-
+        // замыкания не ускользают (lifetime-гард компилятора)
+        match verify_carrier(
+            self.clock.as_ref(),
+            move || {
+                let repo = repo.clone();
+                let bd = bd.clone();
+                async move { repo.read_issue(&bd, number).await }
+            },
+            move |v: &crate::ports::IssueView| v.body == expected,
+        )
+        .await
+        {
+            Delivery::Verified(view) => Ok(BodyWriteReceipt {
+                body_hash: md_section::body_hash(&view.body),
+                body_size: view.body.len(),
+                verified: true,
+            }),
+            Delivery::Stale => {
+                tracing::error!(
+                    event = "write.delivery_mismatch",
+                    kind = "body",
+                    number,
+                    "Запись тела не подтвердилась контрольным чтением носителя"
+                );
+                Err(UsecaseError::Board(format!(
+                    "тело #{number}: запись не подтвердилась чтением носителя — \
+                     GitHub отдаёт не записанное; не ретраить слепо, сверь task_get"
+                )))
+            }
+            Delivery::Blind => {
+                tracing::warn!(
+                    event = "write.delivery_unverified",
+                    kind = "body",
+                    number,
+                    "Контрольное чтение носителя не удалось — квитанция от отправленного тела"
+                );
+                Ok(BodyWriteReceipt {
+                    body_hash: md_section::body_hash(clean),
+                    body_size: clean.len(),
+                    verified: false,
+                })
+            }
+        }
     }
 
     async fn set_body_section(
@@ -480,7 +621,7 @@ impl TaskWriter for TaskWriteUseCase {
         }
         let (next, edit) = md_section::replace_md_section(&current.body, section, content)
             .map_err(UsecaseError::Board)?;
-        let receipt = self.set_body(number, &next).await?;
+        let receipt = self.set_body(project, number, &next).await?;
         let (action, duplicates_removed) = match edit {
             md_section::SectionEdit::Replaced { duplicates_removed } => {
                 (SectionAction::Replaced, duplicates_removed)
@@ -493,7 +634,209 @@ impl TaskWriter for TaskWriteUseCase {
             duplicates_removed,
             body_hash: receipt.body_hash,
             body_size: receipt.body_size,
+            verified: receipt.verified,
         })
+    }
+}
+
+/// Контрольное чтение носителя после успешной мутации (честная квитанция
+/// #1331, ADR-093): мутация отвечает успехом только как факт доставки.
+/// В аномальных окнах носителя (18.44–18.52Z 18.11) эхо-PATCH проходило
+/// при неприменившейся записи — контрольное чтение ловит то, что эхо
+/// пропускает; сильнее на Issues API ничего нет (If-Match не поддерживается).
+const VERIFY_ATTEMPTS: usize = 3;
+const VERIFY_PAUSE_MS: u64 = 1000;
+
+enum Delivery<T> {
+    /// Носитель прочитан и содержит ожидаемое — факт доставки.
+    Verified(T),
+    /// Носитель читается, но ожидаемого нет ни в одной из попыток —
+    /// фантом либо экстремальный лаг; квитанция громко отказывает
+    /// (агенту: не ретраить слепо — сверить task_get).
+    Stale,
+    /// Носитель не прочитан ни разу (сеть, GraphQL-бэкофф) — верификация
+    /// невозможна; квитанция строится от отправленного + warning
+    /// (канон ADR-093: применённую мутацию не ретраят).
+    Blind,
+}
+
+/// До VERIFY_ATTEMPTS попыток чтения носителя с паузой VERIFY_PAUSE_MS
+/// между ними (план-контракт 3×1с, прецедент verify_status): пауза
+/// смягчает ложные Stale-отказы на секундном лаге видимости носителя —
+/// минутные аномальные окна инцидента #1331 не покрываются ни паузой,
+/// ни ретраями, но и не осложняются ими. Последняя попытка решает исход:
+/// Ok-мимо — Stale, Err — Blind.
+async fn verify_carrier<T, Fut, F, M>(clock: &dyn Clock, mut read: F, matches: M) -> Delivery<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, UsecaseError>>,
+    M: Fn(&T) -> bool,
+{
+    let mut stale = false;
+    for attempt in 0..VERIFY_ATTEMPTS {
+        if attempt > 0 {
+            clock.sleep_ms(VERIFY_PAUSE_MS);
+        }
+        match read().await {
+            Ok(v) if matches(&v) => return Delivery::Verified(v),
+            Ok(_) => stale = true,
+            Err(_) => stale = false,
+        }
+    }
+    if stale {
+        Delivery::Stale
+    } else {
+        Delivery::Blind
+    }
+}
+
+/// Дисплей-шапка task_get («--- fm ---» + branch/pr/automerge/body_hash)
+/// — рендер MCP-карточки, не носитель: агенты копируют вывод task_get
+/// назад в task_body, и шапка наслаивалась в теле (fm-стек инцидента
+/// #1331). Срезается на границе записи: инвариант ADR-105 «тело — чистый
+/// markdown» держит сервер, не дисциплина агента (прецедент #1151).
+/// Консервативно: строго набор/порядок ключей рендера, любой посторонний
+/// контент («--- fm ---» внутри текста) не трогается.
+fn strip_task_get_header(md: &str) -> &str {
+    const KEYS: [&str; 4] = ["branch: ", "pr: ", "automerge: ", "body_hash: "];
+    let Some(rest) = md.strip_prefix("--- fm ---\n") else {
+        return md;
+    };
+    let mut pos = rest;
+    for key in KEYS {
+        let Some(line_end) = pos.find('\n') else {
+            return md;
+        };
+        if !pos[..line_end].starts_with(key) {
+            return md;
+        }
+        pos = &pos[line_end + 1..];
+    }
+    pos.trim_start_matches('\n')
+}
+
+/// Ожидания контрольного чтения edit: Some — значение менялось и должно
+/// присутствовать на носителе; None — не менялось и не сверяется.
+#[derive(Clone)]
+struct EditExpectations {
+    title: Option<String>,
+    branch: Option<String>,
+    pr: Option<String>,
+    priority: Option<String>,
+    automerge: Option<bool>,
+}
+
+impl EditExpectations {
+    fn is_empty(&self) -> bool {
+        matches!(
+            (
+                &self.title,
+                &self.branch,
+                &self.pr,
+                &self.priority,
+                self.automerge
+            ),
+            (None, None, None, None, None)
+        )
+    }
+
+    /// Несошедшие ключи последнего чтения — в текст громкой ошибки.
+    fn mismatches(&self, view: &crate::ports::IssueView) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if let Some(t) = &self.title {
+            if view.task.title() != t {
+                out.push("тайтл");
+            }
+        }
+        if let Some(b) = &self.branch {
+            if view.task.branch().map(|x| x.as_str()) != Some(b.as_str()) {
+                out.push("ветка");
+            }
+        }
+        if let Some(u) = &self.pr {
+            if view.task.pr().map(|x| x.as_str()) != Some(u.as_str()) {
+                out.push("PR");
+            }
+        }
+        if let Some(p) = &self.priority {
+            if view.task.priority() != crate::naming::parse_priority(p) {
+                out.push("приоритет");
+            }
+        }
+        if let Some(a) = self.automerge {
+            if view.task.automerge() != a {
+                out.push("automerge");
+            }
+        }
+        out
+    }
+}
+
+impl TaskWriteUseCase {
+    /// Контрольное чтение носителя после успешного edit (#1331): одно
+    /// read_issue сверяет все записанные значения (тайтл/ветка/PR/приоритет/
+    /// automerge). Stale — громкая ошибка с перечнем несошедших; Blind —
+    /// warning (канон ADR-093: применённую мутацию не ретраят).
+    async fn verify_edit_delivery(
+        &self,
+        board: &str,
+        number: u64,
+        want: EditExpectations,
+    ) -> UsecaseResult<()> {
+        if want.is_empty() {
+            return Ok(());
+        }
+        let repo = self.board.clone();
+        let bd = board.to_string();
+        let matches_want = want.clone();
+        let matches = move |v: &crate::ports::IssueView| matches_want.mismatches(v).is_empty();
+        match verify_carrier(
+            self.clock.as_ref(),
+            move || {
+                let repo = repo.clone();
+                let bd = bd.clone();
+                async move { repo.read_issue(&bd, number).await }
+            },
+            matches,
+        )
+        .await
+        {
+            Delivery::Verified(_) => Ok(()),
+            Delivery::Stale => {
+                // перечень несошедших — контрольное перечитывание носителя:
+                // редкая ветка, точный текст громкой ошибки стоит чтения
+                let detail = match self.board.read_issue(board, number).await {
+                    Ok(view) => {
+                        let m = want.mismatches(&view);
+                        if m.is_empty() {
+                            String::new()
+                        } else {
+                            format!("не сошлись: {} — ", m.join(", "))
+                        }
+                    }
+                    Err(_) => String::new(),
+                };
+                tracing::error!(
+                    event = "write.delivery_mismatch",
+                    kind = "edit",
+                    number,
+                    "Запись edit не подтвердилась контрольным чтением носителя"
+                );
+                Err(UsecaseError::Board(format!(
+                    "edit #{number}: запись не подтвердилась чтением носителя ({detail}\
+                     тайтл/ветка/PR/приоритет/automerge) — не ретраить слепо, сверь task_get"
+                )))
+            }
+            Delivery::Blind => {
+                tracing::warn!(
+                    event = "write.delivery_unverified",
+                    kind = "edit",
+                    number,
+                    "Контрольное чтение носителя не удалось — значения не верифицированы"
+                );
+                Ok(())
+            }
+        }
     }
 }
 
@@ -506,7 +849,9 @@ fn render_create_body(spec: &NewTask) -> String {
     let content = if spec.body_md.is_empty() {
         safe_title
     } else {
-        crate::fm_lite::strip(&spec.body_md).to_string()
+        // fm и дисплей-шапка task_get — на границе (инвариант сервера,
+        // #1151; fm-стек инцидента #1331)
+        crate::fm_lite::strip(strip_task_get_header(&spec.body_md)).to_string()
     };
     // тело уже в канон-форме (агенты шлют «## Постановка…») — не дублируем
     // H2 (инцидент #1149: скелет prepend'ался к готовому телу)
@@ -538,6 +883,11 @@ mod tests {
     /// set_board_cells логируются — юзкейс обязан маршрутизировать
     /// Приоритет/Automerge в board-порт (read-your-writes #1258),
     /// а не в fields.store (там эти ячейки снапшота протухали).
+    /// Носитель (carrier) — честный read-after-write: мутации обновляют,
+    /// read_issue/latest_comments читают записанное; phantom — режим
+    /// «мутация отвечает успехом, носитель не меняется» (инцидент #1331,
+    /// красный тест дыры контракта); read_err — носитель не читается
+    /// (Blind-ветка, ADR-093).
     #[derive(Default)]
     struct FakeBoard {
         cells: std::sync::Mutex<Vec<CellWrite>>,
@@ -546,6 +896,56 @@ mod tests {
         cold_hits: Vec<u64>,
         /// Транзиентный сбой REST-поиска (Low-2 ревью): create fail-open.
         search_err: bool,
+        carrier: std::sync::Mutex<Carrier>,
+        phantom: bool,
+        read_err: bool,
+    }
+
+    /// Носитель контрольного чтения фейка: мутации пишут, чтения отдают.
+    #[derive(Default, Clone)]
+    struct Carrier {
+        title: String,
+        body: String,
+        comments: Vec<CommentRef>,
+        branch: Option<String>,
+        pr: Option<String>,
+        priority: Option<String>,
+        automerge: bool,
+    }
+
+    impl Carrier {
+        /// Агрегат для IssueView: поля собираются так же, как адаптер
+        /// собирает их из issue-носителя (map_task_fields-семантика).
+        fn view(&self, number: u64) -> IssueView {
+            let mut task = Task::new(number, self.title.clone(), Status::Empty);
+            let branch = self
+                .branch
+                .as_deref()
+                .and_then(uwuwu_domain::BranchName::parse);
+            let pr = self.pr.as_deref().and_then(uwuwu_domain::PrUrl::parse);
+            let vcs = match (branch, pr) {
+                (Some(branch), Some(url)) => uwuwu_domain::Vcs::PullRequest { branch, url },
+                (Some(branch), None) => uwuwu_domain::Vcs::Branch(branch),
+                (None, Some(url)) => uwuwu_domain::Vcs::Artifact { url },
+                (None, None) => uwuwu_domain::Vcs::Local,
+            };
+            let priority = self
+                .priority
+                .as_deref()
+                .map(crate::naming::parse_priority)
+                .unwrap_or(uwuwu_domain::Priority::Empty);
+            task.apply_fields(uwuwu_domain::TaskFields::new(
+                Default::default(),
+                vcs,
+                priority,
+            ));
+            task.set_automerge(self.automerge);
+            IssueView {
+                task,
+                body: self.body.clone(),
+                comments: self.comments.clone(),
+            }
+        }
     }
 
     /// Запись ячеек снапшота: номер + приоритет + automerge (#1258).
@@ -555,6 +955,10 @@ mod tests {
     impl TaskBoardRepo for FakeBoard {
         async fn row_status(&self, _board: &str, _number: u64) -> UsecaseResult<Option<Status>> {
             Ok(None)
+        }
+
+        async fn row_exists(&self, _board: &str, _number: u64) -> UsecaseResult<bool> {
+            Ok(false)
         }
 
         async fn read_board(&self, _board: &str) -> UsecaseResult<Vec<Task>> {
@@ -571,6 +975,13 @@ mod tests {
                 .lock()
                 .expect("fake board")
                 .push((n, p.map(str::to_string), a));
+            if !self.phantom {
+                let mut c = self.carrier.lock().expect("fake carrier");
+                c.priority = p.map(str::to_string);
+                if let Some(a) = a {
+                    c.automerge = a;
+                }
+            }
             Ok(())
         }
         async fn set_status(&self, _b: &str, _n: u64, _s: Status) -> UsecaseResult<()> {
@@ -586,21 +997,41 @@ mod tests {
             &self,
             _b: &str,
             _n: u64,
-            _branch: &uwuwu_domain::BranchName,
+            branch: &uwuwu_domain::BranchName,
         ) -> UsecaseResult<()> {
+            if !self.phantom {
+                self.carrier.lock().expect("fake carrier").branch =
+                    Some(branch.as_str().to_string());
+            }
             Ok(())
         }
-        async fn post_comment(&self, _n: u64, _body: &str) -> UsecaseResult<String> {
-            Ok(String::new())
+        async fn post_comment(&self, n: u64, body: &str) -> UsecaseResult<String> {
+            // фантом возвращает стандартный id без записи носителя:
+            // нестандартный (пустой) ответ — отдельная fail-open ветка
+            if self.phantom {
+                return Ok("phantom-comment".into());
+            }
+            let mut c = self.carrier.lock().expect("fake carrier");
+            let id = format!("fakec-{}", c.comments.len() + 1);
+            c.comments.push(CommentRef {
+                id: id.clone(),
+                created_ms: 0,
+                body: body.to_string(),
+            });
+            let _ = n;
+            Ok(id)
         }
         async fn close_issue(&self, _n: u64) -> UsecaseResult<()> {
             Ok(())
         }
         async fn latest_comments(&self, _n: u64) -> UsecaseResult<Vec<CommentRef>> {
-            Ok(Vec::new())
+            Ok(self.carrier.lock().expect("fake carrier").comments.clone())
         }
-        async fn read_issue(&self, _b: &str, _n: u64) -> UsecaseResult<IssueView> {
-            panic!("create не читает issue");
+        async fn read_issue(&self, _b: &str, n: u64) -> UsecaseResult<IssueView> {
+            if self.read_err {
+                return Err(UsecaseError::Board("carrier read 503 (мок)".into()));
+            }
+            Ok(self.carrier.lock().expect("fake carrier").view(n))
         }
         async fn issue_fields(&self, _n: u64) -> UsecaseResult<uwuwu_domain::TaskFields> {
             panic!("create не читает поля доски");
@@ -614,7 +1045,10 @@ mod tests {
         ) -> UsecaseResult<u64> {
             Ok(1)
         }
-        async fn rename_issue(&self, _n: u64, _t: &str) -> UsecaseResult<()> {
+        async fn rename_issue(&self, _n: u64, t: &str) -> UsecaseResult<()> {
+            if !self.phantom {
+                self.carrier.lock().expect("fake carrier").title = t.to_string();
+            }
             Ok(())
         }
         async fn patch_cells(&self, _n: u64, _m: FmMutator) -> UsecaseResult<()> {
@@ -632,7 +1066,10 @@ mod tests {
             }
             Ok(self.cold_hits.clone())
         }
-        async fn replace_body(&self, _n: u64, _b: &str) -> UsecaseResult<()> {
+        async fn replace_body(&self, _n: u64, b: &str) -> UsecaseResult<()> {
+            if !self.phantom {
+                self.carrier.lock().expect("fake carrier").body = b.to_string();
+            }
             Ok(())
         }
     }
@@ -669,6 +1106,29 @@ mod tests {
         writecase_with_cold(fields, Vec::new())
     }
 
+    /// Вариант с настроенным носителем: phantom («мутация отвечает успехом,
+    /// носитель не меняется» — красный класс инцидента #1331) или read_err
+    /// (носитель не читается ни разу — Blind-ветка ADR-093).
+    fn writecase_carrier(
+        fields: Arc<FakeFields>,
+        phantom: bool,
+        read_err: bool,
+    ) -> TaskWriteUseCase {
+        let board = Arc::new(FakeBoard {
+            cells: std::sync::Mutex::default(),
+            phantom,
+            read_err,
+            ..Default::default()
+        });
+        TaskWriteUseCase {
+            board,
+            fields,
+            boards: vec![("uwuwu".into(), "Задачи uwuwu".into())],
+            clock: Arc::new(crate::pipeline::tick_tests::FixedClock),
+            state: Arc::new(crate::pipeline::tick_tests::MemState::empty()),
+        }
+    }
+
     /// Вариант с «холодными» номерами репо (клин #1293): issues_with_title
     /// фейка возвращает их для любого тайтла — create обязан отклонить.
     fn writecase_with_cold(
@@ -678,7 +1138,7 @@ mod tests {
         let board = Arc::new(FakeBoard {
             cells: std::sync::Mutex::default(),
             cold_hits,
-            search_err: false,
+            ..Default::default()
         });
         let u = TaskWriteUseCase {
             board: board.clone(),
@@ -717,6 +1177,7 @@ mod tests {
             cells: std::sync::Mutex::default(),
             cold_hits: Vec::new(),
             search_err: true,
+            ..Default::default()
         });
         let u = TaskWriteUseCase {
             board: board.clone(),
@@ -743,7 +1204,7 @@ mod tests {
         let board = Arc::new(FakeBoard {
             cells: std::sync::Mutex::default(),
             cold_hits: vec![1243],
-            search_err: false,
+            ..Default::default()
         });
         let u = TaskWriteUseCase {
             board: board.clone(),
@@ -771,7 +1232,7 @@ mod tests {
         let board = Arc::new(FakeBoard {
             cells: std::sync::Mutex::default(),
             cold_hits: vec![5],
-            search_err: false,
+            ..Default::default()
         });
         let u = TaskWriteUseCase {
             board: board.clone(),
@@ -957,5 +1418,146 @@ mod tests {
         let out = render_create_body(&spec(with_fm));
         assert!(!out.contains("status:"), "fm вырезан: {out}");
         assert_eq!(out.matches("## Постановка").count(), 1);
+    }
+
+    /// Дисплей-шапка task_get срезается на границе записи (fm-стек
+    /// инцидента #1331: агент копирует вывод task_get назад в task_body).
+    #[test]
+    fn task_get_display_header_is_stripped() {
+        let md = "--- fm ---\nbranch: work/task-1331\npr: —\nautomerge: true\nbody_hash: 9de430c691c92328\n\n## Постановка\nтекст";
+        assert_eq!(strip_task_get_header(md), "## Постановка\nтекст");
+    }
+
+    #[test]
+    fn task_get_header_in_middle_is_kept() {
+        let md =
+            "## Секция\n\n--- fm ---\nbranch: x\npr: y\nautomerge: true\nbody_hash: h\n\nтекст";
+        assert_eq!(
+            strip_task_get_header(md),
+            md,
+            "«шапка» в середине тела — не наша граница"
+        );
+    }
+
+    #[test]
+    fn task_get_header_partial_or_foreign_is_kept() {
+        // неполный набор ключей — не рендер task_get
+        let md = "--- fm ---\nbranch: x\npr: y\n\n## Тело";
+        assert_eq!(strip_task_get_header(md), md);
+        // посторонняя строка в «шапке» — не трогаем
+        let md2 = "--- fm ---\nbranch: x\nслучайная строка\nautomerge: true\nbody_hash: h\n\n## Т";
+        assert_eq!(strip_task_get_header(md2), md2);
+        // валидный fm старого канона — это fm_lite, не дисплей-шапка
+        let md3 = "---\ntitle: x\n---\nтекст";
+        assert_eq!(strip_task_get_header(md3), md3);
+    }
+
+    // --- Честные квитанции: контрольное чтение носителя (#1331) ---
+
+    /// Красный класс инцидента #1331: мутация отвечает успехом, носитель
+    /// не меняется — task_body обязан отказывать громко, а не рапортовать
+    /// квитанцию о недоставленном теле.
+    #[tokio::test]
+    async fn phantom_body_write_is_loud() {
+        let u = writecase_carrier(Arc::new(FakeFields::default()), true, false);
+        let err = u
+            .set_body("uwuwu", 1, "## Новое тело\n")
+            .await
+            .expect_err("фантомная запись тела — громкий отказ");
+        assert!(
+            err.to_string().contains("не подтвердилась"),
+            "текст отказа: {err}"
+        );
+    }
+
+    /// Коммент: пост «принят» с id, лента носителя его не содержит — громко.
+    #[tokio::test]
+    async fn phantom_comment_is_loud() {
+        let u = writecase_carrier(Arc::new(FakeFields::default()), true, false);
+        let err = u
+            .comment(1, "probe-1331", None)
+            .await
+            .expect_err("фантомный коммент — громкий отказ");
+        assert!(
+            err.to_string().contains("не подтвердился"),
+            "текст отказа: {err}"
+        );
+    }
+
+    /// edit с полями: ветка записана, носитель её не видит — громко.
+    /// Пин на вычисленный перечень («не сошлись: ветка») — регресс к
+    /// статичному тексту без контрольного перечитывания ловится здесь
+    /// (раунд 2 ревью #1331: вербикт-подстроки — живая практика репо).
+    #[tokio::test]
+    async fn phantom_edit_fields_are_loud() {
+        let u = writecase_carrier(Arc::new(FakeFields::default()), true, false);
+        let err = u
+            .edit(
+                "uwuwu",
+                1,
+                TaskPatch {
+                    branch: Some("work/task-1".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("фантомный edit — громкий отказ");
+        let text = err.to_string();
+        assert!(text.contains("не подтвердилась"), "текст отказа: {text}");
+        assert!(
+            text.contains("не сошлись: ветка"),
+            "перечень несошедших ключей вычислен, не статичен: {text}"
+        );
+    }
+
+    /// rename: тайтл записан, носитель отдаёт старый — громко (находка
+    /// Common ревью плана: rename в скоупе честных квитанций).
+    #[tokio::test]
+    async fn phantom_rename_is_loud() {
+        let u = writecase_carrier(Arc::new(FakeFields::default()), true, false);
+        let err = u
+            .edit(
+                "uwuwu",
+                1,
+                TaskPatch {
+                    title: Some("новый тайтл".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("фантомный rename — громкий отказ");
+        assert!(
+            err.to_string().contains("не подтвердилась"),
+            "текст отказа: {err}"
+        );
+    }
+
+    /// Blind-ветка (ADR-093): носитель не читается — успех с непроверенной
+    /// квитанцией от отправленного тела; ретрай мутации не навязывается.
+    #[tokio::test]
+    async fn blind_body_warns_and_reports_sent_body() {
+        let u = writecase_carrier(Arc::new(FakeFields::default()), false, true);
+        let r = u.set_body("uwuwu", 1, "## Тело\n").await.unwrap();
+        assert!(!r.verified, "непроверенная квитанция");
+        assert_eq!(r.body_hash, md_section::body_hash("## Тело\n"));
+        assert_eq!(r.body_size, "## Тело\n".len());
+    }
+
+    /// Честный носитель: квитанция от прочитанного с носителя.
+    #[tokio::test]
+    async fn honest_body_receipt_carries_carrier_body() {
+        let u = writecase_carrier(Arc::new(FakeFields::default()), false, false);
+        let r = u.set_body("uwuwu", 1, "## Тело\n").await.unwrap();
+        assert!(r.verified, "квитанция с контрольным чтением");
+        assert_eq!(r.body_hash, md_section::body_hash("## Тело\n"));
+    }
+
+    /// Честный носитель: коммент найден в ленте — успех.
+    #[tokio::test]
+    async fn honest_comment_is_verified() {
+        let u = writecase_carrier(Arc::new(FakeFields::default()), false, false);
+        u.comment(1, "текст", None)
+            .await
+            .expect("доставленный коммент");
     }
 }

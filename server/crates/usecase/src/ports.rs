@@ -23,6 +23,10 @@ pub trait TaskBoardRepo: Send + Sync {
     /// None — Status-значения на носителе нет (строки нет на доске /
     /// поле не задано); Some(Empty) — значение носителя непарсящееся.
     async fn row_status(&self, board: &str, number: u64) -> UsecaseResult<Option<Status>>;
+    /// Предикат присутствия строки на доске — независим от читаемости
+    /// Status (строка без поля/в read-лаге всё ещё строка; close-поиск
+    /// доски #1236).
+    async fn row_exists(&self, board: &str, number: u64) -> UsecaseResult<bool>;
     /// Заявка сессии в слот (claim/спавн-привязка).
     async fn set_session(
         &self,
@@ -295,6 +299,11 @@ pub trait PrGateway: Send + Sync {
 pub trait Clock: Send + Sync {
     fn utc_minute(&self) -> UtcMinute;
     fn now_ms(&self) -> u64;
+    /// Пауза между контрольными чтениями носителя после мутации (#1331,
+    /// план-контракт «3×1с»): смягчает ложные Stale-отказы на секундном
+    /// лаге видимости носителя. Дефолт — мгновенный возврат: фейки часов
+    /// тестов не спят; SystemClock спит реально.
+    fn sleep_ms(&self, _ms: u64) {}
 }
 
 /// Нативные поля issue (сессии/ветка/PR/приоритет/тип): fm-зеркало снесено.

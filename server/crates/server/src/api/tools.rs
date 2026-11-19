@@ -1,9 +1,12 @@
 //! Реестр MCP-инструментов: дескрипторы + диспетчер. Тонкие обёртки
 //! юзкейсов (views) — никакой бизнес-логики в presentation.
 
+use base64::Engine as _;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use uwuwu_usecase::{DocsView, PersonView, TaskView, TaskWriteUseCase, TaskWriter};
+use uwuwu_usecase::{
+    BlobPlace, BlobUseCase, DocsView, PersonView, TaskView, TaskWriteUseCase, TaskWriter,
+};
 
 pub struct ToolHub {
     pub tasks: Arc<TaskView>,
@@ -15,6 +18,8 @@ pub struct ToolHub {
     pub sessions: Arc<uwuwu_usecase::SessionRouter>,
     pub search: Arc<uwuwu_usecase::SearchUseCase>,
     pub crons: Arc<uwuwu_usecase::CronUseCase>,
+    /// Blob-канал (#1292): вложения к задачам/докам через приватный S3.
+    pub blobs: Arc<BlobUseCase>,
 }
 
 /// Дефолтный проект для инструментов без явного project.
@@ -138,9 +143,9 @@ pub fn tool_descriptors() -> Value {
         ),
         tool(
             "cron_list",
-            "Инвентарь кронов проекта (мастера в вики-папке Кроны: расписание + журнал-хвост)",
+            "Инвентарь кронов (мастера /cron/<имя>/README.md: расписание + журнал-хвост)",
             object(json!({
-                "project": string("проект; дефолт uwuwu")
+                "project": string("фильтр по проекту (fm project мастера); без него — все кроны")
             }))
         ),
         tool(
@@ -183,6 +188,26 @@ pub fn tool_descriptors() -> Value {
                                     task_get или прошлая квитанция); обязателен")
             }))
         ),
+        tool(
+            "blob_put",
+            "Положить файл в приватный blob-бакет (Tigris) — вложение к \
+             задаче/доку: ключ + presigned-ссылка (TTL 7 суток; истёкшая \
+             переподписывается blob_get по ключу)",
+            object(json!({
+                "filename": string("имя файла с расширением — content-type \
+                                   берётся из него"),
+                "data_base64": string("содержимое файла base64; лимит 20 MiB"),
+                "number": integer("номер задачи: ключ blobs/<project>/<number>/…; \
+                                  без него — сегмент misc"),
+                "project": string("проект; дефолт uwuwu")
+            }))
+        ),
+        tool(
+            "blob_get",
+            "Свежая presigned-ссылка на ранее положенный blob по ключу \
+             (переподпись истёкшей; существование объекта не проверяется)",
+            object(json!({ "key": string("ключ из blob_put (blobs/…)") }))
+        ),
     ])
 }
 
@@ -210,7 +235,7 @@ impl ToolHub {
             "goal_list" => self.goal_list(&project).await,
             "docs_append" => self.docs_append(args).await,
             "docs_write" => self.docs_write(args).await,
-            "cron_list" => self.cron_list(&project).await,
+            "cron_list" => self.cron_list(args).await,
             "search" => self.search(args).await,
             "session_export" => self.session_export(args).await,
             "task_create" => self.task_create(&project, args).await,
@@ -218,8 +243,10 @@ impl ToolHub {
             "task_claim" => self.task_claim(args).await,
             "task_comment" => self.task_comment(args).await,
             "task_close" => self.task_close(args).await,
-            "task_body" => self.task_body(args).await,
+            "task_body" => self.task_body(&project, args).await,
             "task_body_section" => self.task_body_section(&project, args).await,
+            "blob_put" => self.blob_put(&project, args).await,
+            "blob_get" => self.blob_get(args).await,
             other => Err(format!("unknown tool: {other}")),
         }
     }
@@ -324,25 +351,32 @@ impl ToolHub {
         ok_text(format!("док «{slug}» записан"))
     }
 
-    async fn cron_list(&self, project: &str) -> Result<Value, String> {
-        // тонкая обёртка: инвентарь живёт в юзкейсе (masters())
+    async fn cron_list(&self, args: &Value) -> Result<Value, String> {
+        // Инвентарь /cron (#1214): project — опциональный фильтр по fm,
+        // без него — все кроны
+        let filter = arg_str(args, "project");
+        let filter = (!filter.is_empty()).then_some(filter.as_str());
         let masters = self
             .crons
-            .masters(project)
+            .masters(filter)
             .await
             .map_err(|e| e.to_string())?;
         let out = masters
             .iter()
             .map(|m| {
                 format!(
-                    "{} — `{}`\n",
+                    "{} [{}] — `{}`\n",
                     m.title,
+                    m.project,
                     uwuwu_usecase::schedule_label(&m.schedule)
                 )
             })
             .collect::<String>();
         ok_text(if out.is_empty() {
-            format!("кроны проекта {project} не найдены")
+            match filter {
+                Some(p) => format!("кроны проекта {p} не найдены"),
+                None => "кроны не найдены".to_string(),
+            }
         } else {
             out
         })
@@ -465,7 +499,7 @@ impl ToolHub {
         ok_text(format!("задача #{number} закрыта"))
     }
 
-    async fn task_body(&self, args: &Value) -> Result<Value, String> {
+    async fn task_body(&self, project: &str, args: &Value) -> Result<Value, String> {
         let number = need_number(args)?;
         let body = arg_str(args, "body");
         if body.trim().is_empty() {
@@ -473,13 +507,17 @@ impl ToolHub {
         }
         let receipt = self
             .writer
-            .set_body(number, &body)
+            .set_body(project, number, &body)
             .await
             .map_err(|e| e.to_string())?;
-        ok_text(format!(
+        let mut msg = format!(
             "тело #{number} заменено; {} байт; body_hash: {}",
             receipt.body_size, receipt.body_hash
-        ))
+        );
+        if !receipt.verified {
+            msg.push_str(delivery_unverified_marker());
+        }
+        ok_text(msg)
     }
 
     async fn task_body_section(&self, project: &str, args: &Value) -> Result<Value, String> {
@@ -499,6 +537,44 @@ impl ToolHub {
             .await
             .map_err(|e| e.to_string())?;
         ok_text(render_section_report(&section, &report))
+    }
+
+    async fn blob_put(&self, project: &str, args: &Value) -> Result<Value, String> {
+        require_args(args, &["filename", "data_base64"])?;
+        let filename = arg_str(args, "filename");
+        let data_base64 = arg_str(args, "data_base64");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data_base64.trim())
+            .map_err(|e| format!("data_base64 не декодируется: {e}"))?;
+        let number = optional_number(args)?;
+        let target = BlobPlace {
+            project: project.to_string(),
+            task: number,
+            filename,
+        };
+        let receipt = self
+            .blobs
+            .place(&target, &bytes)
+            .await
+            .map_err(|e| e.to_string())?;
+        ok_text(format!(
+            "ключ: {}\nссылка (TTL 7 суток): {}\n{}; {} байт",
+            receipt.key, receipt.url, receipt.content_type, receipt.size
+        ))
+    }
+
+    async fn blob_get(&self, args: &Value) -> Result<Value, String> {
+        let raw = arg_str(args, "key");
+        if raw.trim().is_empty() {
+            return Err("key обязателен".into());
+        }
+        let key = uwuwu_domain::BlobKey::parse(raw.trim())
+            .ok_or("ключ должен иметь форму blobs/<project>/<task|misc>/<sha8>-<имя>")?;
+        let url = self.blobs.fresh_url(&key).map_err(|e| e.to_string())?;
+        ok_text(format!(
+            "ссылка (TTL 7 суток): {url}\n(существование объекта не проверяется — \
+             подпись локальна; замену ссылки в носителе делай текстовыми тулами)"
+        ))
     }
 }
 
@@ -549,6 +625,18 @@ fn need_number(args: &Value) -> Result<u64, String> {
         .ok_or("number обязателен (число)".to_string())
 }
 
+/// Опциональный number: отсутствует/null → None, мусор — громкий отказ.
+fn optional_number(args: &Value) -> Result<Option<u64>, String> {
+    match args.get("number") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            .map(Some)
+            .ok_or("number обязан быть числом".to_string()),
+    }
+}
+
 /// Квитанция секционной правки для агента: исход + новое тело (хэш/размер).
 /// Компактно — полное тело не возвращается (сознательное сужение #1152:
 /// возврат больших тел убивал бы экономию секционного пути).
@@ -563,9 +651,23 @@ fn render_section_report(section: &str, report: &uwuwu_usecase::SectionEditRepor
         verdict.push_str(&format!(" (дублей снят ×{})", report.duplicates_removed));
     }
     format!(
-        "{verdict}; тело {} байт; body_hash: {}",
-        report.body_size, report.body_hash
+        "{verdict}; тело {} байт; body_hash: {}{}",
+        report.body_size,
+        report.body_hash,
+        if report.verified {
+            String::new()
+        } else {
+            delivery_unverified_marker().to_string()
+        }
     )
+}
+
+/// Маркер деградированной квитанции (#1331): контрольное чтение носителя
+/// не состоялось — hash/размер от отправленного, ретрай мутации запрещён.
+/// Единая точка текста для task_body и секционного отчёта.
+fn delivery_unverified_marker() -> &'static str {
+    "; ⚠ доставка не подтверждена контрольным чтением (носитель не прочитан) — \
+     ретрай мутации запрещён, сверь task_get"
 }
 
 fn ok_text(text: String) -> Result<Value, String> {
@@ -611,6 +713,8 @@ mod tests {
             "task_close",
             "task_body",
             "task_body_section",
+            "blob_put",
+            "blob_get",
             "docs_ls",
             "docs_read",
             "docs_write",
@@ -624,7 +728,7 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "нет инструмента {expected}");
         }
-        assert_eq!(names.len(), 19, "контракт поверхности: {names:?}");
+        assert_eq!(names.len(), 21, "контракт поверхности: {names:?}");
     }
 
     #[test]

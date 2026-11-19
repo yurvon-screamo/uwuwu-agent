@@ -90,6 +90,35 @@ struct StateFile {
     own_comments: BTreeMap<String, u64>,
 }
 
+/// Переезд носителя ботов (#1214): ключи старой раскладки
+/// `Projects/<proj>/Боты/<имя>` → `bot/<имя>`. Существующий новый
+/// ключ приоритетен — свежие записи не перетираются; коллизия двух
+/// легаси-ключей с одинаковым именем бота — громкий warn (тихий дроп
+/// строки состояния прячет потерю сессии/offset).
+fn migrate_bot_keys(bots: &mut BTreeMap<String, BotRow>) {
+    let legacy: Vec<String> = bots
+        .keys()
+        .filter(|k| {
+            let segs: Vec<&str> = k.split('/').collect();
+            segs.len() == 4 && segs[0] == "Projects" && segs[2] == "Боты"
+        })
+        .cloned()
+        .collect();
+    for key in legacy {
+        let Some(row) = bots.remove(&key) else {
+            continue;
+        };
+        let name = key.rsplit('/').next().unwrap_or_default();
+        let new = format!("bot/{name}");
+        if bots.contains_key(&new) {
+            tracing::warn!(event = "state.bot_key_collision", from = %key, to = %new,
+                "Коллизия легаси-ключей ботов — запись старого ключа отброшена (новый приоритетен)");
+            continue;
+        }
+        bots.insert(new, row);
+    }
+}
+
 pub struct JsonStateStore {
     path: PathBuf,
     state: std::sync::Mutex<StateFile>,
@@ -103,6 +132,11 @@ impl JsonStateStore {
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok())
             .unwrap_or_default();
+        // Миграция ключей ботов при переезде носителя (#1214): старая
+        // раскладка `Projects/<proj>/Боты/<имя>` → `bot/<имя>`. Сессия
+        // и offset переживают переезд; существующий новый ключ
+        // приоритетен (не перетираем свежие записи).
+        migrate_bot_keys(&mut state.bots);
         // Миграция legacy вечных маркеров (#1306) с разбором когорт:
         // в старом векторе лежали и рабочие сессии, и бот-сессии (старый
         // раннер маркировал их как вечный скип). Бот-когорта (id из
@@ -647,18 +681,18 @@ mod tests {
             let s = store(path.clone());
             s.set_last_comment_id("Задачи uwuwu", 7, "c1");
             // бот: сессия + offset переживают рестарт (секция bots)
-            s.set_bot_session("Projects/uwuwu/Боты/x", Some("ses_abc"));
-            s.set_bot_offset("Projects/uwuwu/Боты/x", 42);
+            s.set_bot_session("bot/x", Some("ses_abc"));
+            s.set_bot_offset("bot/x", 42);
             TickStateStore::save(&s).unwrap();
         }
         let s = store(path.clone());
         assert_eq!(s.last_comment_id("Задачи uwuwu", 7).as_deref(), Some("c1"));
         assert_eq!(
-            s.bot_session("Projects/uwuwu/Боты/x").as_deref(),
+            s.bot_session("bot/x").as_deref(),
             Some("ses_abc"),
             "рестарт восстанавливает сессию бота"
         );
-        assert_eq!(s.bot_offset("Projects/uwuwu/Боты/x"), Some(42));
+        assert_eq!(s.bot_offset("bot/x"), Some(42));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -769,6 +803,55 @@ mod tests {
             "legacy-поле в новом файле не пишется"
         );
         assert!(raw.contains("\"dreamer\""), "новая секция меток на месте");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bot_keys_migrated_to_flat_layout_on_load() {
+        // #1214: переезд носителя ботов — ключи state `Projects/*/Боты/X`
+        // → `bot/X` при загрузке: сессия и offset переживают переезд;
+        // существующий новый ключ приоритетен (свежее не перетирается).
+        let dir = std::env::temp_dir().join(format!("uwuwu-state-bot-mig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"rows":{},"spawns":{},
+                "bots":{"Projects/uwuwu/Боты/Помощник":{"session":"ses_old","offset":7},
+                        "bot/Помощник":{"session":"ses_new"}}}"#,
+        )
+        .unwrap();
+        let s = store_at(path.clone(), 0);
+        {
+            let guard = s.state.lock().expect("state lock");
+            let bots = &guard.bots;
+            assert!(
+                !bots.contains_key("Projects/uwuwu/Боты/Помощник"),
+                "старый ключ вынесен: {bots:?}"
+            );
+            let migrated = bots.get("bot/Помощник").expect("новый ключ на месте");
+            assert_eq!(migrated.session.as_deref(), Some("ses_new"));
+            assert!(migrated.offset.is_none(), "новый ключ приоритетен");
+        }
+        // чистая миграция: старый ключ без соседа переносится целиком
+        let other = dir.join("state2.json");
+        std::fs::write(
+            &other,
+            r#"{"rows":{},"spawns":{},
+                "bots":{"Projects/origa/Боты/Маркетинг":{"session":"ses_m","offset":3}}}"#,
+        )
+        .unwrap();
+        let s2 = store_at(other, 0);
+        {
+            let guard = s2.state.lock().expect("state lock");
+            let row = guard.bots.get("bot/Маркетинг").expect("ключ перенесён");
+            assert_eq!(row.session.as_deref(), Some("ses_m"));
+            assert_eq!(row.offset, Some(3));
+            assert!(
+                !guard.bots.contains_key("Projects/origa/Боты/Маркетинг"),
+                "старый ключ вынесен"
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

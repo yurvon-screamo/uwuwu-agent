@@ -24,6 +24,14 @@ pub enum UsecaseError {
     /// (dead-session класс, #1288) — финальная, не временная: ретрай той
     /// же сессии бессмысленен, маршрут — resurrection/парковка.
     SessionNotFound(String),
+    /// Blob-канал (#1292): отказ S3-носителя (сеть/статус) или ввода.
+    Blob(String),
+    /// Файл превышает потолок blob-канала (20 MiB, прецедент UC-06).
+    BlobTooBig(String),
+    /// Blob-канал не сконфигурирован: не заданы env `UWUWU_S3_*` (#1292).
+    BlobNotConfigured(String),
+    /// Дедуп-ключ blob не прошёл доменный гард `BlobKey` (#1292).
+    BlobBadKey(String),
 }
 
 impl fmt::Display for UsecaseError {
@@ -36,6 +44,10 @@ impl fmt::Display for UsecaseError {
             Self::Telegram(m) => write!(f, "telegram: {m}"),
             Self::TelegramTooBig(m) => write!(f, "telegram too big: {m}"),
             Self::SessionNotFound(m) => write!(f, "сессия не найдена (dead-session): {m}"),
+            Self::Blob(m) => write!(f, "blob: {m}"),
+            Self::BlobTooBig(m) => write!(f, "blob too big: {m}"),
+            Self::BlobNotConfigured(m) => write!(f, "blob не сконфигурирован: {m}"),
+            Self::BlobBadKey(m) => write!(f, "blob bad key: {m}"),
         }
     }
 }

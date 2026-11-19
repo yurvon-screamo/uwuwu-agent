@@ -183,6 +183,9 @@ impl TaskBoardRepo for RowsBoard {
     async fn row_status(&self, _b: &str, _n: u64) -> UsecaseResult<Option<Status>> {
         Ok(None)
     }
+    async fn row_exists(&self, _b: &str, n: u64) -> UsecaseResult<bool> {
+        Ok(self.rows.iter().any(|t| t.number() == n))
+    }
     async fn set_session(&self, _b: &str, _n: u64, _s: Slot, _sess: &str) -> UsecaseResult<()> {
         Ok(())
     }
@@ -255,15 +258,15 @@ struct CronWiki;
 impl WikiRepo for CronWiki {
     async fn read_doc(&self, slug: &str) -> UsecaseResult<Option<String>> {
         Ok(match slug {
-            "Projects/uwuwu/Кроны/Тест" => {
-                Some("---\ntitle: Тест\nschedule: 5m\n---\n\nТело".into())
+            "cron/Тест/README" => {
+                Some("---\ntitle: Тест\nschedule: 5m\nproject: uwuwu\n---\n\nТело".into())
             }
             _ => None,
         })
     }
     async fn list_docs(&self, prefix: &str) -> UsecaseResult<Vec<String>> {
-        Ok(if prefix.contains("Кроны") {
-            vec!["Projects/uwuwu/Кроны/Тест".into()]
+        Ok(if prefix.contains("cron") {
+            vec!["cron/Тест/README".into()]
         } else {
             vec![]
         })
@@ -398,12 +401,12 @@ async fn cron_run_carries_model_from_server_map() {
         sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         clock: Arc::new(TestClock),
         models: models(),
-        checkout: "/tmp".into(),
+        projects: std::collections::HashMap::from([("uwuwu".to_string(), "/tmp".to_string())]),
         cup: 7,
     };
 
     // Act
-    let fired = u.tick("uwuwu").await.unwrap();
+    let fired = u.tick().await.unwrap();
 
     // Assert
     assert_eq!(fired.len(), 1, "крон-файр состоялся");

@@ -59,7 +59,7 @@ MOCK_PID=$!
 sleep 1
 
 # вики-док бота: «один док = один бот», токен только в env стенда
-BOT_DOC='{"Projects/uwuwu/Боты/Проба-раннера": "---\ntitle: Проба раннера\nmodel: zai-coding-plan/glm-5.3-flash\ntoken_env: UWUWU_BOT_TOKEN_E2E\nowner: yurvon\nworkspace: /tmp/opencode\ngreeting: привет от стенда\n---\n\nОтвечай кратко, одной строкой."}'
+BOT_DOC='{"bot/Проба-раннера/README": "---\ntitle: Проба раннера\nmodel: zai-coding-plan/glm-5.3-flash\ntoken_env: UWUWU_BOT_TOKEN_E2E\nowner: yurvon\nworkspace: /tmp/opencode\ngreeting: привет от стенда\n---\n\nОтвечай кратко, одной строкой."}'
 
 say "сервер (live, memory-hub, вики в памяти)"
 UWUWU_SERVER_CONFIG=$PWD/ops/config.memory.e2e.toml \
@@ -124,7 +124,7 @@ python3 - "$STATE" <<'PY'
 import json, sys
 st = json.load(open(sys.argv[1]))
 bots = st.get("bots") or {}
-row = bots.get("Projects/uwuwu/Боты/Проба-раннера")
+row = bots.get("bot/Проба-раннера")
 assert row, f"секция bots пуста: {list(bots)}"
 assert row.get("session"), "нет сессии в state"
 assert row.get("offset"), "нет offset в state"

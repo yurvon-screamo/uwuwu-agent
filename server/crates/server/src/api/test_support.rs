@@ -4,14 +4,80 @@
 //! обоих тест-файлах (identical-code smell, раунд #1256).
 
 use async_trait::async_trait;
+use std::sync::Arc;
 use uwuwu_domain::{Slot, Status};
 use uwuwu_usecase::{
-    AgentSessionGateway, DreamerMark, Liveness, SessionInfo, SessionSpec, TickStateStore,
-    UsecaseResult, WikiRepo,
+    AgentSessionGateway, DreamerMark, Liveness, SessionInfo, SessionSpec, TaskView,
+    TaskWriteUseCase, TickStateStore, UsecaseResult, WikiRepo,
 };
+
+use crate::clock::SystemClock;
+use crate::mockhub::MemoryHub;
+
+use super::tools::ToolHub;
 
 /// Вики в пробах диспетчера не читается: доков нет.
 pub(crate) struct StubWiki;
+
+/// Blob-канал в пробах диспетчера: memory-стор (#1292) — полный путь
+/// place→presign без S3, как прод-контур, но без сети.
+pub(crate) fn blob_usecase() -> Arc<uwuwu_usecase::BlobUseCase> {
+    Arc::new(uwuwu_usecase::BlobUseCase::ready(Arc::new(
+        crate::s3::MemoryBlobStore::default(),
+    )))
+}
+
+/// Blob-канал «не сконфигурирован»: громкий отказ с перечнем (ADR-010).
+pub(crate) fn blob_usecase_missing(names: &[&str]) -> Arc<uwuwu_usecase::BlobUseCase> {
+    Arc::new(uwuwu_usecase::BlobUseCase::missing(
+        names.iter().map(|name| (*name).to_string()).collect(),
+    ))
+}
+
+/// Фикстура ToolHub на MemoryHub-носителе + стабах сессий/state. Вики и
+/// blob-бэкенд — параметры: pins гоняют docs_* на memory-вики, диспетчерные
+/// пробы — на StubWiki; blob — memory для happy-path, missing для отказов
+/// (четыре точки сборки — одна фабрика, ревью #1292).
+pub(crate) fn tool_hub(
+    wiki: Arc<dyn WikiRepo>,
+    blobs: Arc<uwuwu_usecase::BlobUseCase>,
+) -> (Arc<ToolHub>, Arc<MemoryHub>) {
+    let memory = Arc::new(MemoryHub::from_env());
+    let board: Arc<dyn uwuwu_usecase::TaskBoardRepo> = memory.clone();
+    let fields: Arc<dyn uwuwu_usecase::IssueFieldStore> = memory.clone();
+    let tools = Arc::new(ToolHub {
+        tasks: Arc::new(TaskView::new(
+            board.clone(),
+            vec![("uwuwu".to_string(), "Задачи uwuwu".to_string())],
+        )),
+        docs: Arc::new(uwuwu_usecase::DocsView::new(wiki.clone())),
+        person: Arc::new(uwuwu_usecase::PersonView::new(wiki.clone())),
+        writer: Arc::new(TaskWriteUseCase {
+            board: board.clone(),
+            fields,
+            boards: vec![("uwuwu".to_string(), "Задачи uwuwu".to_string())],
+            clock: Arc::new(SystemClock),
+            state: Arc::new(StubState),
+        }),
+        wiki: wiki.clone(),
+        sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(Arc::new(
+            StubSessions,
+        ))),
+        search: Arc::new(uwuwu_usecase::SearchUseCase { semantic: None }),
+        blobs,
+        crons: Arc::new(uwuwu_usecase::CronUseCase {
+            wiki,
+            sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(Arc::new(
+                StubSessions,
+            ))),
+            clock: Arc::new(SystemClock),
+            models: Arc::new(uwuwu_usecase::SpawnModels::canonical()),
+            projects: Default::default(),
+            cup: 7,
+        }),
+    });
+    (tools, memory)
+}
 
 #[async_trait]
 impl WikiRepo for StubWiki {

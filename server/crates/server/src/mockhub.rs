@@ -239,6 +239,19 @@ impl TaskBoardRepo for MemoryHub {
                 .map(|t| t.status()))
         })
     }
+    async fn row_exists(&self, board: &str, number: u64) -> UsecaseResult<bool> {
+        self.with_state(|state| {
+            self.ensure_seed(state);
+            Ok(state
+                .tasks
+                .get(&number)
+                .filter(|t| match state.board_tags.get(&t.number()) {
+                    Some(tag) => tag == board,
+                    None => true,
+                })
+                .is_some())
+        })
+    }
 
     async fn set_session(
         &self,
@@ -309,6 +322,13 @@ impl TaskBoardRepo for MemoryHub {
     }
 
     async fn post_comment(&self, number: u64, body: &str) -> UsecaseResult<String> {
+        // Fault-режим phantom-записей (#1331): «успех» со стандартным id,
+        // состояние носителя не меняется — контрольное чтение юзкейса
+        // обязано отказывать громко. Не пустой id: пустой — отдельная
+        // fail-open ветка нестандартного ответа.
+        if phantom_writes() {
+            return Ok("phantom-comment".into());
+        }
         self.with_state(|state| {
             let counter = &mut state.counter;
             *counter += 1;
@@ -373,6 +393,9 @@ impl TaskBoardRepo for MemoryHub {
     }
 
     async fn rename_issue(&self, number: u64, title: &str) -> UsecaseResult<()> {
+        if phantom_writes() {
+            return Ok(());
+        }
         self.with_state(|state| {
             let task = state
                 .tasks
@@ -438,6 +461,9 @@ impl TaskBoardRepo for MemoryHub {
     }
 
     async fn replace_body(&self, number: u64, body_md: &str) -> UsecaseResult<()> {
+        if phantom_writes() {
+            return Ok(());
+        }
         self.with_state(|state| {
             if !state.bodies.contains_key(&number) {
                 return Err(UsecaseError::Board(format!("mockhub: #{number} нет")));
@@ -506,6 +532,14 @@ impl uwuwu_usecase::WikiRepo for MemoryHub {
     }
 }
 
+/// Fault-режим e2e-фазы phantom-записей (#1331): мутации носителя
+/// отвечают успехом, состояние не меняется — контрольное чтение юзкейса
+/// обязано превращать «успех» в громкий отказ. Включение: env
+/// UWUWU_MOCK_PHANTOM_WRITES=1 (только мок-хаб стенда, прод не касается).
+fn phantom_writes() -> bool {
+    std::env::var("UWUWU_MOCK_PHANTOM_WRITES").is_ok_and(|v| v == "1")
+}
+
 #[async_trait]
 impl IssueFieldStore for MemoryHub {
     async fn load(&self, number: u64) -> UsecaseResult<HashMap<String, String>> {
@@ -553,6 +587,9 @@ impl IssueFieldStore for MemoryHub {
     }
 
     async fn store(&self, number: u64, patch: &[(&str, Option<String>)]) -> UsecaseResult<()> {
+        if phantom_writes() {
+            return Ok(());
+        }
         use uwuwu_domain::Slot;
         self.with_state(|state| {
             if !state.tasks.contains_key(&number) {
@@ -663,6 +700,45 @@ mod tests {
             .await
             .expect("чтение без тега");
         assert_eq!(any, Some(Status::InProgress));
+    }
+
+    #[tokio::test]
+    async fn row_exists_respects_board_tag_and_absent_rows() {
+        // Pv2-путь close() (#1236): поиск доски строки — предикат
+        // присутствия (строка без читаемого Status всё ещё строка),
+        // борд-уважение — как у row_status (#1235 Low-1), мисса — false.
+        let hub = MemoryHub::with_seeds(vec![SeedRow {
+            board: Some("Задачи uwuwu".into()),
+            number: 11,
+            status: Status::Analys,
+            priority: Priority::Empty,
+            days_closed: 0,
+        }]);
+        assert!(
+            hub.row_exists("Задачи uwuwu", 11)
+                .await
+                .expect("чтение своей доски"),
+            "строка своей доски — true"
+        );
+        assert!(
+            !hub.row_exists("Задачи origa", 11)
+                .await
+                .expect("чтение чужой доски"),
+            "номер другой доски — не наша строка"
+        );
+        assert!(
+            !hub.row_exists("Задачи uwuwu", 99).await.expect("мисса"),
+            "несуществующая строка — false"
+        );
+        // строка без тега видна на любой доске стенда (паритет row_status)
+        let hub_free = MemoryHub::with_seed(Some((7, Status::InProgress)));
+        assert!(
+            hub_free
+                .row_exists("какая-то доска", 7)
+                .await
+                .expect("чтение без тега"),
+            "строка без тега — на любой доске"
+        );
     }
 
     #[tokio::test]
