@@ -76,32 +76,18 @@ impl CronUseCase {
         };
         let masters = self.scan_masters().await?;
         for master in masters {
-            let slug = master.slug.clone();
-            let name = cron_name(&slug).to_string();
+            let name = cron_name(&master.slug).to_string();
             let journal = format!("{CRON_DIR}/{name}/Журнал");
             let journal_md = self.wiki.read_doc(&journal).await?.unwrap_or_default();
+            warn_stale_run(&master.slug, &journal_md, self.clock.now_ms());
             let now = self.clock.now_ms();
-            // Инвариант DS: ран не закрылся = сигнал сбоя — последняя строка
-            // журнала «запуск» без сводки старше 2 часов → warn (наблюдаемость)
-            if let Some(last) = journal_md.lines().rev().find(|l| !l.trim().is_empty()) {
-                if last.contains("запуск (демон)") {
-                    let stale = parse_iso_ms(last.split_whitespace().nth(1).unwrap_or_default())
-                        .map(|ts| now.saturating_sub(ts) > 2 * 3_600_000)
-                        .unwrap_or(false);
-                    if stale {
-                        tracing::warn!(event = "cron.run_stale", cron = %slug,
-                            last = %last.chars().take(60).collect::<String>(),
-                            "Крон-ран не закрылся >2ч — сигнал сбоя");
-                    }
-                }
-            }
             if !master.schedule.is_due(now, last_run_ms(&journal_md)) {
                 continue;
             }
             if busy >= self.cup {
                 tracing::info!(
                     event = "cron.held_cup",
-                    cron = %slug,
+                    cron = %master.slug,
                     active = busy,
                     cap = self.cup,
                     "Крон-файр отложен: CUP cap — ран не считается состоявшимся"
@@ -109,41 +95,61 @@ impl CronUseCase {
                 continue;
             }
             let Some(checkout) = self.projects.get(&master.project) else {
-                tracing::warn!(event = "cron.project_unknown", cron = %slug,
+                tracing::warn!(event = "cron.project_unknown", cron = %master.slug,
                     project = %master.project,
                     "fm project вне карты [[project]] — крон не файрится (skip+warn)");
                 continue;
             };
-            let stamp = jst_stamp(now);
-            self.wiki
-                .append_doc(
-                    &journal,
-                    &format!("- {stamp} запуск (демон)"),
-                    &format!("cron: запуск {slug}"),
-                )
+            let outcome = self
+                .fire_run(&master, &journal, &journal_md, checkout, now)
                 .await?;
-            let prompt = run_prompt(&master.project, &master, &journal_md);
-            let sm = match master.agent {
-                AgentSlot::Role(agent) => self.models.for_agent(agent),
-                AgentSlot::Default => self.models.for_default(),
-            };
-            let spec = SessionSpec {
-                custom_agent: None,
-                directory: checkout.clone(),
-                title: format!("⏰ {} · {}", master.title, stamp),
-                agent: master.agent,
-                model: sm.model,
-                variant: sm.variant,
-                bootstrap: false,
-            };
-            let sessions = self.sessions.project(&master.project);
-            let session = sessions.create_session(&spec).await?;
-            sessions.prompt(&session, &prompt).await?;
             busy += 1; // файр этого тика занимает слот капа
-            tracing::info!(event = "cron.fired", cron = %slug, session = %session, "Cron fired");
-            fired.push(FireOutcome { slug, session });
+            if let Some(outcome) = outcome {
+                fired.push(outcome);
+            }
         }
         Ok(fired)
+    }
+
+    /// Файр одного мастера: журнальная строка + спавн рана на его
+    /// проект-исполнителе. None — спавн не удался (журнал уже пометил
+    /// запуск; рестарт расписание повторит).
+    async fn fire_run(
+        &self,
+        master: &CronMaster,
+        journal: &str,
+        journal_md: &str,
+        checkout: &str,
+        now: u64,
+    ) -> UsecaseResult<Option<FireOutcome>> {
+        let slug = master.slug.clone();
+        let stamp = jst_stamp(now);
+        self.wiki
+            .append_doc(
+                journal,
+                &format!("- {stamp} запуск (демон)"),
+                &format!("cron: запуск {slug}"),
+            )
+            .await?;
+        let prompt = run_prompt(&master.project, master, journal_md);
+        let sm = match master.agent {
+            AgentSlot::Role(agent) => self.models.for_agent(agent),
+            AgentSlot::Default => self.models.for_default(),
+        };
+        let spec = SessionSpec {
+            custom_agent: None,
+            directory: checkout.to_string(),
+            title: format!("⏰ {} · {}", master.title, stamp),
+            agent: master.agent,
+            model: sm.model,
+            variant: sm.variant,
+            bootstrap: false,
+        };
+        let sessions = self.sessions.project(&master.project);
+        let session = sessions.create_session(&spec).await?;
+        sessions.prompt(&session, &prompt).await?;
+        tracing::info!(event = "cron.fired", cron = %slug, session = %session, "Cron fired");
+        Ok(Some(FireOutcome { slug, session }))
     }
 
     /// Мастера: `cron/<имя>/README.md` (имя без слэша). Прочие пути
@@ -273,6 +279,25 @@ fn cron_name(slug: &str) -> &str {
         .and_then(|r| r.strip_suffix("/README"))
         .filter(|n| !n.is_empty() && !n.contains('/'))
         .unwrap_or_else(|| slug.rsplit('/').next().unwrap_or(slug))
+}
+
+/// Инвариант DS: ран не закрылся = сигнал сбоя — последняя строка
+/// журнала «запуск» без сводки старше 2 часов → warn (наблюдаемость).
+fn warn_stale_run(slug: &str, journal_md: &str, now: u64) {
+    let Some(last) = journal_md.lines().rev().find(|l| !l.trim().is_empty()) else {
+        return;
+    };
+    if !last.contains("запуск (демон)") {
+        return;
+    }
+    let stale = parse_iso_ms(last.split_whitespace().nth(1).unwrap_or_default())
+        .map(|ts| now.saturating_sub(ts) > 2 * 3_600_000)
+        .unwrap_or(false);
+    if stale {
+        tracing::warn!(event = "cron.run_stale", cron = %slug,
+            last = %last.chars().take(60).collect::<String>(),
+            "Крон-ран не закрылся >2ч — сигнал сбоя");
+    }
 }
 
 /// Мастер: fm-поля title/schedule/agent/project + тело; schedule и
