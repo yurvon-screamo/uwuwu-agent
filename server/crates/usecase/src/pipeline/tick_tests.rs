@@ -1442,8 +1442,9 @@ impl TaskBoardRepo for CommentBoard {
     async fn row_status(&self, _b: &str, _n: u64) -> UsecaseResult<Option<Status>> {
         Ok(None)
     }
-    // фикстура без строк: нет row_status ⇒ строки нет (#1236; стаб-долг #431)
-    async fn row_exists(&self, _board: &str, _n: u64) -> UsecaseResult<bool> {
+    // строк задач фейк не несёт — только комментарии (close на нём честно
+    // отвечает «не на досках»)
+    async fn row_exists(&self, _b: &str, _n: u64) -> UsecaseResult<bool> {
         Ok(false)
     }
     async fn set_session(&self, _b: &str, _n: u64, _slot: Slot, _s: &str) -> UsecaseResult<()> {
