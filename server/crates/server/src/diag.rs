@@ -1,6 +1,8 @@
-//! Диагностика окружения памяти (срез A #1294): THP-режим хоста и
-//! AnonHugePages процесса. Вердикт THP-пробы — прямое наблюдение в
-//! логах (server.thp), а не корреляция падения Railway-метрики.
+//! Диагностика окружения памяти: срез A #1294 — THP-режим хоста и
+//! AnonHugePages процесса (server.thp); срез B' #1294 — разводка
+//! «куча vs cgroup-учёт» (server.memory): Railway-метрика =
+//! cgroup memory.current = RSS + page cache + kernel, mmap LanceDB
+//! оседает в page cache и засчитывается метрикой, не будучи кучей.
 
 /// Снимок THP-контекста процесса: режим хоста + huge-страницы процесса.
 #[derive(Debug)]
@@ -20,8 +22,49 @@ pub fn snapshot() -> ThpSnapshot {
     }
 }
 
+/// Разводка памяти процесса и cgroup (срез B' #1294): «кто держит
+/// полгига» — куча (RSS) или page cache (mmap-чтение LanceDB).
+///
+/// Скоуп: cgroup-путь /sys/fs/cgroup осмыслен внутри контейнера (Railway —
+/// целевой случай: файлы видят cgroup процесса). На systemd-хосте без
+/// контейнера те же пути существуют и молча дают счётчики корневой
+/// cgroup хоста — числа валидны, но это не процесс (наблюдение волны 1:
+/// хостовые observe-прогоны). Инструмент прод-диагностики — контейнер.
+#[derive(Debug)]
+pub struct MemorySnapshot {
+    /// RSS процесса, КБ (smaps_rollup Rss).
+    pub rss_kb: Option<u64>,
+    /// cgroup memory.current, КБ — то, что показывает Railway-метрика.
+    pub cgroup_current_kb: Option<u64>,
+    /// cgroup memory.stat `file` — page cache, КБ.
+    pub cgroup_file_kb: Option<u64>,
+    /// cgroup memory.stat `anon` — анонимная память cgroup, КБ.
+    pub cgroup_anon_kb: Option<u64>,
+}
+
+pub fn memory_snapshot() -> MemorySnapshot {
+    let stat = read_sys("/sys/fs/cgroup/memory.stat");
+    MemorySnapshot {
+        rss_kb: read_sys("/proc/self/smaps_rollup").and_then(|raw| rollup_field(&raw, "Rss:")),
+        cgroup_current_kb: read_sys("/sys/fs/cgroup/memory.current")
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .map(bytes_to_kb),
+        // stat читается один раз — file/anon из одного мгновения снапшона
+        cgroup_file_kb: stat
+            .as_deref()
+            .and_then(|raw| cgroup_stat_field(raw, "file")),
+        cgroup_anon_kb: stat
+            .as_deref()
+            .and_then(|raw| cgroup_stat_field(raw, "anon")),
+    }
+}
+
 fn read_sys(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
+}
+
+fn bytes_to_kb(bytes: u64) -> u64 {
+    bytes / 1024
 }
 
 /// Активный THP-режим — в квадратных скобках: «always madvise [never]».
@@ -33,16 +76,29 @@ fn parse_enabled(raw: &str) -> Option<String> {
 
 /// AnonHugePages из smaps_rollup: строка «AnonHugePages:   2048 kB».
 fn parse_rollup(raw: &str) -> Option<u64> {
+    rollup_field(raw, "AnonHugePages:")
+}
+
+/// Поле smaps_rollup: «<field>  2048 kB» → КБ.
+fn rollup_field(raw: &str, field: &str) -> Option<u64> {
+    raw.lines().find(|l| l.starts_with(field)).and_then(|l| {
+        l.trim_start_matches(field)
+            .trim()
+            .trim_end_matches("kB")
+            .trim()
+            .parse::<u64>()
+            .ok()
+    })
+}
+
+/// Поле memory.stat cgroup v2 («anon 123456»): значение в байтах → КБ.
+/// Точное совпадение имени: `file` не ловит `file_mapped`.
+fn cgroup_stat_field(raw: &str, field: &str) -> Option<u64> {
     raw.lines()
-        .find(|l| l.starts_with("AnonHugePages:"))
-        .and_then(|l| {
-            l.trim_start_matches("AnonHugePages:")
-                .trim()
-                .trim_end_matches("kB")
-                .trim()
-                .parse::<u64>()
-                .ok()
-        })
+        .filter_map(|l| l.split_once(' '))
+        .find(|(name, _)| *name == field)
+        .and_then(|(_, v)| v.parse::<u64>().ok())
+        .map(bytes_to_kb)
 }
 
 #[cfg(test)]
@@ -86,6 +142,53 @@ mod tests {
     fn enabled_empty_or_garbage_is_none() {
         assert_eq!(parse_enabled(""), None);
         assert_eq!(parse_enabled("AnonHugePages: 0 kB\n"), None);
+    }
+
+    #[test]
+    fn rollup_field_reads_rss() {
+        let raw = "Rss:              45940 kB\nAnonHugePages:         0 kB\n";
+        assert_eq!(rollup_field(raw, "Rss:"), Some(45940));
+        assert_eq!(rollup_field("VmRSS: 100 kB\n", "Rss:"), None);
+        assert_eq!(rollup_field("Rss: abc kB\n", "Rss:"), None);
+    }
+
+    #[test]
+    fn cgroup_stat_exact_name_bytes_to_kb() {
+        let raw = "anon 251658240\nfile 1048576\nfile_mapped 2048\nshmem 4096\n";
+        // точное имя: file не ловит file_mapped
+        assert_eq!(cgroup_stat_field(raw, "file"), Some(1024));
+        assert_eq!(cgroup_stat_field(raw, "file_mapped"), Some(2));
+        assert_eq!(cgroup_stat_field(raw, "anon"), Some(245760));
+        assert_eq!(cgroup_stat_field(raw, "sock"), None);
+        assert_eq!(cgroup_stat_field("garbage\n", "anon"), None);
+        assert_eq!(cgroup_stat_field("anon not-a-number\n", "anon"), None);
+    }
+
+    #[test]
+    fn memory_snapshot_reads_local_env() {
+        // Форма: в контейнере/на хосте procfs/cgroupfs доступны; None
+        // допустим только при недоступности файлов (не мусорных значениях).
+        // Гвардия на каждый путь: хост без cgroupfs-маунтов проверяет только
+        // Rss, контейнер/cgroup v2 — все четыре поля (пин проводки
+        // «путь → поле» среза B' #1294).
+        let snap = memory_snapshot();
+        if std::path::Path::new("/proc/self/smaps_rollup").exists() {
+            assert!(snap.rss_kb.is_some(), "Rss парсится");
+            assert!(snap.rss_kb.unwrap_or(0) > 0, "Rss живого процесса > 0");
+        }
+        if std::path::Path::new("/sys/fs/cgroup/memory.stat").exists() {
+            assert!(
+                snap.cgroup_file_kb.is_some(),
+                "memory.stat file (page cache) парсится"
+            );
+            assert!(snap.cgroup_anon_kb.is_some(), "memory.stat anon парсится");
+        }
+        if std::path::Path::new("/sys/fs/cgroup/memory.current").exists() {
+            assert!(
+                snap.cgroup_current_kb.is_some(),
+                "memory.current парсится (байты → КБ)"
+            );
+        }
     }
 
     #[test]
