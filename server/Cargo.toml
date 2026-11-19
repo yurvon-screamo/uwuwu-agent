@@ -19,6 +19,11 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "tim
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# blob-канал #1292: Tigris S3 (SigV4 sans-IO; rustcrypto — без xml/md-5/full,
+# тулам нужны только GetObject/PutObject + presign) + дедуп-хэш + base64-вход
+rusty-s3 = { version = "0.12", default-features = false, features = ["rustcrypto"] }
+sha2 = "0.10"
+base64 = "0.23"
 # dev
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }

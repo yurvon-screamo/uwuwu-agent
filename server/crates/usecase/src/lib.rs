@@ -3,6 +3,7 @@
 //! pub use из lib. Папки: pipeline/ (тик, действия, триаж, дример),
 //! tasks/ (запись, вьюхи), crons/, search/.
 
+pub mod blobs;
 pub mod bots;
 mod crons;
 mod error;
@@ -19,6 +20,9 @@ mod spawn_model_tests;
 pub mod spawn_models;
 mod tasks;
 
+pub use blobs::{
+    BlobPlace, BlobPutReceipt, BlobStore, BlobUseCase, BLOB_MAX_BYTES, BLOB_PRESIGN_TTL_SECS,
+};
 pub use bots::{
     build_prompt, chunk_reply, classify_message, parse_bot_doc, plan_action, BotStateStore,
     TelegramGateway, TgMessage, TgUpdate,

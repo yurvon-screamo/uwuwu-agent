@@ -3,7 +3,7 @@
 //! клиенты обязаны это переваривать. Auth — bearer (тот же, что /health).
 
 use crate::api::tools::ToolHub;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -13,6 +13,12 @@ use std::sync::Arc;
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// Потолок тела MCP-запроса: blob_put гонит файл base64-строкой в JSON-RPC
+/// (20 MiB → ~28 MiB тело) — дефолт axum (2 MiB) отрезал бы молча (#1292).
+/// Цена осознана: потолок общий для всех MCP-запросов; тяжёлые тела ездят
+/// только через blob_put (контекст памяти — #1294).
+pub const BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+
 pub struct McpState {
     pub bearer: Arc<String>,
     pub tools: Arc<ToolHub>,
@@ -21,6 +27,7 @@ pub struct McpState {
 pub fn router(state: Arc<McpState>) -> Router {
     Router::new()
         .route("/mcp", post(handle).get(reject).delete(reject))
+        .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES))
         .with_state(state)
 }
 
@@ -121,4 +128,58 @@ fn json_error(id: Option<Value>, code: i64, message: &str) -> Response {
                 .to_string(),
         ))
         .expect("static response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::test_support::{blob_usecase, tool_hub, StubWiki};
+    use tower::ServiceExt;
+
+    fn app() -> Router {
+        let (tools, _memory) = tool_hub(Arc::new(StubWiki), blob_usecase());
+        let state = Arc::new(McpState {
+            bearer: Arc::new("test-bearer".to_string()),
+            tools,
+        });
+        router(state)
+    }
+
+    /// Лимит тела отрезает на extractor'е: тело сверх BODY_LIMIT_BYTES —
+    /// 413 до bearer/парсинга (дефолт 2 MiB отрезал бы blob_put молча, #1292).
+    #[tokio::test]
+    async fn oversized_body_is_rejected_with_413() {
+        let oversized = vec![b'x'; BODY_LIMIT_BYTES + 1];
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/mcp")
+                    .header("authorization", "Bearer test-bearer")
+                    .body(axum::body::Body::from(oversized))
+                    .expect("request ok"),
+            )
+            .await
+            .expect("service ok");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// Тело в пределах лимита доходит до обработчика (без-cookie → 401
+    /// от bearer-гарда — значит лимит пропустил).
+    #[tokio::test]
+    async fn body_within_limit_passes_to_handler() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.to_vec();
+        let response = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/mcp")
+                    .header("authorization", "Bearer test-bearer")
+                    .body(axum::body::Body::from(body))
+                    .expect("request ok"),
+            )
+            .await
+            .expect("service ok");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }
