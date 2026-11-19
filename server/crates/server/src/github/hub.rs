@@ -144,6 +144,35 @@ fn is_rate_limited(e: &UsecaseError) -> bool {
         .contains("gh graphql [rate_limited]")
 }
 
+/// Транспортный флап gql-точки (обрыв соединения, усечение тела, не-JSON,
+/// 5xx): единый тег [TRANSPORT] в тексте отказа (#1330) — по паттерну
+/// gh_tagged/is_rate_limited, не строковые эвристики по текстам GitHub.
+fn gh_transport_tagged(detail: String) -> UsecaseError {
+    UsecaseError::Board(format!("gh graphql [TRANSPORT]: {detail}"))
+}
+
+/// Транспортный класс отказа gql-чтения: тег [TRANSPORT] — контракт;
+/// rate limit/permission и сырые не-тегированные тексты классом не считаются.
+fn is_transport_flap(e: &UsecaseError) -> bool {
+    e.to_string()
+        .to_lowercase()
+        .contains("gh graphql [transport]")
+}
+
+/// Политика короткого ретрая чтения (#1330): разовый транспортный флап —
+/// одна повторная попытка после паузы; rate limit/permission (ADR-110),
+/// graphql errors и исчерпание попыток — Err наверх как есть. Константы
+/// кода сознательно (прецедент #1281): всего 2 попытки, пауза 3 сек.
+const TRANSPORT_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_secs(3);
+const TRANSPORT_RETRY_ATTEMPTS: u32 = 2;
+
+fn retry_after_flap(e: &UsecaseError, attempt: u32) -> Option<std::time::Duration> {
+    if attempt >= TRANSPORT_RETRY_ATTEMPTS || !is_transport_flap(e) {
+        return None;
+    }
+    Some(TRANSPORT_RETRY_PAUSE)
+}
+
 #[derive(Default, Clone)]
 struct BoardMeta {
     project_id: String,
@@ -205,23 +234,26 @@ impl GitHubHub {
             .json(&json!({ "query": query, "variables": variables }))
             .send()
             .await
-            .map_err(|e| UsecaseError::Board(format!("graphql transport: {e}")))?;
+            .map_err(|e| gh_transport_tagged(format!("сбой соединения: {e}")))?;
         let status = resp.status();
         let headers = resp.headers().clone();
         let text = resp
             .text()
             .await
-            .map_err(|e| UsecaseError::Board(format!("graphql body: {e}")))?;
+            .map_err(|e| gh_transport_tagged(format!("обрыв чтения ответа: {e}")))?;
         if let Some(fail) = crate::gherr::classify(status, &headers) {
             return Err(gh_tagged(&fail));
         }
         let body: Value = serde_json::from_str(&text)
-            .map_err(|e| UsecaseError::Board(format!("graphql не-JSON (HTTP {status}): {e}")))?;
+            .map_err(|e| gh_transport_tagged(format!("не-JSON (HTTP {status}): {e}")))?;
         if !status.is_success() {
-            return Err(UsecaseError::Board(format!(
-                "gh api {status}: {}",
-                trunc(&text)
-            )));
+            // 5xx — транспортный класс (#1330: 502/503/504 с валидным телом
+            // ретраятся наравне с обрывами); прочие не-успехи — как раньше
+            return Err(if status.is_server_error() {
+                gh_transport_tagged(format!("HTTP {status}: {}", trunc(&text)))
+            } else {
+                UsecaseError::Board(format!("gh api {status}: {}", trunc(&text)))
+            });
         }
         if let Some(errors) = body.get("errors") {
             // rate limit: детект — одна точка gherr (оба формата GitHub:
@@ -243,6 +275,31 @@ impl GitHubHub {
         body.get("data")
             .cloned()
             .ok_or_else(|| UsecaseError::Board("graphql: нет data".into()))
+    }
+
+    /// Чтение gql с коротким ретраем (#1330): разовый транспортный флап
+    /// (502/обрыв/усечение) не роняет тик. Только идемпотентные чтения —
+    /// мутации зовут gql() напрямую: 502 после успешного применения =
+    /// риск двойного применения. Rate limit/permission не ретраятся
+    /// (ADR-110: немедленный громкий Err), gql_block не задет.
+    async fn gql_retrying(&self, query: &str, variables: Value) -> UsecaseResult<Value> {
+        match self.gql(query, variables.clone()).await {
+            Ok(data) => Ok(data),
+            Err(first) => match retry_after_flap(&first, 1) {
+                None => Err(first),
+                Some(pause) => {
+                    tracing::warn!(
+                        event = "gql.transport_retry",
+                        pause_secs = pause.as_secs(),
+                        error = %first,
+                        "транспортный флап gql-чтения — короткий ретрай (#1330)"
+                    );
+                    tokio::time::sleep(pause).await;
+                    // вторая попытка — последняя: её Err наверх как есть
+                    self.gql(query, variables).await
+                }
+            },
+        }
     }
 
     async fn rest(
@@ -316,7 +373,7 @@ impl GitHubHub {
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_PAGES {
             let data = self
-                .gql(
+                .gql_retrying(
                     QUERY,
                     json!({ "owner": owner, "name": name, "board": board, "after": cursor }),
                 )
@@ -405,7 +462,7 @@ impl GitHubHub {
             .split_once('/')
             .ok_or_else(|| UsecaseError::Board(format!("repo: {}", self.repo)))?;
         let data = self
-            .gql(
+            .gql_retrying(
                 q,
                 json!({ "owner": owner, "name": name, "n": number as i64 }),
             )
@@ -449,7 +506,7 @@ impl GitHubHub {
             .split_once('/')
             .ok_or_else(|| UsecaseError::Board(format!("repo: {}", self.repo)))?;
         let data = self
-            .gql(
+            .gql_retrying(
                 q,
                 json!({ "owner": owner, "name": name, "n": number as i64 }),
             )
@@ -1570,6 +1627,64 @@ mod tests {
         assert!(is_rate_limited(&backoff));
         let unrelated = UsecaseError::Board("graphql errors: NOT_FOUND".into());
         assert!(!is_rate_limited(&unrelated));
+    }
+
+    #[test]
+    fn is_transport_flap_matches_only_owned_tag() {
+        // (#1330) транспортный тег — контракт детектора: чужие классы
+        // (rate limit/permission) и легаси-сырые тексты классом не считаются
+        let transport = gh_transport_tagged("не-JSON (HTTP 502 Bad Gateway): eof".into());
+        assert!(is_transport_flap(&transport));
+        let limited = UsecaseError::Board(
+            "gh graphql [RATE_LIMITED]: GitHub rate limit (core): квота исчерпана".into(),
+        );
+        assert!(
+            !is_transport_flap(&limited),
+            "rate limit — не транспортный класс"
+        );
+        let permission = UsecaseError::Board(
+            "gh graphql [PERMISSION]: HTTP 403 (не rate limit): проверь GH_TOKEN/права токена"
+                .into(),
+        );
+        assert!(
+            !is_transport_flap(&permission),
+            "permission — не транспортный класс"
+        );
+        let legacy = UsecaseError::Board("graphql не-JSON (HTTP 502): eof".into());
+        assert!(
+            !is_transport_flap(&legacy),
+            "сырой текст без тега — не транспортный класс"
+        );
+    }
+
+    #[test]
+    fn transport_retry_policy_retries_once_on_flap_only() {
+        // (#1330) разовый транспортный флап → одна повторная попытка после
+        // паузы; rate limit/permission/graphql errors — без ретрая (ADR-110)
+        let flap = gh_transport_tagged("не-JSON (HTTP 502): eof".into());
+        assert_eq!(
+            retry_after_flap(&flap, 1),
+            Some(std::time::Duration::from_secs(3)),
+            "флап на первой попытке → пауза перед повтором"
+        );
+        assert_eq!(
+            retry_after_flap(&flap, 2),
+            None,
+            "флап на второй попытке → исчерпание, Err наверх как есть"
+        );
+        let limited = UsecaseError::Board("gh graphql [RATE_LIMITED]: бэкофф ещё 4 мин".into());
+        let permission = UsecaseError::Board(
+            "gh graphql [PERMISSION]: HTTP 403 (не rate limit): проверь GH_TOKEN/права токена"
+                .into(),
+        );
+        let graphql_errors = UsecaseError::Board("graphql errors: NOT_FOUND".into());
+        for error in [&limited, &permission, &graphql_errors] {
+            assert_eq!(
+                retry_after_flap(error, 1),
+                None,
+                "чужой класс — немедленный громкий Err без ретрая"
+            );
+        }
     }
 
     #[test]
