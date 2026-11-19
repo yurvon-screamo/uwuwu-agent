@@ -2269,6 +2269,48 @@ async fn recreate_session_rearms_manual_for_new_session() {
 }
 
 #[tokio::test]
+async fn dead_session_recreate_by_runner_rearms_manual() {
+    // Живой прогон #1221 (тестировщик): восстановление раннера после
+    // потери сессии исполнителем (liveness::Dead) — тот же инвариант,
+    // что у RecreateSession и компакта: пересозданная doc-сессия обязана
+    // получить методичку первым же промптом, иначе бот остаётся вовсе
+    // без неё (hash в state указывал на старую, погибшую сессию).
+    let wiki = Arc::new(FakeWiki::default());
+    let sessions = FakeSessions::new();
+    let state = Arc::new(FakeState::default());
+    let clock = FakeClock::at(10_000_000);
+    let tg = FakeTg::new(vec![]);
+    let sup =
+        doc_bot_with_manual(&wiki, &sessions, &state, &clock, &tg, "UWUWU_BOT_TOKEN_DEAD").await;
+    let old = state.bot_session(SLUG).unwrap();
+    // исполнитель потерял сессию (рестарт opencode)
+    sessions.set_liveness(&old, Liveness::Dead);
+    tg.inject(private_update(2, "yurvon", "после рестарта исполнителя"));
+    wait_until(
+        || {
+            state
+                .bot_session(SLUG)
+                .map(|s| s != old)
+                .unwrap_or(false)
+        },
+        2000,
+    )
+    .await;
+    wait_until(|| sessions.prompts_snapshot().len() == 2, 2000).await;
+    let prompts = sessions.prompts_snapshot();
+    assert_eq!(
+        prompts[1].0,
+        state.bot_session(SLUG).unwrap(),
+        "промпт ушёл в пересозданную сессию"
+    );
+    assert!(
+        prompts[1].1.starts_with("Методичка бота"),
+        "пересозданная раннером doc-сессия осталась без методички — hash не сброшен при Dead-восстановлении"
+    );
+    wait_until(|| state.bot_manual_hash(SLUG).is_some(), 2000).await;
+}
+
+#[tokio::test]
 async fn compact_scan_failure_skips_whole_pass() {
     let wiki = Arc::new(FakeWiki::default());
     let sessions = FakeSessions::new();
