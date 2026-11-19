@@ -143,9 +143,9 @@ pub fn tool_descriptors() -> Value {
         ),
         tool(
             "cron_list",
-            "Инвентарь кронов проекта (мастера в вики-папке Кроны: расписание + журнал-хвост)",
+            "Инвентарь кронов (мастера /cron/<имя>/README.md: расписание + журнал-хвост)",
             object(json!({
-                "project": string("проект; дефолт uwuwu")
+                "project": string("фильтр по проекту (fm project мастера); без него — все кроны")
             }))
         ),
         tool(
@@ -235,7 +235,7 @@ impl ToolHub {
             "goal_list" => self.goal_list(&project).await,
             "docs_append" => self.docs_append(args).await,
             "docs_write" => self.docs_write(args).await,
-            "cron_list" => self.cron_list(&project).await,
+            "cron_list" => self.cron_list(args).await,
             "search" => self.search(args).await,
             "session_export" => self.session_export(args).await,
             "task_create" => self.task_create(&project, args).await,
@@ -351,25 +351,32 @@ impl ToolHub {
         ok_text(format!("док «{slug}» записан"))
     }
 
-    async fn cron_list(&self, project: &str) -> Result<Value, String> {
-        // тонкая обёртка: инвентарь живёт в юзкейсе (masters())
+    async fn cron_list(&self, args: &Value) -> Result<Value, String> {
+        // Инвентарь /cron (#1214): project — опциональный фильтр по fm,
+        // без него — все кроны
+        let filter = arg_str(args, "project");
+        let filter = (!filter.is_empty()).then_some(filter.as_str());
         let masters = self
             .crons
-            .masters(project)
+            .masters(filter)
             .await
             .map_err(|e| e.to_string())?;
         let out = masters
             .iter()
             .map(|m| {
                 format!(
-                    "{} — `{}`\n",
+                    "{} [{}] — `{}`\n",
                     m.title,
+                    m.project,
                     uwuwu_usecase::schedule_label(&m.schedule)
                 )
             })
             .collect::<String>();
         ok_text(if out.is_empty() {
-            format!("кроны проекта {project} не найдены")
+            match filter {
+                Some(p) => format!("кроны проекта {p} не найдены"),
+                None => "кроны не найдены".to_string(),
+            }
         } else {
             out
         })

@@ -255,7 +255,7 @@ mod tests {
     fn fixture() -> BotSpec {
         BotSpec {
             agent: None,
-            slug: "Projects/uwuwu/Боты/x".into(),
+            slug: "bot/x".into(),
             title: "x".into(),
             enabled: true,
             model: uwuwu_domain::BotModel {

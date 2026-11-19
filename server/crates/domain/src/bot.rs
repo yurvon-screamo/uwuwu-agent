@@ -9,11 +9,11 @@ pub struct BotModel {
     pub variant: Option<String>,
 }
 
-/// Спека бота из `Projects/<proj>/Боты/<имя>.md` (fm-шапка + тело).
+/// Спека бота из `bot/<имя>/README.md` (fm-шапка + тело; #1214).
 /// Тело дока — методичка агента (системный контекст сессии).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BotSpec {
-    /// Слэг дока (Projects/<proj>/Боты/<имя>) — ключ состояния/раннтайма.
+    /// Слэг дока (bot/<имя>) — ключ состояния/раннтайма.
     pub slug: String,
     /// fm title (дефолт — имя дока).
     pub title: String,
@@ -75,7 +75,7 @@ mod tests {
             .map_or((rest, None), |(i, v)| (i, Some(v.to_string())));
         BotSpec {
             agent: None,
-            slug: "Projects/uwuwu/Боты/x".into(),
+            slug: "bot/x".into(),
             title: "x".into(),
             enabled: true,
             model: BotModel {
