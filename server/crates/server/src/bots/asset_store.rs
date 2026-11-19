@@ -1,7 +1,8 @@
 //! Реализации `BotAssetStore` (#1171): прод — коммит файла в приватный
-//! hub-репо (`assets/bots/<бот>/…`, ff-only через GitWikiWriter), e2e/
-//! memory — в-памяти приёмник стенда. Нормализация имени — контракт
-//! usecase (`normalize_asset_name`), здесь только путь и ссылка.
+//! hub-репо рядом с доком бота (`docs/bot/<бот>/…`, ff-only через
+//! GitWikiWriter; раскладка /bot — #1214), e2e/memory — в-памяти
+//! приёмник стенда. Нормализация имени — контракт usecase
+//! (`normalize_asset_name`), здесь только путь и ссылка.
 
 use std::sync::Mutex;
 use uwuwu_usecase::bots::{normalize_asset_name, BotAssetStore, MediaKind};
@@ -56,7 +57,7 @@ impl BotAssetStore for GitAssetStore {
         let bot_name = bot.rsplit('/').next().unwrap_or(bot);
         let st = stamp();
         let name = normalize_asset_name(filename, kind, &st);
-        let path = format!("assets/bots/{bot_name}/{st}-{name}");
+        let path = format!("docs/bot/{bot_name}/{st}-{name}");
         self.writer
             .commit_bytes(&path, bytes, "bot asset (uwuwu #1171)")
             .await?;
@@ -84,7 +85,7 @@ impl BotAssetStore for MemoryAssetStore {
         let bot_name = bot.rsplit('/').next().unwrap_or(bot);
         let st = stamp();
         let name = normalize_asset_name(filename, kind, &st);
-        let path = format!("assets/bots/{bot_name}/{st}-{name}");
+        let path = format!("docs/bot/{bot_name}/{st}-{name}");
         let url = format!("memory://{path}");
         self.files
             .lock()
@@ -104,7 +105,7 @@ mod tests {
     fn raw_url_percent_encodes_spaces_and_cyrillic() {
         let name = normalize_asset_name(Some("скрин от МПНЧ.png"), MediaKind::Document, "1");
         assert_eq!(name, "скрин от МПНЧ.png");
-        let url = raw_url("o/r", "main", &format!("assets/bots/x/1-{name}"));
+        let url = raw_url("o/r", "main", &format!("docs/bot/x/1-{name}"));
         assert!(!url.contains(' '), "пробелы закодированы: {url}");
         assert!(url.contains("%20"), "пробел = %20: {url}");
         assert!(
@@ -114,7 +115,7 @@ mod tests {
         assert!(url.ends_with(".png"), "расширение живёт: {url}");
     }
 
-    /// Путь ассета всегда внутри assets/bots/<бот>/, одно-компонентное
+    /// Путь ассета всегда внутри docs/bot/<бот>/, одно-компонентное
     /// имя — сепараторы из file_name не пробрасываются в путь (#1171).
     #[test]
     fn asset_path_is_single_component_name() {
@@ -126,12 +127,7 @@ mod tests {
     async fn memory_store_roundtrip_url_and_bytes() {
         let store = MemoryAssetStore::default();
         let url = store
-            .put(
-                "Projects/uwuwu/Боты/Помощник",
-                MediaKind::Photo,
-                None,
-                b"\x89PNG",
-            )
+            .put("bot/Помощник", MediaKind::Photo, None, b"\x89PNG")
             .await
             .expect("put");
         // фолбэк имени фото с реальным stamp: <ms>-photo-<ms>.jpg
@@ -145,7 +141,7 @@ mod tests {
             !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()),
             "url: {url}"
         );
-        assert!(url.contains("assets/bots/Помощник/"), "url: {url}");
+        assert!(url.contains("docs/bot/Помощник/"), "url: {url}");
         // байты сохранены в store (приватно проверяемо внутри структуры)
         assert!(!store.files.lock().expect("l").is_empty());
     }

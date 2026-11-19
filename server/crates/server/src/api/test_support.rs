@@ -72,7 +72,7 @@ pub(crate) fn tool_hub(
             ))),
             clock: Arc::new(SystemClock),
             models: Arc::new(uwuwu_usecase::SpawnModels::canonical()),
-            checkout: String::new(),
+            projects: Default::default(),
             cup: 7,
         }),
     });

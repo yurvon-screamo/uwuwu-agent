@@ -7,7 +7,7 @@
 use super::ports::MediaKind;
 
 /// Потолок имени в байтах: запас до 255-байтового лимита файловых систем
-/// с прицелом на префикс `assets/bots/<бот>/<stamp>-`.
+/// с прицелом на префикс `docs/bot/<бот>/<stamp>-`.
 const NAME_MAX_BYTES: usize = 120;
 
 /// Нормализованное имя файла ассета: One component, safe bytes, non-empty.
