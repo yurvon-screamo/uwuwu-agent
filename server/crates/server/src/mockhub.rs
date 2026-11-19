@@ -322,6 +322,13 @@ impl TaskBoardRepo for MemoryHub {
     }
 
     async fn post_comment(&self, number: u64, body: &str) -> UsecaseResult<String> {
+        // Fault-режим phantom-записей (#1331): «успех» со стандартным id,
+        // состояние носителя не меняется — контрольное чтение юзкейса
+        // обязано отказывать громко. Не пустой id: пустой — отдельная
+        // fail-open ветка нестандартного ответа.
+        if phantom_writes() {
+            return Ok("phantom-comment".into());
+        }
         self.with_state(|state| {
             let counter = &mut state.counter;
             *counter += 1;
@@ -386,6 +393,9 @@ impl TaskBoardRepo for MemoryHub {
     }
 
     async fn rename_issue(&self, number: u64, title: &str) -> UsecaseResult<()> {
+        if phantom_writes() {
+            return Ok(());
+        }
         self.with_state(|state| {
             let task = state
                 .tasks
@@ -451,6 +461,9 @@ impl TaskBoardRepo for MemoryHub {
     }
 
     async fn replace_body(&self, number: u64, body_md: &str) -> UsecaseResult<()> {
+        if phantom_writes() {
+            return Ok(());
+        }
         self.with_state(|state| {
             if !state.bodies.contains_key(&number) {
                 return Err(UsecaseError::Board(format!("mockhub: #{number} нет")));
@@ -519,6 +532,14 @@ impl uwuwu_usecase::WikiRepo for MemoryHub {
     }
 }
 
+/// Fault-режим e2e-фазы phantom-записей (#1331): мутации носителя
+/// отвечают успехом, состояние не меняется — контрольное чтение юзкейса
+/// обязано превращать «успех» в громкий отказ. Включение: env
+/// UWUWU_MOCK_PHANTOM_WRITES=1 (только мок-хаб стенда, прод не касается).
+fn phantom_writes() -> bool {
+    std::env::var("UWUWU_MOCK_PHANTOM_WRITES").is_ok_and(|v| v == "1")
+}
+
 #[async_trait]
 impl IssueFieldStore for MemoryHub {
     async fn load(&self, number: u64) -> UsecaseResult<HashMap<String, String>> {
@@ -566,6 +587,9 @@ impl IssueFieldStore for MemoryHub {
     }
 
     async fn store(&self, number: u64, patch: &[(&str, Option<String>)]) -> UsecaseResult<()> {
+        if phantom_writes() {
+            return Ok(());
+        }
         use uwuwu_domain::Slot;
         self.with_state(|state| {
             if !state.tasks.contains_key(&number) {
