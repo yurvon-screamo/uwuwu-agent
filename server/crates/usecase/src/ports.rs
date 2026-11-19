@@ -123,6 +123,15 @@ pub struct IssueView {
     pub comments: Vec<CommentRef>,
 }
 
+/// Итог append-мутации дока (#1353): честность ответа read-after-write.
+/// `created` — файла не было, док создан этой строкой (иначе — append к
+/// существующему телу); `lines` — строк в доке после записи.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppendDocOutcome {
+    pub created: bool,
+    pub lines: usize,
+}
+
 /// Вики-репозиторий: чтение/запись доков (MCP docs_*, кроны, дример).
 #[async_trait]
 pub trait WikiRepo: Send + Sync {
@@ -137,8 +146,15 @@ pub trait WikiRepo: Send + Sync {
     async fn doc_shas(&self) -> UsecaseResult<Vec<(String, String)>>;
     /// Перезапись дока (commit в ветку, ff-only).
     async fn write_doc(&self, slug: &str, content: &str, message: &str) -> UsecaseResult<()>;
-    /// Append строки в конец дока (создаёт при отсутствии).
-    async fn append_doc(&self, slug: &str, line: &str, message: &str) -> UsecaseResult<()>;
+    /// Append строки в конец дока (создаёт при отсутствии); возвращает
+    /// факт операции — создан или append к существующему, строк после
+    /// записи (#1353: ответ тула отражает факт, не эхо ввода).
+    async fn append_doc(
+        &self,
+        slug: &str,
+        line: &str,
+        message: &str,
+    ) -> UsecaseResult<AppendDocOutcome>;
 }
 
 /// Коммент задачи в терминах wakeup: идентичность + время создания.
