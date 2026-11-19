@@ -684,6 +684,38 @@ async fn run(
         clock,
     }));
 
+    // Срез B' #1294: разводка «куча vs cgroup-учёт» — первая точка сразу
+    // (бут), дальше каждые 30 мин (page cache от mmap LanceDB прогревается
+    // работой; Railway-метрика = cgroup current, куча = RSS).
+    let memory_task = tokio::spawn(async {
+        let mut iv = tokio::time::interval(std::time::Duration::from_secs(1800));
+        iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            iv.tick().await;
+            let m = diag::memory_snapshot();
+            tracing::info!(
+                event = "server.memory",
+                rss_kb = m.rss_kb.map(|v| v.to_string()).as_deref().unwrap_or("n/a"),
+                cgroup_current_kb = m
+                    .cgroup_current_kb
+                    .map(|v| v.to_string())
+                    .as_deref()
+                    .unwrap_or("n/a"),
+                page_cache_kb = m
+                    .cgroup_file_kb
+                    .map(|v| v.to_string())
+                    .as_deref()
+                    .unwrap_or("n/a"),
+                cgroup_anon_kb = m
+                    .cgroup_anon_kb
+                    .map(|v| v.to_string())
+                    .as_deref()
+                    .unwrap_or("n/a"),
+                "Memory snapshot"
+            );
+        }
+    });
+
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {},
         _ = sigterm() => {},
@@ -691,6 +723,7 @@ async fn run(
     tracing::info!(event = "server.stopping", "Server stopping");
     http_task.abort();
     tick_task.abort();
+    memory_task.abort();
     Ok(())
 }
 
