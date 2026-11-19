@@ -24,6 +24,12 @@ pub fn snapshot() -> ThpSnapshot {
 
 /// Разводка памяти процесса и cgroup (срез B' #1294): «кто держит
 /// полгига» — куча (RSS) или page cache (mmap-чтение LanceDB).
+///
+/// Скоуп: cgroup-путь /sys/fs/cgroup осмыслен внутри контейнера (Railway —
+/// целевой случай: файлы видят cgroup процесса). На systemd-хосте без
+/// контейнера те же пути существуют и молча дают счётчики корневой
+/// cgroup хоста — числа валидны, но это не процесс (наблюдение волны 1:
+/// хостовые observe-прогоны). Инструмент прод-диагностики — контейнер.
 #[derive(Debug)]
 pub struct MemorySnapshot {
     /// RSS процесса, КБ (smaps_rollup Rss).
@@ -37,15 +43,19 @@ pub struct MemorySnapshot {
 }
 
 pub fn memory_snapshot() -> MemorySnapshot {
+    let stat = read_sys("/sys/fs/cgroup/memory.stat");
     MemorySnapshot {
         rss_kb: read_sys("/proc/self/smaps_rollup").and_then(|raw| rollup_field(&raw, "Rss:")),
         cgroup_current_kb: read_sys("/sys/fs/cgroup/memory.current")
             .and_then(|raw| raw.trim().parse::<u64>().ok())
             .map(bytes_to_kb),
-        cgroup_file_kb: read_sys("/sys/fs/cgroup/memory.stat")
-            .and_then(|raw| cgroup_stat_field(&raw, "file")),
-        cgroup_anon_kb: read_sys("/sys/fs/cgroup/memory.stat")
-            .and_then(|raw| cgroup_stat_field(&raw, "anon")),
+        // stat читается один раз — file/anon из одного мгновения снапшона
+        cgroup_file_kb: stat
+            .as_deref()
+            .and_then(|raw| cgroup_stat_field(raw, "file")),
+        cgroup_anon_kb: stat
+            .as_deref()
+            .and_then(|raw| cgroup_stat_field(raw, "anon")),
     }
 }
 
