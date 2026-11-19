@@ -61,7 +61,7 @@ export default Plugin.define({
             questions: {
               type: "object",
               description:
-                "Разовые вопросы вместо встроенного чек-листа: map id → {type: noul|choice|score, instructions, criteria?}. id — [A-Za-z0-9_-]{1,64}. criteria у choice — объект label→описание (2–255 опций, обязателен), у score — массив уровней 2–10 от меньшего к большему (обязателен), у noul — опционально {true_description, false_description}. Одновременный checklist и questions — ошибка.",
+                "Разовые вопросы вместо встроенного чек-листа: map id → {type: noul|choice|score, instructions, criteria?}. id — [A-Za-z0-9_-]{1,64}. criteria у choice — объект label→описание (2–255 опций, обязателен), у score — массив уровней 2–255 от меньшего к большему (обязателен), у noul — опционально {true_description, false_description}. Одновременный checklist и questions — ошибка.",
               additionalProperties: {
                 type: "object",
                 properties: {

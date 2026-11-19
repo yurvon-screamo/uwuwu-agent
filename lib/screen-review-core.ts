@@ -174,7 +174,8 @@ function validateQuestion(id: string, q: ScreenQuestion): void {
     }
     const badKey = labels.find((k) => k.length < 1 || k.length > MAX_OPTION_KEY_LENGTH)
     if (badKey !== undefined) {
-      throw inputFail(id, `ключ опции «${badKey.slice(0, 24)}…» длиннее ${MAX_OPTION_KEY_LENGTH} символов (API отвечает 400)`)
+      const shown = badKey.length === 0 ? "«» (пустой)" : `«${badKey.slice(0, 24)}…»`
+      throw inputFail(id, `ключ опции ${shown} вне лимита 1–${MAX_OPTION_KEY_LENGTH} символов (API отвечает 400)`)
     }
     return
   }

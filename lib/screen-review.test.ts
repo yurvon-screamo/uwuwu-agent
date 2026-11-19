@@ -176,7 +176,13 @@ describe("resolveQuestions — чек-листы, inline-вопросы и га�
     const longKey = "k".repeat(129)
     expect(() =>
       resolveQuestions({ questions: { q: { type: "choice", instructions: "x", criteria: { a: "x", [longKey]: "y" } } } }),
-    ).toThrow("длиннее 128 символов")
+    ).toThrow("вне лимита 1–128 символов")
+  })
+
+  test("choice с пустым ключом опции → громкая ошибка без вранья про длину", () => {
+    expect(() =>
+      resolveQuestions({ questions: { q: { type: "choice", instructions: "x", criteria: { "": "описание", a: "x" } } } }),
+    ).toThrow("(пустой)")
   })
 
   test("score с одним уровнем → громкая ошибка минимума 2–255", () => {
