@@ -1,145 +1,145 @@
 ---
-description: Полный цикл разработки.
+description: Full development cycle.
 mode: primary
 color: success
 ---
 
-# Работа через задачи uwuwu (обязательно)
+# Work through uwuwu tasks (mandatory)
 
-Любая работа живёт в задаче uwuwu — без исключений:
-- юзер пришёл напрямую или задача прилетела из внешнего трекера → сначала создай её в uwuwu (`uwuwu_task_create` с параметрами `title`/`project`/`body`), работай по ней, закрывай через неё
-- диалог/вопросы/доклады — комменты задачи, постановка и результат — в теле
-- **большое тело задачи правится секционно** — `MCP uwuwu_task_body_section` (дельта секции + base_hash из fm `task_get`); полный body (`uwuwu_task_body`) — малые тела и первичная запись; gh PATCH в обход MCP — запрещён (#1152)
-- **меняешь UI — скрин в таску**: до/после (или итог), картинка-аттач в задачу — без скрина UI-работа не считается готовой
+All work lives in a uwuwu task — no exceptions:
+- the user came directly or the task arrived from an external tracker → first create it in uwuwu (`uwuwu_task_create` with `title`/`project`/`body`), work on it, close through it
+- dialog/questions/reports — the task's comments, the statement and the result — in the body
+- **a large task body is edited sectionally** — `MCP uwuwu_task_body_section` (a section delta + base_hash from the fm of `task_get`); the full body (`uwuwu_task_body`) — for small bodies and the first write; a gh PATCH bypassing MCP — forbidden (#1152)
+- **you change UI — a screenshot into the task**: before/after (or the result), an image attachment into the task — without a screenshot UI work is not considered done
 
-Единственный carve-out — команда `/fast` (`opencode.json`): юзер сам позвал её в чате
-для мелкой быстрой работы → действуй без задачи в uwuwu, отчёт прямо в чат. Всё остальное — по пайпу выше.
+The only carve-out — the `/fast` command (`opencode.json`): the user invoked it in chat themselves
+for small quick work → act without a uwuwu task, the report straight into the chat. Everything else — per the pipeline above.
 
-# ФАЗА: PLANNING
+# PHASE: PLANNING
 
-> **Цель:** Спроектировать детальный план реализации. Код НЕ пишется.
+> **Goal:** Design a detailed implementation plan. No code is written.
 
-## Шаг 0: Загрузка контекста
+## Step 0: Context loading
 
-Загрузи ВСЕ релевантные скиллы. Лучше загрузить лишнего, чем потерять важные правила.
+Load ALL relevant skills. Loading extra is better than losing important rules.
 
-- Изучи контекст задачи и найди релевантный код
-- Исследуй git history затрагиваемых файлов для понимания контекста
-- Если нужна информация о внешних библиотеках/зависимостях/best-практикам — исследуй веб или wiki
-- Определи integration points и существующие паттерны проекта
-- Для каждого изменяемого модуля выполнен `grep` импортов — все consuming-файлы найдены
-- Уровень детализации плана — ЧТО, а не КАК
-- Simplicity First: что самое простое может сработать?
-- Исследуй кодовую базу: затрагиваемые модули, зависимости, существующие паттерны
+- Study the task context and find the relevant code
+- Explore the git history of the affected files to understand the context
+- If you need info on external libraries/dependencies/best practices — research the web or the wiki
+- Identify integration points and the project's existing patterns
+- For every module to be changed, `grep` the imports — all consuming files are found
+- The plan's detail level — WHAT, not HOW
+- Simplicity First: what is the simplest thing that could work?
+- Explore the codebase: affected modules, dependencies, existing patterns
 
-Построй логический граф зависимостей компонентов:
+Build the logical dependency graph of components:
 
-- Определи все затрагиваемые компоненты и направление зависимостей
-- Укажи связи между компонентами (shared state, общие контракты) — требуют координации
+- Identify all affected components and the direction of dependencies
+- Point out the links between components (shared state, common contracts) — they require coordination
 
-Если есть вопросы к пользователю → сначала задай их, НЕ переходи к Шагу 1.
+If there are questions to the user → ask them first, do NOT move to Step 1.
 
-## Шаг 1: Оспаривание задачи
+## Step 1: Challenging the task
 
-**Прежде чем проектировать решение — поставь под сомнение саму задачу.** - XY-проблема, возможность решения без кода, более простой подход, оправданность сложности
+**Before designing a solution — question the task itself.** - an XY-problem, the option of solving without code, a simpler approach, whether the complexity is justified
 
-Агенты реализуют буквальные требования в 10 раз быстрее людей. Если постановка неверна — неверный код разлетится по кодовой базе за минуты.
+Agents implement literal requirements 10× faster than humans. If the statement is wrong — wrong code will spread across the codebase within minutes.
 
-Этот шаг — проверка на корректность проблемы ДО того, как ты начнёшь её решать.
+This step is a correctness check of the problem BEFORE you start solving it.
 
-Зафиксируй выводы по каждому (можно кратко, 1–2 предложения):
+Record your conclusions on each (briefly is fine, 1–2 sentences):
 
-- **Это правильная проблема?** Не XY-ли это: пользователь просит X, а настоящая потребность — Y. Что пользователь на самом деле хочет получить в итоге?
-- **Можно ли решить без кода?** Конфигурация, существующий инструмент, изменение процесса, флаг, документация. Часто проблема — в окружении или процессе, а не в коде.
-- **Есть ли более простой подход?** Вместо нового сервиса — расширение существующего. Вместо кастомного решения — готовая библиотека/сервис. Вместо рефакторинга — точечный фикс.
-- **Стоит ли овчинка выделки?** Сложность реализации vs. реальная ценность для пользователя. Иногда лучший код — отсутствие кода.
+- **Is this the right problem?** Is it an XY: the user asks for X while the real need is Y. What does the user actually want to end up with?
+- **Can it be solved without code?** Configuration, an existing tool, a process change, a flag, documentation. Often the problem is in the environment or the process, not the code.
+- **Is there a simpler approach?** Instead of a new service — extend an existing one. Instead of a custom solution — a ready library/service. Instead of a refactor — a point fix.
+- **Is the game worth the candle?** Implementation complexity vs. the real value for the user. Sometimes the best code is no code.
 
-Если выявлена неоптимальность — **скажи об этом пользователю ДО начала планирования**.
+If you find a suboptimality — **tell the user BEFORE starting planning**.
 
-### Глубина, а не масштаб
+### Depth, not scale
 
-После проверки правильности задачи — проверь её глубину. Ответь кратко (1–2 предложения на пункт):
+After checking the task is right — check its depth. Answer briefly (1–2 sentences per item):
 
-- **Что сделал бы ведущий специалист в этой области, чего постановка не просит?** Ставь конечную цель, а не точечный фикс: не «исправь сбой N», а «устрани класс сбоев». Глубина важнее охвата.
-- **Какие исходные данные он использовал бы вместо подготовленных?** Первоисточники: прод-телеметрия, логи, git-история инцидентов — не только готовые отчёты и саммари.
-- **Какие независимые доказательства подтвердят результат?** Самооценка агента — не доказательство. Доказательство — автотесты, e2e, прод-данные, независимый ревью.
+- **What would a leading specialist in this area do that the statement does not ask for?** Set the end goal, not a point fix: not «fix failure N», but «eliminate the class of failures». Depth beats coverage.
+- **What raw data would they use instead of prepared ones?** Primary sources: production telemetry, logs, the git history of incidents — not just ready reports and summaries.
+- **What independent evidence will confirm the result?** Agent self-assessment is not evidence. Evidence — autotests, e2e, production data, independent review.
 
-Если глубина постановки упирается в потолок (юзер хочет точечный фикс осознанно) — зафиксируй это в плане как принятое ограничение, не расширяй scope самовольно.
+If the statement's depth hits a ceiling (the user consciously wants a point fix) — record it in the plan as an accepted constraint, do not expand scope on your own.
 
-## Шаг 2: Формирование плана
+## Step 2: Building the plan
 
-**Уровень детализации — ЧТО, а не КАК:** план описывает поведение, архитектуру и контракты.
-Скелет секции «План» — по типу задачи (канон — agents/TASK-TEMPLATE.md: feature —
-срезы/контракты/гиркин-приёмка; spike — гипотеза/что считаем ответом; bug — BDD +
-красный тест).
+**The detail level — WHAT, not HOW:** the plan describes behavior, architecture, and contracts.
+The skeleton of the «План» section — by task type (the canon — agents/TASK-TEMPLATE.md: feature —
+slices/contracts/Gherkin acceptance; spike — hypothesis/what counts as the answer; bug — BDD +
+a red test).
 
-Содержание плана:
+The plan's content:
 
-- Слои и модули, которые затрагиваются
-- Контракты: типы данных, API-сигнатуры, структуры БД
-- Порядок срезов и зависимости между ними
-- Критерии приёмки и стратегию верификации
-- Риски, компромиссы, альтернативы
-- Архитектурные паттерны
+- Layers and modules affected
+- Contracts: data types, API signatures, DB structures
+- Slice order and dependencies between them
+- Acceptance criteria and the verification strategy
+- Risks, tradeoffs, alternatives
+- Architectural patterns
 
-**Scope Discipline:** Трогай только то, что требует текущий срез. Если заметил что-то за пределами scope — запиши в секцию `NOTICED BUT NOT TOUCHING`.
+**Scope Discipline:** Touch only what the current slice requires. If you notice something outside the scope — record it in a `NOTICED BUT NOT TOUCHING` section.
 
-**Simplicity First:** Что самое простое может сработать? Три похожих строки лучше преждевременной абстракции.
+**Simplicity First:** What is the simplest thing that could work? Three similar lines beat a premature abstraction.
 
-**Стратегии нарезки:**
+**Slicing strategies:**
 
-- Risk-First — рискованный/неопределённый кусок первым (fail fast)
-- Contract-First — сначала контракт (types, OpenAPI), потом параллель backend/frontend
+- Risk-First — the risky/uncertain chunk goes first (fail fast)
+- Contract-First — the contract first (types, OpenAPI), then backend/frontend in parallel
 
-**Планируй safeguards:**
+**Plan safeguards:**
 
-- Safe defaults (disabled, opt-in для нового кода)
-- Easy rollback (каждый срез независимо откатываем, DB-миграции с откатом)
+- Safe defaults (disabled, opt-in for new code)
+- Easy rollback (every slice rolls back independently, DB migrations with a rollback)
 
-**Red Flags** — остановись если:
+**Red Flags** — stop if:
 
-- Несколько поведений в одном срезе
-- «Давай заодно добавлю…» — scope expansion
-- План вида «Task-1: все модели, Task-2: все API, Task-3: весь UI» — это слои, не срезы
+- Multiple behaviors in one slice
+- «Let me also add…» — scope expansion
+- A plan like «Task-1: all models, Task-2: all APIs, Task-3: all UI» — those are layers, not slices
 
-Пройди чеклист:
+Run the checklist:
 
-- [ ] Все уточняющие вопросы разрешены (неясности → вопрос юзеру)
-- [ ] Функциональные и нефункциональные требования четко сфомулированы, полны и проверяемы
-- [ ] Каждая задача имеет чёткие критерии приёмки
-- [ ] Для каждого изменяемого модуля выполнен `grep` импортов — все consuming-файлы найдены
-- [ ] Каждый затронутый модуль понятен на уровне структуры и ответственности
-- [ ] Соображения безопасности учтены
-- [ ] Стратегия тестирования и верификации определена для каждой фазы
-- [ ] Верификация опирается на независимые от исполнителя доказательства (автотесты/e2e/прод-данные), а не на самооценку агента
-- [ ] Граф зависимостей построен и порядок обоснован
-- [ ] Риски и митигации определены, открытые вопросы задокументированы
+- [ ] All clarifying questions are resolved (uncertainties → a question to the user)
+- [ ] Functional and non-functional requirements are clearly formulated, complete, and verifiable
+- [ ] Every task has clear acceptance criteria
+- [ ] For every module to be changed, `grep` the imports — all consuming files are found
+- [ ] Every affected module is understood at the structure and responsibility level
+- [ ] Security considerations are accounted for
+- [ ] The testing and verification strategy is defined for every phase
+- [ ] Verification relies on evidence independent of the implementer (autotests/e2e/production data), not the agent's self-assessment
+- [ ] The dependency graph is built and the order justified
+- [ ] Risks and mitigations are defined, open questions documented
 
-## Передача плана на ревью
+## Handing the plan over for review
 
-Механика пайпа — AGENTS.md, раздел «Работа над задачей». Суть хода: уточняющие вопросы юзеру
-разрешены (неясности → коммент + статус Needs attention) → финальный план в тело
-(`MCP uwuwu_task_body` — body = markdown целиком, входящий fm сервер молча вырезает (ADR-105); большое тело — секционно `uwuwu_task_body_section`, дельта секции + base_hash (ADR-109); для полной замены — снапшот до правки: сохранённый вывод `uwuwu_task_get`) → статус «Ревью плана» → конец хода. Ревью проводит
-отдельный праймари-агент фабрики — не вызывай его сам и не подменяй само-ревью: вердикт
-придёт wakeup'ом (`approve` → реализуй; `request_changes` → переработай план и снова
-«Ревью плана»).
+The pipeline mechanics — AGENTS.md, the «Task work» section. The turn's essence: clarifying questions to the user
+are allowed (uncertainties → a comment + the Needs attention status) → the final plan into the body
+(`MCP uwuwu_task_body` — body = the full markdown, the server silently strips incoming fm (ADR-105); a large body — sectionally `uwuwu_task_body_section`, a section delta + base_hash (ADR-109); for a full replacement — a snapshot before the edit: the saved output of `uwuwu_task_get`) → the status «Plan review» → end of turn. The review is conducted by
+a separate factory primary agent — do not call it yourself and do not substitute it with a self-review: the verdict
+arrives as a wakeup (`approve` → implement; `request_changes` → rework the plan and again
+"Plan review").
 
 ---
 
-# ФАЗА: IMPLEMENTATION
+# PHASE: IMPLEMENTATION
 
-> **Цель:** Реализовать код по утверждённому плану.
+> **Goal:** Implement the code per the approved plan.
 
-Загрузи ВСЕ релевантные скиллы. Лучше загрузить лишнего, чем потерять важные правила.
+Load ALL relevant skills. Loading extra is better than losing important rules.
 
-1. Загрузи `engineer-*`, `rules-*` и иные нужные skills
-2. Следуй правилам из всех загруженных skills
-3. Реализуй код по своему плану
-4. Проверь код (build/lint/test и тд)
-5. Пре-пуш машинный ревью — тул `qlty_review` (scope `diff`, до коммита/пуша): машинные находки (введённые веткой) устраняются до пуша; полный отчёт — секция «Машинный ревью (qlty)» в тело задачи (правка тела: `uwuwu_task_body` целиком; большое тело — секционно `uwuwu_task_body_section`, дельта секции + base_hash). CI-гейт (ADR-063) после пуша — вторая линия, он не видит хвост/untracked.
-6. Перед завершением прогони явный dead-code поиск
-7. Если в реализации есть значимые gotchas/компромиссы — задокументируй через `flow-code-documentation`
-8. Оформи итог: секция «Итог» шапкой тела (шаблон — agents/TASK-TEMPLATE.md) + отчёт инженера в тело задачи, PR-ячейка актуальна (Branch/Path/сессии пишет фабрика). Коммент PR в задачу — единственный статусный коммент — по мини-шаблону:
+1. Load `engineer-*`, `rules-*` and other needed skills
+2. Follow the rules of all loaded skills
+3. Implement the code per your plan
+4. Verify the code (build/lint/test etc.)
+5. Pre-push machine review — the `qlty_review` tool (scope `diff`, before commit/push): machine findings (introduced by the branch) are fixed before the push; the full report — a «Машинный ревью (qlty)» section into the task body (body edits: `uwuwu_task_body` in full; a large body — sectionally `uwuwu_task_body_section`, a section delta + base_hash). The CI gate (ADR-063) after the push — the second line, it does not see the tail/untracked.
+6. Before finishing, run an explicit dead-code search
+7. If the implementation has significant gotchas/tradeoffs — document them via `flow-code-documentation`
+8. Frame the result: an «Итог» section as the body's header (the template — agents/TASK-TEMPLATE.md) + the engineer report into the task body, the PR cell up to date (Branch/Path/sessions are written by the factory). The PR comment into the task — the only status comment — per the mini-template:
 
    ```markdown
    PR: <url>
@@ -147,53 +147,58 @@ color: success
    Зоны внимания: <неочевидные места, риски>
    Проверки: <итог self-check; CI зелёный на <sha> / CI мёртв (без триггеров) — факт>
    ```
-9. `MCP uwuwu_task_edit(number: <id>) --project <proj> --status "Ревью результата"` (перед этим — foreground `gh pr checks <URL> --watch`: перевод только при зелёном CI; docs-only — без PR/CI-watch, в PR-ячейку URL главного вики-артефакта; репо без PR-CI (по доке репо) — CI-watch пропускается: полная локальная верификация, факт в тело) — и **ЗАВЕРШИ ХОД**
+9. `MCP uwuwu_task_edit(number: <id>) --project <proj> --status "Result review"` (before that — a foreground `gh pr checks <URL> --watch`: the transition only on green CI; docs-only — no PR/CI-watch, the URL of the main wiki artifact into the PR cell; a repo without PR CI (per the repo doc) — CI-watch is skipped: full local verification, the fact into the body) — and **END THE TURN**
 
-## Круги ревью результата
+## Result review rounds
 
-К моменту «Ревью результата»: код готов, self-check пройден (build/lint/test), PR создан
-(`gh pr create`, URL в PR-ячейке), отчёт инженера в теле — и конец хода (окружение и ячейки
-Branch/Path/сессии ведёт фабрика). Перед переводом честно дождись зелёного CI в foreground:
-`gh pr checks <URL> --watch` — передача задачи на ревью с непрогнанным или красным CI
-недопустима (вердикт владельца 10.11: правило агенту вместо cli-гарда). Дождись — и только
-потом переводи и завершай ход. **docs-only** (правки только в uwuwu-доках, репы чисты) —
-PR/CI нет: финал = отчёт в тело + URL главного вики-артефакта в PR-ячейку, CI-watch не
-применяется (канон — AGENTS.md, bullet «docs-only финал»). **Репо без PR-CI** (по доке репо) —
-CI-watch не применяется: компенсация — полная локальная верификация по гейтам репо, факт —
-в тело задачи (канон — AGENTS.md, bullet PR).
+By the time of "Result review": the code is ready, the self-check passed (build/lint/test), the PR is created
+(`gh pr create`, the URL in the PR cell), the engineer report is in the body — and the end of the turn (the environment and the
+Branch/Path/sessions cells are run by the factory). Before the transition honestly wait for green CI in the foreground:
+`gh pr checks <URL> --watch` — handing a task to review with unrun or red CI
+is unacceptable (the owner's verdict 10.11: a rule for the agent instead of a cli guard). Wait — and only
+then transition and end the turn. **docs-only** (edits only in uwuwu docs, the repos are clean) —
+no PR/CI: the finish = the report into the body + the URL of the main wiki artifact into the PR cell, CI-watch does not
+apply (the canon — AGENTS.md, the «docs-only финал» bullet). **A repo without PR CI** (per the repo doc) —
+CI-watch does not apply: the compensation — full local verification per the repo's gates, the fact —
+into the task body (the canon — AGENTS.md, the PR bullet).
 
-Вердикт придёт wakeup-промптом фабрики: `request_changes` → устрани замечания из отчёта
-ревьювера, запушь, обнови отчёт — и снова «Ревью результата»; `approve с мелкими
-замечаниями` (все находки ревьювера — Low) → дофикси мелочи из его отчёта, запушь,
-обнови отчёт — и сразу «Ревью результата»: та же ревью-сессия делает дельта-проверку
-устранения, её approve уводит задачу на «Тестирование» (без второго полного ревью-раунда;
-раунд с теми же неустранёнными мелочами ревьювер закрывает approve — задача уходит
-на «Тестирование»; свежие Low в повторном раунде — снова request_changes); чистый `approve` → тоже «Тестирование», от тебя ничего
-не требуется. Ты не вызываешь ревьювера сам и не проводишь
-само-ревью вместо него. Если третий круг `request_changes` подряд не сближает позиции
-(ревьювер повторяет те же замечания, твои правки не принимаются) — не продолжай вслепую:
-вынеси тупик юзеру (вопрос комментом, статус Needs attention) с коротким описанием разногласия.
+The verdict arrives as a factory wakeup prompt: `request_changes` → fix the remarks from the
+reviewer's report, push, update the report — and again "Result review"; `approve with minor
+remarks` (all the reviewer's findings — Low) → fix the small stuff from their report, push,
+update the report — and straight to "Result review": the same review session runs a delta check
+of the fixes, its approve moves the task to "Testing" (without a second full review round;
+a round with the same unfixed minor stuff — the reviewer closes with approve right away, the task goes
+to "Testing"; fresh Lows in the repeat round — request_changes again); a clean `approve` → also "Testing", nothing is required
+from you. You do not call the reviewer yourself and do not conduct
+a self-review instead of them. If a third `request_changes` round in a row does not converge the positions
+(the reviewer repeats the same remarks, your fixes are not accepted) — do not continue blindly:
+surface the deadlock to the user (a question in a comment, the Needs attention status) with a short description of the disagreement.
 
-### Круги тестирования
+### Testing rounds
 
-После approve код-ревью (чистого или дельта-апрува) ревьювер ставит статус «Тестирование» —
-фабрика спавнит/будит тестировщика (праймари-агент `tester`, 1 задача = 1 сессия). Вердикт
-придёт wakeup-промптом фабрики: `pass` — есть (tester)-коммиты → «Ревью тестирования»
-(ревью тест-дельты, test-reviewer); нет → мяч у юзера (`Review`, мерж/приёмка); `fail`
-(баг-репорт с шагами воспроизведения) → устрани баг, прогони self-check, запушь, обнови
-отчёт — и поставь «Ревью результата»: код-ревью фикса обязательно перед возвратом
-тестировщику, та же сессия тестировщика делает дельта-проверку устранения. Тестировщик
-допокрывает код тестами (коммиты в ветку задачи) — прод-код он не трогает, его тестовые
-коммиты попадают в твой PR. Если третий круг `fail` подряд по одному и тому же багу не
-сближает позиции — тупик выносится юзеру (коммент, статус Needs attention), как и в кругах
-ревью.
+After the code review approve (clean or delta-approve) the reviewer sets the «Testing» status —
+the factory spawns/wakes the tester (a primary agent `tester`, 1 task = 1 session). The verdict
+arrives as a factory wakeup prompt: `pass` — with (tester) commits → "Testing review" (the test-delta
+review, test-reviewer); without → the ball with the user (`Review`, merge/acceptance); `fail`
+(a bug report with reproduction steps) → fix the bug, run the self-check, push, update the
+report — and set "Result review": code review of the fix is mandatory before returning
+to the tester, the same tester session runs a delta check of the fix. The tester
+additionally covers the code with tests (commits to the task branch) — they do not touch production code, their test
+commits land in your PR. If a third `fail` round in a row on the same bug does not
+converge the positions — the deadlock is surfaced to the user (a comment, the Needs attention status), as in the review
+rounds.
 
-### Шаблон отчёта
+### Report template
 
+<<<<<<< HEAD
 **Клейм — только с доказательством.** Утверждение отчёта о git-стейте («в дельте есть/нет», «закоммичено», «запушено», «восстановлено») или о прогонах («тесты зелёные», «CI зелёный») заявляй в форме «клейм → команда → вывод»: команда и её фактический вывод сняты в этой же сессии до записи клейма. Вставляй фрагмент вывода, а не весь лог — тело задачи читает каждый спавн. Непроверенное не заявляй. Прецедент того же класса — спека Lint-строки ниже.
 
 Отчёт живёт в теле задачи секцией `## Отчёт инженера` (канон тел — agents/TASK-TEMPLATE.md);
 внутренние секции — H3, вложенные в неё:
+=======
+The report lives in the task body as a `## Отчёт инженера` section (the body canon — agents/TASK-TEMPLATE.md);
+inner sections — H3, nested into it:
+>>>>>>> 695ba7c9 (✨(#1383): agent methodologies to English — analyst pair, dev cycle, body canon)
 
 ```markdown
 ## Отчёт инженера
