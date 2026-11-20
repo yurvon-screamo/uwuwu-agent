@@ -130,33 +130,26 @@ fn cfg(name: &str, default: &str) -> String {
 /// Стадия по спавн-промпту (маркеры из spawn_prompt юзкейса) →
 /// канон-переход, который делает «агент» этой стадии.
 /// Возвращает (ключ стадии, статус-цель, вердикт-строка).
+/// Маркеры — дословные фрагменты spawn_prompt/волн (pipeline/actions.rs,
+/// pipeline/analyst*.rs): пин-тест stage_markers_map_to_canon_transitions
+/// держит их синхронно с живыми промптами (#1383 — английский канон).
 fn stage_action_of_prompt(prompt: &str) -> Option<(&'static str, &'static str, &'static str)> {
     // (стадия, статус-цель, вердикт-строка для коммента)
-    Some(if prompt.contains("стадия утряски") {
-        ("design", "Ревью плана", "план собран, на ревью (мок)")
-    } else if prompt.contains("ревью плана") {
+    Some(if prompt.contains("design stage: study the statement") {
+        ("design", "Plan review", "план собран, на ревью (мок)")
+    } else if prompt.contains("plan review: paraphrase") {
         ("plan", "In Progress", "план approve (мок)")
-    } else if prompt.contains("реализация по утверждённому плану") {
-        ("dev", "Ревью результата", "реализация завершена (мок)")
-    } else if prompt.contains("ревью результата") {
-        ("result", "Тестирование", "ревью approve (мок)")
-    } else if prompt.contains("тестовая дельта ветки") {
-        // #1413: уникальный stage-маркер тест-ревьювера, не подстрока
-        // имени статуса «Ревью тестирования» — она живёт и в
-        // finish-инструкции тестировщика (чекпойнт pass), матч по имени
-        // статуса классифицировал бы tester-промпт как test-review
-        ("test-review", "Review", "тест-ревью: чисто (мок)")
-    } else if prompt.contains("тестирование") {
+    } else if prompt.contains("implementation per the approved plan") {
+        ("dev", "Result review", "реализация завершена (мок)")
+    } else if prompt.contains("result review: code/CI/report") {
+        ("result", "Testing", "ревью approve (мок)")
+    } else if prompt.contains("testing: feature quality") {
         // дефолт стенда — pass с тест-коммитами: полный цикл конвейера
-        // (#1413); «pass без тест-коммитов → Review» — сценар test:review
-        (
-            "test",
-            "Ревью тестирования",
-            "тест pass, есть тест-коммиты (мок)",
-        )
-    } else if prompt.contains("Аналитика волны") {
+        // (#1413); «pass без тест-коммитов → Review» — сценарий test:review
+        ("test", "Testing review", "тест pass, есть тест-коммиты (мок)")
+    } else if prompt.contains("Analytics wave (project") {
         ("analys", "Review Analys", "аналитика: проработано (мок)")
-    } else if prompt.contains("Ревью аналитики") {
+    } else if prompt.contains("Analytics review (project") {
         ("analys-review", "Todo", "ревью аналитики: approve (мок)")
     } else {
         // wakeup/крон/дример/прочее: без перехода статуса
@@ -178,16 +171,18 @@ fn scripted_verdict(verdicts: &Mutex<Vec<String>>, stage: &str) -> Option<String
 
 /// Действие «агента» при wakeup по ТЕКУЩЕМУ СТАТУСУ строки (стадию из
 /// промпта не извлечь — wakeup-промпт общий). Дев дорабатывает и ведёт
-/// на ревью, ревью-стадии подтверждают, тест проходит.
+/// на ревью, ревью-стадии подтверждают, тест проходит. Статусы с доски
+/// резолвятся доменно (parse_status — канон и легаси до rename #1383).
 fn action_for_status(status: &str) -> (&'static str, &'static str) {
-    match status.trim() {
-        "Design" => ("Ревью плана", "план доработан (мок)"),
-        "In Progress" => ("Ревью результата", "доработка завершена (мок)"),
-        "Ревью результата" => ("Тестирование", "ревью approve (мок)"),
+    use uwuwu_usecase::parse_status;
+    match parse_status(status) {
+        uwuwu_domain::Status::Design => ("Plan review", "план доработан (мок)"),
+        uwuwu_domain::Status::InProgress => ("Result review", "доработка завершена (мок)"),
+        uwuwu_domain::Status::ReviewResult => ("Testing", "ревью approve (мок)"),
         // дефолт стенда: pass с тест-коммитами → ревью тестирования (#1413)
-        "Тестирование" => ("Ревью тестирования", "тест pass, есть тест-коммиты (мок)"),
-        "Ревью тестирования" => ("Review", "тест-ревью approve (мок)"),
-        "Ревью плана" => ("In Progress", "план approve (мок)"),
+        uwuwu_domain::Status::Testing => ("Testing review", "тест pass, есть тест-коммиты (мок)"),
+        uwuwu_domain::Status::ReviewTesting => ("Review", "тест-ревью approve (мок)"),
+        uwuwu_domain::Status::ReviewPlan => ("In Progress", "план approve (мок)"),
         _ => ("", "сводка (мок)"),
     }
 }
@@ -1304,21 +1299,37 @@ mod tests {
 
     #[test]
     fn stage_markers_map_to_canon_transitions() {
-        // маркеры спавн-промптов → канон-переходы конвейера
+        // маркеры спавн-промптов → канон-переходы конвейера; фрагменты
+        // дословны из pipeline/actions.rs (spawn_prompt) и pipeline/
+        // analyst{,_review}.rs (#1383 — английский канон промптов)
         let cases = [
-            ("стадия утряски: изучи постановку", "Ревью плана"),
-            ("ревью плана: парафриз", "In Progress"),
-            ("реализация по утверждённому плану", "Ревью результата"),
-            ("ревью результата: код/CI", "Тестирование"),
-            // дефолт стенда: pass с тест-коммитами — полный цикл (#1413)
-            ("тестирование: качество фичи", "Ревью тестирования"),
-            ("ревью тестирования: тестовая дельта ветки", "Review"),
+>>>>>>> 1401d5a (🐛(#1383): review round 1/2 — mock stand sync + lib runtime strings + AGENTS.md H2)
             (
-                "Аналитика волны (проект p) — строки в Analys",
+                "You are a uwuwu pipeline agent (repo canon). design stage: study the statement, clarify with the owner, build the plan.",
+                "Plan review",
+            ),
+            (
+                "You are a uwuwu pipeline agent (repo canon). plan review: paraphrase/zoom-out/readiness, verdict in a comment.",
+                "In Progress",
+            ),
+            (
+                "You are a uwuwu pipeline agent (repo canon). implementation per the approved plan; run the task per the AGENTS.md canon.",
+                "Result review",
+            ),
+            (
+                "You are a uwuwu pipeline agent (repo canon). result review: code/CI/report, verdict in a comment.",
+                "Testing",
+            ),
+            (
+                "You are a uwuwu pipeline agent (repo canon). testing: feature quality, pass/fail verdict with steps.",
+                "Review",
+            ),
+            (
+                "Analytics wave (project p) — rows in Analys, the whole batch:",
                 "Review Analys",
             ),
             (
-                "Ревью аналитики (проект p) — строки в Review Analys",
+                "Analytics review (project p) — rows in Review Analys, the whole wave:",
                 "Todo",
             ),
         ];
@@ -1326,6 +1337,7 @@ mod tests {
             let (_, status, _) = stage_action_of_prompt(prompt).unwrap();
             assert_eq!(status, want, "промпт «{prompt}»");
         }
+<<<<<<< HEAD
         // тест-ревьювер классифицируется по уникальному stage-маркеру
         let (test_review_stage, _, _) =
             stage_action_of_prompt("ревью тестирования: тестовая дельта ветки").unwrap();
@@ -1342,16 +1354,28 @@ mod tests {
             "tester-промпт не перехватывается test-review-маркером"
         );
         // триаж выведен (#1135): старого маркера нет
+=======
+        // триаж выведен (#1135): старого маркера нет; русские легаси-маркеры
+        // круга 1 больше не матчатся (мёртвый контракт не пинится)
         assert_ne!(
             stage_action_of_prompt("Триаж черновика #5").unwrap().0,
             "triage"
         );
+        assert_ne!(
+            stage_action_of_prompt("стадия утряски: изучи постановку")
+                .unwrap()
+                .0,
+            "design",
+            "легаси-русский маркер мёртв после #1383"
+        );
         // wakeup/крон/дример — без перехода статуса
         assert_eq!(
-            stage_action_of_prompt("Wakeup: новый коммент").unwrap().1,
+            stage_action_of_prompt("Wakeup: new comments on task")
+                .unwrap()
+                .1,
             ""
         );
-        assert_eq!(stage_action_of_prompt("Крон-ран «X»").unwrap().1, "");
+        assert_eq!(stage_action_of_prompt("Cron run «X»").unwrap().1, "");
     }
 
     #[test]

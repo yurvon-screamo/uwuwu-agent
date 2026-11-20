@@ -81,7 +81,7 @@ export async function runScreenReview(input: ScreenReviewInput, deps: ScreenRevi
   const notAbsolute = input.images.filter((p) => !isAbsolute(p))
   if (notAbsolute.length > 0) {
     throw new Error(
-      `screen_review: пути к скринам должны быть абсолютными (cwd тулa — сервер opencode, не сессия агента): ${notAbsolute.join(", ")}`,
+      `screen_review: screenshot paths must be absolute (the tool cwd is the opencode server, not the agent session): ${notAbsolute.join(", ")}`,
     )
   }
   const questions = resolveQuestions(input)
@@ -95,7 +95,7 @@ export async function runScreenReview(input: ScreenReviewInput, deps: ScreenRevi
   const state = input.state ?? DEFAULT_STATE
   const threshold = input.threshold ?? DEFAULT_THRESHOLD
   if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
-    throw new Error(`screen_review: threshold — число 0..1 (вероятность), получено ${threshold}`)
+    throw new Error(`screen_review: threshold — a number 0..1 (a probability), got ${threshold}`)
   }
 
   const sections: string[] = []
@@ -107,7 +107,7 @@ export async function runScreenReview(input: ScreenReviewInput, deps: ScreenRevi
     )
     verdicts.push(verdict)
     sections.push(renderVerdictSection(verdict, state, threshold))
-    await deps.onProgress?.(`screen_review: ${index + 1}/${input.images.length} — ${verdict.imageName} готов`)
+    await deps.onProgress?.(`screen_review: ${index + 1}/${input.images.length} — ${verdict.imageName} done`)
   }
   const flagged = verdicts.filter((v) => sectionHasFlags(v, threshold))
   const summary = renderSummary(flagged.map((v) => v.imageName))
@@ -121,11 +121,11 @@ const sectionHasFlags = (verdict: ScreenVerdict, threshold: number): boolean =>
   })
 
 function renderSummary(flaggedScreens: string[]): string {
-  const lines = ["### Сводка", ""]
+  const lines = ["### Summary", ""]
   if (flaggedScreens.length === 0) {
-    lines.push("Скринов с флагами нет.")
+    lines.push("No flagged screenshots.")
   } else {
-    lines.push(`Скрины с флагами (смотреть глазами в первую очередь): ${flaggedScreens.map((n) => `\`${n}\``).join(", ")}.`)
+    lines.push(`Flagged screenshots (look with your own eyes first): ${flaggedScreens.map((n) => `\`${n}\``).join(", ")}.`)
   }
   return lines.join("\n")
 }
@@ -147,7 +147,7 @@ async function reviewImage(
     imageBase64 = await (deps.readImageBase64 ?? defaultReadImageBase64)(imagePath)
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
-    throw new Error(`screen_review: скрин не читан — ${imagePath}: ${msg}`)
+    throw new Error(`screen_review: screenshot unreadable — ${imagePath}: ${msg}`)
   }
   const request = buildRequest(config.model, state, imageBase64, mimeType, questions)
   const headers = { "x-goog-api-key": config.apiKey }
@@ -160,11 +160,11 @@ async function reviewImage(
     // (паттерн lib/qlty-review.ts — отказы внешних вызовов с контекстом)
     const msg = e instanceof Error ? e.message : String(e)
     const cause = (e as { cause?: unknown }).cause
-    const causeMsg = cause === undefined || cause === null ? "" : ` (причина: ${describeCause(cause)})`
-    throw new Error(`screen_review: Gemini Decisions API недоступна — ${imagePath} → ${DECISIONS_URL}: ${msg}${causeMsg}`)
+    const causeMsg = cause === undefined || cause === null ? "" : ` (cause: ${describeCause(cause)})`
+    throw new Error(`screen_review: the Gemini Decisions API is unreachable — ${imagePath} → ${DECISIONS_URL}: ${msg}${causeMsg}`)
   }
   if (response.status !== 200) {
-    throw new Error(`screen_review: decisions api ${response.status} на ${imagePath} — ${truncate(response.body)}`)
+    throw new Error(`screen_review: decisions api ${response.status} on ${imagePath} — ${truncate(response.body)}`)
   }
   const label = `screen_review (${basename(imagePath)})`
   const { answers, inputTokens } = parseAnswers(response.body, label, Object.keys(questions))

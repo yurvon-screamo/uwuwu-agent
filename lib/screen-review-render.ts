@@ -20,11 +20,11 @@ export function scoreVerdictLabel(answer: DecisionAnswer): string | null {
 
 export function renderVerdictSection(verdict: ScreenVerdict, state: string, threshold: number): string {
   const lines: string[] = []
-  lines.push(`### Скрин: ${verdict.imageName}`)
+  lines.push(`### Screenshot: ${verdict.imageName}`)
   lines.push("")
-  lines.push(`Путь: \`${verdict.imagePath}\` · state: ${state} · input_tokens: ${verdict.inputTokens}`)
+  lines.push(`Path: \`${verdict.imagePath}\` · state: ${state} · input_tokens: ${verdict.inputTokens}`)
   lines.push("")
-  lines.push("| Вопрос | Тип | Вердикт | P (проблема) | Флаг |")
+  lines.push("| Question | Type | Verdict | P (problem) | Flag |")
   lines.push("| --- | --- | --- | --- | --- |")
   const flags: Array<{ id: string; p: number }> = []
   for (const [id, answer] of Object.entries(verdict.answers)) {
@@ -35,12 +35,12 @@ export function renderVerdictSection(verdict: ScreenVerdict, state: string, thre
   }
   lines.push("")
   if (flags.length > 0) {
-    lines.push(`**Сигналы** (P > ${threshold}):`)
+    lines.push(`**Signals** (P > ${threshold}):`)
     for (const { id, p } of flags.sort((a, b) => b.p - a.p)) {
       lines.push(`- ${id} — P ${round(p)}`)
     }
   } else {
-    lines.push(`**Сигналов нет** — ни один вопрос не превысил порог ${threshold}.`)
+    lines.push(`**No signals** — no question exceeded the ${threshold} threshold.`)
   }
   return lines.join("\n")
 }
@@ -60,12 +60,12 @@ const round = (n: number): string => String(Math.round(n * 100) / 100)
 
 export function renderReport(sections: string[], meta: { model: string; checklistName: string }, threshold: number): string {
   const head = [
-    `## screen_review (${meta.model}, чек-лист ${meta.checklistName}, порог ${threshold})`,
+    `## screen_review (${meta.model}, checklist ${meta.checklistName}, threshold ${threshold})`,
     "",
   ]
   const tail = [
     "",
-    "> Роль тула — скринер/прицел, не финальный судья: флаги — куда смотреть глазами; финальное суждение — за агентом/человеком.",
+    "> The tool is a screener/aimer, not the final judge: the flags show where to look with your own eyes; the final judgment — the agent/human.",
   ]
   return [...head, ...sections, ...tail].join("\n")
 }

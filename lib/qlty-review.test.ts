@@ -106,9 +106,9 @@ describe("parseSarif — startLine толерантен (инцидент origa 
       delta: [f({ line: null, path: "go.mod", ruleId: "osv-scanner:GO-2026-1234", level: "error", message: "vuln" }), f({ line: 3 })],
       smells: [],
     })
-    expect(md).toContain("- [osv-scanner:GO-2026-1234] go.mod (строка неизвестна) (error) — vuln")
+    expect(md).toContain("- [osv-scanner:GO-2026-1234] go.mod (line unknown) (error) — vuln")
     expect(md).toContain("- [ruff:F401] src/a.py:3 (warning) — `os` imported but unused")
-    expect(md).toContain("Итог: 2 delta + 0 smells.")
+    expect(md).toContain("Verdict: 2 delta + 0 smells.")
   })
 
   test("startLine не в контракте обязательных полей", () => {
@@ -145,11 +145,11 @@ describe("parseSarif — контракт SARIF", () => {
   })
 
   test("не JSON → громкая ошибка", () => {
-    expect(() => parseSarif("not json at all", "test")).toThrow(/не SARIF/)
+    expect(() => parseSarif("not json at all", "test")).toThrow(/is not SARIF/)
   })
 
   test("пустой runs → контракт нарушен", () => {
-    expect(() => parseSarif(JSON.stringify({ runs: [] }), "test")).toThrow(/контракт SARIF нарушен.*runs\[0\]/)
+    expect(() => parseSarif(JSON.stringify({ runs: [] }), "test")).toThrow(/the SARIF contract is broken.*runs\[0\]/)
   })
 
   test.each([
@@ -177,7 +177,7 @@ describe("parseSarif — контракт SARIF", () => {
       },
     ],
   ])("дрейф формата (%s) → громкая ошибка с версией контракта", (_name, broken) => {
-    expect(() => parseSarif(JSON.stringify(broken), "test")).toThrow(/контракт SARIF нарушен/)
+    expect(() => parseSarif(JSON.stringify(broken), "test")).toThrow(/the SARIF contract is broken/)
     try {
       parseSarif(JSON.stringify(broken), "test")
     } catch (e) {
@@ -239,11 +239,11 @@ describe("renderReport — формат по мотивам qltysh", () => {
       smells: [f({ ruleId: "qlty:similar-code", path: "src/x.py", line: 10, level: "warning", message: "Found 16 lines of similar code in 2 locations (mass = 53)" })],
     })
     expect(md).toContain("**Машинный ревью (qlty v0.661.0)** — scope `diff`")
-    expect(md).toContain("**Delta (qlty check --upstream: находки в изменённых строках)**")
+    expect(md).toContain("**Delta (qlty check --upstream: findings in changed lines)**")
     expect(md).toContain("- [ruff:F401] src/new.py:3 (warning) — `os` imported but unused")
-    expect(md).toContain("**Smells (qlty smells, новые против upstream)**")
+    expect(md).toContain("**Smells (qlty smells, new against upstream)**")
     expect(md).toContain("- [qlty:similar-code] src/x.py:10")
-    expect(md).toContain("Итог: 1 delta + 1 smells.")
+    expect(md).toContain("Verdict: 1 delta + 1 smells.")
   })
 
   test("чистый прогон — без групп, ✅-итог", () => {
@@ -256,7 +256,7 @@ describe("renderReport — формат по мотивам qltysh", () => {
       delta: [],
       smells: [],
     })
-    expect(md).toContain("✅ новых машинных находок нет.")
+    expect(md).toContain("✅ no new machine findings.")
     expect(md).not.toContain("**Delta (")
     expect(md).not.toContain("**Smells (")
   })
@@ -268,12 +268,12 @@ describe("renderReport — формат по мотивам qltysh", () => {
       upstream: "origin/master",
       directory: "/repo",
       commit: "abc123",
-      notes: ["scope=commit: прогон по рабочей копии."],
+      notes: ["scope=commit: a run over the working copy."],
       delta: [],
       smells: [],
     })
     expect(md).toContain("scope `commit` (`abc123`)")
-    expect(md).toContain("> ⚠ scope=commit: прогон по рабочей копии.")
+    expect(md).toContain("> ⚠ scope=commit: a run over the working copy.")
   })
 })
 
@@ -378,7 +378,7 @@ describe("runReview — оркестрация на fake-deps", () => {
     }
     expect(
       runReview({ scope: "commit", directory: "/repo", commit: "rootcafe" }, fakeDeps(repo)),
-    ).rejects.toThrow(/нет родителя/)
+    ).rejects.toThrow(/has no parent/)
   })
 
   test("пустая дельта (SARIF с пустыми results) — ✅-отчёт", async () => {
@@ -387,7 +387,7 @@ describe("runReview — оркестрация на fake-deps", () => {
       qlty: (args) => (isSmellsCall(args) ? SMELLS_EMPTY : EMPTY_RESULTS_SARIF),
     }
     const r = await runReview({ scope: "diff", directory: "/repo" }, fakeDeps(repo))
-    expect(r.markdown).toContain("✅ новых машинных находок нет.")
+    expect(r.markdown).toContain("✅ no new machine findings.")
     expect(r.qltyVersion).toBe("0.661.0")
     expect(r.delta).toBe(0)
     expect(r.smells).toBe(0)
@@ -402,7 +402,7 @@ describe("runReview — оркестрация на fake-deps", () => {
     expect(r.delta).toBe(2)
     const filtered = await runReview({ scope: "diff", directory: "/repo", paths: ["docs/*"] }, fakeDeps(repo))
     expect(filtered.delta).toBe(0)
-    expect(filtered.markdown).toContain("✅ новых машинных находок нет.")
+    expect(filtered.markdown).toContain("✅ no new machine findings.")
   })
 
   test("смешанная дельта (есть line и без startLine) — отчёт, не ошибка (инцидент 10.11)", async () => {
@@ -434,8 +434,8 @@ describe("runReview — оркестрация на fake-deps", () => {
     const r = await runReview({ scope: "diff", directory: "/repo" }, fakeDeps(repo))
     expect(r.delta).toBe(2)
     expect(r.markdown).toContain("[ruff:F401] src/changed.py:1")
-    expect(r.markdown).toContain("[osv-scanner:GO-2026-1234] go.mod (строка неизвестна)")
-    expect(r.markdown).not.toContain("контракт SARIF нарушен")
+    expect(r.markdown).toContain("[osv-scanner:GO-2026-1234] go.mod (line unknown)")
+    expect(r.markdown).not.toContain("the SARIF contract is broken")
   })
 
   test("пустой merge-base — громкая ошибка", async () => {
@@ -445,7 +445,7 @@ describe("runReview — оркестрация на fake-deps", () => {
     }
     expect(
       runReview({ scope: "diff", directory: "/repo" }, fakeDeps(repo)),
-    ).rejects.toThrow(/merge-base.*пуст/)
+    ).rejects.toThrow(/merge-base.*is empty/)
   })
 })
 
@@ -490,7 +490,7 @@ describe("runReview e2e — живой qlty (UWUWU_E2E=1)", () => {
         expect(r.markdown).toContain("bad.py")
         expect(r.markdown).toContain("ruff:")
         expect(r.markdown).toContain("Итог:")
-        expect(r.markdown).not.toContain("контракт SARIF нарушен")
+        expect(r.markdown).not.toContain("the SARIF contract is broken")
       } finally {
         rmSync(root, { recursive: true, force: true })
       }
