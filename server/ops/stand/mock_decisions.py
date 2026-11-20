@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 LOCK = threading.Lock()
 CALLS = 0
 STATUS = "In Progress"  # дефолт вердикта фазы «шум гасится»
+NO_ROUTE = {"error": "no route"}
 
 CHOICE_LABELS = {
     "InProgress": "In Progress",
@@ -42,7 +43,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         global CALLS, STATUS
         if self.path != "/decisions":
-            self._json(404, {"error": "no route"})
+            self._json(404, NO_ROUTE)
             return
         length = int(self.headers.get("Content-Length", "0"))
         self.rfile.read(length)
@@ -70,14 +71,14 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 self._json(200, {"calls": CALLS})
             return
-        self._json(404, {"error": "no route"})
+        self._json(404, NO_ROUTE)
 
     def _read(self):
         length = int(self.headers.get("Content-Length", "0"))
         return json.loads(self.rfile.read(length) or b"{}")
 
     def do_PUT(self):
-        global STATUS
+        global STATUS, CALLS
         if self.path == "/set":
             STATUS = self._read().get("status", "InProgress")
             self._json(200, {"ok": True, "status": STATUS})
@@ -87,7 +88,7 @@ class Handler(BaseHTTPRequestHandler):
                 CALLS = 0
             self._json(200, {"ok": True})
             return
-        self._json(404, {"error": "no route"})
+        self._json(404, NO_ROUTE)
 
 
 if __name__ == "__main__":

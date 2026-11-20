@@ -1423,7 +1423,6 @@ impl TickUseCase {
     ) -> bool {
         if rounds >= REVIEW_ROUND_CAP + self.judge_cfg.escalate_after {
             out.review_flagged += 1;
-            out.judge_calls += 1;
             out.judge_forced += 1;
             tracing::warn!(
                 event = "judge.rounds_forced",
@@ -1666,7 +1665,6 @@ impl TickUseCase {
             "Судья: перенос строки вердиктом"
         );
         if target == Status::NeedsAttention {
-            out.stall_flagged += 1;
             return Ok(StallAct::Flagged);
         }
         Ok(StallAct::None)
@@ -1704,9 +1702,7 @@ impl TickUseCase {
         )
         .await?;
         self.state.clear_stall(&board.board, task.number());
-        out.judge_calls += 1;
         out.judge_forced += 1;
-        out.stall_flagged += 1;
         let _ = now;
         Ok(StallAct::Flagged)
     }
