@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOCK = threading.Lock()
 CALLS = 0
-STATUS = "In Progress"  # дефолт вердикта фазы «шум гасится»
+STATUS = "Design"  # дефолт: вердикт = текущий статус (Design-строка фазы) — wake без переноса; нелегальный дефолт (In Progress на Design) гард каноничности отклоняет
 NO_ROUTE = {"error": "no route"}
 
 CHOICE_LABELS = {
