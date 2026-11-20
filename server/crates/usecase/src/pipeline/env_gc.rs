@@ -50,18 +50,24 @@ pub struct EnvGcOutcome {
     pub failed: usize,
 }
 
+/// Контекст прохода: всё, что нужно одной доске, — не дублируется
+/// аргументами (qlty function-parameters).
+pub struct EnvGcCtx<'a> {
+    pub board_name: &'a str,
+    /// Мастер-чекаут проекта на исполнителе (cwd bootstrap-сессии).
+    pub checkout: &'a str,
+    /// Корень env задач на исполнителе.
+    pub env_root: &'a str,
+    pub tasks: &'a [Task],
+    pub sessions: &'a Gateway,
+    pub models: &'a SpawnModels,
+}
+
 /// Проход env-gc по одной доске: отбор → гарды сессий → shell-снос.
-pub async fn sweep_envs(
-    board_name: &str,
-    checkout: &str,
-    env_root: &str,
-    tasks: &[Task],
-    sessions: &Gateway,
-    models: &SpawnModels,
-    policy: EnvGcPolicy,
-) -> UsecaseResult<EnvGcOutcome> {
+pub async fn sweep_envs(ctx: &EnvGcCtx<'_>, policy: EnvGcPolicy) -> UsecaseResult<EnvGcOutcome> {
     let mut out = EnvGcOutcome::default();
-    let mut candidates: Vec<&Task> = tasks
+    let mut candidates: Vec<&Task> = ctx
+        .tasks
         .iter()
         .filter(|t| t.is_env_gc_candidate(policy.now_ms, policy.age_days))
         .collect();
@@ -73,7 +79,7 @@ pub async fn sweep_envs(
     candidates.sort_by_key(|t| t.closed_at());
     tracing::info!(
         event = "env.gc.candidates",
-        board = board_name,
+        board = ctx.board_name,
         candidates = out.candidates,
         observe = policy.observe,
         "env-gc: кандидаты на снос"
@@ -82,7 +88,7 @@ pub async fn sweep_envs(
         for t in &candidates {
             tracing::info!(
                 event = "env.gc.observe",
-                board = board_name,
+                board = ctx.board_name,
                 number = t.number(),
                 "observe: env строки ушёл бы в снос"
             );
@@ -91,10 +97,10 @@ pub async fn sweep_envs(
     }
     // Гард 2: скан исполнителя — отказ = no-op прохода (ADR-058:
     // «не знаю» ≠ «можно сносить»).
-    let Ok(list) = sessions.list_sessions().await else {
+    let Ok(list) = ctx.sessions.list_sessions().await else {
         tracing::warn!(
             event = "env.gc.blind",
-            board = board_name,
+            board = ctx.board_name,
             "Скан исполнителя недоступен — проход no-op"
         );
         return Ok(out);
@@ -112,11 +118,12 @@ pub async fn sweep_envs(
     let targets: Vec<&Task> = candidates.into_iter().take(ENV_GC_BATCH_CAP).collect();
     // Bootstrap-сессия на проход: cwd = чекаут проекта — в нём живёт
     // ownership-гард скрипта; slash-команды = shell без LLM-решений.
-    let boot_model = models.for_default();
-    let bootstrap = match sessions
+    let boot_model = ctx.models.for_default();
+    let bootstrap = match ctx
+        .sessions
         .create_session(&SessionSpec {
-            directory: checkout.to_string(),
-            title: format!("env-gc {board_name}"),
+            directory: ctx.checkout.to_string(),
+            title: format!("env-gc {}", ctx.board_name),
             custom_agent: None,
             agent: AgentSlot::Default,
             model: boot_model.model,
@@ -129,29 +136,29 @@ pub async fn sweep_envs(
         Err(e) => {
             tracing::warn!(
                 event = "env.gc.blind",
-                board = board_name,
+                board = ctx.board_name,
                 error = %e,
                 "Bootstrap-сессия не создана — проход no-op"
             );
             return Ok(out);
         }
     };
-    let ctx = row::RowCtx {
-        board_name,
-        env_root,
+    let row_ctx = row::RowCtx {
+        board_name: ctx.board_name,
+        env_root: ctx.env_root,
         bootstrap: &bootstrap,
-        sessions,
+        sessions: ctx.sessions,
         sightings: &sightings,
         policy,
     };
     for t in &targets {
-        sweep_row(&ctx, t, &mut out).await;
+        sweep_row(&row_ctx, t, &mut out).await;
     }
     // Любой исход: bootstrap гасится (нет утечки сессий, как у спавна).
-    let _ = sessions.delete_session(&bootstrap).await;
+    let _ = ctx.sessions.delete_session(&bootstrap).await;
     tracing::info!(
         event = "env.gc.completed",
-        board = board_name,
+        board = ctx.board_name,
         candidates = out.candidates,
         held = out.held_live,
         dispatched = out.dispatched,
