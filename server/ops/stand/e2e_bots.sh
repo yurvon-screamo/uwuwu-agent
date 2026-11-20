@@ -279,4 +279,32 @@ done
 [ -n "$KIND" ] || fail "отказ о не-поддержанном типе не отправлен (лог: $LOG_SRV)"
 say "видео: явный отказ, тихой потери нет"
 
-say "ИТОГ: E2E ботов зелёный (spawn → reply → greeting → state → рестарт → private-only → media)"
+# ---------- форварды (#1416): пересланный пост → факт в промпте сессии ----------
+# Наблюдаемость: реплай мока несёт только последнюю строку промпта, маркер —
+# первая; mock_opencode логирует head-строку промпта — маркер грепается в LOG_MOCK
+say "инжект форварда владельца (канал)…"
+curl -s -X POST "http://127.0.0.1:$PORT_TG/inject" -H 'Content-Type: application/json' \
+  -d '{"update_id":9,"chat_id":42,"username":"yurvon","text":"пост про nginx","forward_origin":{"type":"channel","chat":{"id":-100123,"type":"channel","title":"Nginx Gems","username":"nginx"}}}' >/dev/null
+FWD=""
+for _ in $(seq 1 20); do
+  sleep 1
+  grep -q "Пересланный пост — канал @nginx" "$LOG_MOCK" && FWD=1 && break
+done
+[ -n "$FWD" ] || fail "форвард-факт не доехал до промпта сессии (лог: $LOG_MOCK, $LOG_SRV)"
+say "форвард доставлен: маркер источника в промпте бот-сессии"
+
+# реплай на форвард доходит владельцу (явный исход, не тихое оседание)
+FWD_REPLY=""
+for _ in $(seq 1 20); do
+  sleep 1
+  FWD_REPLY=$(curl -s "http://127.0.0.1:$PORT_TG/sent" | python3 -c "
+import json,sys
+sent=json.load(sys.stdin)['sent']
+hits=[m['text'] for m in sent if 'пост про nginx' in m['text']]
+print(hits[0] if hits else '')" 2>/dev/null)
+  [ -n "$FWD_REPLY" ] && break
+done
+[ -n "$FWD_REPLY" ] || fail "реплай на форвард не дошёл до ТГ"
+say "форвард: реплай владельцу отправлен"
+
+say "ИТОГ: E2E ботов зелёный (spawn → reply → greeting → state → рестарт → private-only → media → forward)"
