@@ -5716,7 +5716,7 @@ async fn analyst_three_real_rounds_escalate_with_honest_message() {
         .find(|l| l.starts_with("comment#1="))
         .expect("коммент владельцу есть");
     assert!(
-        comment.contains("3 реальных круга (Review Analys → Analys)"),
+        comment.contains("3 full rounds (Review Analys → Analys)"),
         "текст эскалации честный: {comment:?}"
     );
     assert!(
