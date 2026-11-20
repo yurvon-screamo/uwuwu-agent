@@ -192,9 +192,9 @@ impl AnalystReviewUseCase {
             .post_comment(
                 task.number(),
                 &format!(
-                    "⚠︎ Цикл-гвард ревью аналитики: {repeats} спавнов ревьювера без прогресса \
-                     статуса (строка ждёт в Review Analys). Строка переведена в \
-                     Needs attention — разбор владельца."
+                    "⚠︎ Analytics review loop guard: {repeats} reviewer spawns without status \
+                     progress (the row waits in Review Analys). The row moved to \
+                     Needs attention — owner's triage."
                 ),
             )
             .await
