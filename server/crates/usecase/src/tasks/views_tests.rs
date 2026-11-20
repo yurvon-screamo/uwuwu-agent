@@ -2,8 +2,9 @@
 //! (#1214). Пины на слаг — переезд носителя закреплён: неверный слаг
 //! персоны ломает person_show для всех агентских сессий.
 
-use super::views::{DocsView, PersonView, ViewError, PERSON_SLUG};
+use super::views::{DocsView, PersonView, PERSON_SLUG};
 use crate::error::UsecaseResult;
+use crate::error::ViewError;
 use crate::ports::{AppendDocOutcome, WikiRepo};
 use std::sync::{Arc, Mutex};
 

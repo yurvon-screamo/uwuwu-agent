@@ -638,6 +638,11 @@ async fn fast_track_from_draft_and_todo() {
     let boards = vec![("uwuwu".to_string(), "Задачи uwuwu".to_string())];
     let tools = Arc::new(ToolHub {
         tasks: Arc::new(TaskView::new(board.clone(), boards.clone())),
+        goals: Arc::new(uwuwu_usecase::GoalsView::new(
+            memory.clone(),
+            vec!["uwuwu".to_string()],
+            "https://github.com/acme/hub/issues?q=label%3Aproj%3A{project}".into(),
+        )),
         docs: Arc::new(DocsView::new(wiki.clone())),
         person: Arc::new(PersonView::new(wiki.clone())),
         writer: Arc::new(TaskWriteUseCase {
@@ -1424,4 +1429,31 @@ async fn task_clean_garbage_ids_is_loud() {
         .await
         .expect_err("ids отсутствует");
     assert!(err.contains("ids обязателен"), "{err}");
+}
+
+// ——— goal_list (#1216): MCP-поверхность — склейка диспетчера с вьюхой ———
+// Носитель в фикстуре — MemoryHub (целей нет): проверяется маршрутизация
+// тула и подсказка носителя с подставленным проектом; живые данные —
+// hub.rs::goals_live_tests (UWUWU_E2E=1).
+#[tokio::test]
+async fn goal_list_on_mcp_surface_carrier_hint_on_empty() {
+    let (tools, _) = hub();
+    let out = call(&tools, "goal_list", json!({}))
+        .await
+        .expect("дефолт-проект uwuwu читается без arguments");
+    assert!(out.contains("цели проекта не заведены"), "{out}");
+    assert!(out.contains("proj:uwuwu"), "{out}");
+    assert!(
+        out.contains("https://github.com/acme/hub"),
+        "URL фильтра из фикс.туры потерян: {out}"
+    );
+}
+
+#[tokio::test]
+async fn goal_list_on_mcp_surface_unknown_project_is_honest() {
+    let (tools, _) = hub();
+    let err = call(&tools, "goal_list", json!({ "project": "origa" }))
+        .await
+        .expect_err("проект вне конфига фикстуры — честный NotFound");
+    assert!(err.contains("вне конфига"), "{err}");
 }

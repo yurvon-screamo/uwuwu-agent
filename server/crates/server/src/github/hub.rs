@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use uwuwu_domain::{Status, Task};
-use uwuwu_usecase::{CommentRef, IssueView, TaskBoardRepo};
+use uwuwu_usecase::{CommentRef, GoalIssue, GoalsRepo, IssueView, TaskBoardRepo};
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 pub struct GitHubHub {
@@ -1246,6 +1246,144 @@ impl TaskBoardRepo for GitHubHub {
 
     async fn latest_comments(&self, number: u64) -> UsecaseResult<Vec<CommentRef>> {
         self.all_comments(number).await
+    }
+}
+
+/// Цели проекта из ответа GitHub issues API (#1216): скип PR-записей
+/// (поле pull_request), gist — первая содержательная строка body.
+/// Чистая функция — юнит-тесты без HTTP.
+pub(crate) fn goals_from_json(items: &[Value]) -> Vec<GoalIssue> {
+    items
+        .iter()
+        .filter(|i| i["pull_request"].is_null())
+        .map(|i| GoalIssue {
+            number: i["number"].as_u64().unwrap_or(0),
+            title: i["title"].as_str().unwrap_or_default().to_string(),
+            gist: uwuwu_usecase::gist_of(i["body"].as_str().unwrap_or_default()),
+        })
+        .collect()
+}
+
+#[async_trait]
+impl GoalsRepo for GitHubHub {
+    /// Открытые цели проекта: issues hub-репо с лейблами `goal` +
+    /// `proj:<проект>` (#1216). REST — вне GraphQL-бюджета (#1243).
+    async fn open_goals(&self, project: &str) -> UsecaseResult<Vec<GoalIssue>> {
+        let (status, body) = self
+            .rest(
+                reqwest::Method::GET,
+                &format!(
+                    "/repos/{}/issues?labels=goal,proj:{}&state=open&per_page=100",
+                    self.repo,
+                    crate::wiki::encode_path(project)
+                ),
+                None,
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(UsecaseError::Board(format!("goal issues: HTTP {status}")));
+        }
+        match body.as_array() {
+            Some(items) => Ok(goals_from_json(items)),
+            None => Ok(Vec::new()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod goals_json_tests {
+    use super::goals_from_json;
+    use serde_json::json;
+
+    #[test]
+    fn maps_number_title_and_first_body_line() {
+        let items = [json!({
+            "number": 52,
+            "title": "Переход к единой ИС на Rust",
+            "body": "Суть: консолидировать контур.\n\nдетали",
+        })];
+        let goals = goals_from_json(&items);
+        assert_eq!(goals.len(), 1);
+        assert_eq!(goals[0].number, 52);
+        assert_eq!(goals[0].title, "Переход к единой ИС на Rust");
+        assert_eq!(goals[0].gist, "Суть: консолидировать контур.");
+    }
+
+    #[test]
+    fn skips_pull_request_records() {
+        let items = [
+            json!({ "number": 52, "title": "цель", "body": "суть" }),
+            json!({
+                "number": 53,
+                "title": "PR: что-то",
+                "body": "diff",
+                "pull_request": { "url": "https://api.github.com/repos/x/y/pulls/53" }
+            }),
+        ];
+        let goals = goals_from_json(&items);
+        assert_eq!(goals.len(), 1);
+        assert_eq!(goals[0].number, 52);
+    }
+
+    #[test]
+    fn empty_or_blank_body_yields_empty_gist() {
+        let items = [
+            json!({ "number": 60, "title": "без тела", "body": "" }),
+            json!({ "number": 61, "title": "null-тело", "body": null }),
+            json!({ "number": 62, "title": "пробельное", "body": "  \n\t " }),
+        ];
+        let goals = goals_from_json(&items);
+        assert_eq!(goals.len(), 3);
+        assert!(goals.iter().all(|g| g.gist.is_empty()));
+    }
+
+    #[test]
+    fn empty_array_yields_empty_list() {
+        assert!(goals_from_json(&[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod goals_live_tests {
+    use super::GitHubHub;
+    use uwuwu_usecase::GoalsRepo;
+
+    // Живой e2e REST-границы целей (#1216): реальный hub-репо, гвард
+    // UWUWU_E2E=1 (культура репо — образец gitea_tests::live_probe_*).
+    // Ловит возврат «слепого» потребителя (мастер: goal_list отвечал
+    // «реестр пуст» на всё): поломку запроса (лейблы/state), маппинг
+    // ответа и проектный фильтр лейблов на живых данных. Фиксация на
+    // живой реестр uwuwu (цели #1393/#1394): если владелец закрыл все
+    // цели — тест правится на актуальный факт, не сносится.
+    #[tokio::test]
+    async fn live_goal_list_reads_open_issues_by_labels() {
+        if std::env::var("UWUWU_E2E").as_deref() != Ok("1") {
+            return;
+        }
+        let token = std::env::var("GH_TOKEN").unwrap_or_default();
+        assert!(!token.is_empty(), "UWUWU_E2E=1: нужен GH_TOKEN");
+        let hub = GitHubHub::new("yurvon-screamo/uwuwu-hub".into(), token);
+        let goals = hub
+            .open_goals("uwuwu")
+            .await
+            .expect("живой REST open_goals uwuwu");
+        assert!(
+            !goals.is_empty(),
+            "реестр uwuwu пуст на живом hub — сломан носитель или запрос"
+        );
+        for g in &goals {
+            assert!(g.number > 0, "номер issue не смапился: {g:?}");
+            assert!(!g.title.is_empty(), "тайтл не смапился: {g:?}");
+        }
+        // проектный фильтр лейблов: несуществующий проект — пусто, не чужие цели
+        let none = hub
+            .open_goals("no-such-proj-1216")
+            .await
+            .expect("живой REST open_goals по несуществующему проекту");
+        assert!(
+            none.is_empty(),
+            "лейбл-фильтр пропустил чужие цели: {none:?}"
+        );
     }
 }
 
