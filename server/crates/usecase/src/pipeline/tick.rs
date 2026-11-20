@@ -1304,10 +1304,10 @@ impl TickUseCase {
             .post_comment(
                 task.number(),
                 &format!(
-                    "⚠︎ Сталл-детект: stage-сессия `{}` молчит {} мин при живой \
-                     сессии — агент не завершает статусную транзакцию (проба \
-                     исполнителя: жива; автопингов в раунде: {count}). Строка в \
-                     Needs attention, разбор владельца.",
+                    "⚠︎ Stall detect: the `{}` stage session has been silent for {} min \
+                     with the session alive — the agent is not completing the status \
+                     transaction (executor probe: alive; auto-pings in the round: {count}). \
+                     The row is in Needs attention, owner's triage.",
                     naming::slot_key(slot),
                     silence / 60_000
                 ),
@@ -1354,10 +1354,10 @@ impl TickUseCase {
             gw.prompt(
                 session,
                 &format!(
-                    "⏰ Мягкий пинг: ход завершён, статусный перевод не выполнен — \
-                     строка #{} стоит. Заверши транзакцию по контракту хода: \
-                     uwuwu_task_edit {{number: {}, status: <следующая стадия>}} \
-                     или вопрос владельцу комментом + Needs attention.",
+                    "⏰ Soft ping: the turn has finished without the status transition — \
+                     row #{} is stalled. Close the transaction per the turn contract: \
+                     uwuwu_task_edit {{number: {}, status: <next stage>}} \
+                     or ask the owner in a comment + Needs attention.",
                     task.number(),
                     task.number()
                 ),
@@ -1384,10 +1384,10 @@ impl TickUseCase {
             .post_comment(
                 task.number(),
                 &format!(
-                    "⏰ Автопинг сталл-детекта: сессия стадии `{}` молчит {} мин при статусе \
-                     {:?} — ход, похоже, завершён без перевода статуса. Заверши транзакцию: \
-                     переведи статус по канону пайпа (или продолжай работу и доведи её до \
-                     статусного перевода).",
+                    "⏰ Stall auto-ping: the `{}` stage session has been silent for {} min at status \
+                     {:?} — the turn seems to have finished without the status transition. Close \
+                     the transaction: set the status per the pipeline canon (or keep working \
+                     until the status transition is done).",
                     naming::slot_key(slot),
                     silence / 60_000,
                     task.status()

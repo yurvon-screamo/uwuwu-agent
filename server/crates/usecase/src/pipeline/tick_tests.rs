@@ -1198,7 +1198,7 @@ async fn soft_ping_prompt_routes_to_project_executor() {
     assert_eq!(out.soft_pings, 1, "мягкий пинг ушёл");
     let named_prompts = named_gw.prompts.lock().unwrap();
     assert!(
-        named_prompts.iter().any(|p| p.contains("Мягкий пинг")),
+        named_prompts.iter().any(|p| p.contains("Soft ping")),
         "soft-ping на гейтвее проекта: {named_prompts:?}"
     );
     // пин агента слота и на мягком пинге (#1300)
@@ -3833,7 +3833,7 @@ async fn soft_ping_wakes_idle_session_without_transaction() {
         .lock()
         .unwrap()
         .iter()
-        .any(|p| p.contains("Мягкий пинг")));
+        .any(|p| p.contains("Soft ping")));
 }
 
 #[tokio::test]
@@ -4142,15 +4142,15 @@ async fn counters_earned_by_current_process_still_escalate() {
         .find(|l| l.starts_with("comment#64="))
         .expect("эскалация постит коммент");
     assert!(
-        comment.contains("при живой сессии"),
+        comment.contains("with the session alive"),
         "подпись различает причину: агент молчит при живой сессии"
     );
     assert!(
-        comment.contains("проба исполнителя: жива"),
+        comment.contains("executor probe: alive"),
         "вердикт пробы в подписи"
     );
     assert!(
-        comment.contains("автопингов в раунде: 2"),
+        comment.contains("auto-pings in the round: 2"),
         "счётчик доставленных пингов раунда в подписи"
     );
 }
@@ -4534,9 +4534,12 @@ async fn spawn_prompt_demands_finish_transaction() {
     };
     let task = Task::new(7, "t".into(), Status::Design);
     let prompt = crate::pipeline::actions::spawn_prompt(&board, &task, Slot::Design);
-    assert!(prompt.contains("ЗАСЫПАЕТ"), "промпт объясняет сон сессии");
     assert!(
-        prompt.contains("Ревью плана"),
+        prompt.contains("SLEEPS after the reply"),
+        "промпт объясняет сон сессии"
+    );
+    assert!(
+        prompt.contains("Plan review"),
         "финал хода назван для стадии"
     );
     assert!(
@@ -5124,7 +5127,7 @@ async fn dreamer_repeat_wakes_linked_session_without_new_spawn() {
         "промпт в связанную дример-сессию"
     );
     assert!(
-        prompts[0].contains("Повторный прогон"),
+        prompts[0].contains("Repeat run"),
         "wakeup-промпт повторного прогона"
     );
     assert!(
@@ -5193,7 +5196,7 @@ async fn dreamer_respawns_when_linked_dreamer_session_dead() {
         "прогон — в новый носитель"
     );
     assert!(
-        prompts[0].contains("Пост-обработка"),
+        prompts[0].contains("Post-processing"),
         "новый носитель без контекста дедупа получает полный промпт"
     );
 }
@@ -5217,7 +5220,7 @@ async fn dreamer_first_run_links_created_session() {
     let prompts = sessions.prompts.lock().unwrap();
     assert_eq!(prompts.len(), 1);
     assert!(
-        prompts[0].contains("Пост-обработка"),
+        prompts[0].contains("Post-processing"),
         "новый носитель получает полный промпт пост-обработки"
     );
 }
@@ -7250,7 +7253,7 @@ async fn round_stale_reset_gives_true_fresh_round_two_pings_before_escalation() 
         .find(|l| l.starts_with("comment#64="))
         .expect("эскалация постит коммент");
     assert!(
-        comment.contains("автопингов в раунде: 2"),
+        comment.contains("auto-pings in the round: 2"),
         "подпись считает пинги ТЕКУЩЕГО процесса (2), а не persisted-мусор: {comment}",
     );
 }

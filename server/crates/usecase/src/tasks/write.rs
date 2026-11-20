@@ -668,8 +668,8 @@ impl TaskWriter for TaskWriteUseCase {
         let actual = md_section::body_hash(&current.body);
         if actual != base_hash {
             return Err(UsecaseError::Board(format!(
-                "тело #{number} изменилось с момента чтения (base_hash мимо); \
-                 актуальный body_hash: {actual} — перечитай task_get и повтори"
+                "body of #{number} changed since the read (stale base_hash); \
+                 current body_hash: {actual} — re-read task_get and retry"
             )));
         }
         let (next, edit) = md_section::replace_md_section(&current.body, section, content)
