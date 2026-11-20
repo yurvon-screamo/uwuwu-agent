@@ -1,8 +1,10 @@
 // screen-review.test.ts — юнит-тесты ядра screen_review (bun test, без сети:
-// оляма подменяется postJson, ФС — readImageBase64). Контракт ответа
-// systemone — константа ANSWER_CONTRACT_FIELDS; нехватка поля = громкая
-// ошибка, не пустой отчёт. Живой контракт зафиксирован пробами 13.11.2026
-// (questions — map; noul/choice/score; usage.input_tokens).
+// API подменяется postJson, ФС — readImageBase64). Контракт ответа Decisions
+// API — константа ANSWER_CONTRACT_FIELDS; нехватка поля = громкая ошибка, не
+// пустой отчёт. Живой контракт Gemini зафиксирован пробами 20.11.2026 (#1362,
+// срез 1): фикстура — живой ответ gemini-decision-1 на синтетический скрин
+// с заведомыми дефектами (двойная рамка, карточка-в-карточке, сдвиг,
+// налезание, слабый контраст — все посажены намеренно, ground truth известен).
 import { describe, expect, test } from "bun:test"
 import {
   ANSWER_CONTRACT_FIELDS,
@@ -11,49 +13,54 @@ import {
   DEFAULT_THRESHOLD,
   parseAnswers,
   problemProbability,
+  resolveMimeType,
   resolveQuestions,
 } from "./screen-review-core"
+import { DECISIONS_URL, DEFAULT_MODEL, runScreenReview, type ScreenReviewDeps } from "./screen-review"
 import { renderReport, renderVerdictSection, scoreVerdictLabel } from "./screen-review-render"
-import { runScreenReview, type ScreenReviewDeps } from "./screen-review"
 
-// Живой ответ systemone от d1-omni (проба 13.11.2026 на эталоне /download,
-// структурно сокращён: 7 ответов — полный чек-лист ui-slop, три типа).
-const SYSTEMONE_OK = JSON.stringify({
-  model: "d1-omni",
+// Живой ответ gemini-decision-1 (проба 20.11.2026, POST /v1beta/decisions,
+// 1634 input-токена, ~1.0 с — все 7 вопросов ui-slop, три типа ответа).
+const GEMINI_OK = JSON.stringify({
   answers: {
-    double_frame: { type: "noul", noul: 0.8537415956049682 },
-    card_in_card: { type: "noul", noul: 0.34 },
-    alignment: { type: "noul", noul: 0.09 },
-    overlap: { type: "noul", noul: 0.11 },
-    contrast: { type: "noul", noul: 0.49 },
+    double_frame: { confidence: 0.7918995921976731, noul: 0.7918995921976731, type: "noul" },
+    card_in_card: { confidence: 0.509538286627421, noul: 0.509538286627421, type: "noul" },
+    alignment: { confidence: 0.5241035189477238, noul: 0.5241035189477238, type: "noul" },
+    overlap: { confidence: 0.7465647392217101, noul: 0.7465647392217101, type: "noul" },
+    contrast: { confidence: 0.5092533537767471, noul: 0.5092533537767471, type: "noul" },
     main_defect: {
+      confidence: 0.5548847972728546,
+      choice: "overlap",
+      probabilities: {
+        overlap: 0.5548847972728546, contrast: 0.1295350356982163, double_frame: 0.11296824431662063,
+        other: 0.10998025809101027, alignment: 0.02326296686378967, none: 0.01693529270245775,
+        card_in_card: 0.05243340505505083,
+      },
       type: "choice",
-      choice: "double_frame",
-      probabilities: { none: 0.37126927631254203, double_frame: 0.5546253782258994, other: 0.07410534546155863 },
-      confidence: 0.3319380673388491,
     },
     severity: {
-      type: "score",
-      score: 1.2746170364258675,
+      confidence: 0.5503023347831089,
+      score: 2.3595156604574994,
+      probabilities: { "0": 0.036449140141597364, "1": 0.11788839404241439, "2": 0.29536013103287934, "3": 0.5503023347831089 },
       legend: { "0": "чисто", "1": "мелкие огрехи", "2": "явные дефекты", "3": "критично" },
-      probabilities: { "0": 0.29671816651427574, "1": 0.13194663054558112, "2": 0.5713352029401432, "3": 0.000001 },
+      type: "score",
     },
   },
-  usage: { input_tokens: 7344, output_tokens: 0 },
+  usage: { total_tokens: 1634, total_input_tokens: 1634, total_output_tokens: 0 },
 })
 
-describe("parseAnswers — контракт ответа systemone (анти-дрейф)", () => {
-  test("живой ответ парсится: три типа, input_tokens", () => {
-    const { answers, inputTokens } = parseAnswers(SYSTEMONE_OK, "test")
-    expect(inputTokens).toBe(7344)
-    expect(answers.double_frame).toEqual({ type: "noul", noul: 0.8537415956049682 })
+describe("parseAnswers — контракт ответа Decisions API (анти-дрейф)", () => {
+  test("живой ответ Gemini парсится: три типа, total_input_tokens", () => {
+    const { answers, inputTokens } = parseAnswers(GEMINI_OK, "test")
+    expect(inputTokens).toBe(1634)
+    expect(answers.double_frame).toEqual({ type: "noul", noul: 0.7918995921976731 })
     expect(answers.main_defect?.type).toBe("choice")
     expect(answers.severity?.type).toBe("score")
   })
 
   test.each([
     ["не JSON", "{oops", "не JSON"],
-    ["answers отсутствует", JSON.stringify({ usage: { input_tokens: 1 } }), "нет map answers"],
+    ["answers отсутствует", JSON.stringify({ usage: { total_input_tokens: 1 } }), "нет map answers"],
     ["noul без числа", JSON.stringify({ answers: { q: { type: "noul" } } }), "type=noul без числа noul"],
     [
       "choice без probabilities",
@@ -83,7 +90,7 @@ describe("parseAnswers — контракт ответа systemone (анти-д�
   test("неполный ответ (подмножество вопросов) → контрактная ошибка с id недостающих", () => {
     const partial = JSON.stringify({
       answers: { double_frame: { type: "noul", noul: 0.5 } },
-      usage: { input_tokens: 1 },
+      usage: { total_input_tokens: 1 },
     })
     const err = (() => {
       try {
@@ -98,12 +105,12 @@ describe("parseAnswers — контракт ответа systemone (анти-д�
   })
 
   test("полный ответ при сверке с вопросами проходит", () => {
-    const { answers } = parseAnswers(SYSTEMONE_OK, "test", Object.keys(resolveQuestions({})))
+    const { answers } = parseAnswers(GEMINI_OK, "test", Object.keys(resolveQuestions({})))
     expect(Object.keys(answers)).toHaveLength(7)
   })
 })
 
-describe("resolveQuestions — чек-листы и inline-вопросы", () => {
+describe("resolveQuestions — чек-листы, inline-вопросы и гарды ограничений API", () => {
   test("дефолт — встроенный ui-slop, 7 вопросов из постановки", () => {
     const q = resolveQuestions({})
     expect(Object.keys(q).sort()).toEqual(
@@ -136,15 +143,92 @@ describe("resolveQuestions — чек-листы и inline-вопросы", () =
     )
     expect(() => resolveQuestions({ questions: many })).toThrow("1–64")
   })
+
+  // ——— гарды ограничений Decisions API (пробы 20.11, #1362) ———
+
+  test.each([
+    ["кириллица в id", { "вопрос_1": { type: "noul" as const, instructions: "x" } }],
+    ["пробел в id", { "my question": { type: "noul" as const, instructions: "x" } }],
+    ["id длиннее 64", { [`${"q".repeat(65)}`]: { type: "noul" as const, instructions: "x" } }],
+  ])("гард id: %s → громкая ошибка входа до сети", (_name, questions) => {
+    expect(() => resolveQuestions({ questions })).toThrow("[A-Za-z0-9_-]{1,64}")
+  })
+
+  test("choice без criteria → громкая ошибка (API отвечает 400 без них)", () => {
+    expect(() => resolveQuestions({ questions: { q: { type: "choice", instructions: "x" } } })).toThrow(
+      "criteria обязательны для type=choice",
+    )
+  })
+
+  test("score без criteria → громкая ошибка", () => {
+    expect(() => resolveQuestions({ questions: { q: { type: "score", instructions: "x" } } })).toThrow(
+      "criteria обязательны для type=score",
+    )
+  })
+
+  test("choice с одной опцией → громкая ошибка минимума 2–255", () => {
+    expect(() =>
+      resolveQuestions({ questions: { q: { type: "choice", instructions: "x", criteria: { a: "описание" } } } }),
+    ).toThrow("2–255 опций, получено 1")
+  })
+
+  test("choice с ключом длиннее 128 символов → громкая ошибка (400 живьём, проба 20.11)", () => {
+    const longKey = "k".repeat(129)
+    expect(() =>
+      resolveQuestions({ questions: { q: { type: "choice", instructions: "x", criteria: { a: "x", [longKey]: "y" } } } }),
+    ).toThrow("вне лимита 1–128 символов")
+  })
+
+  test("choice с пустым ключом опции → громкая ошибка без вранья про длину", () => {
+    expect(() =>
+      resolveQuestions({ questions: { q: { type: "choice", instructions: "x", criteria: { "": "описание", a: "x" } } } }),
+    ).toThrow("(пустой)")
+  })
+
+  test("score с одним уровнем → громкая ошибка минимума 2–255", () => {
+    expect(() =>
+      resolveQuestions({ questions: { q: { type: "score", instructions: "x", criteria: ["один"] } } }),
+    ).toThrow("2–255 уровней, получено 1")
+  })
+
+  test("noul с массивом criteria → громкая ошибка shape", () => {
+    expect(() =>
+      resolveQuestions({ questions: { q: { type: "noul", instructions: "x", criteria: ["нет", "да"] } } }),
+    ).toThrow("{true_description, false_description}")
+  })
+
+  test("noul с чужими ключами criteria → громкая ошибка shape", () => {
+    expect(() =>
+      resolveQuestions({ questions: { q: { type: "noul", instructions: "x", criteria: { yes: "да", no: "нет" } } } }),
+    ).toThrow("true_description и false_description")
+  })
+
+  test("noul с правильным shape criteria проходит (принят API живьём, проба 20.11)", () => {
+    const q = resolveQuestions({
+      questions: {
+        q: { type: "noul", instructions: "x", criteria: { true_description: "да", false_description: "нет" } },
+      },
+    })
+    expect(q.q.criteria).toEqual({ true_description: "да", false_description: "нет" })
+  })
+
+  test("ключи опций choice со свободным charset проходят (пробел/кириллица приняты API, проба 20.11)", () => {
+    const q = resolveQuestions({
+      questions: { q: { type: "choice", instructions: "x", criteria: { "my option": "обычная", "вариант_2": "нажатая" } } },
+    })
+    expect(Object.keys(q.q.criteria as Record<string, string>)).toEqual(["my option", "вариант_2"])
+  })
 })
 
-describe("buildRequest — questions уходят map'ом (не массивом)", () => {
-  test("questions — объект с ключами-id", () => {
+describe("buildRequest — input-блоки text+image, questions map'ом", () => {
+  test("сборка запроса Decisions API", () => {
     const q = resolveQuestions({})
-    const req = buildRequest("d1-omni", "state", "B64", q)
-    expect(req.model).toBe("d1-omni")
-    expect(req.state).toBe("state")
-    expect(req.images).toEqual(["B64"])
+    const req = buildRequest("gemini-decision-1", "state", "B64", "image/png", q)
+    expect(req.model).toBe("gemini-decision-1")
+    expect(req.input).toEqual([
+      { type: "text", text: "state" },
+      { type: "image", data: "B64", mime_type: "image/png" },
+    ])
     expect(Array.isArray(req.questions)).toBe(false)
     expect(req.questions.double_frame?.type).toBe("noul")
   })
@@ -153,6 +237,21 @@ describe("buildRequest — questions уходят map'ом (не массиво�
     const slop = CHECKLISTS["ui-slop"]
     expect(slop.main_defect.criteria).toHaveProperty("none")
     expect(slop.severity.criteria).toEqual(["чисто", "мелкие огрехи", "явные дефекты", "критично"])
+  })
+})
+
+describe("resolveMimeType — расширение в mime (image-блок API требует mime_type)", () => {
+  test.each([
+    ["/shots/a.png", "image/png"],
+    ["/shots/a.JPG", "image/jpeg"],
+    ["/shots/a.jpeg", "image/jpeg"],
+    ["/shots/a.webp", "image/webp"],
+  ])("%s → %s", (path, mime) => {
+    expect(resolveMimeType(path)).toBe(mime)
+  })
+
+  test("неизвестное расширение → громкая ошибка со списком поддерживаемых", () => {
+    expect(() => resolveMimeType("/shots/a.gif")).toThrow(".png, .jpg/.jpeg, .webp")
   })
 })
 
@@ -205,21 +304,22 @@ describe("scoreVerdictLabel — подпись уровня по legend", () => 
   })
 })
 
-describe("renderVerdictSection — таблица и флаги порога", () => {
-  const { answers } = parseAnswers(SYSTEMONE_OK, "test")
-  const verdict = { imagePath: "/shots/download.png", imageName: "download.png", answers, inputTokens: 7344 }
+describe("renderVerdictSection — таблица и флаги порога (живой вердикт Gemini)", () => {
+  const { answers } = parseAnswers(GEMINI_OK, "test")
+  const verdict = { imagePath: "/shots/dashboard.png", imageName: "dashboard.png", answers, inputTokens: 1634 }
 
-  test("флаг P>0.6 на double_frame 0.85, без флага на 0.55-критерии", () => {
+  test("флаги P>0.6: double_frame 0.79, overlap 0.75, severity 0.96; тонкие ~0.5 — без флага", () => {
     const md = renderVerdictSection(verdict, "state", DEFAULT_THRESHOLD)
-    expect(md).toContain("### Скрин: download.png")
-    expect(md).toContain("/shots/download.png")
-    expect(md).toContain("input_tokens: 7344")
-    // noul 0.85 > 0.6 — флаг; choice top 0.55 < 0.6 — нет; score 1-P(чисто)=0.70 > 0.6 — флаг
-    expect(md).toContain("| double_frame | noul | 0.85 | 0.85 | ⚠️ |")
-    expect(md).toContain("| main_defect | choice | double_frame (0.55) · conf 0.33 | 0.55 | — |")
-    expect(md).toContain("| severity | score | 1.27 — мелкие огрехи → явные дефекты | 0.7 | ⚠️ |")
+    expect(md).toContain("### Скрин: dashboard.png")
+    expect(md).toContain("/shots/dashboard.png")
+    expect(md).toContain("input_tokens: 1634")
+    expect(md).toContain("| double_frame | noul | 0.79 | 0.79 | ⚠️ |")
+    expect(md).toContain("| overlap | noul | 0.75 | 0.75 | ⚠️ |")
+    expect(md).toContain("| main_defect | choice | overlap (0.55) · conf 0.55 | 0.55 | — |")
+    expect(md).toContain("| severity | score | 2.36 — явные дефекты → критично | 0.96 | ⚠️ |")
     expect(md).toContain("**Сигналы** (P > 0.6)")
-    expect(md).toContain("- double_frame — P 0.85")
+    expect(md).toContain("- severity — P 0.96")
+    expect(md).toContain("- double_frame — P 0.79")
   })
 
   test("нет сигналов — явная строка, не тишина", () => {
@@ -231,8 +331,8 @@ describe("renderVerdictSection — таблица и флаги порога", (
 
 describe("renderReport — шапка и напоминание роли скринера", () => {
   test("шапка с моделью и чек-листом, хвост с ролью скринера", () => {
-    const md = renderReport(["секция"], { model: "d1-omni", checklistName: "ui-slop" }, 0.6)
-    expect(md).toContain("## screen_review (d1-omni, чек-лист ui-slop, порог 0.6)")
+    const md = renderReport(["секция"], { model: DEFAULT_MODEL, checklistName: "ui-slop" }, 0.6)
+    expect(md).toContain("## screen_review (gemini-decision-1, чек-лист ui-slop, порог 0.6)")
     expect(md).toContain("скринер/прицел, не финальный судья")
     expect(md).toContain("секция")
   })
@@ -245,11 +345,11 @@ const okDeps = (screens: string[]): ScreenReviewDeps => ({
     if (!screens.includes(path)) throw new Error(`enoent: ${path}`)
     return "B64"
   },
-  postJson: async () => ({ status: 200, body: SYSTEMONE_OK }),
-  config: { ollamaUrl: "http://mock:11434", model: "d1-omni" },
+  postJson: async () => ({ status: 200, body: GEMINI_OK }),
+  config: { apiKey: "test-key", model: "gemini-decision-1" },
 })
 
-describe("runScreenReview — пер-скрин семантика и валидация входа", () => {
+describe("runScreenReview — пер-скрин семантика, auth и валидация входа", () => {
   test("два скрина → две секции, атрибуция вердиктов к скрину", async () => {
     const md = await runScreenReview({ images: ["/a.png", "/b.png"] }, okDeps(["/a.png", "/b.png"]))
     expect(md).toContain("### Скрин: a.png")
@@ -266,11 +366,29 @@ describe("runScreenReview — пер-скрин семантика и валид
     await expect(runScreenReview({ images: ["/missing.png"] }, okDeps([]))).rejects.toThrow("/missing.png")
   })
 
-  test("ollama 500 → честный текст ошибки с телом ответа", async () => {
+  test("нет GEMINI_API_KEY → громкая ошибка конфигурации до сети", async () => {
     const deps = okDeps(["/a.png"])
-    deps.postJson = async () => ({ status: 500, body: '{"error":"model is required"}' })
-    await expect(runScreenReview({ images: ["/a.png"] }, deps)).rejects.toThrow("ollama 500")
-    await expect(runScreenReview({ images: ["/a.png"] }, deps)).rejects.toThrow("model is required")
+    deps.config = { apiKey: "", model: "gemini-decision-1" }
+    await expect(runScreenReview({ images: ["/a.png"] }, deps)).rejects.toThrow("GEMINI_API_KEY не задан")
+  })
+
+  test("ключ уходит в заголовок x-goog-api-key (не в URL и не в тело)", async () => {
+    const seen: Array<{ url: string; headers: Record<string, string> }> = []
+    const deps = okDeps(["/a.png"])
+    deps.postJson = async (url, _body, headers) => {
+      seen.push({ url, headers })
+      return { status: 200, body: GEMINI_OK }
+    }
+    await runScreenReview({ images: ["/a.png"] }, deps)
+    expect(seen[0]?.url).toBe(DECISIONS_URL)
+    expect(seen[0]?.headers["x-goog-api-key"]).toBe("test-key")
+  })
+
+  test("decisions api 500 → честный текст ошибки с телом ответа", async () => {
+    const deps = okDeps(["/a.png"])
+    deps.postJson = async () => ({ status: 500, body: '{"error":{"message":"internal error"}}' })
+    await expect(runScreenReview({ images: ["/a.png"] }, deps)).rejects.toThrow("decisions api 500")
+    await expect(runScreenReview({ images: ["/a.png"] }, deps)).rejects.toThrow("internal error")
   })
 
   test("inline-вопросы уходят в запрос, отчёт помечен <inline>", async () => {
@@ -282,9 +400,8 @@ describe("runScreenReview — пер-скрин семантика и валид
       return {
         status: 200,
         body: JSON.stringify({
-          model: body.model,
           answers: Object.fromEntries(ids.map((id) => [id, { type: "noul", noul: 0.1 }])),
-          usage: { input_tokens: 100 },
+          usage: { total_input_tokens: 100 },
         }),
       }
     }
@@ -293,16 +410,21 @@ describe("runScreenReview — пер-скрин семантика и валид
       deps,
     )
     expect(md).toContain("чек-лист <inline>")
-    const req = seenRequests[0] as { questions: Record<string, unknown> }
+    const req = seenRequests[0] as { questions: Record<string, unknown>; input: unknown[] }
     expect(Object.keys(req.questions)).toEqual(["only"])
     expect(md).toContain("| only | noul |")
+    expect(req.input).toEqual([
+      { type: "text", text: "Скриншот пользовательского интерфейса" },
+      { type: "image", data: "B64", mime_type: "image/png" },
+    ])
   })
 
   test("кастомный порог передаётся в рендер", async () => {
     const md = await runScreenReview({ images: ["/a.png"], threshold: 0.9 }, okDeps(["/a.png"]))
     expect(md).toContain("порог 0.9")
-    // noul 0.85 < 0.9 — флага нет, сводка без скринов
-    expect(md).toContain("Скринов с флагами нет.")
+    // живой вердикт: максимум «вероятности проблемы» — severity 0.96; порог 0.97 выше всех — флагов нет
+    const md2 = await runScreenReview({ images: ["/a.png"], threshold: 0.97 }, okDeps(["/a.png"]))
+    expect(md2).toContain("Скринов с флагами нет.")
   })
 
   test.each([
@@ -321,17 +443,21 @@ describe("runScreenReview — пер-скрин семантика и валид
     )
   })
 
+  test("неизвестное расширение → громкая ошибка до чтения файла", async () => {
+    await expect(runScreenReview({ images: ["/a.gif"] }, okDeps([]))).rejects.toThrow("неизвестное расширение")
+  })
+
   test("сетевое исключение → обёртка со скрином, URL и причиной", async () => {
     const deps = okDeps(["/a.png"])
-    const cause = new Error("connect ECONNREFUSED 127.0.0.1:11434")
+    const cause = new Error("connect ECONNREFUSED 127.0.0.1:443")
     const fetchFailed = new Error("fetch failed", { cause })
     deps.postJson = async () => {
       throw fetchFailed
     }
     const err = (await runScreenReview({ images: ["/a.png"] }, deps).catch((e: unknown) => e as Error)) as Error
-    expect(err.message).toContain("оляма недоступна")
+    expect(err.message).toContain("Gemini Decisions API недоступна")
     expect(err.message).toContain("/a.png")
-    expect(err.message).toContain("http://mock:11434/v1/systemone")
+    expect(err.message).toContain(DECISIONS_URL)
     expect(err.message).toContain("ECONNREFUSED")
   })
 
@@ -349,21 +475,22 @@ describe("runScreenReview — пер-скрин семантика и валид
   })
 })
 
-// ——— живой e2e: живая оляма d1-omni, realDeps (гвард UWUWU_E2E=1) ———
+// ——— живой e2e: живой Gemini Decisions API (гвард UWUWU_E2E=1 + ключ) ———
 // Главный пользовательский сценарий тула end-to-end: сгенерированный PNG →
-// чтение с диска → живой POST /v1/systemone → parseAnswers (контракт) →
-// markdown-отчёт. Не зависит от внешних файлов-эталонов (проба 13.11:
-// контракт держится на 1x1 PNG — модель отвечает полным форматом на все
+// чтение с диска → живой POST /v1beta/decisions → parseAnswers (контракт) →
+// markdown-отчёт. Не зависит от внешних файлов-эталонов (пробы 20.11:
+// контракт держится и на 1x1 PNG — модель отвечает полным форматом на все
 // вопросы; калибровка вероятностей — не предмет e2e, её не проверяем).
 // Гвард по культуре репо (прецедент qlty-review.test.ts): без UWUWU_E2E=1
-// сразу зелёный — живой модели в CI нет; на ноде без d1-omni при включённом
-// гварде тест падает честной ошибкой «оляма недоступна» — это контракт тула.
+// или без GEMINI_API_KEY сразу skip — живого API в CI нет; при включённом
+// гварде без ключа тест падает честной ошибкой «GEMINI_API_KEY не задан» —
+// это контракт тула.
 
-const omniE2E = process.env.UWUWU_E2E === "1"
+const geminiE2E = process.env.UWUWU_E2E === "1" && Boolean(process.env.GEMINI_API_KEY)
 
-describe("runScreenReview e2e — живая оляма d1-omni (UWUWU_E2E=1)", () => {
-  test.skipIf(!omniE2E)(
-    "скрин через живой /v1/systemone → отчёт с полным чек-листом и атрибуцией",
+describe("runScreenReview e2e — живой Gemini Decisions API (UWUWU_E2E=1)", () => {
+  test.skipIf(!geminiE2E)(
+    "скрин через живой /v1beta/decisions → отчёт с полным чек-листом и атрибуцией",
     async () => {
       const { rmSync } = await import("node:fs")
       const { mkdtemp, writeFile } = await import("node:fs/promises")
@@ -383,7 +510,7 @@ describe("runScreenReview e2e — живая оляма d1-omni (UWUWU_E2E=1)", 
         const report = await runScreenReview({ images: [imagePath] })
 
         // шапка с моделью и дефолтным чек-листом, хвост с ролью скринера
-        expect(report).toContain("## screen_review (d1-omni, чек-лист ui-slop, порог 0.6)")
+        expect(report).toContain("## screen_review (gemini-decision-1, чек-лист ui-slop, порог 0.6)")
         expect(report).toContain("Роль тула — скринер/прицел, не финальный судья")
         // атрибуция к скрину: секция с именем файла
         expect(report).toContain(`### Скрин: e2e-probe.png`)
@@ -392,12 +519,12 @@ describe("runScreenReview e2e — живая оляма d1-omni (UWUWU_E2E=1)", 
           expect(report).toContain(`| ${id} |`)
         }
         expect(report).toMatch(/input_tokens: \d+/)
-        // дрейф формата олямы не маскируется
-        expect(report).not.toContain("контракт ответа systemone нарушен")
+        // дрейф формата API не маскируется
+        expect(report).not.toContain("контракт ответа Decisions API нарушен")
       } finally {
         rmSync(dir, { recursive: true, force: true })
       }
     },
-    200_000,
+    60_000,
   )
 })

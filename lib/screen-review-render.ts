@@ -4,11 +4,11 @@
 // на вынос). Только отрисовка: порог-семантика — problemProbability в core.
 import {
   problemProbability,
+  type DecisionAnswer,
   type ScreenVerdict,
-  type SystemOneAnswer,
 } from "./screen-review-core"
 
-export function scoreVerdictLabel(answer: SystemOneAnswer): string | null {
+export function scoreVerdictLabel(answer: DecisionAnswer): string | null {
   if (answer.type !== "score" || !answer.legend) return null
   const lo = Math.floor(answer.score)
   const hi = Math.ceil(answer.score)
@@ -45,7 +45,7 @@ export function renderVerdictSection(verdict: ScreenVerdict, state: string, thre
   return lines.join("\n")
 }
 
-function verdictCell(answer: SystemOneAnswer): string {
+function verdictCell(answer: DecisionAnswer): string {
   if (answer.type === "noul") return round(answer.noul)
   if (answer.type === "choice") {
     const conf = answer.confidence !== undefined ? ` · conf ${round(answer.confidence)}` : ""
