@@ -35,15 +35,15 @@ ADRs capture the reasoning behind significant technical decisions. They're the h
 
 ### ADR Template
 
-Store ADRs in `docs/decisions/` with sequential numbering:
+Store ADRs in `docs/decisions/` named `ADR-<name>` (human-readable slug: lowercase kebab-case, starts with a letter, 2–5 words):
 
 > **uwuwu-проекты (репо с контуром uwuwu)**: ADR живут не в репо, а в вики проекта (`Projects/<proj>/ADR`), и ведёт их дример пост-фактум — решения фиксируй в теле задачи, дример разложит по ADR. Путь `docs/decisions/` — для generic-проектов без вики-канона.
 
 ```markdown
-# ADR-001: Use PostgreSQL for primary database
+# ADR-use-postgresql: Use PostgreSQL for primary database
 
 ## Status
-Accepted | Superseded by ADR-XXX | Deprecated
+Accepted | Superseded by ADR-<name> | Deprecated
 
 ## Date
 2025-01-15

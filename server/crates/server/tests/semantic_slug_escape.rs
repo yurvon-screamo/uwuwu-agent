@@ -13,9 +13,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use axum::routing::post;
-use axum::{Json, Router};
-use search::semantic::{OllamaEmbeddings, EMBED_MODEL, EMBED_MODEL_DIMS};
+use search::semantic::{Embedder, EMBED_MODEL_DIMS};
 use search::semantic_backend::LanceSemanticBackend;
 use uwuwu_usecase::{AppendDocOutcome, SemanticBackend, UsecaseResult, WikiRepo};
 
@@ -69,23 +67,20 @@ impl WikiRepo for FakeWiki {
     }
 }
 
-/// In-process стаб /api/embeddings: фиксированный нулевой вектор нужной
-/// размерности. Эмбеддинги — внешний unmanaged-dep (Ollama за туннелем,
-/// ADR-108), стаб эндпоинта — штатный приём тестов; ADR-110 не задет —
-/// её скоуп GitHub-транспорты.
-async fn embed_stub_url() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind embed stub");
-    let addr = listener.local_addr().expect("embed stub addr");
-    let app = Router::new().route(
-        "/api/embeddings",
-        post(|| async { Json(serde_json::json!({ "embedding": vec![0.0f32; EMBED_MODEL_DIMS] })) }),
-    );
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("serve embed stub");
-    });
-    format!("http://{addr}")
+/// Фиксированный мок-эмбеддер: нулевые векторы нужной размерности. Трейт
+/// `Embedder` (#1363) — эмбеддинги внешний unmanaged-dep, мок трейта —
+/// штатный приём тестов; ADR-110 не задет — её скоуп GitHub-транспорты.
+struct FixedEmbedder;
+
+#[async_trait]
+impl Embedder for FixedEmbedder {
+    async fn embed_docs(&self, docs: &[(String, String)]) -> UsecaseResult<Vec<Vec<f32>>> {
+        Ok(docs.iter().map(|_| vec![0.0f32; EMBED_MODEL_DIMS]).collect())
+    }
+
+    async fn embed_query(&self, _query: &str) -> UsecaseResult<Vec<f32>> {
+        Ok(vec![0.0f32; EMBED_MODEL_DIMS])
+    }
 }
 
 /// Lance-том в уникальной временной папке (без новой dev-dep tempfile).
@@ -120,10 +115,7 @@ async fn backend_with_quoted_doc() -> (LanceSemanticBackend, TempDirGuard) {
             (DOC_MD.to_string(), "sha-1392".to_string()),
         )]),
     });
-    let embeddings = Arc::new(OllamaEmbeddings::new(
-        embed_stub_url().await,
-        EMBED_MODEL.into(),
-    ));
+    let embeddings: Arc<dyn Embedder> = Arc::new(FixedEmbedder);
     let backend = LanceSemanticBackend::open(dir, wiki, None, embeddings)
         .await
         .expect("open lance backend");

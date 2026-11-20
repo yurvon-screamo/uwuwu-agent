@@ -58,6 +58,10 @@ pub struct TgMessage {
     pub caption: Option<String>,
     /// Media-вложение; None — чисто текстовое/служебное сообщение.
     pub media: Option<TgMedia>,
+    /// Форвард-факт (#1416): человекочитаемый источник пересылки
+    /// («канал @username», «юзер @username», «чат «title»», «скрытый
+    /// источник»); None — обычное сообщение, промпт без маркера.
+    pub forward: Option<String>,
 }
 
 #[async_trait]

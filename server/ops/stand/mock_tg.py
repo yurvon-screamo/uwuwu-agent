@@ -6,13 +6,16 @@ Endpoints:
   POST /bot<token>/sendMessage — записать отправку
   POST /bot<token>/getFile     — file_path по file_id; >20 MiB — 400 too big (#1171)
   GET  /file/bot<token>/<path> — байты файла (сохранены при inject)
-  POST /inject                 — {update_id, chat_type, chat_id, username, text[, media]}
+  POST /inject                 — {update_id, chat_type, chat_id, username, text[, media][, forward_origin]}
   GET  /sent                   — {"ok":true,"sent":[{chat_id,text},…]}
   POST /reset                  — очистить очередь и отправки
 
 media в inject (e2e аттачей, #1171):
   {"kind":"photo"|"document"|"video", "file_id":"x",
    "file_name":"скрин.png", "file_size":12345, "caption":"…"}
+
+forward_origin в inject (e2e форвардов, #1416): объект Bot API как есть
+  ({"type":"channel","chat":{…}}) — сплайсится в message без переработки.
 
 Запуск: MOCK_TG_PORT=8098 python3 ops/stand/mock_tg.py
 """
@@ -116,6 +119,8 @@ class Api(BaseHTTPRequestHandler):
                 msg["message"].update(media)
                 if body["media"].get("caption"):
                     msg["message"]["caption"] = body["media"]["caption"]
+            if body.get("forward_origin"):
+                msg["message"]["forward_origin"] = body["forward_origin"]
             with LOCK:
                 UPDATES.append(msg)
                 LOCK.notify_all()
