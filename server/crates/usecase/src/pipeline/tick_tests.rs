@@ -6900,7 +6900,7 @@ async fn cup_preempt_yields_slot_on_priority_drop() {
             .unwrap()
             .iter()
             .any(|l| l.contains("status#")),
-        "жертве статус не трогается (возобновление — respawn'ом)"
+        "жертве статус не трогается (возобновление — plain-спавном)"
     );
 }
 

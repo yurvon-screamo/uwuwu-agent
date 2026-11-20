@@ -486,7 +486,7 @@ sleep 1
 UWUWU_SERVER_CONFIG=$CONFIG_PREEMPT UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
   UWUWU_SERVER_MODE=live \
   UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
-  UWUWU_MOCK_SEED="2046:In Progress:High;2048:In Progress:High;2049:In Progress:High" \
+  UWUWU_MOCK_SEED="2046:In Progress:High;2048:In Progress:High;2049:In Progress:High;2050:In Progress:High" \
   RUST_LOG=info "$BIN_SRV" >"$LOG_SRV_PRE" 2>&1 &
 SRV_PID=$!
 # тики до HeldCup: жертва 2046 спавнится и busy (не отвечает), кандидат
@@ -543,6 +543,26 @@ grep -q '"event":"spawn.done","number":2049,"slot":"Dev"' "$LOG_SRV_PRE" \
   || fail "кандидат 2049 не получил слот после второй волны"
 grep -q 'loop_escalated' "$LOG_SRV_PRE" && fail "луп-гвард эскалировал на второй волне (фикс сломан)"
 say "#1412: вторая волна — 2049 гасит 2048, эскалаций нет"
+# Волна 3 (#1412, low #6): 2050 High гасит 2049 (can_preempt High/Low) —
+# третий преемпшен за окно → IncidentLoudness достигает порога 3 и шлёт
+# cup.preempt_unnotified (notify в e2e не настроен → off-ветка).
+mcp task_edit '{"number":2049,"project":"uwuwu","priority":"low"}' | grep -q '"isError":false' \
+  || fail "task_edit priority 2049 не применился"
+SEEN=0
+while [ $SEEN -lt 12 ]; do
+  SEEN=$((SEEN + 1)); sleep 5
+  [ "$(grep -c '"event":"cup.preempt"' "$LOG_SRV_PRE" || true)" -ge 3 ] && break
+done
+[ "$(grep -c '"event":"cup.preempt"' "$LOG_SRV_PRE" || true)" -ge 3 ] \
+  || fail "третья волна: 2050 не гасит 2049 (третьего cup.preempt нет)"
+grep -q '"event":"cup.preempt","waiter":2050,"victim":2049' "$LOG_SRV_PRE" \
+  || fail "третья волна: waiter/victim не 2050/2049"
+grep -q '"event":"spawn.done","number":2050,"slot":"Dev"' "$LOG_SRV_PRE" \
+  || fail "кандидат 2050 не получил слот после третьей волны"
+grep -q '"event":"cup.preempt_unnotified"' "$LOG_SRV_PRE" \
+  || fail "IncidentLoudness не достиг порога 3 (cup.preempt_unnotified отсутствует)"
+grep -q 'loop_escalated' "$LOG_SRV_PRE" && fail "луп-гвард эскалировал на третьей волне (фикс сломан)"
+say "#1412: третья волна — 2050 гасит 2049, IncidentLoudness → cup.preempt_unnotified, эскалаций нет"
 # pid-scoped зачистка (конвенция #1263): чужие стенды не трогаем
 kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
 wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
