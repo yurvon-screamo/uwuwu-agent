@@ -5,30 +5,38 @@
 
 use uwuwu_domain::{Agent, Priority, Schedule, ScheduleKind, Slot, Status, TaskType};
 
-/// Каноническое имя статуса (колонка доски).
-pub fn status_name(s: Status) -> &'static str {
+/// Все валидные имена статуса на носителе: канон первым (запись/lookup
+/// предпочитает его), легаси-русские — чтение/резолв досок до rename
+/// опций (контракт окна merge→rename #1383, прецедент #1280 Autodone).
+pub fn status_names(s: Status) -> &'static [&'static str] {
     match s {
-        Status::Draft => "Draft",
-        Status::Analys => "Analys",
-        Status::ReviewAnalys => "Review Analys",
-        Status::Todo => "Todo",
-        Status::Design => "Design",
-        Status::ReviewPlan => "Ревью плана",
-        Status::InProgress => "In Progress",
-        Status::ReviewResult => "Ревью результата",
-        Status::Testing => "Тестирование",
-        Status::ReviewTesting => "Ревью тестирования",
-        Status::UserReview => "Review",
-        Status::Done => "Done",
-        Status::NeedsAttention => "Needs attention",
-        Status::Wait => "Wait",
-        Status::Deleted => "Deleted",
-        Status::Empty => "",
+        Status::Draft => &["Draft"],
+        Status::Analys => &["Analys"],
+        Status::ReviewAnalys => &["Review Analys"],
+        Status::Todo => &["Todo"],
+        Status::Design => &["Design"],
+        Status::ReviewPlan => &["Plan review", "Ревью плана"],
+        Status::InProgress => &["In Progress"],
+        Status::ReviewResult => &["Result review", "Ревью результата"],
+        Status::Testing => &["Testing", "Тестирование"],
+        Status::ReviewTesting => &["Testing review", "Ревью тестирования"],
+        Status::UserReview => &["Review"],
+        Status::Done => &["Done"],
+        Status::NeedsAttention => &["Needs attention"],
+        Status::Wait => &["Wait", "Вейт"],
+        Status::Deleted => &["Deleted"],
+        Status::Empty => &[],
     }
+}
+
+/// Каноническое имя статуса (колонка доски) — первый из status_names.
+pub fn status_name(s: Status) -> &'static str {
+    status_names(s).first().copied().unwrap_or("")
 }
 
 /// Парсинг статуса с доски. Неизвестное имя → Empty: строка выпадает из
 /// рабочих списков (легаси/мусор); логирование сырых имён — дело инфры.
+/// Принимает канон и легаси-русские имена (окно merge→rename #1383).
 pub fn parse_status(raw: &str) -> Status {
     match raw.trim() {
         "Draft" => Status::Draft,
@@ -36,16 +44,14 @@ pub fn parse_status(raw: &str) -> Status {
         "Review Analys" => Status::ReviewAnalys,
         "Todo" => Status::Todo,
         "Design" => Status::Design,
-        "Ревью плана" => Status::ReviewPlan,
+        "Plan review" | "Ревью плана" => Status::ReviewPlan,
         "In Progress" => Status::InProgress,
-        "Ревью результата" => Status::ReviewResult,
-        "Тестирование" => Status::Testing,
-        "Ревью тестирования" => Status::ReviewTesting,
+        "Result review" | "Ревью результата" => Status::ReviewResult,
+        "Testing" | "Тестирование" => Status::Testing,
         "Review" => Status::UserReview,
         "Done" => Status::Done,
         "Needs attention" => Status::NeedsAttention,
-        "Wait" => Status::Wait,
-        "Вейт" => Status::Wait,
+        "Wait" | "Вейт" => Status::Wait,
         "Deleted" => Status::Deleted,
         _ => Status::Empty,
     }
@@ -138,7 +144,9 @@ pub fn priority_name(p: Priority) -> &'static str {
 
 /// Имя нативного поля issue с приоритетом (чтение enrichment и запись
 /// create — одно знание; snapshot-колонка доски зовётся тем же словом).
-pub const F_PRIORITY: &str = "Приоритет";
+/// Канон английский (#1383); физические поля с легаси-лейблом «Приоритет»
+/// резолвятся на границе носителя (fields.rs resolve_field).
+pub const F_PRIORITY: &str = "Priority";
 
 /// Единое имя поля автомержа (#1232): записывается create/task_edit.
 /// Legacy «Autodone» резолвится на границе носителя (fields.rs store,
@@ -177,16 +185,16 @@ pub fn slot_key(slot: Slot) -> &'static str {
 /// Человекочитаемый вид расписания (инвентарь cron_list).
 pub fn schedule_label(s: &Schedule) -> String {
     match s.kind() {
-        ScheduleKind::Interval(m) => format!("каждые {} мин", m.get()),
+        ScheduleKind::Interval(m) => format!("every {} min", m.get()),
         ScheduleKind::Daily(at) => format!(
-            "ежедневно {:02}:{:02} JST",
+            "daily {:02}:{:02} JST",
             at.minute_of_day() / 60,
             at.minute_of_day() % 60
         ),
         ScheduleKind::Once { at, on } => {
             let (day, month) = on.parts();
             format!(
-                "разово {:02}:{:02} {day:02}.{month:02}",
+                "once {:02}:{:02} {day:02}.{month:02}",
                 at.minute_of_day() / 60,
                 at.minute_of_day() % 60
             )
@@ -212,6 +220,7 @@ pub const TASK_TYPES: [TaskType; 9] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uwuwu_domain::{IntervalMinutes, JstTime};
 
     #[test]
     fn priority_parsing_unified() {
@@ -252,14 +261,53 @@ mod tests {
     }
 
     #[test]
-    fn status_wait_alias() {
-        // Алиас «Вейт» — мост совместимости переименования: прод-сервер до
-        // деплоя нового бинарника пишет «Вейт», а state.rs парсит last_status
-        // тем же parse_status. Удаление алиаса должно валить этот тест,
-        // а не молча ломать чтение легаси-значений.
+    fn status_canon_names_are_english() {
+        assert_eq!(status_name(Status::ReviewPlan), "Plan review");
+        assert_eq!(status_name(Status::ReviewResult), "Result review");
+        assert_eq!(status_name(Status::Testing), "Testing");
         assert_eq!(status_name(Status::Wait), "Wait");
-        assert_eq!(parse_status("Wait"), Status::Wait);
+    }
+
+    #[test]
+    fn legacy_status_names_parse_and_resolve() {
+        // легаси-русские имена валидны на чтении/резолве до rename опций
+        // досок (контракт окна merge→rename #1383); запись — всегда канон
+        assert_eq!(parse_status("Ревью плана"), Status::ReviewPlan);
+        assert_eq!(parse_status("Ревью результата"), Status::ReviewResult);
+        assert_eq!(parse_status("Тестирование"), Status::Testing);
         assert_eq!(parse_status("Вейт"), Status::Wait);
+        assert_eq!(parse_status(" Ревью плана "), Status::ReviewPlan);
+        // канон первым: lookup предпочитает английский, легаси — запасной
+        assert_eq!(
+            status_names(Status::ReviewPlan),
+            ["Plan review", "Ревью плана"]
+        );
+        assert_eq!(
+            status_names(Status::ReviewResult),
+            ["Result review", "Ревью результата"]
+        );
+        assert_eq!(status_names(Status::Testing), ["Testing", "Тестирование"]);
+        assert_eq!(status_names(Status::Wait), ["Wait", "Вейт"]);
+        // статусы без легаси — одиночное имя
+        assert_eq!(status_names(Status::Todo), ["Todo"]);
+        assert_eq!(status_names(Status::Empty), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn priority_field_canon_english() {
+        assert_eq!(F_PRIORITY, "Priority");
+    }
+
+    #[test]
+    fn schedule_label_is_english() {
+        let every = schedule_label(&Schedule::new(ScheduleKind::Interval(
+            IntervalMinutes::new(5).expect("valid interval"),
+        )));
+        assert_eq!(every, "every 5 min");
+        let daily = schedule_label(&Schedule::new(ScheduleKind::Daily(
+            JstTime::new(9, 0).expect("valid time"),
+        )));
+        assert_eq!(daily, "daily 09:00 JST");
     }
 
     #[test]

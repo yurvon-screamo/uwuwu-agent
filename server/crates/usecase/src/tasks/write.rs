@@ -218,8 +218,8 @@ impl TaskWriteUseCase {
             return Ok(());
         }
         Err(UsecaseError::Board(format!(
-            "переход из Analys #{number}: не заполнены обязательные поля — {}; \
-             заполни (task_edit priority / automerge) и повтори переход",
+            "Analys exit #{number}: required fields not set — {}; \
+             fill them in (task_edit priority / automerge) and retry the transition",
             empty.join(", ")
         )))
     }
@@ -373,7 +373,7 @@ impl TaskWriter for TaskWriteUseCase {
                     "Гард канона: переход запрещён (fresh row_status)"
                 );
                 return Err(UsecaseError::Board(format!(
-                    "переход {:?} → {:?} вне канона конвейера",
+                    "transition {:?} → {:?} outside the pipeline canon",
                     current, status
                 )));
             }

@@ -572,7 +572,7 @@ async fn analysis_pipeline_edges_on_mcp_surface() {
     )
     .await
     .expect_err("In Progress → Todo вне канона");
-    assert!(err.contains("вне канона"), "{err}");
+    assert!(err.contains("outside the pipeline canon"), "{err}");
 }
 
 /// Гейт полноты полей на MCP-поверхности (#1280): выход из Analys с пустым
@@ -603,7 +603,7 @@ async fn analys_exit_gate_on_mcp_surface() {
     )
     .await
     .expect_err("пустой Приоритет не выпускает строку из Analys");
-    assert!(err.contains("Приоритет"), "перечень без Приоритета: {err}");
+    assert!(err.contains("Priority"), "перечень без Приоритета: {err}");
     assert!(
         !err.contains("Automerge"),
         "заполненное поле в перечне: {err}"
