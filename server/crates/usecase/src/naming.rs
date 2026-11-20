@@ -17,6 +17,7 @@ pub fn status_name(s: Status) -> &'static str {
         Status::InProgress => "In Progress",
         Status::ReviewResult => "Ревью результата",
         Status::Testing => "Тестирование",
+        Status::ReviewTesting => "Ревью тестирования",
         Status::UserReview => "Review",
         Status::Done => "Done",
         Status::NeedsAttention => "Needs attention",
@@ -39,6 +40,7 @@ pub fn parse_status(raw: &str) -> Status {
         "In Progress" => Status::InProgress,
         "Ревью результата" => Status::ReviewResult,
         "Тестирование" => Status::Testing,
+        "Ревью тестирования" => Status::ReviewTesting,
         "Review" => Status::UserReview,
         "Done" => Status::Done,
         "Needs attention" => Status::NeedsAttention,
@@ -55,6 +57,7 @@ pub fn agent_name(a: Agent) -> &'static str {
         Agent::PlanReviewer => "plan-reviewer",
         Agent::CodeQualityReviewer => "code-quality-reviewer",
         Agent::Tester => "tester",
+        Agent::TestReviewer => "test-reviewer",
         Agent::Dreamer => "dreamer",
         Agent::Analyst => "analyst",
         Agent::AnalystReviewer => "analyst-reviewer",
@@ -151,6 +154,7 @@ pub fn slot_key(slot: Slot) -> &'static str {
         Slot::PlanReview => "plan-review",
         Slot::ResultReview => "result-review",
         Slot::Test => "test",
+        Slot::TestReview => "test-review",
     }
 }
 
@@ -271,6 +275,7 @@ mod tests {
             slot_key(Slot::PlanReview),
             slot_key(Slot::ResultReview),
             slot_key(Slot::Test),
+            slot_key(Slot::TestReview),
         ];
         for i in 0..keys.len() {
             for j in i + 1..keys.len() {

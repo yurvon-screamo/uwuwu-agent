@@ -793,7 +793,7 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
         ),
         (
             crate::github::fields::F_REVIEW_SESSION,
-            vec![Slot::PlanReview, Slot::ResultReview],
+            vec![Slot::PlanReview, Slot::ResultReview, Slot::TestReview],
         ),
         (crate::github::fields::F_TEST_SESSION, vec![Slot::Test]),
     ] {
@@ -915,9 +915,9 @@ impl TaskBoardRepo for GitHubHub {
     ) -> UsecaseResult<()> {
         let name = match slot {
             uwuwu_domain::Slot::Dev => crate::github::fields::F_DEV_SESSION,
-            uwuwu_domain::Slot::PlanReview | uwuwu_domain::Slot::ResultReview => {
-                crate::github::fields::F_REVIEW_SESSION
-            }
+            uwuwu_domain::Slot::PlanReview
+            | uwuwu_domain::Slot::ResultReview
+            | uwuwu_domain::Slot::TestReview => crate::github::fields::F_REVIEW_SESSION,
             uwuwu_domain::Slot::Test => crate::github::fields::F_TEST_SESSION,
             uwuwu_domain::Slot::Design => crate::github::fields::F_DEV_SESSION,
         };
@@ -994,9 +994,9 @@ impl TaskBoardRepo for GitHubHub {
             uwuwu_domain::Slot::Dev | uwuwu_domain::Slot::Design => {
                 crate::github::fields::F_DEV_SESSION
             }
-            uwuwu_domain::Slot::PlanReview | uwuwu_domain::Slot::ResultReview => {
-                crate::github::fields::F_REVIEW_SESSION
-            }
+            uwuwu_domain::Slot::PlanReview
+            | uwuwu_domain::Slot::ResultReview
+            | uwuwu_domain::Slot::TestReview => crate::github::fields::F_REVIEW_SESSION,
             uwuwu_domain::Slot::Test => crate::github::fields::F_TEST_SESSION,
         };
         self.fields.store(number, &[(name, None)]).await?;

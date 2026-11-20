@@ -739,6 +739,7 @@ pub(crate) fn spawn_prompt(board: &BoardPlan, task: &Task, slot: Slot) -> String
         Slot::PlanReview => "ревью плана: парафриз/zoom-out/readiness, вердикт комментом",
         Slot::ResultReview => "ревью результата: код/CI/отчёт, вердикт комментом",
         Slot::Test => "тестирование: качество фичи, вердикт pass/fail с шагами",
+        Slot::TestReview => "ревью тестирования: тестовая дельта ветки, вердикт комментом",
     };
     let finish = match slot {
         Slot::Design => "план в тело → переведи статус в «Ревью плана»",
@@ -746,6 +747,9 @@ pub(crate) fn spawn_prompt(board: &BoardPlan, task: &Task, slot: Slot) -> String
         Slot::PlanReview => "вердикт комментом → approve/request_changes и статус по вердикту",
         Slot::ResultReview => "вердикт комментом → approve/request_changes и статус по вердикту",
         Slot::Test => "вердикт pass/fail комментом → статус Review или In Progress",
+        Slot::TestReview => {
+            "вердикт комментом → «Review» (чисто) или «Тестирование» (находки) по вердикту"
+        }
     };
     format!(
         "Задача #{number} «{title}» (доска «{board}», проект {project}).\n\

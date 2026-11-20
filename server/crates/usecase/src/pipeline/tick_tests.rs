@@ -121,6 +121,7 @@ impl TaskBoardRepo for FakeBoard {
                     Slot::PlanReview,
                     Slot::ResultReview,
                     Slot::Test,
+                    Slot::TestReview,
                 ] {
                     if let Some(s) = t.session_of(slot) {
                         f.set_session(slot, uwuwu_domain::SessionRef::parse(s).unwrap());
@@ -2304,6 +2305,82 @@ async fn escalation_digest_without_session_is_honest_dash() {
     assert!(
         digest.contains("последняя ревью-сессия: —"),
         "пустой слот — «—» в дайджесте: {digest}"
+    );
+}
+
+#[tokio::test]
+async fn test_review_cycle_counts_and_escalates_with_test_review_digest() {
+    // #1413: пара тест-ревью цикла (ReviewTesting → Testing) считается
+    // тем же капом; дайджест эскалации называет сессию TestReview-слота
+    let state = Arc::new(MemState(Mutex::default()));
+    // счёт 1: первый возврат тест-ревьювера (ReviewTesting → Testing)
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((52, Status::ReviewTesting));
+    let (u, _, _, _) = usecase_with_state(
+        vec![task(52, Status::Testing)],
+        PrState::Missing,
+        state.clone(),
+    );
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        state.review_rounds("B", 52),
+        1,
+        "возврат тест-ревьювера — счёт 1"
+    );
+    // баланс 3 + ещё один возврат — кап: эскалация с TestReview-дайджестом
+    state.0.lock().unwrap().review_rounds.push((53, 3));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((53, Status::ReviewTesting));
+    let mut t = task(53, Status::Testing);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::TestReview,
+        uwuwu_domain::SessionRef::parse("ses_test_rev_live").unwrap(),
+    );
+    t.apply_fields(f);
+    let (u2, board, _, _) = usecase_with_state(vec![t], PrState::Missing, state.clone());
+    u2.run(&plan(Mode::Live, 7)).await.unwrap();
+    let log = board.log.lock().unwrap();
+    let digest = log
+        .iter()
+        .find(|l| l.starts_with("comment#53=⚠︎ Кап ревью-раундов"))
+        .expect("дайджест эскалации тест-цикла");
+    assert!(
+        digest.contains("последняя ревью-сессия: ses_test_rev_live"),
+        "id тест-ревью-сессии в дайджесте: {digest}"
+    );
+    assert_eq!(state.review_rounds("B", 53), 0, "эскалация — свежий бюджет");
+}
+
+#[tokio::test]
+async fn test_review_cycle_approve_resets_counter() {
+    // #1413: approve тест-ревьювера (ReviewTesting → UserReview) — цикл
+    // сошёлся, счётчик с нуля
+    let state = Arc::new(MemState(Mutex::default()));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((54, Status::ReviewTesting));
+    let (u, _, _, _) = usecase_with_state(
+        vec![task(54, Status::UserReview)],
+        PrState::Missing,
+        state.clone(),
+    );
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        state.review_rounds("B", 54),
+        0,
+        "approve — цикл сошёлся, счётчик с нуля"
     );
 }
 
