@@ -33,6 +33,7 @@ SKILLS rules:
 - ALWAYS: перед нетривиальной задачей — `MCP uwuwu_search` по теме. Накопление знаний — автоматическое.
 - Мутации MCP uwuwu (task_create/edit/claim/comment/close/body, docs_write/append) возвращают финальное состояние или явную ошибку. Вне поверхности MCP: правки goal-реестра и персоны, semantic-обслуживание, батч-снос строк доски — заводи задачу на сервер, не обходи.
 - **Транспорт — hub** (multi-PC: все машины — один GitHub-инстанс). Env: `UWUWU_HUB_REPO` (дефолт `yurvon-screamo/uwuwu-hub` зашит в сервер), `GH_TOKEN` (классический PAT с repo — keyring после ребута залочен и gh вешает). Всё в fish universal vars + environment.d.
+- Свой sessionID агент берёт из env `OPENCODE_SESSION_ID` — opencode прокидывает его в каждый shell-вызов сессии (`echo $OPENCODE_SESSION_ID`); видна только в shell-туле, терминалы opencode её не получают.
 - `uwuwu_search` — гибрид: полнотекст по контенту чанков + семантика (OpenRouter free-эмбеддинги, индекс дотягивается сервером); отказы секций — честные строки, не тихая слепота. Обслуживание индекса — автоматически тиком сервера.
 - Адресация доков: `uwuwu_docs_read(slug)`, `uwuwu_docs_ls(path)` — перечень детей папки; `uwuwu_projects` — проекты конвейера.
 - Ноутбучная ветка `uwuwu_docs_ls(path)`: префикс-имя открытого ноутбука резолвится в детей его корня — `uwuwu_docs_ls(path: "Projects")` даёт перечень папок проектов; составной «Projects/<проект>» не резолвится (ADR-081).
