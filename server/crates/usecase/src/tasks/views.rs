@@ -1,7 +1,7 @@
 //! Query-юзкейсы (чтения для MCP-инструментов): тонкая оркестрация
 //! портов без мутаций. Презентация (MCP) зовёт только их.
 
-use crate::error::{UsecaseError, ViewError};
+use crate::error::ViewError;
 use crate::ports::{IssueView, TaskBoardRepo, WikiRepo};
 use std::sync::Arc;
 use uwuwu_domain::Task;

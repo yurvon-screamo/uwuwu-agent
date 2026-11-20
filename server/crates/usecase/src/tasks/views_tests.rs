@@ -3,8 +3,8 @@
 //! персоны ломает person_show для всех агентских сессий.
 
 use super::views::{PersonView, PERSON_SLUG};
-use crate::error::ViewError;
 use crate::error::UsecaseResult;
+use crate::error::ViewError;
 use crate::ports::{AppendDocOutcome, WikiRepo};
 use std::sync::{Arc, Mutex};
 
