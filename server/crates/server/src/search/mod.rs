@@ -5,7 +5,9 @@
 mod semantic;
 mod semantic_backend;
 
-pub use semantic::{Embedder, GeminiEmbeddings, RATE_LIMIT_CAP_SECS, EMBED_MODEL};
+pub use semantic::{
+    Embedder, GeminiEmbeddings, RATE_LIMIT_CAP_SECS, RATE_LIMIT_DEFAULT_SECS, EMBED_MODEL,
+};
 pub use semantic_backend::LanceSemanticBackend;
 
 /// Документов за один тик semantic-sync (#1363): производная замеров спайка —

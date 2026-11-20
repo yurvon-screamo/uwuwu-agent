@@ -680,8 +680,9 @@ async fn run(
                             retry_after_secs,
                             ..
                         }) => {
-                            let secs =
-                                retry_after_secs.unwrap_or(300).min(search::RATE_LIMIT_CAP_SECS);
+                            let secs = retry_after_secs
+                                .unwrap_or(search::RATE_LIMIT_DEFAULT_SECS)
+                                .min(search::RATE_LIMIT_CAP_SECS);
                             let until = now + secs * 1000;
                             *backoff.lock().expect("backoff lock") = until;
                             tracing::warn!(event = "semantic.backoff_rate_limited",

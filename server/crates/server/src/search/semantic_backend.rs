@@ -1,6 +1,6 @@
 //! SemanticBackend на LanceDB embedded (решение задачи #1133): таблица чанков
 //! (slug/idx/text/vector) + FTS (BM25) — гибрид с векторным поиском.
-//! Эмбеддинги — Ollama-совместимый endpoint (локальная машина через туннель).
+//! Эмбеддинги — Gemini Embedding 2 через Embedder-трейт (#1363).
 //! Инкремент — doc_hash в мета-таблице.
 
 use crate::search::semantic::{chunk_text, Embedder, EMBED_MODEL_DIMS};
@@ -112,12 +112,9 @@ impl LanceSemanticBackend {
                 .execute()
                 .await
                 .map_err(|e| err(format!("open chunks: {e}")))?;
-            let dim = table
-                .schema()
-                .await
-                .map_err(|e| err(format!("schema: {e}")))
-                .ok()
-                .and_then(|s| vector_dim(&s));
+            // схема недоступна → dim None → guard no-op (ошибка вылезет ниже
+            // на ensure/чтении — здесь она не должна ломать миграционный путь)
+            let dim = table.schema().await.ok().and_then(|s| vector_dim(&s));
             if dims_stale(dim) {
                 tracing::warn!(
                     event = "semantic.dim_migration",

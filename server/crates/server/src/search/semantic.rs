@@ -21,6 +21,9 @@ const API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 const SERVICE: &str = "gemini-embeddings";
 /// Кап бэкоффа на 429 (RetryInfo может обещать и больше — не тише прод-тика).
 pub const RATE_LIMIT_CAP_SECS: u64 = 15 * 60;
+/// Дефолт бэкоффа 429 без RetryInfo в теле (единый носитель — сайдкар берёт
+/// его же через этот экспорт; размазывать литерал по слоям запрещено).
+pub const RATE_LIMIT_DEFAULT_SECS: u64 = 300;
 
 /// Источник векторов для семантического индекса. Реализации несут формат
 /// префиксов провайдера сами — вызывающая сторона знает только (title, text).
@@ -54,10 +57,12 @@ fn parse_retry_delay(body: &serde_json::Value) -> Option<u64> {
             continue;
         }
         let raw = d.get("retryDelay")?.as_str()?;
+        // protobuf-Duration легален в дробной форме («26.5s») — округляем
+        // вверх: чуть переспать безопаснее, чем досрочно долбить квоту
         let secs = if raw.ends_with('s') {
-            raw.trim_end_matches('s').parse::<u64>().ok()?
+            raw.trim_end_matches('s').parse::<f64>().ok()?.ceil() as u64
         } else if raw.ends_with('m') {
-            raw.trim_end_matches('m').parse::<u64>().ok()? * 60
+            (raw.trim_end_matches('m').parse::<f64>().ok()? * 60.0).ceil() as u64
         } else {
             return None;
         };
@@ -121,7 +126,8 @@ impl GeminiEmbeddings {
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err(UsecaseError::RateLimited {
                 service: SERVICE.into(),
-                retry_after_secs: parse_retry_delay(&body).or(Some(300)),
+                // дефолт при отсутствии RetryInfo ставит сайдкар (RATE_LIMIT_DEFAULT_SECS)
+                retry_after_secs: parse_retry_delay(&body),
             });
         }
         if !status.is_success() {
@@ -157,6 +163,14 @@ impl GeminiEmbeddings {
         if vecs.iter().any(|v| v.is_empty()) {
             return Err(UsecaseError::State(format!("{SERVICE}: пустой embedding")));
         }
+        // размерность — единая валидация для обоих путей (docs/query): при
+        // оверрайде модели без 1536 отказ будет внятным, а не «batch: …» из Lance
+        if let Some(v) = vecs.iter().find(|v| v.len() != EMBED_MODEL_DIMS) {
+            return Err(UsecaseError::State(format!(
+                "{SERVICE}: вектор {}-dim вместо {EMBED_MODEL_DIMS}",
+                v.len()
+            )));
+        }
         Ok(vecs)
     }
 }
@@ -169,19 +183,12 @@ impl Embedder for GeminiEmbeddings {
     }
 
     async fn embed_query(&self, query: &str) -> UsecaseResult<Vec<f32>> {
-        let mut v = self
-            .embed_many(vec![query_text(query)])
+        // размерность валидирует embed_one — общий путь с embed_docs
+        self.embed_many(vec![query_text(query)])
             .await?
             .into_iter()
             .next()
-            .ok_or_else(|| UsecaseError::State(format!("{SERVICE}: пустой ответ на запрос")))?;
-        if v.len() != EMBED_MODEL_DIMS {
-            return Err(UsecaseError::State(format!(
-                "{SERVICE}: вектор {}-dim вместо {EMBED_MODEL_DIMS}",
-                v.len()
-            )));
-        }
-        Ok(std::mem::take(&mut v))
+            .ok_or_else(|| UsecaseError::State(format!("{SERVICE}: пустой ответ на запрос")))
     }
 }
 
@@ -248,6 +255,19 @@ mod tests {
         assert_eq!(parse_retry_delay(&mins), Some(120));
         let none = serde_json::json!({"error": {"message": "no details"}});
         assert_eq!(parse_retry_delay(&none), None);
+    }
+
+    #[test]
+    fn retry_delay_fractional_duration_rounds_up() {
+        // protobuf-Duration допускает дробные секунды — округление вверх
+        let frac = serde_json::json!({
+            "error": {"details": [{"@type": "google.rpc.RetryInfo", "retryDelay": "26.5s"}]}
+        });
+        assert_eq!(parse_retry_delay(&frac), Some(27));
+        let frac_min = serde_json::json!({
+            "error": {"details": [{"@type": "google.rpc.RetryInfo", "retryDelay": "1.5m"}]}
+        });
+        assert_eq!(parse_retry_delay(&frac_min), Some(90));
     }
 
     #[test]
