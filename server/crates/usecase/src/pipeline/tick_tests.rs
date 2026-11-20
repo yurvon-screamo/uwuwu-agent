@@ -7217,7 +7217,8 @@ async fn cup_preempt_wave_does_not_escalate_victim_loop() {
         });
         let out = u.run(&plan(Mode::Live, 2)).await.unwrap();
         assert_eq!(
-            out.preempts, 1,
+            out.preempts,
+            1,
             "волна {}: жертва гасится кандидатом",
             wave + 1
         );
@@ -7231,12 +7232,7 @@ async fn cup_preempt_wave_does_not_escalate_victim_loop() {
             .last()
             .cloned()
             .expect("спавн кандидата в тике волны");
-        set_row_cell(
-            &board,
-            2 + wave,
-            Slot::Dev,
-            Some(&cand_session),
-        );
+        set_row_cell(&board, 2 + wave, Slot::Dev, Some(&cand_session));
         busy_exactly(&sessions, &["ses_x".to_string()]); // ход кандидата доведён
         mark_dead(&sessions, &victim_session);
         sessions
@@ -7251,7 +7247,8 @@ async fn cup_preempt_wave_does_not_escalate_victim_loop() {
         // затишье: слот свободен — жертва возвращается в работу
         let out = u.run(&plan(Mode::Live, 2)).await.unwrap();
         assert_eq!(
-            out.spawns_done, 1,
+            out.spawns_done,
+            1,
             "волна {}: жертва возвращается штатным спавном",
             wave + 1
         );
@@ -7348,6 +7345,7 @@ async fn cup_preempt_clear_session_failure_degrades_to_respawn() {
     // её dead-веткой (respawn с луп-гвардом), как до фикса
     busy_exactly(&sessions, &[]);
     mark_dead(&sessions, "ses_a");
+    sessions.live.lock().unwrap().retain(|s| s.id != "ses_a");
     let out2 = u.run(&plan(Mode::Live, 1)).await.unwrap();
     assert_eq!(
         out2.spawns_done, 1,
