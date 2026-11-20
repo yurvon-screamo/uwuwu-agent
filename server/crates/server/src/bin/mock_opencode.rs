@@ -793,7 +793,9 @@ async fn prompt(
             return (StatusCode::NOT_FOUND, Json(json!({ "status": "404" })));
         }
     }
-    tracing::info!(event = "mock.prompt", %id, len = text.len(), "POST /prompt");
+    tracing::info!(event = "mock.prompt", %id, len = text.len(),
+        head = text.lines().find(|l| !l.trim().is_empty()).unwrap_or_default(),
+        "POST /prompt");
     let mut sessions = store.sessions.lock().expect("store");
     if let Some(s) = sessions.get_mut(&id) {
         s.updated_ms = now_ms();

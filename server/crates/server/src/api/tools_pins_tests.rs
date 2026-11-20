@@ -148,6 +148,68 @@ async fn task_get_accepts_number_as_string() {
     assert!(text.contains("body_hash: "));
 }
 
+/// Метка времени коммента в выводе task_get (#1432): строка после «---»
+/// — ISO 8601 UTC ровно формата YYYY-MM-DDTHH:MM:SSZ (контракт
+/// тайминг-разборов дримера); тело коммента следует за меткой.
+#[tokio::test]
+async fn task_get_comment_carries_iso_utc_stamp() {
+    let tools = hub();
+    let created = call(
+        &tools,
+        "task_create",
+        json!({ "title": "пин метки", "body": "## Постановка\n\nтело" }),
+    )
+    .await
+    .expect("create");
+    let number: u64 = created
+        .trim_start_matches("создана задача #")
+        .split(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .expect("number");
+    call(
+        &tools,
+        "task_comment",
+        json!({ "number": number, "text": "вербатим" }),
+    )
+    .await
+    .expect("comment");
+    let text = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    let block = text
+        .split("--- комменты (последние) ---\n")
+        .nth(1)
+        .expect("хвост комментов");
+    let stamp = block
+        .trim_start_matches("---\n")
+        .lines()
+        .next()
+        .expect("строка метки");
+    assert_eq!(stamp.len(), 20, "метка YYYY-MM-DDTHH:MM:SSZ ровно: {stamp}");
+    let separators = [
+        (4, '-'),
+        (7, '-'),
+        (10, 'T'),
+        (13, ':'),
+        (16, ':'),
+        (19, 'Z'),
+    ];
+    for (i, ch) in stamp.chars().enumerate() {
+        match separators.iter().find(|(pos, _)| *pos == i) {
+            Some((_, expected)) => assert_eq!(ch, *expected, "позиция {i} в «{stamp}»"),
+            None => assert!(ch.is_ascii_digit(), "позиция {i} в «{stamp}» — не цифра"),
+        }
+    }
+    let body_line = block
+        .trim_start_matches("---\n")
+        .lines()
+        .nth(1)
+        .expect("тело за меткой");
+    assert_eq!(body_line, "вербатим");
+}
+
 #[tokio::test]
 async fn task_create_rejects_unknown_type_with_canonical_list() {
     let tools = hub();
