@@ -490,6 +490,20 @@ impl GitHubHub {
         Ok(String::new())
     }
 
+    /// state issue (closed?) — REST issues GET (core-бакет, не GraphQL).
+    /// Гард-чтение row_status резолвит им терминальность расщеплённых
+    /// строк (#1403): closed → Done независимо от отставшего поля.
+    async fn issue_state_closed(&self, number: u64) -> UsecaseResult<bool> {
+        let (_, issue) = self
+            .rest(
+                reqwest::Method::GET,
+                &format!("/repos/{}/issues/{number}", self.repo),
+                None,
+            )
+            .await?;
+        Ok(issue["state"].as_str() == Some("closed"))
+    }
+
     /// Статусный value строки КОНКРЕТНОЙ доски читает Pv2Rest
     /// (pv2::read_status — гард-семантика с write-through); прежний
     /// GraphQL carrier_status снён с переводом гард-пути на REST (#1236).
@@ -668,6 +682,17 @@ impl GitHubHub {
     }
 }
 
+/// Гард-резолюция статуса строки (#1403): закрытый issue терминален
+/// независимо от отставшего Pv2-поля (UC-07, то же правило «closed
+/// терминален», что в read_issue/parse_page). state не читался (None —
+/// отказ носителя) — деградация к парсу поля, прежнее поведение.
+fn guard_status(parsed: Status, issue_closed: Option<bool>) -> Status {
+    match issue_closed {
+        Some(true) => Status::Done,
+        _ => parsed,
+    }
+}
+
 fn parse_page(items: &[Value], meta: &mut BoardMeta) -> Vec<Task> {
     items
         .iter()
@@ -842,7 +867,30 @@ impl TaskBoardRepo for GitHubHub {
             // поле не задано / read-лаг); непустое непарсящееся — Some(Empty)
             None => Ok(None),
             Some(raw) if raw.trim().is_empty() => Ok(None),
-            Some(raw) => Ok(Some(uwuwu_usecase::parse_status(&raw))),
+            Some(raw) => {
+                let parsed = uwuwu_usecase::parse_status(&raw);
+                if parsed == Status::Done {
+                    // поле уже терминально — state не читаем (бюджет REST)
+                    return Ok(Some(Status::Done));
+                }
+                // Терминальная резолюция (#1403): issue, закрытый мимо
+                // task_close, терминален независимо от отставшего поля —
+                // гард edit() режет фантомные переходы громкой канон-ошибкой
+                // вместо тихой записи в закрытый issue
+                let closed = match self.issue_state_closed(number).await {
+                    Ok(closed) => Some(closed),
+                    Err(e) => {
+                        tracing::warn!(
+                            event = "row_status.state_unreadable",
+                            number,
+                            error = %e,
+                            "state issue не читался — гард отвечает парсом поля (#1403)"
+                        );
+                        None
+                    }
+                };
+                Ok(Some(guard_status(parsed, closed)))
+            }
         }
     }
 
@@ -2041,6 +2089,33 @@ mod tests {
         let rows = parse_page(&items, &mut meta);
         assert_eq!(rows[0].status(), Status::Done);
         assert_eq!(meta.items.get(&7).map(String::as_str), Some("IT_x"));
+    }
+
+    #[test]
+    fn guard_status_resolves_closed_issue_over_stale_field() {
+        // #1403: расщеплённая строка — закрытый мимо task_close issue
+        // терминален при любом парсе поля, включая мусорное (Empty)
+        assert_eq!(guard_status(Status::ReviewResult, Some(true)), Status::Done);
+        assert_eq!(guard_status(Status::Empty, Some(true)), Status::Done);
+    }
+
+    #[test]
+    fn guard_status_keeps_field_parse_for_open_issue() {
+        // открытый issue — гард отвечает парсом поля, как прежде
+        assert_eq!(
+            guard_status(Status::ReviewResult, Some(false)),
+            Status::ReviewResult
+        );
+    }
+
+    #[test]
+    fn guard_status_degrades_to_field_parse_when_state_unreadable() {
+        // деградационный пин (#1403): отказ чтения state — прежнее
+        // поведение (парс поля), не тихий Done и не Err
+        assert_eq!(
+            guard_status(Status::ReviewResult, None),
+            Status::ReviewResult
+        );
     }
 
     #[test]

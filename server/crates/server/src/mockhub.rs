@@ -241,7 +241,17 @@ impl TaskBoardRepo for MemoryHub {
                     Some(tag) => tag == board,
                     None => true,
                 })
-                .map(|t| t.status()))
+                .map(|t| {
+                    // Терминальная резолюция (#1403, паритет GitHubHub):
+                    // закрытый мимо task_close issue терминален независимо
+                    // от отставшего поля (UC-07) — гард edit() режет
+                    // фантомные переходы громкой канон-ошибкой
+                    if state.closed.contains_key(&number) {
+                        Status::Done
+                    } else {
+                        t.status()
+                    }
+                }))
         })
     }
     async fn row_exists(&self, board: &str, number: u64) -> UsecaseResult<bool> {
@@ -773,6 +783,73 @@ mod tests {
     //! не должна ползти.
 
     use super::*;
+    use crate::api::test_support::StubState;
+    use crate::clock::SystemClock;
+    use std::sync::Arc;
+    use uwuwu_usecase::{TaskPatch, TaskWriteUseCase, TaskWriter};
+
+    /// Расщеплённая строка стенда (#1403, инцидент foilcap #1332): issue
+    /// закрыт мимо task_close — close_issue_ext молча блокирует transition
+    /// (канон: Done — только через close), поле остаётся «Ревью результата»,
+    /// закрытие фиксируется. Живой пример расщепления «поле против state».
+    async fn split_row() -> (MemoryHub, u64) {
+        let hub = MemoryHub::with_seeds(vec![SeedRow {
+            board: Some("Задачи uwuwu".into()),
+            number: 21,
+            status: Status::ReviewResult,
+            priority: Priority::Empty,
+            days_closed: 0,
+        }]);
+        // сид стенда ленивый (ensure_seed на чтениях) — прогрев до close
+        assert!(
+            hub.row_exists("Задачи uwuwu", 21).await.expect("seed"),
+            "сид-строка #21 на доске"
+        );
+        hub.close_issue_ext(21, false)
+            .await
+            .expect("закрытие issue мимо task_close");
+        (hub, 21)
+    }
+
+    #[tokio::test]
+    async fn row_status_resolves_closed_issue_over_stale_field() {
+        let (hub, n) = split_row().await;
+        let current = hub
+            .row_status("Задачи uwuwu", n)
+            .await
+            .expect("чтение носителя");
+        assert_eq!(
+            current,
+            Some(Status::Done),
+            "закрытый issue терминален (UC-07) — гард не должен валидировать \
+             фантомный статус отставшего поля"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_on_split_row_is_blocked_with_canon_error() {
+        let (hub, n) = split_row().await;
+        let hub = Arc::new(hub);
+        let writer = TaskWriteUseCase {
+            board: hub.clone() as Arc<dyn TaskBoardRepo>,
+            fields: hub as Arc<dyn IssueFieldStore>,
+            boards: vec![("uwuwu".to_string(), "Задачи uwuwu".to_string())],
+            clock: Arc::new(SystemClock),
+            state: Arc::new(StubState),
+        };
+        let patch = TaskPatch {
+            status: Some(Status::NeedsAttention),
+            ..Default::default()
+        };
+        let err = writer
+            .edit("uwuwu", n, patch)
+            .await
+            .expect_err("фантомный переход в закрытую строку отклонён гардом");
+        assert!(
+            format!("{err}").contains("вне канона"),
+            "громкая канон-ошибка про терминальность, получили: {err}"
+        );
+    }
 
     #[tokio::test]
     async fn row_status_respects_board_tag() {
