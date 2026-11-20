@@ -50,13 +50,13 @@ STATE="$RUN_DIR/state.json"
 CONFIG="$RUN_DIR/config.memory.toml"
 sed "s|http://127.0.0.1:8099|http://127.0.0.1:$PORT_MOCK|" \
   ops/config.memory.toml > "$CONFIG"
-MOCK_PID=""; SRV_PID=""; MOCK2_PID=""
+MOCK_PID=""; SRV_PID=""; MOCK2_PID=""; MOCK_JUDGE_PID=""
 
 say()  { printf '\033[1;34m[e2e]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[e2e FAIL]\033[0m %s\n' "$*"; KEEP=1; exit 1; }
 
 cleanup() { # только СВОИ процессы (pid-scoped): параллельные стенды не трогаем
-  for pid in "$SRV_PID" "$MOCK_PID" "$MOCK2_PID"; do
+  for pid in "$SRV_PID" "$MOCK_PID" "$MOCK2_PID" "$MOCK_JUDGE_PID"; do
     [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
   done
   # пер-ран бинари тяжёлые (~2.2 ГБ debug-сборка) — снимаются ВСЕГДА:
