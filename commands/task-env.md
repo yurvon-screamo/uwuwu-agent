@@ -1,6 +1,6 @@
 ---
-description: "uwuwu-server: детерминированная подготовка env задачи (worktree+ветка), вызывается конвейером"
+description: "uwuwu-server: deterministic task env setup (worktree+branch), invoked by the pipeline"
 ---
 !`$HOME/uwuwu-agent/server/ops/task-env.sh $1`
 
-Служебная команда конвейера: окружение задачи готово по выводу выше. Ничего не делай и не отвечай вопросами.
+A pipeline service command: the task environment is ready per the output above. Do nothing and do not reply with questions.
