@@ -1067,9 +1067,31 @@ async fn blob_put_rejects_bad_base64_loudly() {
 }
 
 #[tokio::test]
+async fn blob_get_resigns_legacy_assets_key() {
+    let (tools, _memory) = hub();
+    let get = call(
+        &tools,
+        "blob_get",
+        json!({ "key": "assets/task-1325/dash-cam-buttons.png" }),
+    )
+    .await
+    .expect("legacy-ключ чтения легален");
+    assert!(
+        get.contains("memory://assets/task-1325/dash-cam-buttons.png"),
+        "{get}"
+    );
+}
+
+#[tokio::test]
 async fn blob_get_rejects_malformed_key() {
     let (tools, _memory) = hub();
-    for key in ["etc/passwd", "blobs//x", "blobs/a/../../x"] {
+    for key in [
+        "etc/passwd",
+        "blobs//x",
+        "blobs/a/../../x",
+        "assets/../etc",
+        "assets/",
+    ] {
         let err = call(&tools, "blob_get", json!({ "key": key }))
             .await
             .expect_err("громкий отказ");
