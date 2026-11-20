@@ -46,9 +46,7 @@ impl JudgeStatus {
             (JudgeStatus::NeedsAttention, "Needs attention"),
             (JudgeStatus::Hold, "hold"),
         ];
-        keys.iter()
-            .find(|(_, k)| *k == key)
-            .map(|(v, _)| *v)
+        keys.iter().find(|(_, k)| *k == key).map(|(v, _)| *v)
     }
 }
 
@@ -112,7 +110,12 @@ pub fn verdict_target(current: Status, verdict: JudgeStatus) -> Option<Status> {
         S::Design => &[S::Design, S::ReviewPlan, S::NeedsAttention],
         S::InProgress => &[S::InProgress, S::ReviewResult, S::NeedsAttention],
         S::ReviewPlan => &[S::ReviewPlan, S::Design, S::NeedsAttention],
-        S::ReviewResult => &[S::ReviewResult, S::InProgress, S::Testing, S::NeedsAttention],
+        S::ReviewResult => &[
+            S::ReviewResult,
+            S::InProgress,
+            S::Testing,
+            S::NeedsAttention,
+        ],
         S::Testing => &[S::Testing, S::NeedsAttention],
         // Вне активных стадий судья не вызывается; защита от races —
         // строгий отказ: конвейер не переносит строки вне канона.
@@ -201,9 +204,15 @@ mod tests {
         assert_eq!(verdict_target(Status::Design, JudgeStatus::Testing), None);
         // отбрасывание работы в Design — не судейское (это request_changes
         // ревьювера); судья будит агента вместо него
-        assert_eq!(verdict_target(Status::InProgress, JudgeStatus::Design), None);
+        assert_eq!(
+            verdict_target(Status::InProgress, JudgeStatus::Design),
+            None
+        );
         // Design → работа мимо ревью плана
-        assert_eq!(verdict_target(Status::Design, JudgeStatus::InProgress), None);
+        assert_eq!(
+            verdict_target(Status::Design, JudgeStatus::InProgress),
+            None
+        );
         // тестирование не раздаёт Review (вердикт тестировщика)
         assert_eq!(
             verdict_target(Status::Testing, JudgeStatus::ReviewResult),
@@ -237,9 +246,6 @@ mod tests {
             verdict_target(Status::Done, JudgeStatus::NeedsAttention),
             None
         );
-        assert_eq!(
-            verdict_target(Status::Todo, JudgeStatus::InProgress),
-            None
-        );
+        assert_eq!(verdict_target(Status::Todo, JudgeStatus::InProgress), None);
     }
 }

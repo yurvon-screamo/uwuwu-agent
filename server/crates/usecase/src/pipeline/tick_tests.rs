@@ -880,8 +880,8 @@ fn usecase_with_state(
         state,
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
-            judge: None,
-            judge_cfg: Default::default(),
+        judge: None,
+        judge_cfg: Default::default(),
     };
     (u, board, sessions, prs)
 }
@@ -934,8 +934,8 @@ fn fixture_usecase(
         state,
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
-            judge: None,
-            judge_cfg: Default::default(),
+        judge: None,
+        judge_cfg: Default::default(),
     };
     (u, board, sessions, prs)
 }
@@ -985,8 +985,8 @@ fn usecase_with_sessions(
         state,
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
-            judge: None,
-            judge_cfg: Default::default(),
+        judge: None,
+        judge_cfg: Default::default(),
     };
     (u, board, sessions, prs)
 }
@@ -1047,8 +1047,8 @@ fn routed_usecase(
         state: Arc::new(MemState(Mutex::default())),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
-            judge: None,
-            judge_cfg: Default::default(),
+        judge: None,
+        judge_cfg: Default::default(),
     }
 }
 
@@ -1277,8 +1277,8 @@ fn wake_usecase(
         state: state.clone(),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
-            judge: None,
-            judge_cfg: Default::default(),
+        judge: None,
+        judge_cfg: Default::default(),
     };
     (u, sessions, state)
 }
@@ -1704,8 +1704,8 @@ async fn dev_spawn_pins_the_developer_agent() {
         state: Arc::new(MemState(Mutex::default())),
         models: Arc::new(crate::spawn_models::SpawnModels::new(map)),
         boot_ms: 0,
-            judge: None,
-            judge_cfg: Default::default(),
+        judge: None,
+        judge_cfg: Default::default(),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.spawns_done, 1);
@@ -2796,8 +2796,8 @@ async fn foreign_executor_failure_does_not_blind_project_guard() {
         state,
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
-            judge: None,
-            judge_cfg: Default::default(),
+        judge: None,
+        judge_cfg: Default::default(),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
@@ -2963,8 +2963,8 @@ async fn wakeup_held_when_cup_full() {
         state: state.clone(),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
-            judge: None,
-            judge_cfg: Default::default(),
+        judge: None,
+        judge_cfg: Default::default(),
     };
     let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
     assert!(
@@ -3036,8 +3036,8 @@ async fn wakeup_delivery_occupies_cup_slot() {
         state: state.clone(),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
-            judge: None,
-            judge_cfg: Default::default(),
+        judge: None,
+        judge_cfg: Default::default(),
     };
     let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
     assert_eq!(
@@ -3427,8 +3427,8 @@ async fn undelivered_comment_is_not_marked_seen() {
         state,
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
-            judge: None,
-            judge_cfg: Default::default(),
+        judge: None,
+        judge_cfg: Default::default(),
     };
     let out = u2.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.wakeups, 1, "коммент доставлен после завершения хода");
@@ -3509,8 +3509,8 @@ async fn multi_comment_tail_delivered_together() {
         state: state.clone(),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
-            judge: None,
-            judge_cfg: Default::default(),
+        judge: None,
+        judge_cfg: Default::default(),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.wakeups, 1);
@@ -3578,8 +3578,8 @@ async fn inflight_comment_delivered_after_agent_reply() {
         state,
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
-            judge: None,
-            judge_cfg: Default::default(),
+        judge: None,
+        judge_cfg: Default::default(),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.wakeups, 1, "in-flight коммент доставлен после ответа");
@@ -3650,8 +3650,8 @@ async fn busy_session_not_pinged_early() {
         state: Arc::new(MemState(Mutex::default())),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
-            judge: None,
-            judge_cfg: Default::default(),
+        judge: None,
+        judge_cfg: Default::default(),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
@@ -3716,8 +3716,8 @@ async fn soft_ping_wakes_idle_session_without_transaction() {
         state: Arc::new(MemState(Mutex::default())),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
-            judge: None,
-            judge_cfg: Default::default(),
+        judge: None,
+        judge_cfg: Default::default(),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.soft_pings, 1, "мягкий пинг ушёл в сессию");
@@ -3787,7 +3787,7 @@ async fn restored_counters_from_previous_process_do_not_escalate_on_first_tick()
         state: Arc::new(seeded),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: NOW,
-    judge: None,
+        judge: None,
         judge_cfg: Default::default(),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
@@ -3862,7 +3862,7 @@ async fn counters_earned_by_current_process_still_escalate() {
         state: Arc::new(seeded),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: NOW - 50 * 60_000,
-    judge: None,
+        judge: None,
         judge_cfg: Default::default(),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
@@ -3945,7 +3945,7 @@ async fn escalation_deferred_when_liveness_probe_unreliable() {
         state: Arc::new(seeded),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: NOW - 50 * 60_000,
-    judge: None,
+        judge: None,
         judge_cfg: Default::default(),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
@@ -4011,8 +4011,8 @@ async fn probe_failure_records_outcome_without_escalation_or_counters() {
         state: state.clone(),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
-            judge: None,
-            judge_cfg: Default::default(),
+        judge: None,
+        judge_cfg: Default::default(),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.probe_failed, 1, "недостоверная проба видна в outcome");
@@ -4091,8 +4091,8 @@ async fn probe_failure_isolated_per_row_other_rows_processed() {
         state: Arc::new(MemState(Mutex::default())),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
-            judge: None,
-            judge_cfg: Default::default(),
+        judge: None,
+        judge_cfg: Default::default(),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
@@ -4168,8 +4168,8 @@ async fn probe_degradation_strip_reaches_threshold_signal() {
         state: Arc::new(MemState(Mutex::default())),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
-            judge: None,
-            judge_cfg: Default::default(),
+        judge: None,
+        judge_cfg: Default::default(),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
@@ -4270,8 +4270,8 @@ async fn idle_sessions_do_not_hold_cup() {
         state,
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
-            judge: None,
-            judge_cfg: Default::default(),
+        judge: None,
+        judge_cfg: Default::default(),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
@@ -6196,8 +6196,8 @@ fn tick_with_clock(
         state,
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
-            judge: None,
-            judge_cfg: Default::default(),
+        judge: None,
+        judge_cfg: Default::default(),
     };
     (u, board, sessions, prs)
 }
@@ -6395,8 +6395,8 @@ async fn enrichment_failure_skips_row() {
         state: Arc::new(MemState(Mutex::default())),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
-            judge: None,
-            judge_cfg: Default::default(),
+        judge: None,
+        judge_cfg: Default::default(),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.enrich_skipped, 1, "строка пропущена, не решена");
@@ -6436,8 +6436,8 @@ async fn orphan_deleted_when_set_session_fails() {
         state: Arc::new(MemState(Mutex::default())),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
-            judge: None,
-            judge_cfg: Default::default(),
+        judge: None,
+        judge_cfg: Default::default(),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.actions_failed, 1, "отказ записи ячейки виден");
@@ -6803,7 +6803,7 @@ async fn round_stale_reset_gives_true_fresh_round_two_pings_before_escalation() 
         state: Arc::new(seeded),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: BOOT,
-    judge: None,
+        judge: None,
         judge_cfg: Default::default(),
     };
     // тик 1 (сразу после рестарта): раунд чужой — сброс + свежий пинг
@@ -7250,8 +7250,8 @@ async fn cup_preempt_wave_does_not_escalate_victim_loop() {
         state: Arc::new(MemState(Mutex::default())),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
-            judge: None,
-            judge_cfg: Default::default(),
+        judge: None,
+        judge_cfg: Default::default(),
     };
     live_busy(&sessions, "ses_a");
     live_busy(&sessions, "ses_x");
@@ -7520,8 +7520,8 @@ async fn executor_failure_lands_in_outcome_by_name() {
         state: Arc::new(MemState(Mutex::default())),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
-            judge: None,
-            judge_cfg: Default::default(),
+        judge: None,
+        judge_cfg: Default::default(),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
@@ -7572,8 +7572,8 @@ async fn named_executor_failure_is_isolated_from_healthy_peer() {
         state: Arc::new(MemState(Mutex::default())),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
-            judge: None,
-            judge_cfg: Default::default(),
+        judge: None,
+        judge_cfg: Default::default(),
     };
     let out = u.run(&routed_plan(Mode::Live)).await.unwrap();
     assert_eq!(
@@ -7629,8 +7629,8 @@ fn lost_usecase(
         state: Arc::new(MemState(Mutex::default())),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
-            judge: None,
-            judge_cfg: Default::default(),
+        judge: None,
+        judge_cfg: Default::default(),
     };
     (u, board, sessions)
 }
@@ -8424,7 +8424,6 @@ fn judge_usecase(
         judge_cfg: cfg,
     };
     (u, board, sessions, state)
-
 }
 
 /// In Progress с дев-сессией + сессия-stage-slot = dev (сталл-точка).
@@ -8442,18 +8441,6 @@ async fn judge_noise_state_wakes_without_transition() {
     // вердикт «текущий статус» = пробуждение без переноса: владельца нет,
     // пингов старой механики нет.
     const NOW: u64 = 100_000_000;
-    struct NowClock;
-    impl Clock for NowClock {
-        fn utc_minute(&self) -> UtcMinute {
-            UtcMinute {
-                minute_of_day: 100,
-                weekday: 3,
-            }
-        }
-        fn now_ms(&self) -> u64 {
-            NOW
-        }
-    }
     let judge = FakeJudge::says(uwuwu_domain::JudgeStatus::InProgress);
     let cfg = JudgeCfg {
         enabled: true,
@@ -8495,7 +8482,6 @@ async fn judge_noise_state_wakes_without_transition() {
     let ctx = judge.calls.lock().unwrap().last().unwrap().clone();
     assert_eq!(ctx.silence_min, 40);
     assert!(ctx.idle, "ход завершён (idle)");
-    let _ = NowClock;
 }
 
 #[tokio::test]
@@ -8503,28 +8489,31 @@ async fn judge_verdict_transitions_row_with_race_check_passing() {
     // Вердикт Тестирование на ReviewResult-строке: перенос + дайджест +
     // промпт агенту; носитель сталла сброшен (статус сменился).
     const NOW: u64 = 100_000_000;
-    struct NowClock;
-    impl Clock for NowClock {
-        fn utc_minute(&self) -> UtcMinute {
-            UtcMinute {
-                minute_of_day: 100,
-                weekday: 3,
-            }
-        }
-        fn now_ms(&self) -> u64 {
-            NOW
-        }
-    }
     let judge = FakeJudge::says(uwuwu_domain::JudgeStatus::Testing);
     let cfg = JudgeCfg {
         enabled: true,
         ..JudgeCfg::default()
     };
     let state = Arc::new(MemState(Mutex::default()));
-    state.0.lock().unwrap().statuses.push((42, Status::ReviewResult));
-    state.0.lock().unwrap().stalls.push((42, Status::ReviewResult, NOW - 3 * 60 * 60_000));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((42, Status::ReviewResult));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .stalls
+        .push((42, Status::ReviewResult, NOW - 3 * 60 * 60_000));
     let (u, board, sessions, state) = judge_usecase(
-        vec![judge_row(42, Status::ReviewResult, "ses_rev", Slot::ResultReview)],
+        vec![judge_row(
+            42,
+            Status::ReviewResult,
+            "ses_rev",
+            Slot::ResultReview,
+        )],
         Vec::new(),
         Some(NOW - 90 * 60_000),
         true,
@@ -8553,7 +8542,10 @@ async fn judge_verdict_transitions_row_with_race_check_passing() {
             .any(|l| l.starts_with("comment#42=⚖︎ Судья:")),
         "дайджест вердикта в ленте"
     );
-    assert!(state.0.lock().unwrap().stalls.is_empty(), "носитель сталла сброшен");
+    assert!(
+        state.0.lock().unwrap().stalls.is_empty(),
+        "носитель сталла сброшен"
+    );
     let _ = sessions;
 }
 
@@ -8562,18 +8554,6 @@ async fn judge_rejects_illegal_verdict_as_hold() {
     // Вердикт Тестирование на Design-строке: прыжок через стадии канона —
     // гард отклоняет, hold-эквивалент (мутаций нет, счётчик rejected).
     const NOW: u64 = 100_000_000;
-    struct NowClock;
-    impl Clock for NowClock {
-        fn utc_minute(&self) -> UtcMinute {
-            UtcMinute {
-                minute_of_day: 100,
-                weekday: 3,
-            }
-        }
-        fn now_ms(&self) -> u64 {
-            NOW
-        }
-    }
     let judge = FakeJudge::says(uwuwu_domain::JudgeStatus::Testing);
     let cfg = JudgeCfg {
         enabled: true,
@@ -8610,18 +8590,6 @@ async fn judge_rejects_illegal_verdict_as_hold() {
 async fn judge_err_falls_back_to_classic_soft_ping() {
     // Судья недоступна (Err) — старая механика: мягкий пинг idle-сессии.
     const NOW: u64 = 100_000_000;
-    struct NowClock;
-    impl Clock for NowClock {
-        fn utc_minute(&self) -> UtcMinute {
-            UtcMinute {
-                minute_of_day: 100,
-                weekday: 3,
-            }
-        }
-        fn now_ms(&self) -> u64 {
-            NOW
-        }
-    }
     let cfg = JudgeCfg {
         enabled: true,
         ..JudgeCfg::default()
@@ -8654,18 +8622,6 @@ async fn judge_guard_forces_park_without_call() {
     // Гвард сверху: 3 вызова без смены статуса — 4-я сталл-точка паркует
     // строку БЕЗ нового вызова модели (слово владельца «порог 3»).
     const NOW: u64 = 100_000_000;
-    struct NowClock;
-    impl Clock for NowClock {
-        fn utc_minute(&self) -> UtcMinute {
-            UtcMinute {
-                minute_of_day: 100,
-                weekday: 3,
-            }
-        }
-        fn now_ms(&self) -> u64 {
-            NOW
-        }
-    }
     let judge = FakeJudge::says(uwuwu_domain::JudgeStatus::Hold);
     let cfg = JudgeCfg {
         enabled: true,
@@ -8675,9 +8631,24 @@ async fn judge_guard_forces_park_without_call() {
     };
     let state = Arc::new(MemState(Mutex::default()));
     // 3 вызова без смены статуса: три записи одного раунда
-    state.0.lock().unwrap().stalls.push((45, Status::InProgress, NOW - 3 * 60 * 60_000));
-    state.0.lock().unwrap().stalls.push((45, Status::InProgress, NOW - 3 * 60 * 60_000));
-    state.0.lock().unwrap().stalls.push((45, Status::InProgress, NOW - 3 * 60 * 60_000));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .stalls
+        .push((45, Status::InProgress, NOW - 3 * 60 * 60_000));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .stalls
+        .push((45, Status::InProgress, NOW - 3 * 60 * 60_000));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .stalls
+        .push((45, Status::InProgress, NOW - 3 * 60 * 60_000));
     let (u, board, sessions, _) = judge_usecase(
         vec![judge_row(45, Status::InProgress, "ses_dev", Slot::Dev)],
         Vec::new(),
@@ -8713,7 +8684,12 @@ async fn judge_cap_verdict_parks_row_on_needs_attention() {
     };
     let state = Arc::new(MemState(Mutex::default()));
     // кап-точка: тик видит смену ReviewResult → InProgress (4-й подряд rc)
-    state.0.lock().unwrap().statuses.push((46, Status::ReviewResult));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((46, Status::ReviewResult));
     state.0.lock().unwrap().review_rounds.push((46, 3));
     let (u, board, _, _) = judge_usecase(
         vec![judge_row(46, Status::InProgress, "ses_dev", Slot::Dev)],
@@ -8750,7 +8726,12 @@ async fn judge_cap_verdict_continues_row_without_park() {
     };
     let state = Arc::new(MemState(Mutex::default()));
     // кап-точка: смена ReviewResult → InProgress при раундах 3 → 4-й подряд
-    state.0.lock().unwrap().statuses.push((47, Status::ReviewResult));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((47, Status::ReviewResult));
     state.0.lock().unwrap().review_rounds.push((47, 3));
     let (u, board, sessions, _) = judge_usecase(
         vec![judge_row(47, Status::InProgress, "ses_dev", Slot::Dev)],

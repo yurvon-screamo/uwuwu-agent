@@ -49,7 +49,8 @@ pub fn query_text(query: &str) -> String {
 
 /// RetryInfo из тела 429: `details[]` с `retryDelay` ("26s", "1m").
 /// Возвращает секунды; без RetryInfo — None (вызывающая сторона ставит дефолт).
-fn parse_retry_delay(body: &serde_json::Value) -> Option<u64> {
+/// pub(crate) — реюз контурами Google API (судья #1364), единственный парсер.
+pub(crate) fn parse_retry_delay(body: &serde_json::Value) -> Option<u64> {
     let err = body.get("error")?;
     for d in err.get("details")?.as_array()? {
         let kind = d.get("@type")?.as_str()?;
@@ -112,7 +113,10 @@ impl GeminiEmbeddings {
             .collect();
         let resp = self
             .http
-            .post(format!("{API_BASE}/models/{}:batchEmbedContents", self.model))
+            .post(format!(
+                "{API_BASE}/models/{}:batchEmbedContents",
+                self.model
+            ))
             .header("x-goog-api-key", &self.api_key)
             .json(&serde_json::json!({ "requests": requests }))
             .send()

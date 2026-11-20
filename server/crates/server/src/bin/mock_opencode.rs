@@ -1108,7 +1108,16 @@ async fn message_tail(store: Arc<Store>, id: String) -> Resp {
     let sessions = store.sessions.lock().expect("store");
     match sessions.get(&id) {
         Some(s) if s.turn_ms.is_some() => {
-            let tail = turn_tail(s.turn_ms.expect("turn_ms checked"));
+            // MOCK_ACTIVITY_AGE_MS (стенд судьи #1364): активность насильно
+            // старая — тишина сессии фиксированно глубока, сталл-контур
+            // (и судья) срабатывает в первых тиках стенда
+            let age = cfg("MOCK_ACTIVITY_AGE_MS", "0").parse::<u64>().unwrap_or(0);
+            let turn = if age > 0 {
+                now_ms().saturating_sub(age)
+            } else {
+                s.turn_ms.expect("turn_ms checked")
+            };
+            let tail = turn_tail(turn);
             (StatusCode::OK, Json(tail))
         }
         Some(s) => {
