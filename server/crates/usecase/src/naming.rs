@@ -252,6 +252,17 @@ mod tests {
     }
 
     #[test]
+    fn status_wait_alias() {
+        // Алиас «Вейт» — мост совместимости переименования: прод-сервер до
+        // деплоя нового бинарника пишет «Вейт», а state.rs парсит last_status
+        // тем же parse_status. Удаление алиаса должно валить этот тест,
+        // а не молча ломать чтение легаси-значений.
+        assert_eq!(status_name(Status::Wait), "Wait");
+        assert_eq!(parse_status("Wait"), Status::Wait);
+        assert_eq!(parse_status("Вейт"), Status::Wait);
+    }
+
+    #[test]
     fn agent_and_type_round_trip() {
         for a in [
             Agent::Developer,
