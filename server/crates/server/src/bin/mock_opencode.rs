@@ -1110,14 +1110,22 @@ async fn message_tail(store: Arc<Store>, id: String) -> Resp {
         Some(s) if s.turn_ms.is_some() => {
             // MOCK_ACTIVITY_AGE_MS (стенд судьи #1364): активность насильно
             // старая — тишина сессии фиксированно глубока, сталл-контур
-            // (и судья) срабатывает в первых тиках стенда
+            // (и судья) срабатывает в первых тиках стенда. Стареть должны
+            // ОБА штампа: проба активности читает time.updated (свежий now
+            // в turn_tail обнулял бы тишину — silent None сталл-контура).
             let age = cfg("MOCK_ACTIVITY_AGE_MS", "0").parse::<u64>().unwrap_or(0);
-            let turn = if age > 0 {
-                now_ms().saturating_sub(age)
-            } else {
-                s.turn_ms.expect("turn_ms checked")
-            };
-            let tail = turn_tail(turn);
+            let mut tail = turn_tail(s.turn_ms.expect("turn_ms checked"));
+            if age > 0 {
+                let old = now_ms().saturating_sub(age);
+                if let Some(msgs) = tail.as_array_mut() {
+                    for m in msgs.iter_mut() {
+                        if let Some(t) = m.get_mut("time") {
+                            t["updated"] = json!(old);
+                            t["created"] = json!(old);
+                        }
+                    }
+                }
+            }
             (StatusCode::OK, Json(tail))
         }
         Some(s) => {
