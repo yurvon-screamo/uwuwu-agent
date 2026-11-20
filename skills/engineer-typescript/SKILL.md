@@ -5,7 +5,7 @@ description: Apply these rules when writing, reviewing, or refactoring TypeScrip
 
 # TypeScript Engineer Standards
 
-> Общие правила (размеры, комментарии, SRP, naming) — в `rules-clean-code`. Здесь только TypeScript-специфика.
+> General rules (sizes, comments, SRP, naming) — in `rules-clean-code`. Only TypeScript specifics here.
 
 ## Typing
 
