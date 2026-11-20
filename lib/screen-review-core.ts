@@ -214,7 +214,7 @@ export function resolveMimeType(path: string): string {
   if (ext === ".png") return "image/png"
   if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg"
   if (ext === ".webp") return "image/webp"
-  throw new Error(`screen_review: неизвестное расширение скрина «${path}» (поддерживаются .png, .jpg/.jpeg, .webp)`)
+  throw new Error(`screen_review: unknown screenshot extension «${path}» (supported: .png, .jpg/.jpeg, .webp)`)
 }
 
 export function buildRequest(
@@ -259,7 +259,7 @@ export function parseAnswers(
   }
   const missing = (expectedIds ?? []).filter((id) => !(id in answers))
   if (missing.length > 0) {
-    throw contractFail(label, `модель ответила не на все вопросы — отсутствуют: ${missing.join(", ")}`)
+    throw contractFail(label, `the model did not answer all questions — missing: ${missing.join(", ")}`)
   }
   const usage = doc.usage?.total_input_tokens ?? doc.usage?.input_tokens
   const inputTokens = typeof usage === "number" ? usage : 0
@@ -267,15 +267,15 @@ export function parseAnswers(
 }
 
 function parseAnswer(id: string, value: unknown, label: string): DecisionAnswer {
-  if (typeof value !== "object" || value === null) throw contractFail(label, `answers[${id}] не объект`)
+  if (typeof value !== "object" || value === null) throw contractFail(label, `answers[${id}] is not an object`)
   const a = value as Record<string, unknown>
   switch (a.type) {
     case "noul":
-      if (typeof a.noul !== "number") throw contractFail(label, `answers[${id}] type=noul без числа noul`)
+      if (typeof a.noul !== "number") throw contractFail(label, `answers[${id}] type=noul without a noul number`)
       return { type: "noul", noul: a.noul }
     case "choice":
       if (typeof a.choice !== "string" || typeof a.probabilities !== "object" || a.probabilities === null) {
-        throw contractFail(label, `answers[${id}] type=choice без choice/probabilities`)
+        throw contractFail(label, `answers[${id}] type=choice without choice/probabilities`)
       }
       return {
         type: "choice",
@@ -284,7 +284,7 @@ function parseAnswer(id: string, value: unknown, label: string): DecisionAnswer 
         confidence: typeof a.confidence === "number" ? a.confidence : undefined,
       }
     case "score":
-      if (typeof a.score !== "number") throw contractFail(label, `answers[${id}] type=score без числа score`)
+      if (typeof a.score !== "number") throw contractFail(label, `answers[${id}] type=score without a score number`)
       return {
         type: "score",
         score: a.score,
@@ -293,7 +293,7 @@ function parseAnswer(id: string, value: unknown, label: string): DecisionAnswer 
         confidence: typeof a.confidence === "number" ? a.confidence : undefined,
       }
     default:
-      throw contractFail(label, `answers[${id}] неизвестный type=${String(a.type)}`)
+      throw contractFail(label, `answers[${id}] unknown type=${String(a.type)}`)
   }
 }
 

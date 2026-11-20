@@ -75,13 +75,13 @@ export async function runReview(input: ReviewInput, deps: ReviewDeps = realDeps)
   if (input.scope === "commit") {
     if (!input.commit) throw new Error("scope=commit requires commit (a SHA/ref)")
     base = (await deps.git(["rev-parse", `${input.commit}^`], dir)).trim()
-    if (base === "") throw new Error(`у ${input.commit} нет родителя — корневой коммит не имеет дельты`)
+    if (base === "") throw new Error(`${input.commit} has no parent — a root commit has no delta`)
     notes.push(
       "scope=commit: a run over the working copy — correct only if the files on disk are in the commit's state (a fresh HEAD in a clean worktree).",
     )
   } else {
     base = (await deps.git(["merge-base", upstream, "HEAD"], dir)).trim()
-    if (base === "") throw new Error(`merge-base ${upstream}..HEAD пуст — репо не git или upstream не существует`)
+    if (base === "") throw new Error(`merge-base ${upstream}..HEAD is empty — not a git repo or the upstream does not exist`)
   }
 
   const deltaRaw = await deps.qlty(["check", "--sarif", "--no-fix", "--no-progress", "--upstream", base], dir)
