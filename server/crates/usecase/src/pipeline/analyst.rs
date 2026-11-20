@@ -278,17 +278,17 @@ fn analyst_prompt(project: &str, rows: &[&Task]) -> String {
         list.push_str(&format!("- #{} «{}»\n", t.number(), t.title()));
     }
     format!(
-        "Аналитика волны (проект {project}) — строки в Analys, пачка целиком:\n\n{list}\n\
-         Действуй по методичке репо agents/analyst. Через MCP uwuwu для каждой строки:\n\
-         1. uwuwu_task_get {{number}} — заявка целиком; источники: Design Spec проекта,\n\
-            README/Домены, ADR, дословные цитаты владельца в заявке/треде.\n\
-         2. Проработка по типу (feature — US/UC/НФТ/«Как тестируем»; bug — симптом +\n\
-            фрейм воспроизведения; spike/docs — гипотеза + «что считаем ответом»);\n\
-            артефакт — переработанное тело (uwuwu_task_body) по TASK-TEMPLATE-костяку типа.\n\
-         3. Вердикты: проработано → uwuwu_task_edit {{number, status: \"Review Analys\"}};\n\
-            дубль/мусор → uwuwu_task_close {{number, not_planned: true}} с обоснованием;\n\
-            реальный блокер → Needs attention; развилка не по ФТ/НФТ → 🚩-флаг в тело\n\
-            (развилка А/Б + явная рекомендация), вопросов владельцу нет.\n\
-         Ты — аналитик: не реализуй задачу, не пиши в Design Spec, не создавай задач."
+        "Analytics wave (project {project}) — rows in Analys, the whole batch:\n\n{list}\n\
+         Act per the repo methodology agents/analyst. Via uwuwu MCP, for each row:\n\
+         1. uwuwu_task_get {{number}} — the full request; sources: the project Design Spec,\n\
+            README/Domains, ADRs, verbatim owner quotes in the request/thread.\n\
+         2. Elaboration by type (feature — US/UC/NFT/«How we test»; bug — symptom +\n\
+            reproduction frame; spike/docs — hypothesis + «what counts as the answer»);\n\
+            the artifact is the reworked body (uwuwu_task_body) per the type's TASK-TEMPLATE skeleton.\n\
+         3. Verdicts: elaborated → uwuwu_task_edit {{number, status: \"Review Analys\"}};\n\
+            duplicate/garbage → uwuwu_task_close {{number, not_planned: true}} with rationale;\n\
+            a real blocker → Needs attention; a fork outside FT/NFT → a 🚩 flag in the body\n\
+            (fork А/Б + an explicit recommendation), no questions to the owner.\n\
+         You are an analyst: do not implement the task, do not write into the Design Spec, do not create tasks."
     )
 }

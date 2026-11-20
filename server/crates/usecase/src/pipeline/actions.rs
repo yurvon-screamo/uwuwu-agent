@@ -101,7 +101,7 @@ impl TickUseCase {
         let branch = uwuwu_domain::BranchName::parse(&format!("work/task-{}", task.number()))
             .ok_or_else(|| {
                 UsecaseError::Board(format!(
-                    "ветка work/task-{} не проходит BranchName::parse",
+                    "branch work/task-{} fails BranchName::parse",
                     task.number()
                 ))
             })?;
@@ -330,7 +330,7 @@ impl TickUseCase {
                     .prompt(
                         session,
                         &format!(
-                            "Wakeup: новые комменты в задаче #{}:\n\n{}",
+                            "Wakeup: new comments on task #{}:\n\n{}",
                             task.number(),
                             body
                         ),
@@ -602,10 +602,10 @@ impl TickUseCase {
             .post_comment(
                 task.number(),
                 &format!(
-                    "⚠︎ Сессия потеряна: доставка в сессию стадии `{}` отклоняется \
-                     исполнителем (404) при живом списке сессий — порог \
-                     {SESSION_LOST_ESCALATE_AFTER} неудач. Строка в Needs attention, \
-                     разбор владельца.",
+                    "⚠︎ Session lost: delivery to the `{}` stage session is rejected \
+                     by the executor (404) while the session list is alive — the \
+                     {SESSION_LOST_ESCALATE_AFTER} failure threshold is hit. The row is in \
+                     Needs attention, owner's triage.",
                     naming::slot_key(slot)
                 ),
             )
@@ -661,23 +661,24 @@ impl TickUseCase {
                 Ok(false)
             }
             PrState::Missing => {
-                self.bounce(board, task, "ветка есть, PR не найден").await?;
+                self.bounce(board, task, "branch set, PR not found").await?;
                 Ok(false)
             }
             PrState::Closed => {
-                self.bounce(board, task, "PR закрыт без мержа").await?;
+                self.bounce(board, task, "PR closed without a merge")
+                    .await?;
                 Ok(false)
             }
             PrState::Open {
                 mergeable: false, ..
             } => {
-                self.bounce(board, task, "PR в конфликте с master").await?;
+                self.bounce(board, task, "PR conflicts with master").await?;
                 Ok(false)
             }
             PrState::Open {
                 ci_green: false, ..
             } => {
-                self.bounce(board, task, "красный CI у PR").await?;
+                self.bounce(board, task, "PR has red CI").await?;
                 Ok(false)
             }
             PrState::Open {
@@ -697,7 +698,7 @@ impl TickUseCase {
                         Ok(true)
                     }
                     Err(e) => {
-                        self.bounce(board, task, &format!("мерж не прошёл: {e}"))
+                        self.bounce(board, task, &format!("merge failed: {e}"))
                             .await?;
                         Ok(false)
                     }
@@ -711,10 +712,7 @@ impl TickUseCase {
             .set_status(&board.board, task.number(), Status::InProgress)
             .await?;
         self.board
-            .post_comment(
-                task.number(),
-                &format!("Автомерж: возврат в работу — {why}."),
-            )
+            .post_comment(task.number(), &format!("Automerge: back to work — {why}."))
             .await?;
         tracing::info!(
             event = "automerge.bounce",
@@ -734,46 +732,48 @@ fn session_title(task: &Task, slot: Slot) -> String {
 
 pub(crate) fn spawn_prompt(board: &BoardPlan, task: &Task, slot: Slot) -> String {
     let stage = match slot {
-        Slot::Design => "стадия утряски: изучи постановку, уточни у владельца, собери план",
-        Slot::Dev => "реализация по утверждённому плану; веди задачу по канону AGENTS.md",
-        Slot::PlanReview => "ревью плана: парафриз/zoom-out/readiness, вердикт комментом",
-        Slot::ResultReview => "ревью результата: код/CI/отчёт, вердикт комментом",
-        Slot::Test => "тестирование: качество фичи, вердикт pass/fail с шагами",
-        Slot::TestReview => "ревью тестирования: тестовая дельта ветки, вердикт комментом",
-    };
+    let stage = STAGE_PROMPTS
+        .iter()
+        .find(|(s, _)| *s == slot)
+        .map(|(_, m)| *m)
+        .unwrap_or_default();
     let finish = match slot {
-        Slot::Design => "план в тело → переведи статус в «Ревью плана»",
-        Slot::Dev => "код/CI/PR/отчёт готовы → переведи статус в «Ревью результата»",
-        Slot::PlanReview => "вердикт комментом → approve/request_changes и статус по вердикту",
-        Slot::ResultReview => "вердикт комментом → approve/request_changes и статус по вердикту",
+        Slot::Design => "plan into the body → set the status to «Plan review»",
+        Slot::Dev => "code/CI/PR/report ready → set the status to «Result review»",
+        Slot::PlanReview => {
+            "verdict in a comment → approve/request_changes and the status per the verdict"
+        }
+        Slot::ResultReview => {
+            "verdict in a comment → approve/request_changes and the status per the verdict"
+        }
         Slot::Test => {
-            "вердикт pass/fail комментом → pass: есть (tester)-коммиты — статус «Ревью тестирования», нет — «Review»; fail — In Progress"
+            "pass/fail verdict in a comment → pass: with (tester) commits — «Testing review»; without — «Review»; fail — In Progress"
         }
         Slot::TestReview => {
-            "вердикт комментом → «Review» (чисто) или «Тестирование» (находки) по вердикту"
+            "verdict in a comment → «Review» (clean) or «Testing» (findings) per the verdict"
         }
     };
+    };
     format!(
-        "Задача #{number} «{title}» (доска «{board}», проект {project}).\n\
-         Ты — агент конвейера uwuwu (методичка репо). {stage}.\n\
+        "Task #{number} «{title}» (board «{board}», project {project}).\n\
+         You are a uwuwu pipeline agent (repo canon). {stage}.\n\
          \n\
-         ⚠ Контракт хода: твоя сессия ЗАСЫПАЕТ после ответа — конвейер не\n\
-         продолжит работу, пока ты не закроешь транзакцию. Ход не завершай\n\
-         без одного из двух:\n\
-         1) статусный перевод (uwuwu_task_edit {{number, status}}): {finish};\n\
-         2) вопрос владельцу комментом (uwuwu_task_comment) + статус\n\
+         ⚠ Turn contract: your session SLEEPS after the reply — the pipeline will not\n\
+         continue until you close the transaction. Do not end the turn without one of:\n\
+         1) a status transition (uwuwu_task_edit {{number, status}}): {finish};\n\
+         2) a question to the owner in a comment (uwuwu_task_comment) + status\n\
          «Needs attention».\n\
-         «Поработал и замолчал» = строка зависает до автопинга конвейера\n\
-         (15 мин при завершённом ходе, до 60 мин — если ход ещё идёт).\n\
+         «Worked and went silent» = the row hangs until the pipeline auto-ping\n\
+         (15 min after a finished turn, up to 60 min while the turn is in progress).\n\
          \n\
-         Платформа — через MCP-инструменты сервера uwuwu (Code Mode: tools.uwuwu.*):\n\
-         - тело задачи и комменты: uwuwu_task_get {{number: {number}}}\n\
-         - персона владельца (читай первой): uwuwu_person_show\n\
-         - канон-доки проекта: uwuwu_docs_read {{slug: \"Projects/{project}/README\"}},\n\
-           Design Spec (Projects/{project}/Design Spec; нет — штатный skip), Деплоймент\n\
-         - вести задачу: uwuwu_task_edit / task_comment / task_claim {{session: свой ses_…}}\n\
+         The platform goes through the uwuwu server MCP tools (Code Mode: tools.uwuwu.*):\n\
+         - task body and comments: uwuwu_task_get {{number: {number}}}\n\
+         - owner persona (read first): uwuwu_person_show\n\
+         - project canon docs: uwuwu_docs_read {{slug: \"Projects/{project}/README\"}},\n\
+           Design Spec (Projects/{project}/Design Spec; if absent — a normal skip), Deployment\n\
+         - run the task: uwuwu_task_edit / task_comment / task_claim {{session: your ses_…}}\n\
          \n\
-         Работай по канону AGENTS.md; доклады и вопросы — комментом (uwuwu_task_comment).",
+         Work per the AGENTS.md canon; reports and questions go in comments (uwuwu_task_comment).",
         number = task.number(),
         title = task.title(),
         board = board.board,

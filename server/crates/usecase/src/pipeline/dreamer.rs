@@ -216,14 +216,14 @@ pub(crate) fn jst_day_key(ms: u64) -> String {
 
 fn dreamer_prompt(target: &str) -> String {
     format!(
-        "Пост-обработка завершённой сессии {target} (агент dreamer, методичка agents/dreamer).\n\n\
-         1. Прочитай сессию: uwuwu_session_export {{session: \"{target}\"}}\n\
-         2. Дедуп: uwuwu_docs_ls / docs_read по Experience — «нечего взять» — нормальный исход,\n\
-            тогда просто зафиксируй это в своём итоге.\n\
-         3. Ценное: класс-приписка в существующую статью опыта (uwuwu_docs_append),\n\
-            новые статьи — умеренно; ADR — только если принято архитектурное решение.\n\
-         4. Гигиена доков: устаревшее/дыры — точечные правки (uwuwu_docs_write).\n\
-         Действуй автономно; итог — краткой строкой.",
+        "Post-processing of a finished session {target} (the dreamer agent, methodology agents/dreamer).\n\n\
+         1. Read the session: uwuwu_session_export {{session: \"{target}\"}}\n\
+         2. Dedup: uwuwu_docs_ls / docs_read over Experience — «nothing to take» is a normal outcome,\n\
+            then just record that in your summary.\n\
+         3. Valuable: a class attribution into an existing experience article (uwuwu_docs_append),\n\
+            new articles — moderately; ADRs — only if an architectural decision was made.\n\
+         4. Doc hygiene: stale content/holes — point edits (uwuwu_docs_write).\n\
+         Act autonomously; the outcome — one brief line.",
     )
 }
 
@@ -232,8 +232,8 @@ fn dreamer_prompt(target: &str) -> String {
 /// дедупа, промпт несёт только факт дельты.
 fn repeat_prompt(target: &str) -> String {
     format!(
-        "Повторный прогон: сессия {target} дополнилась новыми сообщениями после прошлого дрима.\n\
-         Перечитай экспорт (uwuwu_session_export {{session: \"{target}\"}}) и дообработай:\n\
-         дедуп с уже записанным, приписки классов, гигиена доков. Итог — краткой строкой.",
+        "Repeat run: session {target} gained new messages after the previous dream.\n\
+         Re-read the export (uwuwu_session_export {{session: \"{target}\"}}) and process the delta:\n\
+         dedup against what is already recorded, class attributions, doc hygiene. Outcome — one brief line.",
     )
 }

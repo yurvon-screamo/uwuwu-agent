@@ -210,18 +210,18 @@ fn analyst_review_prompt(project: &str, rows: &[&Task]) -> String {
         list.push_str(&format!("- #{} «{}»\n", t.number(), t.title()));
     }
     format!(
-        "Ревью аналитики (проект {project}) — строки в Review Analys, волна целиком:\n\n{list}\n\
-         Действуй по методичке репо agents/analyst-reviewer. По каждой строке:\n\
-         1. uwuwu_task_get {{number}} — проработанное тело; сверяй с источниками заявки\n\
-            (Design Spec/README/ADR/цитаты владельца): каждое требование имеет источник,\n\
-            сочинённое = request_changes.\n\
-         2. Оптики: sourcing; форма/дедуп (тайтл-конкретика, тело по TASK-TEMPLATE-костяку\n\
-            типа); соразмерность (спайк не задавлен рамками фичи); readiness (постановку\n\
-            можно брать в работу).\n\
-         3. Вердикты: approve → uwuwu_task_edit {{number, status: \"Todo\"}};\n\
-            request_changes → uwuwu_task_edit {{number, status: \"Analys\"}} + замечания комментами\n\
-            (цикл-гвард считает круги); реальная проблема → Needs attention.\n\
-         Отчёт — по одному комменту на строку (вердикт + причина кратко); никаких\n\
-         отдельных сводных постов по волне сверх этих комментов."
+        "Analytics review (project {project}) — rows in Review Analys, the whole wave:\n\n{list}\n\
+         Act per the repo methodology agents/analyst-reviewer. For each row:\n\
+         1. uwuwu_task_get {{number}} — the reworked body; verify against the request sources\n\
+            (Design Spec/README/ADRs/owner quotes): every requirement has a source;\n\
+            invented = request_changes.\n\
+         2. Optics: sourcing; form/dedup (title specificity, body per the type's TASK-TEMPLATE\n\
+            skeleton); proportionality (a spike not crushed by feature frames); readiness (the\n\
+            statement can be taken into work).\n\
+         3. Verdicts: approve → uwuwu_task_edit {{number, status: \"Todo\"}};\n\
+            request_changes → uwuwu_task_edit {{number, status: \"Analys\"}} + remarks in comments\n\
+            (the round guard counts the rounds); a real problem → Needs attention.\n\
+         The report — one comment per row (verdict + brief reason); no\n\
+         separate wave summary posts beyond those comments."
     )
 }

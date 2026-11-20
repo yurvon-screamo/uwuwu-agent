@@ -263,7 +263,7 @@ fn h3_twin_refuses_with_level_and_byte_line() {
         "байт-точная строка заголовка: {err}"
     );
     assert!(
-        err.contains("пином `### Подсекция`"),
+        err.contains("pinned `### Подсекция`"),
         "рецепт пина в ошибке: {err}"
     );
     assert!(
@@ -414,9 +414,9 @@ fn clear_request_for_absent_section_refuses() {
     let md = "## А\nтело\n";
     for query in ["Новая", "## Новая"] {
         let err = replace_md_section(md, query, "").unwrap_err();
-        assert!(err.contains("очищать нечего"), "{query}: {err}");
+        assert!(err.contains("nothing to clear"), "{query}: {err}");
         assert!(
-            err.contains("не найдена"),
+            err.contains("not found"),
             "причина — отсутствие секции: {err}"
         );
     }
@@ -429,11 +429,11 @@ fn prefixed_h3_query_absent_section_refuses_no_append() {
     let md = "## А\nтело\n";
     let err = replace_md_section(md, "### Новая", "контент").unwrap_err();
     assert!(
-        err.contains("h3 не найдена"),
+        err.contains("at h3 not found"),
         "уровень пина в ошибке: {err}"
     );
     assert!(
-        err.contains("append только для h2"),
+        err.contains("append is for h2 only"),
         "причина отказа: {err}"
     );
 }
@@ -481,10 +481,13 @@ fn h4_inside_h3_is_not_boundary() {
 fn pinned_h3_absent_with_h2_twin_refuses_with_pin_hint() {
     let md = "## Подсекция\nввод\n";
     let err = replace_md_section(md, "### Подсекция", "новое\n").unwrap_err();
-    assert!(err.contains("тёзка на уровне h2"), "уровень тёзки: {err}");
+    assert!(
+        err.contains("namesake exists at h2"),
+        "уровень тёзки: {err}"
+    );
     assert!(err.contains("«## Подсекция»"), "байт-точная строка: {err}");
     assert!(
-        err.contains("пином `## Подсекция`"),
+        err.contains("pinned `## Подсекция`"),
         "подсказка пина: {err}"
     );
 }
@@ -524,11 +527,11 @@ fn h1_pin_absent_refuses() {
     let md = "## Постановка\nтело\n";
     let err = replace_md_section(md, "# Титул", "новое\n").unwrap_err();
     assert!(
-        err.contains("h1 не найдена"),
+        err.contains("at h1 not found"),
         "уровень пина в ошибке: {err}"
     );
     assert!(
-        err.contains("append только для h2"),
+        err.contains("append is for h2 only"),
         "причина отказа: {err}"
     );
 }
@@ -538,9 +541,12 @@ fn bare_query_with_live_h3_twin_and_no_h2_guards() {
     // не тихая замена h3: bare пинит h2, тёзка на h3 — громкий отказ
     let md = "### Подсекция\nдетали\n";
     let err = replace_md_section(md, "Подсекция", "новое\n").unwrap_err();
-    assert!(err.contains("тёзка на уровне h3"), "гард, не замена: {err}");
     assert!(
-        err.contains("пином `### Подсекция`"),
+        err.contains("namesake exists at h3"),
+        "гард, не замена: {err}"
+    );
+    assert!(
+        err.contains("pinned `### Подсекция`"),
         "подсказка пина: {err}"
     );
 }

@@ -46,14 +46,9 @@ pub fn parse_status(raw: &str) -> Status {
         "Design" => Status::Design,
         "Plan review" | "Ревью плана" => Status::ReviewPlan,
         "In Progress" => Status::InProgress,
-<<<<<<< HEAD
-        "Ревью результата" => Status::ReviewResult,
-        "Тестирование" => Status::Testing,
-        "Ревью тестирования" => Status::ReviewTesting,
-=======
         "Result review" | "Ревью результата" => Status::ReviewResult,
         "Testing" | "Тестирование" => Status::Testing,
->>>>>>> f505bc51 (✨(server #1383): status/marker contract canon to English with legacy aliases)
+        "Testing review" | "Ревью тестирования" => Status::ReviewTesting,
         "Review" => Status::UserReview,
         "Done" => Status::Done,
         "Needs attention" => Status::NeedsAttention,
