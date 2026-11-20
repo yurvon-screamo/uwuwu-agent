@@ -245,9 +245,12 @@ pub fn tool_descriptors() -> Value {
         ),
         tool(
             "blob_get",
-            "Свежая presigned-ссылка на ранее положенный blob по ключу \
-             (переподпись истёкшей; существование объекта не проверяется)",
-            object(json!({ "key": string("ключ из blob_put (blobs/…)") }))
+            "Свежая presigned-ссылка на blob по ключу — переподпись истёкшей; \
+             существование объекта не проверяется. Ключи: канон из blob_put \
+             (blobs/…) или legacy assets/… — вложения, перенесённые из репо \
+             hub в бакет (#1365)",
+            object(json!({ "key": string("ключ из blob_put (blobs/…) или \
+                             legacy-ключ перенесённого вложения (assets/<путь>)") }))
         ),
     ])
 }
@@ -675,8 +678,10 @@ impl ToolHub {
         if raw.trim().is_empty() {
             return Err("key обязателен".into());
         }
-        let key = uwuwu_domain::BlobKey::parse(raw.trim())
-            .ok_or("ключ должен иметь форму blobs/<project>/<task|misc>/<sha8>-<имя>")?;
+        let key = uwuwu_domain::BlobKey::parse_read(raw.trim()).ok_or(
+            "ключ должен иметь форму blobs/<project>/<task|misc>/<sha8>-<имя> \
+             или assets/<путь перенесённого вложения>",
+        )?;
         let url = self.blobs.fresh_url(&key).map_err(|e| e.to_string())?;
         ok_text(format!(
             "ссылка (TTL 7 суток): {url}\n(существование объекта не проверяется — \
