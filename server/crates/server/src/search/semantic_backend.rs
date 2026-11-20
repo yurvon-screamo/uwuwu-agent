@@ -29,6 +29,13 @@ fn err(msg: String) -> UsecaseError {
     UsecaseError::State(format!("lance: {msg}"))
 }
 
+/// SQL-литерал предиката по слагу: апостроф удваивается по SQL-конвенции
+/// DataFusion (`''`) — сырая интерполяция рвёт литерал на слагах с `'`
+/// (#1392: Unterminated string literal → sync в часовом бэкоффе).
+fn slug_pred(slug: &str) -> String {
+    format!("slug = '{}'", slug.replace('\'', "''"))
+}
+
 pub struct LanceSemanticBackend {
     wiki: Arc<dyn WikiRepo>,
     /// Персист sha-инкремента: /…/semantic_shas.json рядом с Lance-том.
@@ -182,12 +189,12 @@ impl LanceSemanticBackend {
     async fn reindex_doc(&self, slug: &str, md: &str, h: i64) -> UsecaseResult<usize> {
         self.chunks()
             .await?
-            .delete(format!("slug = '{slug}'").as_str())
+            .delete(slug_pred(slug).as_str())
             .await
             .map_err(|e| err(format!("del chunks {slug}: {e}")))?;
         self.docs()
             .await?
-            .delete(format!("slug = '{slug}'").as_str())
+            .delete(slug_pred(slug).as_str())
             .await
             .map_err(|e| err(format!("del meta {slug}: {e}")))?;
         let texts = chunk_text(md);
