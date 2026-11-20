@@ -36,6 +36,7 @@ pub use naming::{
     schedule_label, slot_key, status_name, task_type_name, F_AUTOMERGE, F_DIRECT, F_PRIORITY,
     TASK_TYPES,
 };
+pub use pipeline::env_gc;
 pub use pipeline::sweeper;
 pub use pipeline::{
     executor::ExecutorLoudness, executor::EXECUTOR_UNAVAILABLE_COOLDOWN_MS,
