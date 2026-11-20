@@ -109,16 +109,28 @@ impl TelegramClient {
     /// Форвард-факт (#1416): Bot API `forward_origin` — 4 типа
     /// (user/hidden_user/chat/channel), каждый сворачивается в
     /// человекочитаемую метку источника для маркера промпта бот-сессии.
+    /// Имя пользователя/псевдоним hidden едет в метку (рекомендация
+    /// план-ревью #1416); author_signature канала не читается — это
+    /// автор поста, не источник пересылки (грань в Границах задачи).
     /// Legacy-поля (forward_from, пре-Bot API 7.0) не читаются: живой
     /// форвард приходит только через forward_origin.
     fn parse_forward(m: &Value) -> Option<String> {
         let origin = &m["forward_origin"];
         match origin["type"].as_str()? {
-            "user" => Some(match origin["sender_user"]["username"].as_str() {
-                Some(u) => format!("юзер @{u}"),
-                None => "юзер".to_string(),
+            "user" => {
+                let sender = &origin["sender_user"];
+                Some(match sender["username"].as_str() {
+                    Some(u) => format!("юзер @{u}"),
+                    None => format!(
+                        "юзер {}",
+                        sender["first_name"].as_str().unwrap_or("без имени")
+                    ),
+                })
+            }
+            "hidden_user" => Some(match origin["sender_user_name"].as_str() {
+                Some(n) => format!("скрытый источник ({n})"),
+                None => "скрытый источник".to_string(),
             }),
-            "hidden_user" => Some("скрытый источник".to_string()),
             "chat" => Self::chat_forward_label(&origin["sender_chat"], "чат"),
             "channel" => Self::chat_forward_label(&origin["chat"], "канал"),
             _ => None,
@@ -399,9 +411,9 @@ mod tests {
         assert_eq!(m.forward.as_deref(), Some("канал @nginx"));
     }
 
-    /// #1416: user-origin — username в метку; без username — просто
-    /// «юзер» (имя/фамилия в промпт не едут); hidden_user — «скрытый
-    /// источник».
+    /// #1416: user-origin — username в метку; без username — имя
+    /// (Bot API first_name, рекомендация план-ревью); hidden_user —
+    /// псевдоним, который ТГ показывает получателю.
     #[test]
     fn parses_user_and_hidden_forward_origins() {
         let with_username = json!({
@@ -436,7 +448,7 @@ mod tests {
         let m = TelegramClient::parse_update(&without_username)
             .message
             .expect("message");
-        assert_eq!(m.forward.as_deref(), Some("юзер"));
+        assert_eq!(m.forward.as_deref(), Some("юзер Пётр"));
 
         let hidden = json!({
             "update_id": 16,
@@ -450,7 +462,7 @@ mod tests {
         let m = TelegramClient::parse_update(&hidden)
             .message
             .expect("message");
-        assert_eq!(m.forward.as_deref(), Some("скрытый источник"));
+        assert_eq!(m.forward.as_deref(), Some("скрытый источник (Кто-то)"));
     }
 
     /// #1416: chat-origin — fallback на тайтл группы без username;

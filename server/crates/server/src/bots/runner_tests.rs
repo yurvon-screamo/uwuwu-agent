@@ -17,7 +17,7 @@ use uwuwu_usecase::{
     SessionInfo, SessionSpec, TickStateStore, UsecaseError, UsecaseResult, WikiRepo,
 };
 
-use super::runner::{process_message, spawn_bot_task, BotDeps, BotStructural};
+use super::runner::{forward_line, process_message, spawn_bot_task, BotDeps, BotStructural};
 use super::supervisor::{BotSupervisor, GuardTiming};
 use super::BotLive;
 
@@ -1893,6 +1893,17 @@ async fn photo_without_caption_gets_no_caption_marker() {
     );
     assert!(p.contains("вложи эту ссылку"), "инструкция в промпте: {p}");
     let _ = s;
+}
+
+/// #1416 (ревью, common): контракт маркера — одна точка формата на обе
+/// ветки; прямой пин литерала, который носят методичка и e2e-стенд.
+#[test]
+fn forward_marker_format_pinned() {
+    assert_eq!(
+        forward_line(&Some("канал @nginx".into())),
+        "[Пересланный пост — канал @nginx]\n"
+    );
+    assert_eq!(forward_line(&None), "");
 }
 
 /// #1416: форвард владельца доезжает в промпт с маркером источника —

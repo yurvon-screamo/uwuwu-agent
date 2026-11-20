@@ -125,7 +125,12 @@ pub(crate) async fn process_message(deps: &BotDeps, m: &TgMessage) -> UsecaseRes
                     return send(deps, m.chat_id, &greeting).await;
                 }
             }
-            run_turn(deps, m.chat_id, &format!("{}{text}", forward_line(m))).await
+            run_turn(
+                deps,
+                m.chat_id,
+                &format!("{}{text}", forward_line(&m.forward)),
+            )
+            .await
         }
         Incoming::Media { caption, media } => {
             process_media(deps, m.chat_id, caption, media, &m.forward).await
@@ -135,8 +140,11 @@ pub(crate) async fn process_message(deps: &BotDeps, m: &TgMessage) -> UsecaseRes
 
 /// Форвард-маркер промпта (#1416): строка-префикс с источником; для
 /// обычного сообщения — пустая строка, промпт байт-в-байт прежний.
-fn forward_line(m: &TgMessage) -> String {
-    match &m.forward {
+/// Единственная точка формата на обе ветки доставки — контракт маркера
+/// носится тремя носителями (сервер ⇄ методичка ⇄ grep e2e-стенда),
+/// дрейф формулировки между ветками исключён (ревью #1416, common).
+pub(crate) fn forward_line(forward: &Option<String>) -> String {
+    match forward {
         Some(origin) => format!("[Пересланный пост — {origin}]\n"),
         None => String::new(),
     }
@@ -191,12 +199,9 @@ async fn process_media(
     tracing::info!(event = "bot.media_delivered", slug = %deps.slug,
         kind = ?media.kind, "Файл забран и приложен к контексту сессии");
     let caption_line = caption.unwrap_or_else(|| "Подписи нет".into());
-    let forward_line = match forward {
-        Some(origin) => format!("[Пересланный пост — {origin}]\n"),
-        None => String::new(),
-    };
+    let prefix = forward_line(forward);
     let media_text = format!(
-        "{forward_line}Владелец прислал файл: {url}\n{caption_line}\n\
+        "{prefix}Владелец прислал файл: {url}\n{caption_line}\n\
 Если оформляешь заявку — вложи эту ссылку в тело задачи (markdown), \
 чтобы контент попал в разбор."
     );
