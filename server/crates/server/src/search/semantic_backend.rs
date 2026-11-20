@@ -3,7 +3,7 @@
 //! Эмбеддинги — Ollama-совместимый endpoint (локальная машина через туннель).
 //! Инкремент — doc_hash в мета-таблице.
 
-use crate::search::semantic::{chunk_text, OllamaEmbeddings, EMBED_MODEL_DIMS};
+use crate::search::semantic::{chunk_text, Embedder, EMBED_MODEL_DIMS};
 use async_trait::async_trait;
 use lancedb::arrow::arrow_array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, Int64Array, LargeStringArray,
@@ -43,7 +43,25 @@ pub struct LanceSemanticBackend {
     /// Задачи для индекса (юзер-стори «по вики/задачам/опыту»); None — стенд.
     issues: Option<Arc<dyn uwuwu_usecase::IssueIndexSource>>,
     db: Connection,
-    embeddings: Arc<OllamaEmbeddings>,
+    embeddings: Arc<dyn Embedder>,
+}
+
+/// Размерность векторной колонки живой таблицы (FixedSizeList list_size).
+fn vector_dim(schema: &ArrowSchema) -> Option<usize> {
+    match schema.field_with_name("vector").ok()?.data_type() {
+        DataType::FixedSizeList(_, size) => Some(*size as usize),
+        _ => None,
+    }
+}
+
+/// Dim-guard (#1363): dims живой таблицы ≠ размерности активного клиента —
+/// пространства эмбеддингов несовместимы, индекс «тихо смешался» бы.
+/// True — таблицы подлежат сносу (переиндексирует штатный sync).
+fn dims_stale(dim: Option<usize>) -> bool {
+    match dim {
+        Some(d) => d != EMBED_MODEL_DIMS,
+        None => false, // нет таблицы/колонки — гарду делать нечего
+    }
 }
 
 fn chunks_schema() -> Arc<ArrowSchema> {
@@ -74,12 +92,47 @@ impl LanceSemanticBackend {
         path: PathBuf,
         wiki: Arc<dyn WikiRepo>,
         issues: Option<Arc<dyn uwuwu_usecase::IssueIndexSource>>,
-        embeddings: Arc<OllamaEmbeddings>,
+        embeddings: Arc<dyn Embedder>,
     ) -> UsecaseResult<Self> {
         let db = ConnectBuilder::new(path.to_str().unwrap_or_default())
             .execute()
             .await
             .map_err(|e| err(format!("connect: {e}")))?;
+        // Dim-guard (#1363): живые таблицы с чужой размерностью сносятся —
+        // пространства эмбеддингов несовместимы, штатный sync перестроит индекс
+        // из первоисточника. Прозрачная переиндексация при смене модели/размерности.
+        let names = db
+            .table_names()
+            .execute()
+            .await
+            .map_err(|e| err(format!("list: {e}")))?;
+        if names.iter().any(|n| n == CHUNKS) {
+            let table = db
+                .open_table(CHUNKS)
+                .execute()
+                .await
+                .map_err(|e| err(format!("open chunks: {e}")))?;
+            let dim = table
+                .schema()
+                .await
+                .map_err(|e| err(format!("schema: {e}")))
+                .ok()
+                .and_then(|s| vector_dim(&s));
+            if dims_stale(dim) {
+                tracing::warn!(
+                    event = "semantic.dim_migration",
+                    old_dim = ?dim, new_dim = EMBED_MODEL_DIMS,
+                    "vector dims changed — индекс снесён, sync перестроит из первоисточника"
+                );
+                db.drop_table(CHUNKS, &[])
+                    .await
+                    .map_err(|e| err(format!("drop chunks: {e}")))?;
+                db.drop_table(DOCS, &[])
+                    .await
+                    .map_err(|e| err(format!("drop meta: {e}")))?;
+                let _ = std::fs::remove_file(path.join("semantic_shas.json"));
+            }
+        }
         let shas_file = path.join("semantic_shas.json");
         let this = Self {
             wiki,
@@ -201,7 +254,12 @@ impl LanceSemanticBackend {
         if texts.is_empty() {
             return Ok(0);
         }
-        let vectors = self.embeddings.embed_batch(&texts).await?;
+        // doc-пары (title, text): retrieval-контракт клиента (#1363)
+        let docs: Vec<(String, String)> = texts
+            .iter()
+            .map(|t| (slug.to_string(), t.clone()))
+            .collect();
+        let vectors = self.embeddings.embed_docs(&docs).await?;
         let slugs: Vec<String> = vec![slug.to_string(); texts.len()];
         let idxs: Vec<i32> = (0..texts.len() as i32).collect();
         let flat: Vec<f32> = vectors.iter().flat_map(|v| v.iter().copied()).collect();
@@ -249,10 +307,7 @@ impl LanceSemanticBackend {
 #[async_trait]
 impl SemanticBackend for LanceSemanticBackend {
     async fn search(&self, query: &str, top: usize) -> UsecaseResult<Vec<(f32, String)>> {
-        let vectors = self.embeddings.embed_batch(&[query.to_string()]).await?;
-        let Some(qv) = vectors.first() else {
-            return Err(err("embedding запроса пуст".into()));
-        };
+        let qv = self.embeddings.embed_query(query).await?;
         let vq = self
             .chunks()
             .await?
@@ -402,6 +457,8 @@ impl SemanticBackend for LanceSemanticBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lancedb::arrow::arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use std::sync::Arc as StdArc;
 
     #[test]
     fn hash_stable() {
@@ -413,5 +470,31 @@ mod tests {
             LanceSemanticBackend::hash("abc"),
             LanceSemanticBackend::hash("abd")
         );
+    }
+
+    fn schema_with_vector(dim: i32) -> ArrowSchema {
+        ArrowSchema::new(vec![ArrowField::new(
+            "vector",
+            DataType::FixedSizeList(
+                StdArc::new(ArrowField::new("item", DataType::Float32, true)),
+                dim,
+            ),
+            false,
+        )])
+    }
+
+    #[test]
+    fn vector_dim_reads_fixed_size_list() {
+        assert_eq!(vector_dim(&schema_with_vector(1024)), Some(1024));
+        assert_eq!(vector_dim(&schema_with_vector(1536)), Some(1536));
+        let no_vector = ArrowSchema::new(vec![ArrowField::new("text", DataType::LargeUtf8, false)]);
+        assert_eq!(vector_dim(&no_vector), None);
+    }
+
+    #[test]
+    fn dim_guard_flags_only_mismatch() {
+        assert!(dims_stale(Some(1024))); // qwen3-эпоха против Gemini 1536
+        assert!(!dims_stale(Some(EMBED_MODEL_DIMS)));
+        assert!(!dims_stale(None)); // пустой volume — миграции нет
     }
 }
