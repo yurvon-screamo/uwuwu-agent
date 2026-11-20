@@ -1,10 +1,11 @@
 // lib/screen-review.ts — оркестрация тулa screen_review: чтение скринов с
 // диска (абсолютные пути на машине сервера opencode — cwd тулa это сервер,
-// не сессия агента, готч qlty_review), per-скрин вызов /v1/systemone
-// локальной олямы (семантика мульти-скрина — решение ревью плана 13.11:
-// один вызов на скрин, вердикты атрибутированы к скрину), сборка отчёта.
-// Регистрация — plugins/screen-review.ts. Сеть и ФС подменяются deps —
-// юнит-тесты без живой модели.
+// не сессия агента, готч qlty_review), per-скрин вызов Google Decisions API
+// (gemini-decision-1, миграция с локальной олямы #1362 — чистая замена,
+// решение владельца 19.11; семантика мульти-скрина — решение ревью плана
+// 13.11: один вызов на скрин, вердикты атрибутированы к скрину), сборка
+// отчёта. Регистрация — plugins/screen-review.ts. Сеть и ФС подменяются
+// deps — юнит-тесты без живого API.
 import { basename, isAbsolute } from "node:path"
 import {
   buildRequest,
@@ -13,17 +14,18 @@ import {
   DEFAULT_THRESHOLD,
   parseAnswers,
   problemProbability,
+  resolveMimeType,
   resolveQuestions,
   type Checklist,
+  type DecisionRequest,
   type ScreenVerdict,
-  type SystemOneRequest,
 } from "./screen-review-core"
 import { renderReport, renderVerdictSection } from "./screen-review-render"
 
-export const DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
-export const DEFAULT_MODEL = "d1-omni"
-/** Холодный старт модели на CPU — десятки секунд (замер 13.11: ~26 с). */
-export const REQUEST_TIMEOUT_MS = 180_000
+export const DECISIONS_URL = "https://generativelanguage.googleapis.com/v1beta/decisions"
+export const DEFAULT_MODEL = "gemini-decision-1"
+/** Латенс API ~0.3–1 с на скрин (проба 20.11); 30 с — запас на большие скрины. */
+export const REQUEST_TIMEOUT_MS = 30_000
 
 export interface ScreenReviewInput {
   images: string[]
@@ -34,18 +36,18 @@ export interface ScreenReviewInput {
 }
 
 export interface ScreenReviewConfig {
-  ollamaUrl: string
+  apiKey: string
   model: string
 }
 
 export const resolveConfig = (env: NodeJS.ProcessEnv = process.env): ScreenReviewConfig => ({
-  ollamaUrl: env.UWUWU_OMNI_URL ?? DEFAULT_OLLAMA_URL,
-  model: env.UWUWU_OMNI_MODEL ?? DEFAULT_MODEL,
+  apiKey: env.GEMINI_API_KEY ?? "",
+  model: DEFAULT_MODEL,
 })
 
 export interface ScreenReviewDeps {
   /** подмена сети в тестах (дефолт — нативный fetch c таймаутом) */
-  postJson?: (url: string, body: SystemOneRequest) => Promise<{ status: number; body: string }>
+  postJson?: (url: string, body: DecisionRequest, headers: Record<string, string>) => Promise<{ status: number; body: string }>
   /** подмена чтения файла в тестах (дефолт — fs/promises readFile → base64) */
   readImageBase64?: (path: string) => Promise<string>
   /** прогресс для агента (плагин кладёт context.progress) — после каждого скрина */
@@ -53,10 +55,14 @@ export interface ScreenReviewDeps {
   config?: ScreenReviewConfig
 }
 
-const defaultPostJson = async (url: string, body: SystemOneRequest): Promise<{ status: number; body: string }> => {
+const defaultPostJson = async (
+  url: string,
+  body: DecisionRequest,
+  headers: Record<string, string>,
+): Promise<{ status: number; body: string }> => {
   const response = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...headers },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   })
@@ -81,6 +87,11 @@ export async function runScreenReview(input: ScreenReviewInput, deps: ScreenRevi
   const questions = resolveQuestions(input)
   const checklistName = input.questions ? "<inline>" : (input.checklist ?? DEFAULT_CHECKLIST)
   const config = deps.config ?? resolveConfig()
+  if (!config.apiKey) {
+    throw new Error(
+      "screen_review: GEMINI_API_KEY не задан — ключ Gemini API (Google AI Studio) нужен в env машины, чистой замены без него нет (#1362)",
+    )
+  }
   const state = input.state ?? DEFAULT_STATE
   const threshold = input.threshold ?? DEFAULT_THRESHOLD
   if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
@@ -130,6 +141,7 @@ async function reviewImage(
   deps: Pick<ScreenReviewDeps, "postJson" | "readImageBase64">,
 ): Promise<ScreenVerdict> {
   const { imagePath, state, questions, config } = args
+  const mimeType = resolveMimeType(imagePath) // громкая ошибка на неизвестном расширении
   let imageBase64: string
   try {
     imageBase64 = await (deps.readImageBase64 ?? defaultReadImageBase64)(imagePath)
@@ -137,11 +149,11 @@ async function reviewImage(
     const msg = e instanceof Error ? e.message : String(e)
     throw new Error(`screen_review: скрин не читан — ${imagePath}: ${msg}`)
   }
-  const url = `${config.ollamaUrl.replace(/\/$/, "")}/v1/systemone`
-  const request = buildRequest(config.model, state, imageBase64, questions)
+  const request = buildRequest(config.model, state, imageBase64, mimeType, questions)
+  const headers = { "x-goog-api-key": config.apiKey }
   let response: { status: number; body: string }
   try {
-    response = await (deps.postJson ?? defaultPostJson)(url, request)
+    response = await (deps.postJson ?? defaultPostJson)(DECISIONS_URL, request, headers)
   } catch (e) {
     // connection refused / DNS / таймаут AbortSignal — HTTP-статуса нет,
     // причина в e.cause: без обёртки агент видит голое «fetch failed»
@@ -149,10 +161,10 @@ async function reviewImage(
     const msg = e instanceof Error ? e.message : String(e)
     const cause = (e as { cause?: unknown }).cause
     const causeMsg = cause === undefined || cause === null ? "" : ` (причина: ${describeCause(cause)})`
-    throw new Error(`screen_review: оляма недоступна — ${imagePath} → ${url}: ${msg}${causeMsg}`)
+    throw new Error(`screen_review: Gemini Decisions API недоступна — ${imagePath} → ${DECISIONS_URL}: ${msg}${causeMsg}`)
   }
   if (response.status !== 200) {
-    throw new Error(`screen_review: ollama ${response.status} на ${imagePath} — ${truncate(response.body)}`)
+    throw new Error(`screen_review: decisions api ${response.status} на ${imagePath} — ${truncate(response.body)}`)
   }
   const label = `screen_review (${basename(imagePath)})`
   const { answers, inputTokens } = parseAnswers(response.body, label, Object.keys(questions))

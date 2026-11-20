@@ -6,6 +6,7 @@
 
 mod api;
 mod bots;
+mod clean_journal;
 mod clock;
 mod config;
 mod diag;
@@ -264,6 +265,10 @@ async fn run(
     ));
     let state_path = cfg.state_path(&config_path);
     let state = Arc::new(state::JsonStateStore::load(state_path, clock.clone()));
+    // undo-журнал чистки (#1158): файл рядом со state.json на volume
+    let clean_journals = Arc::new(clean_journal::JsonCleanJournals::load(
+        cfg.state_path(&config_path).with_file_name("undo.json"),
+    ));
     let spawn_models = Arc::new(match cfg.executor.models.as_ref() {
         Some(raw) => {
             let mut map = std::collections::HashMap::new();
@@ -400,6 +405,17 @@ async fn run(
             boards: boards_cfg.clone(),
             clock: clock.clone(),
             state: state.clone(),
+        }),
+        clean: Arc::new(uwuwu_usecase::TaskCleanUseCase {
+            // driver-независимо: gh-хаб и memory-хаб несут CleanBoardRepo
+            clean: match &memory_hub {
+                Some(mem) => mem.clone() as Arc<dyn uwuwu_usecase::CleanBoardRepo>,
+                None => github_hub.clone().expect("gh-хаб собран при driver=github")
+                    as Arc<dyn uwuwu_usecase::CleanBoardRepo>,
+            },
+            journals: clean_journals,
+            boards: boards_cfg.clone(),
+            clock: clock.clone(),
         }),
         wiki: wiki.clone(),
         sessions: sessions.clone(),
@@ -559,7 +575,7 @@ async fn run(
         // через raw-гейтвей дефолтного исполнителя (вне спавн-бюджета/CUP;
         // маршрутизация ботов по executor — вне скоупа #1203)
         let bot_sessions: Arc<dyn uwuwu_usecase::AgentSessionGateway> = raw_default.clone();
-        let bot_supervisor = Arc::new(bots::BotSupervisor::new(
+        let mut bot_supervisor = bots::BotSupervisor::new(
             wiki.clone(),
             bot_sessions,
             state.clone(),
@@ -570,7 +586,19 @@ async fn run(
                 Arc::new(tg::TelegramClient::new(token.to_string()))
                     as Arc<dyn uwuwu_usecase::bots::TelegramGateway>
             }),
-        ));
+        );
+        // Автокомпакт вечных сессий (#1221): секция [compact] конфига;
+        // отсутствует — off (safe default). Пороги — ms-арифметика поверх
+        // минутных полей секции.
+        bot_supervisor.compact = cfg
+            .compact
+            .clone()
+            .map(|c| uwuwu_usecase::bots::CompactPolicy {
+                idle_ms: c.idle_min * 60_000,
+                min_context_pct: c.min_context_pct,
+                cooldown_ms: c.cooldown_min * 60_000,
+            });
+        let bot_supervisor = Arc::new(bot_supervisor);
         sidecars.push(Sidecar {
             name: "bots".into(),
             tick: Box::new(move || {
@@ -701,6 +729,11 @@ async fn run(
         clock,
     }));
 
+    // Срез B' #1294: разводка «куча vs cgroup-учёт» — первая точка сразу
+    // (бут), дальше каждые 30 мин (page cache от mmap LanceDB прогревается
+    // работой; Railway-метрика = cgroup current, куча = RSS).
+    let memory_task = tokio::spawn(memory_loop());
+
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {},
         _ = sigterm() => {},
@@ -708,7 +741,40 @@ async fn run(
     tracing::info!(event = "server.stopping", "Server stopping");
     http_task.abort();
     tick_task.abort();
+    memory_task.abort();
     Ok(())
+}
+
+/// Периодический снимок памяти (срез B' #1294): событие server.memory —
+/// RSS процесса против cgroup-счётчика (Railway-метрика = cgroup current;
+/// page cache от mmap LanceDB прогревается работой, не куча).
+async fn memory_loop() {
+    let mut iv = tokio::time::interval(std::time::Duration::from_secs(1800));
+    iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        iv.tick().await;
+        let m = diag::memory_snapshot();
+        tracing::info!(
+            event = "server.memory",
+            rss_kb = m.rss_kb.map(|v| v.to_string()).as_deref().unwrap_or("n/a"),
+            cgroup_current_kb = m
+                .cgroup_current_kb
+                .map(|v| v.to_string())
+                .as_deref()
+                .unwrap_or("n/a"),
+            page_cache_kb = m
+                .cgroup_file_kb
+                .map(|v| v.to_string())
+                .as_deref()
+                .unwrap_or("n/a"),
+            cgroup_anon_kb = m
+                .cgroup_anon_kb
+                .map(|v| v.to_string())
+                .as_deref()
+                .unwrap_or("n/a"),
+            "Memory snapshot"
+        );
+    }
 }
 
 /// SIGTERM (Railway stop): graceful без паники.

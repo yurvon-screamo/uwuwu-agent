@@ -7,6 +7,7 @@ use super::fields::{parse_field_values, Fields, IssueFields};
 use super::pv2::Pv2Rest;
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 use uwuwu_domain::{Status, Task};
 use uwuwu_usecase::{CommentRef, GoalIssue, GoalsRepo, IssueView, TaskBoardRepo};
@@ -1269,6 +1270,81 @@ mod goals_json_tests {
     #[test]
     fn empty_array_yields_empty_list() {
         assert!(goals_from_json(&[]).is_empty());
+    }
+}
+
+/// Чистка доски (#1158): свежие пробы мимо кэшей + REST-мутации сноса/
+/// восстановления (ADR-113 — Pv2 REST, развод квот). Вердикты юзкейса
+/// стоят на этих пробах — недостоверная проба = Divergent = не трогать.
+#[async_trait]
+impl uwuwu_usecase::CleanBoardRepo for GitHubHub {
+    async fn fresh_index(
+        &self,
+        board: &str,
+    ) -> UsecaseResult<HashMap<u64, uwuwu_usecase::RowBinding>> {
+        Ok(self
+            .pv2
+            .fresh_index(board)
+            .await?
+            .into_iter()
+            .map(|(number, item)| {
+                (
+                    number,
+                    uwuwu_usecase::RowBinding {
+                        item_id: item.id,
+                        status_raw: item.status.filter(|s| !s.trim().is_empty()),
+                    },
+                )
+            })
+            .collect())
+    }
+
+    async fn fresh_issue(&self, number: u64) -> UsecaseResult<Option<uwuwu_usecase::IssueProbe>> {
+        let (status, issue) = self
+            .rest(
+                reqwest::Method::GET,
+                &format!("/repos/{}/issues/{number}", self.repo),
+                None,
+            )
+            .await?;
+        // 404 — issue нет (снесён вручную): None для вердикта Divergent
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(UsecaseError::Board(format!(
+                "issue probe #{number}: HTTP {status}"
+            )));
+        }
+        Ok(Some(uwuwu_usecase::IssueProbe {
+            title: issue["title"].as_str().unwrap_or_default().to_string(),
+            open: issue["state"].as_str() == Some("open"),
+            body: issue["body"].as_str().unwrap_or_default().to_string(),
+        }))
+    }
+
+    async fn remove_row(&self, board: &str, number: u64, item_id: u64) -> UsecaseResult<()> {
+        self.pv2.delete_item(board, number, item_id).await?;
+        // снапшот GraphQL-вью тоже отдаёт строку (кэш 240 с) — сброс:
+        // следующий read_board видит состав после сноса
+        self.invalidate_snapshot(board);
+        Ok(())
+    }
+
+    async fn restore_row(
+        &self,
+        board: &str,
+        number: u64,
+        status_raw: Option<&str>,
+    ) -> UsecaseResult<u64> {
+        // add без дефолта Analys (в отличие от create_issue): undo возвращает
+        // статус из журнала, не дефолт create-пути
+        let item_id = self.pv2.add_item(board, number).await?;
+        if let Some(raw) = status_raw.filter(|s| !s.trim().is_empty()) {
+            self.pv2.set_status(board, number, raw).await?;
+        }
+        self.invalidate_snapshot(board);
+        Ok(item_id)
     }
 }
 

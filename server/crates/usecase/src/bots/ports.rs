@@ -102,8 +102,15 @@ pub trait BotStateStore: Send + Sync {
     fn set_bot_offset(&self, slug: &str, offset: u64);
     /// Hash методички, вшитой в сессию бутстрап-промптом (doc-режим):
     /// расхождение = правка методички → следующий промпт понесёт её
-    /// снова (один раз), дальше — чистый текст.
+    /// снова (один раз), дальше — чистый текст. Some — записать,
+    /// None — забыть: сброс = «методички в живой сессии нет» —
+    /// дозаправка следующим промптом (компакт #1221 суммаризует
+    /// бутстрап; recreate теряет сессию целиком).
     fn bot_manual_hash(&self, slug: &str) -> Option<u64>;
-    fn set_bot_manual_hash(&self, slug: &str, hash: u64);
+    fn set_bot_manual_hash(&self, slug: &str, hash: Option<u64>);
+    /// Метка последней адмиссии компакта (#1221): 0 — не было; коулдаун
+    /// матрицы вердикта переживает рестарт сервера (персиста в state).
+    fn bot_compact_ms(&self, slug: &str) -> u64;
+    fn set_bot_compact_ms(&self, slug: &str, ms: u64);
     fn save(&self) -> UsecaseResult<()>;
 }

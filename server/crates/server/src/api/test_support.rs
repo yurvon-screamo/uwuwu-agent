@@ -45,6 +45,7 @@ pub(crate) fn tool_hub(
     let memory = Arc::new(MemoryHub::from_env());
     let board: Arc<dyn uwuwu_usecase::TaskBoardRepo> = memory.clone();
     let fields: Arc<dyn uwuwu_usecase::IssueFieldStore> = memory.clone();
+    let clean_repo: Arc<dyn uwuwu_usecase::CleanBoardRepo> = memory.clone();
     let tools = Arc::new(ToolHub {
         tasks: Arc::new(TaskView::new(
             board.clone(),
@@ -63,6 +64,12 @@ pub(crate) fn tool_hub(
             boards: vec![("uwuwu".to_string(), "Задачи uwuwu".to_string())],
             clock: Arc::new(SystemClock),
             state: Arc::new(StubState),
+        }),
+        clean: Arc::new(uwuwu_usecase::TaskCleanUseCase {
+            clean: clean_repo,
+            journals: Arc::new(StubJournals::default()),
+            boards: vec![("uwuwu".to_string(), "Задачи uwuwu".to_string())],
+            clock: Arc::new(SystemClock),
         }),
         wiki: wiki.clone(),
         sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(Arc::new(
@@ -103,6 +110,61 @@ impl WikiRepo for StubWiki {
             created: false,
             lines: 0,
         })
+    }
+}
+
+/// Undo-журналы в армах диспетчера: память на время пробы, персистентность
+/// не проверяется (юзкейс-пины clean.rs покрывают контракт журнала).
+pub(crate) struct StubJournals {
+    entries: std::sync::Mutex<std::collections::BTreeMap<String, uwuwu_usecase::CleanJournal>>,
+}
+
+impl Default for StubJournals {
+    fn default() -> Self {
+        Self {
+            entries: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+}
+
+impl uwuwu_usecase::CleanJournalStore for StubJournals {
+    fn put(&self, journal: &uwuwu_usecase::CleanJournal) -> UsecaseResult<()> {
+        self.entries
+            .lock()
+            .expect("stub journals")
+            .insert(journal.id.clone(), journal.clone());
+        Ok(())
+    }
+    fn get(
+        &self,
+        project: &str,
+        id: Option<&str>,
+    ) -> UsecaseResult<Option<uwuwu_usecase::CleanJournal>> {
+        let guard = self.entries.lock().expect("stub journals");
+        match id {
+            Some(id) => Ok(guard.get(id).filter(|j| j.project == project).cloned()),
+            None => Ok(guard
+                .values()
+                .filter(|j| j.project == project)
+                .max_by(|a, b| {
+                    a.created_ms
+                        .cmp(&b.created_ms)
+                        .then_with(|| a.id.cmp(&b.id))
+                })
+                .cloned()),
+        }
+    }
+    fn ids(&self, project: &str) -> UsecaseResult<Vec<String>> {
+        let mut by_age: Vec<(u64, String)> = self
+            .entries
+            .lock()
+            .expect("stub journals")
+            .values()
+            .filter(|j| j.project == project)
+            .map(|j| (j.created_ms, j.id.clone()))
+            .collect();
+        by_age.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        Ok(by_age.into_iter().map(|(_, id)| id).collect())
     }
 }
 

@@ -6,11 +6,14 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use uwuwu_domain::{BotAction, BotSpec};
+use uwuwu_domain::{BotAction, BotSpec, ModelRef};
 use uwuwu_usecase::bots::{
-    parse_bot_doc, plan_action, BotAssetStore, BotStateStore, TelegramGateway,
+    compact_verdict, parse_bot_doc, plan_action, BotAssetStore, BotStateStore, CompactFacts,
+    CompactPolicy, TelegramGateway,
 };
-use uwuwu_usecase::{AgentSessionGateway, Clock, TickStateStore, UsecaseResult, WikiRepo};
+use uwuwu_usecase::{
+    AgentSessionGateway, Clock, Liveness, TickStateStore, UsecaseResult, WikiRepo,
+};
 
 use super::runner::{spawn_bot_task, BotStructural, RETRY_PAUSE_MS};
 use super::BotLive;
@@ -79,6 +82,9 @@ pub struct BotSupervisor {
     pub(crate) reply_cap_ms: u64,
     pub(crate) reply_poll_ms: u64,
     pub(crate) guard: GuardTiming,
+    /// Политика автокомпакта (#1221): None — механика off (safe default,
+    /// секция [compact] конфига отсутствует).
+    pub(crate) compact: Option<CompactPolicy>,
     running: Mutex<HashMap<String, Running>>,
 }
 
@@ -106,6 +112,7 @@ impl BotSupervisor {
             reply_cap_ms: 3_600_000,
             reply_poll_ms: 2_000,
             guard: GuardTiming::default(),
+            compact: None,
             running: Mutex::new(HashMap::new()),
         }
     }
@@ -142,17 +149,136 @@ impl BotSupervisor {
                     "Док-спека не парсится — бот не поднимается (молчаливый пропуск прячет опечатку)");
             }
         }
-        let mut running = self.running.lock().expect("bots lock");
-        self.apply_stops(&mut running, &scanned);
-        self.revive_dead(&mut running, &scanned);
-        self.apply_diffs(&mut running, &scanned);
+        {
+            let mut running = self.running.lock().expect("bots lock");
+            self.apply_stops(&mut running, &scanned);
+            self.revive_dead(&mut running, &scanned);
+            self.apply_diffs(&mut running, &scanned);
+        } // гард умер в скоупе — future остаётся Send (await ниже)
+        self.compact_pass().await;
         Ok(())
     }
 
-    /// Скан реестра /bot (#1214): один list_docs, бот-док —
-    /// `bot/<имя>/README.md` (читается по слагу-файлу); спека и ключи
-    /// state/раннтайма — короткий `bot/<имя>`. Бот не требует
-    /// конфигурации [[project]] сервера (workspace в fm).
+    /// «Сессия потеряна исполнителем» (404-класс отказа пробы):
+    /// liveness-проба различает Dead от транспортного Unknown — пропуск
+    /// только по Dead, Unknown завершает проход (транспорт от гейта не
+    /// отличить — не долбим).
+    async fn session_gone(&self, session: &str) -> bool {
+        matches!(self.sessions.liveness(session).await, Liveness::Dead)
+    }
+
+    /// Компакт-проход (#1221): по живым ботам с сессией — факты (busy/
+    /// idle/занятость окна) → матрица вердикта → нативный compact
+    /// admission в окне неактивности. Секция конфига отсутствует —
+    /// no-op. Отказ union-скана — проход пропущен; транспортный отказ
+    /// пробы — проход тика завершён; потерянная сессия (404-класс) —
+    /// мимо одного бота, соседи продолжаются (ревью L1 #1221).
+    async fn compact_pass(&self) {
+        let Some(policy) = self.compact else { return };
+        let scan = match self.sessions.list_sessions().await {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::warn!(event = "bot.compact_scan_failed", error = %e,
+                    "Union-скан недоступен — компакт-проход пропущен");
+                return;
+            }
+        };
+        let now = self.clock.now_ms();
+        let snapshot: Vec<(String, BotSpec)> = {
+            let running = self.running.lock().expect("bots lock");
+            running
+                .iter()
+                .map(|(slug, r)| (slug.clone(), r.spec.clone()))
+                .collect()
+        };
+        for (slug, spec) in snapshot {
+            let Some(session) = self.state.bot_session(&slug) else {
+                continue; // сессии ещё нет — компактировать нечего
+            };
+            let busy = scan
+                .iter()
+                .find(|s| s.id == session)
+                .map(|s| s.busy)
+                .unwrap_or(false);
+            let idle_ms = match self.sessions.last_activity_ms(&session).await {
+                Ok(ms) => ms.map(|ms| now.saturating_sub(ms)),
+                Err(e) => {
+                    // 404-класс (сессия потеряна исполнителем) — мимо этого
+                    // бота, соседи продолжают (ревью L1 #1221); прочий
+                    // отказ (транспорт/гейт) — проход тика завершён, не
+                    // долбим упавший исполнитель.
+                    if self.session_gone(&session).await {
+                        tracing::warn!(event = "bot.compact_session_gone", slug = %slug,
+                            session = %session,
+                            "Сессия потеряна исполнителем — бот пропущен, соседи продолжаются");
+                        continue;
+                    }
+                    tracing::warn!(event = "bot.compact_probe_failed", slug = %slug,
+                        error = %e, "Проба активности не удалась — компакт-проход завершён");
+                    return;
+                }
+            };
+            let model = ModelRef::new(spec.model.provider.clone(), spec.model.id.clone());
+            let usage_pct = match self.sessions.context_usage_pct(&session, &model).await {
+                Ok(u) => u,
+                Err(e) => {
+                    if self.session_gone(&session).await {
+                        tracing::warn!(event = "bot.compact_session_gone", slug = %slug,
+                            session = %session,
+                            "Сессия потеряна исполнителем — бот пропущен, соседи продолжаются");
+                        continue;
+                    }
+                    tracing::warn!(event = "bot.compact_probe_failed", slug = %slug,
+                        error = %e, "Проба занятости не удалась — компакт-проход завершён");
+                    return;
+                }
+            };
+            let facts = CompactFacts {
+                busy,
+                idle_ms,
+                usage_pct,
+                last_compact_ms: self.state.bot_compact_ms(&slug),
+                now_ms: now,
+            };
+            let verdict = compact_verdict(&facts, &policy);
+            if !verdict.fire {
+                tracing::debug!(event = "bot.compact_skip", slug = %slug,
+                    reason = %verdict.reason, "Компакт: не стреляем");
+                continue;
+            }
+            // Метка ДО POST (ADR-082): коулдаун переживает рестарт
+            // сервера, повторная адмиссия исключена.
+            self.state.set_bot_compact_ms(&slug, now);
+            if let Err(e) = self.state.save() {
+                tracing::warn!(event = "bot.state_save_failed", slug = %slug, error = %e,
+                    "Метка компакта не персистится — рестарт может дать повторную адмиссию");
+            }
+            match self.sessions.compact_session(&session).await {
+                Ok(()) => {
+                    // doc-режим: бутстрап-методичка ушла в суммаризацию —
+                    // дозаправка следующим промптом (сброс hash);
+                    // agent-режим компактом не задевается (методичка —
+                    // системный контекст agents/<name>.md)
+                    if spec.agent.is_none() {
+                        self.state.set_bot_manual_hash(&slug, None);
+                        if let Err(e) = self.state.save() {
+                            tracing::warn!(event = "bot.state_save_failed", slug = %slug,
+                                error = %e, "Сброс manual-hash не персистится — методичка не дозаправится");
+                        }
+                    }
+                    tracing::info!(event = "bot.compacted", slug = %slug,
+                        session = %session, reason = %verdict.reason,
+                        "Нативный compact admitted");
+                }
+                Err(e) => {
+                    tracing::warn!(event = "bot.compact_failed", slug = %slug,
+                        session = %session, error = %e,
+                        "Адмиссия компакта не удалась — ретрай по коулдауну");
+                }
+            }
+        }
+    }
+
     async fn scan(&self) -> UsecaseResult<Vec<(String, Result<BotSpec, String>)>> {
         let mut out = Vec::new();
         for slug in self.wiki.list_docs("bot").await? {
@@ -297,6 +423,11 @@ impl BotSupervisor {
                         Some(BotAction::RecreateSession) => {
                             entry.task.abort();
                             self.state.set_bot_session(slug, None);
+                            // Методичка вшита в старую сессию (doc-режим) —
+                            // свежая её не получит: сброс hash = дозаправка
+                            // первым же промптом (#1221, тот же инвариант,
+                            // что у компакта).
+                            self.state.set_bot_manual_hash(slug, None);
                             if let Err(e) = self.state.save() {
                                 tracing::warn!(event = "bot.state_save_failed", slug = %slug, error = %e,
                                     "Сброс сессии не персистится — рестарт реанимирует старую сессию без новой model/workspace");

@@ -53,6 +53,11 @@ pub use router::SessionRouter;
 pub use search::{sync_allowed, SearchHit, SearchUseCase, SemanticBackend};
 pub use spawn_models::SpawnModels;
 pub use tasks::body_hash;
+pub use tasks::clean::{
+    CleanBoardRepo, CleanExecReport, CleanJournal, CleanJournalStore, CleanRow, CleanRowReport,
+    CleanVerdict, IssueProbe, RowBinding, TaskCleanUseCase, UndoOutcome, UndoReport,
+    CLEAN_BATCH_CAP,
+};
 pub use tasks::views::{DocsView, PersonView, TaskView};
 pub use tasks::write::{
     BodyWriteReceipt, NewTask, SectionAction, SectionEditReport, TaskPatch, TaskWriteUseCase,
