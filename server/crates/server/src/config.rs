@@ -135,6 +135,16 @@ pub struct Config {
     /// «старше недели»).
     #[serde(default)]
     pub sweep_days: u32,
+    /// env-gc (#1431): снос env терминальных строк, чей issue закрыт
+    /// строго старше этого числа суток (боевой 2 = «строго больше 48 ч»).
+    /// 0 = выключен (дефолт кода — kill-switch).
+    #[serde(default)]
+    pub env_gc_days: u32,
+    /// observe-гейт env-gc (#1431, срез 4 плана): кандидаты в лог,
+    /// команд нет — флип в false после пробы. Дефолт true (safe default:
+    /// деструктивная механика стартует только наблюдением).
+    #[serde(default = "default_true")]
+    pub env_gc_observe: bool,
     #[serde(default = "default_port")]
     port_cfg: u16,
     pub hub: HubCfg,
@@ -155,6 +165,10 @@ pub struct Config {
 
 fn default_poll() -> u64 {
     180
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_port() -> u16 {
@@ -235,6 +249,15 @@ impl Config {
         }
         if self.policy.cup == 0 {
             return Err(ConfigError::Validation("cup = 0 (конвейер стоит)".into()));
+        }
+        // env-gc (#1431): снос обязан успевать до архивации строки в
+        // холодный ящик — иначе env уходит в сироты вне досягаемости
+        // доски. sweep_days = 0 (клин выключен) — инвариант не применим.
+        if self.env_gc_days > 0 && self.sweep_days > 0 && self.env_gc_days >= self.sweep_days {
+            return Err(ConfigError::Validation(format!(
+                "env_gc_days ({}) обязан быть меньше sweep_days ({}): снос env должен успеть до архивации строки",
+                self.env_gc_days, self.sweep_days
+            )));
         }
         if !self.executor.url.starts_with("http") {
             return Err(ConfigError::Validation("executor.url не http(s)".into()));
@@ -724,5 +747,37 @@ env_root = "/tmp/env"
             .validate()
             .expect_err("неизвестный executor должен падать");
         assert!(err.to_string().contains("не найден"), "{err}");
+    }
+
+    #[test]
+    fn env_gc_defaults_are_off_and_observe() {
+        // Safe defaults (#1431): kill-switch 0 + observe — деструктивная
+        // механика стартует только наблюдением и по явному конфигу
+        let cfg = toml::from_str::<Config>(&minimal()).expect("toml парсится");
+        assert_eq!(cfg.env_gc_days, 0, "дефолт кода — выключен");
+        assert!(cfg.env_gc_observe, "дефолт кода — observe");
+        cfg.validate().expect("дефолты валидны");
+    }
+
+    #[test]
+    fn rejects_env_gc_days_not_older_than_sweep_days() {
+        // Инвариант порядка «снос 48 ч ≪ архивация 7 суток» (#1431):
+        // env_gc_days ≥ sweep_days при живом клине — громкий старт.
+        // Голые ключи — строго до base (после [[project]] они легли бы
+        // в таблицу проекта)
+        let raw = format!("sweep_days = 7\nenv_gc_days = 7\n{}\n", base_two_projects());
+        let cfg = toml::from_str::<Config>(&raw).expect("toml парсится");
+        let err = cfg.validate().expect_err("инвариант порядка обязан падать");
+        assert!(err.to_string().contains("env_gc_days"), "{err}");
+    }
+
+    #[test]
+    fn env_gc_days_valid_when_sweep_disabled() {
+        // sweep_days = 0 (клин выключен): строки не уходят в архив,
+        // сирот не бывает — инвариант порядка не применим
+        let raw = format!("sweep_days = 0\nenv_gc_days = 2\n{}\n", base_two_projects());
+        let cfg = toml::from_str::<Config>(&raw).expect("toml парсится");
+        cfg.validate()
+            .expect("клин выключен — инвариант не применим");
     }
 }
