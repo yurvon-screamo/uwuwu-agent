@@ -179,3 +179,28 @@ async fn docs_ls_clean_listing_unchanged() {
         vec!["P/Design Spec".to_string(), "P/README".to_string()]
     );
 }
+
+#[tokio::test]
+async fn docs_ls_empty_wiki_yields_empty_listing() {
+    // Пустая вики: dirs-вычисление на пустом входе — пустой листинг без
+    // паники (граничный вход коллизии-постобработки).
+    let view = DocsView::new(docs_wiki(&[]));
+    let out = view.list("").await.unwrap();
+    assert!(out.is_empty());
+}
+
+#[tokio::test]
+async fn docs_ls_stem_neighbor_not_leaked_into_listing() {
+    // Сосед по стему («XY» при запросе «X»): граница префикса — «{norm}/»
+    // или p == norm (выравнивание MemWiki с адаптером github_wiki, Low
+    // ревью #1385) — сосед не попадает в листинг, коллизия X помечена.
+    let view = DocsView::new(docs_wiki(&["X", "X/a", "XY"]));
+    let out = sorted(view.list("X").await.unwrap());
+    assert_eq!(
+        out,
+        vec![
+            "X (неоднозначно: файл «X.md» + папка «X/»)".to_string(),
+            "X/a".to_string(),
+        ]
+    );
+}
