@@ -350,15 +350,15 @@ async fn run(
             "main".to_string(),
         )),
     };
-    // Семантика: LanceDB embedded + Ollama-туннель (env UWUWU_EMBED_URL;
-    // нет туннеля — поиск честно без индекса)
-    let embed_url = std::env::var("UWUWU_EMBED_URL")
+    // Семантика: LanceDB embedded + Gemini Embedding 2 (#1363; env GEMINI_API_KEY;
+    // нет ключа — поиск честно без семантического индекса)
+    let gemini_key = std::env::var("GEMINI_API_KEY")
         .ok()
         .filter(|v| !v.is_empty());
-    let semantic_backend: Option<Arc<dyn uwuwu_usecase::SemanticBackend>> = match embed_url {
-        Some(url) => {
-            let embed = Arc::new(search::OllamaEmbeddings::new(
-                url,
+    let semantic_backend: Option<Arc<dyn uwuwu_usecase::SemanticBackend>> = match gemini_key {
+        Some(key) => {
+            let embed: Arc<dyn search::Embedder> = Arc::new(search::GeminiEmbeddings::new(
+                key,
                 std::env::var("UWUWU_EMBED_MODEL")
                     .ok()
                     .filter(|v| !v.is_empty())
@@ -666,7 +666,10 @@ async fn run(
     if let Some(backend) = semantic_backend.clone() {
         let clock2 = clock.clone();
 
-        // backoff: отказ туннеля/Ollama → тишина на час (не долбим каждые 3 мин)
+        // Backoff дифференцированный (#1363): 429 — ожидаемый сигнал лимитов
+        // Gemini free tier, бэкофф в минутах из RetryInfo (кап 15 мин);
+        // транспортный/5xx отказ — час, как прежде. Часовой бэкофф на 429
+        // запрещён — это тишина вместо работы.
         let backoff_until = Arc::new(std::sync::Mutex::new(0u64));
         sidecars.push(Sidecar {
             name: "semantic-sync".into(),
@@ -685,12 +688,24 @@ async fn run(
                     if !uwuwu_usecase::sync_allowed(clock.utc_minute()) {
                         return Ok(());
                     }
-                    // локальная Ollama без квот: бюджет щедрее free-плана
-                    // budget 4: догоняющий батч влезает в сайдкар-таймаут с запасом
-                    // (16 доков × ~30 чанков × RTT-туннеля = 120с+ → тик умирал на
-                    // таймауте ДО итогового лога; прогресс частями коммитился, но шумно)
-                    match b.sync_index(4).await {
+                    // бюджет = производная замеров спайка #1363 (формула в теле
+                    // задачи): ток-бюджет тика ≤ TPM_факт × pacing, гард 120с сайдкара
+                    match b.sync_index(search::SEMANTIC_SYNC_BUDGET).await {
                         Ok(_) => Ok(()),
+                        Err(uwuwu_usecase::UsecaseError::RateLimited {
+                            retry_after_secs,
+                            ..
+                        }) => {
+                            let secs = retry_after_secs
+                                .unwrap_or(search::RATE_LIMIT_DEFAULT_SECS)
+                                .min(search::RATE_LIMIT_CAP_SECS);
+                            let until = now + secs * 1000;
+                            *backoff.lock().expect("backoff lock") = until;
+                            tracing::warn!(event = "semantic.backoff_rate_limited",
+                                until_ms = until, retry_after_secs = secs,
+                                "Semantic sync: 429, пауза в минутах");
+                            Ok(())
+                        }
                         Err(e) => {
                             let until = now + 3_600_000;
                             *backoff.lock().expect("backoff lock") = until;

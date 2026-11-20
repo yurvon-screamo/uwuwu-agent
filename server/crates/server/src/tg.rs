@@ -9,7 +9,7 @@ use uwuwu_usecase::bots::{MediaKind, TelegramGateway, TgMedia, TgMessage, TgUpda
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 const API_BASE: &str = "https://api.telegram.org";
-/// Оверрайд базы ТГ-API (мок-стенд e2e) — паритет UWUWU_EMBED_URL.
+/// Оверрайд базы ТГ-API (мок-стенд e2e)
 const ENV_TG_API: &str = "UWUWU_TG_API";
 
 pub struct TelegramClient {

@@ -32,6 +32,9 @@ pub enum UsecaseError {
     BlobNotConfigured(String),
     /// Дедуп-ключ blob не прошёл доменный гард `BlobKey` (#1292).
     BlobBadKey(String),
+    /// Эмбеддинг-маршрут упёрся в лимиты провайдера (HTTP 429, #1363):
+    /// временная — ретрай осмыслен в том же часу; бэкофф из RetryInfo.
+    RateLimited { service: String, retry_after_secs: Option<u64> },
 }
 
 impl fmt::Display for UsecaseError {
@@ -48,6 +51,10 @@ impl fmt::Display for UsecaseError {
             Self::BlobTooBig(m) => write!(f, "blob too big: {m}"),
             Self::BlobNotConfigured(m) => write!(f, "blob не сконфигурирован: {m}"),
             Self::BlobBadKey(m) => write!(f, "blob bad key: {m}"),
+            Self::RateLimited { service, retry_after_secs } => match retry_after_secs {
+                Some(s) => write!(f, "{service}: rate limited, retry after {s}s"),
+                None => write!(f, "{service}: rate limited"),
+            },
         }
     }
 }
