@@ -827,19 +827,30 @@ impl TickUseCase {
                     .clear_spawn_loop(&victim.board, victim.number, victim.slot);
                 self.state
                     .clear_spawn_ms(&victim.board, victim.number, victim.slot);
-                if let Err(e) = self
+                let cleared = match self
                     .board
                     .clear_session(&victim.board, victim.number, victim.slot)
                     .await
                 {
-                    out.actions_failed += 1;
-                    tracing::warn!(
-                        event = "cup.preempt.clear_failed",
-                        victim = victim.number,
-                        error = %e,
-                        "Гашение состоялось, снятие ячейки не удалось — строка обслужится dead-веткой (прежняя механика)"
-                    );
-                }
+                    Ok(()) => {
+                        tracing::info!(
+                            event = "cup.preempt.cleared_cell",
+                            victim = victim.number,
+                            "Гашение — не смерть (#1412): ячейка снята, слот в очередь"
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        out.actions_failed += 1;
+                        tracing::warn!(
+                            event = "cup.preempt.clear_failed",
+                            victim = victim.number,
+                            error = %e,
+                            "Гашение состоялось, снятие ячейки не удалось — строка обслужится dead-веткой (прежняя механика)"
+                        );
+                        false
+                    }
+                };
                 tracing::info!(
                     event = "cup.preempt",
                     waiter = task.number(),
@@ -847,6 +858,7 @@ impl TickUseCase {
                     victim_session = %victim.session,
                     "CUP: слот отдан — low-актив погашен (abort+delete), возобновление — возврат в очередь спавна с чистым счётчиком"
                 );
+                let _ = cleared;
                 true
             }
             (abort_r, delete_r) => {

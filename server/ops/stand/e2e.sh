@@ -524,22 +524,24 @@ LEFT=$(curl -s --max-time 5 "http://127.0.0.1:$PORT_MOCK/api/session" | grep -c 
 [ "$LEFT" -eq 0 ] || fail "жертва 2046 не удалена с исполнителя (delete пропущен?)"
 grep -q '"preempts":1,' "$LOG_SRV_PRE" || fail "tick.completed не несёт preempts=1"
 grep -q 'loop_escalated' "$LOG_SRV_PRE" && fail "луп-гвард эскалировал"
-say "#1412: гашение — сброс ячейки и луп-гварда (cup.preempt.cleared_cell), 2048 заспавнена"
-# Волна 2 (#1412): 2049 High гасит 2046 (can_preempt High/Low) — счётчик
-# луп-гварда 2046 был сброшен в гашение выше (эскалации нет)
-mcp task_edit '{"number":2046,"project":"uwuwu","priority":"low"}' | grep -q '"isError":false' \
-  || fail "task_edit priority 2046 не применился"
+say "#1412: гашение — сброс ячейки и луп-гварда (cup.preempt.cleared_cell), 2048 заспавнена; ×5-цикл — unit-тест cup_preempt_wave"
+# Волна 2 (#1412): 2049 High гасит 2048 (can_preempt High/Low) — луп-гвард
+# 2048 был сброшен при первом гашении (эскалации нет)
+mcp task_edit '{"number":2048,"project":"uwuwu","priority":"low"}' | grep -q '"isError":false' \
+  || fail "task_edit priority 2048 не применился"
 SEEN=0
 while [ $SEEN -lt 12 ]; do
   SEEN=$((SEEN + 1)); sleep 5
-  grep -q '"event":"cup.preempt","waiter":2049,"victim":2046' "$LOG_SRV_PRE" && break
+  [ "$(grep -c '"event":"cup.preempt"' "$LOG_SRV_PRE" || true)" -ge 2 ] && break
 done
-grep -q '"event":"cup.preempt","waiter":2049,"victim":2046' "$LOG_SRV_PRE" \
-  || fail "вторая волна: 2049 не гасит 2046"
+[ "$(grep -c '"event":"cup.preempt"' "$LOG_SRV_PRE" || true)" -ge 2 ] \
+  || fail "вторая волна: 2049 не гасит 2048 (второго cup.preempt нет)"
+grep -q '"event":"cup.preempt","waiter":2049,"victim":2048' "$LOG_SRV_PRE" \
+  || fail "вторая волна: waiter/victim не 2049/2048"
 grep -q '"event":"spawn.done","number":2049,"slot":"Dev"' "$LOG_SRV_PRE" \
   || fail "кандидат 2049 не получил слот после второй волны"
-grep -q '"preempts":2,' "$LOG_SRV_PRE" || fail "tick.completed не несёт preempts=2"
 grep -q 'loop_escalated' "$LOG_SRV_PRE" && fail "луп-гвард эскалировал на второй волне (фикс сломан)"
+say "#1412: вторая волна — 2049 гасит 2048, эскалаций нет"
 # pid-scoped зачистка (конвенция #1263): чужие стенды не трогаем
 kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
 wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
