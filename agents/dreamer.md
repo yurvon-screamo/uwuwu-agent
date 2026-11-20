@@ -83,8 +83,8 @@ Compare with what actually happened in the session and the git state:
   a dedup search of the topic via `MCP uwuwu_search "<тема>"` (full-text + doc sections +
   semantics). A live ADR found that the new one supersedes **in full** — before/when creating the new
   one, move its status (the «Статус» line in the doc's md)
-  to `Superseded by ADR-NNN · <дата> (Accepted · <оригинальная дата>)`, where
-  NNN — the new ADR's number; the existing tail of the status line (footnotes: know-how,
+  to `Superseded by ADR-<slug> · <дата> (Accepted · <оригинальная дата>)`, where
+  `ADR-<slug>` — the new ADR's name; the existing tail of the status line (footnotes: know-how,
   rollback paths) — keep it; change the lead, do not erase facts. A case without an ADR successor
   (the mechanics removed, no new ADR
   present) — `Superseded · <дата> — <факт-сноска, PR #NNN>`. A partial overlap
@@ -282,7 +282,7 @@ record — an operational log for recurrence assessment, not a transfer of verdi
 experience (step 5 stays about transferable knowledge). Before opening, check the
 pain project's ADR folder (per the step 7 rule): the pattern contradicts a superseded
 decision (a Superseded status) — do not open the task, a registry record with the outcome
-«против ADR-NNN, решение владельца».
+«против ADR-<имя или легаси-номер>, решение владельца».
 
 ### 9. Degradation and modesty
 
