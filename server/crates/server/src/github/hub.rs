@@ -1273,6 +1273,50 @@ mod goals_json_tests {
     }
 }
 
+#[cfg(test)]
+mod goals_live_tests {
+    use super::GitHubHub;
+    use uwuwu_usecase::GoalsRepo;
+
+    // Живой e2e REST-границы целей (#1216): реальный hub-репо, гвард
+    // UWUWU_E2E=1 (культура репо — образец gitea_tests::live_probe_*).
+    // Ловит возврат «слепого» потребителя (мастер: goal_list отвечал
+    // «реестр пуст» на всё): поломку запроса (лейблы/state), маппинг
+    // ответа и проектный фильтр лейблов на живых данных. Фиксация на
+    // живой реестр uwuwu (цели #1393/#1394): если владелец закрыл все
+    // цели — тест правится на актуальный факт, не сносится.
+    #[tokio::test]
+    async fn live_goal_list_reads_open_issues_by_labels() {
+        if std::env::var("UWUWU_E2E").as_deref() != Ok("1") {
+            return;
+        }
+        let token = std::env::var("GH_TOKEN").unwrap_or_default();
+        assert!(!token.is_empty(), "UWUWU_E2E=1: нужен GH_TOKEN");
+        let hub = GitHubHub::new("yurvon-screamo/uwuwu-hub".into(), token);
+        let goals = hub
+            .open_goals("uwuwu")
+            .await
+            .expect("живой REST open_goals uwuwu");
+        assert!(
+            !goals.is_empty(),
+            "реестр uwuwu пуст на живом hub — сломан носитель или запрос"
+        );
+        for g in &goals {
+            assert!(g.number > 0, "номер issue не смапился: {g:?}");
+            assert!(!g.title.is_empty(), "тайтл не смапился: {g:?}");
+        }
+        // проектный фильтр лейблов: несуществующий проект — пусто, не чужие цели
+        let none = hub
+            .open_goals("no-such-proj-1216")
+            .await
+            .expect("живой REST open_goals по несуществующему проекту");
+        assert!(
+            none.is_empty(),
+            "лейбл-фильтр пропустил чужие цели: {none:?}"
+        );
+    }
+}
+
 /// Чистка доски (#1158): свежие пробы мимо кэшей + REST-мутации сноса/
 /// восстановления (ADR-113 — Pv2 REST, развод квот). Вердикты юзкейса
 /// стоят на этих пробах — недостоверная проба = Divergent = не трогать.
