@@ -73,6 +73,7 @@ impl TaskBoardRepo for SweepBoard {
         _n: u64,
         _p: Option<&str>,
         _a: Option<bool>,
+        _d: Option<bool>,
     ) -> UsecaseResult<()> {
         Ok(())
     }

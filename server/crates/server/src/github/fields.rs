@@ -198,38 +198,21 @@ impl IssueFields {
         if resolve_field(&catalog, name).is_some() {
             return Ok(());
         }
-        // «Тип» — single-select канона (create без поля падал «глобальное
-        // поле не найдено», инцидент #1149); автомерж (#1232) —
-        // single_select off/on; прочие имена — текст
-        let body = match name {
-            "Тип" => {
-                let colors = [
-                    "red", "purple", "blue", "gray", "gray", "green", "yellow", "orange", "pink",
-                    "green", "blue",
-                ];
-                let options: Vec<Value> = uwuwu_usecase::TASK_TYPES
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| {
-                        json!({ "name": uwuwu_usecase::task_type_name(*t), "color": colors[i],
-                                "priority": i + 1 })
-                    })
-                    .collect();
-                json!({ "name": name, "data_type": "single_select", "options": options })
-            }
-            "Automerge" | "Autodone" => json!({
-                "name": name, "data_type": "single_select",
-                "options": [
-                    { "name": "off", "color": "gray" },
-                    { "name": "on", "color": "green" },
-                ]
-            }),
-            _ => json!({ "name": name, "data_type": "text" }),
-        };
-        let (status, _resp) = self
+        let body = ensure_field_body(name);
+        let (status, resp) = self
             .rest(reqwest::Method::POST, "/user/issue-fields", Some(body))
             .await?;
-        if !status.is_success() && status.as_u16() != 422 {
+        if status.as_u16() == 422 {
+            // 422 различается честно: «already exists» — гонка ensure'ов
+            // (параллельные create'ы, ADR-057-семейство), идемпотентно ok;
+            // прочий 422 — ошибка формы тела, раньше маскировалась любым
+            // 422 (баг-репорт #1357 круг 1, п.2) — громкий отказ с телом
+            if !field_422_already_exists(&resp) {
+                return Err(UsecaseError::Board(format!(
+                    "создание поля «{name}»: HTTP 422 — {resp}"
+                )));
+            }
+        } else if !status.is_success() {
             return Err(UsecaseError::Board(format!(
                 "создание поля «{name}»: HTTP {status}"
             )));
@@ -237,6 +220,62 @@ impl IssueFields {
         *self.catalog.lock().expect("catalog lock") = None;
         Ok(())
     }
+}
+
+/// Тело POST /user/issue-fields по имени поля. Опции single_select несут
+/// priority: без него GitHub отвечает 422 на свежей среде (баг-репорт
+/// #1357 круг 1; рабочий образец — ветка «Тип»). «Тип» — single-select
+/// канона (инцидент #1149); автомерж (#1232) — single_select off/on;
+/// direct (#1357) — тот же паттерн; прочие имена — текст.
+fn ensure_field_body(name: &str) -> Value {
+    let on_off = |on_color: &str| {
+        json!({
+            "options": [
+                { "name": "off", "color": "gray", "priority": 1 },
+                { "name": "on", "color": on_color, "priority": 2 },
+            ]
+        })
+    };
+    match name {
+        "Тип" => {
+            let colors = [
+                "red", "purple", "blue", "gray", "gray", "green", "yellow", "orange", "pink",
+                "green", "blue",
+            ];
+            let options: Vec<Value> = uwuwu_usecase::TASK_TYPES
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    json!({ "name": uwuwu_usecase::task_type_name(*t), "color": colors[i],
+                            "priority": i + 1 })
+                })
+                .collect();
+            json!({ "name": name, "data_type": "single_select", "options": options })
+        }
+        "Automerge" | "Autodone" => {
+            let mut body = on_off("green");
+            body["name"] = json!(name);
+            body["data_type"] = json!("single_select");
+            body
+        }
+        // direct-класс (#1357): тот же носитель-паттерн, legacy-алиаса нет
+        uwuwu_usecase::F_DIRECT => {
+            let mut body = on_off("orange");
+            body["name"] = json!(name);
+            body["data_type"] = json!("single_select");
+            body
+        }
+        _ => json!({ "name": name, "data_type": "text" }),
+    }
+}
+
+/// Детектор «422 = поле уже есть» (гонка параллельных ensure'ов,
+/// ADR-057-семейство): GitHub отдаёт errors[].code с already_exists
+/// префиксом. Прочий 422 — ошибка формы тела, не маскируется
+/// (баг-репорт #1357 круг 1, п.2).
+fn field_422_already_exists(resp: &Value) -> bool {
+    let s = resp.to_string();
+    s.contains("already exists") || s.contains("already_exists")
 }
 
 /// issue_field_values → карта (name → value; select — имя опции).
@@ -282,6 +321,86 @@ impl IssueFieldStore for IssueFields {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ensure-боди несёт priority в каждой опции: GitHub 422 без него
+    /// на свежей среде (баг-репорт #1357 круг 1; семья — Automerge и Direct).
+    #[test]
+    fn ensure_field_body_options_carry_priority() {
+        for name in ["Automerge", "Autodone", uwuwu_usecase::F_DIRECT] {
+            let body = ensure_field_body(name);
+            assert_eq!(body["name"], *name, "{name}: имя поля в теле");
+            assert_eq!(body["data_type"], "single_select");
+            let options = body["options"].as_array().expect("options");
+            assert_eq!(options.len(), 2, "{name}: off/on");
+            for (i, opt) in options.iter().enumerate() {
+                assert_eq!(
+                    opt["priority"].as_u64(),
+                    Some((i + 1) as u64),
+                    "{name}: опция {} без priority (422 на свежей среде)",
+                    opt["name"]
+                );
+            }
+        }
+        // «Тип» — рабочий образец, тоже под пином
+        let kind = ensure_field_body("Тип");
+        for opt in kind["options"].as_array().expect("options") {
+            assert!(
+                opt["priority"].as_u64().is_some(),
+                "«Тип» опция без priority"
+            );
+        }
+        // прочие имена — текст (без options)
+        let text = ensure_field_body("Сессия dev");
+        assert_eq!(text["data_type"], "text");
+    }
+
+    /// 422 различается честно: already exists — идемпотентный ok,
+    /// прочий 422 (ошибка формы) — громкий отказ, не маскировка
+    /// (баг-репорт #1357 круг 1, п.2).
+    #[test]
+    fn ensure_field_422_already_exists_is_tolerated() {
+        let already = json!({
+            "message": "Validation Failed",
+            "errors": [{ "resource": "IssueField", "code": "already_exists_at_user" }]
+        });
+        assert!(field_422_already_exists(&already));
+        let already_verbose = json!({ "message": "name already exists on this account" });
+        assert!(field_422_already_exists(&already_verbose));
+        let other = json!({ "message": "Validation Failed: priority is invalid" });
+        assert!(
+            !field_422_already_exists(&other),
+            "не-already 422 не маскируется: {other}"
+        );
+    }
+
+    /// REST-путь чтения direct (#1357, тестировщик): issue_field_values
+    /// с Direct читается в карту, read_issue поверх мапит «on» → флаг.
+    #[test]
+    fn parse_field_values_direct_on_off() {
+        let issue = json!({
+            "issue_field_values": [
+                { "issue_field_name": "Direct", "single_select_option": { "name": "on" } },
+            ]
+        });
+        let f = parse_field_values(&issue);
+        assert_eq!(
+            f.get(uwuwu_usecase::F_DIRECT).map(String::as_str),
+            Some("on")
+        );
+        let issue_off = json!({
+            "issue_field_values": [
+                { "issue_field_name": "Direct", "single_select_option": { "name": "off" } },
+            ]
+        });
+        let f = parse_field_values(&issue_off);
+        assert_eq!(
+            f.get(uwuwu_usecase::F_DIRECT).map(String::as_str),
+            Some("off")
+        );
+        // отсутствующее поле — ключа нет (внутри read_issue → direct=false)
+        let bare = parse_field_values(&json!({ "issue_field_values": [] }));
+        assert!(!bare.contains_key(uwuwu_usecase::F_DIRECT));
+    }
 
     #[test]
     fn parses_inline_values() {

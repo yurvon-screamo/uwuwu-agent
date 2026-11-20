@@ -305,6 +305,7 @@ impl TaskBoardRepo for MemoryHub {
         number: u64,
         priority: Option<&str>,
         automerge: Option<bool>,
+        direct: Option<bool>,
     ) -> UsecaseResult<()> {
         self.with_state(|state| {
             // сид материализуется лениво — симметрично row_status/set_status
@@ -320,6 +321,9 @@ impl TaskBoardRepo for MemoryHub {
             }
             if let Some(a) = automerge {
                 task.set_automerge(a);
+            }
+            if let Some(d) = direct {
+                task.set_direct(d);
             }
             Ok(())
         })
@@ -684,6 +688,11 @@ impl IssueFieldStore for MemoryHub {
                     uwuwu_usecase::F_AUTOMERGE.into(),
                     if t.automerge() { "on" } else { "off" }.into(),
                 );
+                // direct (#1357): поле строки, как automerge/priority на стенде
+                out.insert(
+                    uwuwu_usecase::F_DIRECT.into(),
+                    if t.direct() { "on" } else { "off" }.into(),
+                );
                 let name = match t.priority() {
                     uwuwu_domain::Priority::High => Some("high"),
                     uwuwu_domain::Priority::Medium => Some("medium"),
@@ -983,7 +992,7 @@ mod tests {
     #[tokio::test]
     async fn board_cells_are_visible_to_read_board_immediately() {
         let hub = MemoryHub::with_seed(Some((7, Status::Analys)));
-        hub.set_board_cells("B", 7, Some("high"), Some(true))
+        hub.set_board_cells("B", 7, Some("high"), Some(true), None)
             .await
             .expect("запись ячеек");
         let rows = hub.read_board("B").await.expect("чтение доски");
@@ -1008,7 +1017,7 @@ mod tests {
             .create_issue("B", "uwuwu", "строка", "тело")
             .await
             .expect("создание строки");
-        hub.set_board_cells("B", n, Some("low"), Some(false))
+        hub.set_board_cells("B", n, Some("low"), Some(false), None)
             .await
             .expect("запись ячеек свежей строки");
         let rows = hub.read_board("B").await.expect("чтение доски");

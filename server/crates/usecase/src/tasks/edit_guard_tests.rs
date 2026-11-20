@@ -68,6 +68,7 @@ impl TaskBoardRepo for StaleBoard {
         _n: u64,
         _p: Option<&str>,
         _a: Option<bool>,
+        _d: Option<bool>,
     ) -> UsecaseResult<()> {
         Ok(())
     }
@@ -138,6 +139,25 @@ impl IssueFieldStore for FilledFields {
         Ok(std::collections::HashMap::from([
             (crate::naming::F_PRIORITY.to_string(), "medium".to_string()),
             (crate::naming::F_AUTOMERGE.to_string(), "on".to_string()),
+        ]))
+    }
+
+    async fn store(&self, _: u64, _: &[(&str, Option<String>)]) -> UsecaseResult<()> {
+        Ok(())
+    }
+}
+
+/// direct-строка (#1357): носитель несёт Direct=on — гард открывает
+/// ребро In Progress → Review только этой строке.
+struct DirectFields;
+
+#[async_trait]
+impl IssueFieldStore for DirectFields {
+    async fn load(&self, _: u64) -> UsecaseResult<std::collections::HashMap<String, String>> {
+        Ok(std::collections::HashMap::from([
+            (crate::naming::F_PRIORITY.to_string(), "medium".to_string()),
+            (crate::naming::F_AUTOMERGE.to_string(), "off".to_string()),
+            (crate::naming::F_DIRECT.to_string(), "on".to_string()),
         ]))
     }
 
@@ -273,9 +293,13 @@ impl TickStateStore for NopState {
 }
 
 fn writer(board: Arc<StaleBoard>) -> TaskWriteUseCase {
+    writer_with(board, Arc::new(FilledFields))
+}
+
+fn writer_with(board: Arc<StaleBoard>, fields: Arc<dyn IssueFieldStore>) -> TaskWriteUseCase {
     TaskWriteUseCase {
         board,
-        fields: Arc::new(FilledFields),
+        fields,
         boards: vec![("uwuwu".into(), "B".into())],
         clock: Arc::new(FixedClock),
         state: Arc::new(NopState),
@@ -345,6 +369,56 @@ async fn dev_sends_to_testing_from_in_progress() {
         .await
         .expect("ребро In Progress → Testing легально (прямая отправка на тест)");
     assert_eq!(board.writes(), vec![(11, Status::Testing)]);
+}
+
+#[tokio::test]
+async fn direct_row_finishes_to_review() {
+    // #1357: direct-строка финализируется агентом сам — In Progress →
+    // Review с флагом Direct=on на носителе; мутация происходит.
+    let board = Arc::new(StaleBoard {
+        snapshot: vec![StaleBoard::task(11, Status::InProgress)],
+        carrier: vec![StaleBoard::task(11, Status::InProgress)],
+        writes: Mutex::new(vec![]),
+    });
+    writer_with(board.clone(), Arc::new(DirectFields))
+        .edit(
+            "uwuwu",
+            11,
+            TaskPatch {
+                status: Some(Status::UserReview),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("direct-ребро In Progress → Review открыто флагом");
+    assert_eq!(board.writes(), vec![(11, Status::UserReview)]);
+}
+
+#[tokio::test]
+async fn ordinary_row_cannot_skip_to_review() {
+    // Без флага direct ребро In Progress → Review вне канона — «Ревью
+    // результата»/«Тестирование» обязательны (регресс-пин канона).
+    let board = Arc::new(StaleBoard {
+        snapshot: vec![StaleBoard::task(11, Status::InProgress)],
+        carrier: vec![StaleBoard::task(11, Status::InProgress)],
+        writes: Mutex::new(vec![]),
+    });
+    let res = writer_with(board.clone(), Arc::new(FilledFields))
+        .edit(
+            "uwuwu",
+            11,
+            TaskPatch {
+                status: Some(Status::UserReview),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(res.is_err(), "без direct-флага ребро закрыто");
+    assert!(
+        board.writes().is_empty(),
+        "мутации не должно быть: {:?}",
+        board.writes()
+    );
 }
 
 #[tokio::test]

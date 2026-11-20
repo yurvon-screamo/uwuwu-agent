@@ -31,7 +31,8 @@ pub use crons::{parse_schedule_text, CronUseCase, FireOutcome, CRON_DIR};
 pub use error::{UsecaseError, UsecaseResult};
 pub use naming::{
     agent_name, parse_agent, parse_priority, parse_status, parse_task_type, priority_name,
-    schedule_label, slot_key, status_name, task_type_name, F_AUTOMERGE, F_PRIORITY, TASK_TYPES,
+    schedule_label, slot_key, status_name, task_type_name, F_AUTOMERGE, F_DIRECT, F_PRIORITY,
+    TASK_TYPES,
 };
 pub use pipeline::sweeper;
 pub use pipeline::{
