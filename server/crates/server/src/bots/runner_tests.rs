@@ -607,6 +607,7 @@ impl TickStateStore for MemTickState {
         None
     }
     fn set_spawn_loop(&self, _b: &str, _n: u64, _s: Slot, _st: Status, _r: u32) {}
+    fn clear_spawn_loop(&self, _b: &str, _n: u64, _s: Slot) {}
     fn reset_stale_spawn_loops(&self, _b: &str, _n: u64, _c: Status) {}
     fn review_rounds(&self, _b: &str, _n: u64) -> u32 {
         0

@@ -527,6 +527,14 @@ impl TickStateStore for JsonStateStore {
         );
     }
 
+    fn clear_spawn_loop(&self, board: &str, number: u64, slot: Slot) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .spawn_loops
+            .remove(&format!("{board}:{number}:{}", naming::slot_key(slot)));
+    }
+
     fn reset_stale_spawn_loops(&self, board: &str, number: u64, current: Status) {
         let prefix = format!("{board}:{number}:");
         let current_name = naming::status_name(current);

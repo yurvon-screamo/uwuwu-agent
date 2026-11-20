@@ -252,6 +252,7 @@ impl TickStateStore for NopState {
     }
 
     fn set_spawn_loop(&self, _: &str, _: u64, _: Slot, _: Status, _: u32) {}
+    fn clear_spawn_loop(&self, _: &str, _: u64, _: Slot) {}
 
     fn reset_stale_spawn_loops(&self, _: &str, _: u64, _: Status) {}
 

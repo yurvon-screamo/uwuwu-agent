@@ -18,7 +18,9 @@ use uwuwu_domain::{
 };
 
 struct FakeBoard {
-    rows: Vec<Task>,
+    /// Mutex — тест-хореографии волн (#1412) добавляют строки между тиками
+    /// (кандидаты приходят волнами, как ночные волны конвейера).
+    rows: std::sync::Mutex<Vec<Task>>,
     log: Mutex<Vec<String>>,
     /// Журнал комментов задач (будильник-сценарии: latest_comments).
     comments: Vec<CommentRef>,
@@ -26,6 +28,8 @@ struct FakeBoard {
     fields_fails: bool,
     /// Отказ set_session (записи ячейки) — сирота-зачистка (#1163).
     set_session_fails: bool,
+    /// Отказ clear_session (снятия ячейки) — краш-окно гашения (#1412).
+    clear_session_fails: AtomicBool,
     /// Отказ set_status (эскалационный ретрай: счётчик стоит на капе —
     /// #1311, ревью L2).
     status_fails: AtomicBool,
@@ -34,7 +38,7 @@ struct FakeBoard {
 #[async_trait]
 impl TaskBoardRepo for FakeBoard {
     async fn read_board(&self, _board: &str) -> UsecaseResult<Vec<Task>> {
-        Ok(self.rows.clone())
+        Ok(self.rows.lock().unwrap().clone())
     }
     async fn set_status(&self, _b: &str, n: u64, s: Status) -> UsecaseResult<()> {
         if self.status_fails.load(Ordering::Relaxed) {
@@ -46,12 +50,14 @@ impl TaskBoardRepo for FakeBoard {
     async fn row_status(&self, _b: &str, n: u64) -> UsecaseResult<Option<Status>> {
         Ok(self
             .rows
+            .lock()
+            .unwrap()
             .iter()
             .find(|t| t.number() == n)
             .map(|t| t.status()))
     }
     async fn row_exists(&self, _b: &str, n: u64) -> UsecaseResult<bool> {
-        Ok(self.rows.iter().any(|t| t.number() == n))
+        Ok(self.rows.lock().unwrap().iter().any(|t| t.number() == n))
     }
     async fn set_session(&self, _b: &str, n: u64, _slot: Slot, s: &str) -> UsecaseResult<()> {
         if self.set_session_fails {
@@ -83,6 +89,11 @@ impl TaskBoardRepo for FakeBoard {
     }
 
     async fn clear_session(&self, _b: &str, n: u64, slot: Slot) -> UsecaseResult<()> {
+        if self.clear_session_fails.load(Ordering::Relaxed) {
+            return Err(UsecaseError::Session(
+                "clear_session недоступен (мок)".into(),
+            ));
+        }
         self.log
             .lock()
             .unwrap()
@@ -97,6 +108,8 @@ impl TaskBoardRepo for FakeBoard {
         // enrichment-фейк: поля несут строки (как настоящий hub из REST)
         Ok(self
             .rows
+            .lock()
+            .unwrap()
             .iter()
             .find(|t| t.number() == n)
             .map(|t| {
@@ -146,6 +159,8 @@ impl TaskBoardRepo for FakeBoard {
     async fn read_issue(&self, _b: &str, n: u64) -> UsecaseResult<crate::ports::IssueView> {
         let task = self
             .rows
+            .lock()
+            .unwrap()
             .iter()
             .find(|t| t.number() == n)
             .cloned()
@@ -163,7 +178,7 @@ impl TaskBoardRepo for FakeBoard {
         title: &str,
         _body: &str,
     ) -> UsecaseResult<u64> {
-        let n = self.rows.len() as u64 + 100;
+        let n = self.rows.lock().unwrap().len() as u64 + 100;
         self.log.lock().unwrap().push(format!("create:{title}"));
         Ok(n)
     }
@@ -761,6 +776,13 @@ impl TickStateStore for MemState {
             g.loops.push((n, s, status, r));
         }
     }
+    fn clear_spawn_loop(&self, _b: &str, n: u64, s: Slot) {
+        self.0
+            .lock()
+            .unwrap()
+            .loops
+            .retain(|(num, slot, _, _)| !(*num == n && *slot == s));
+    }
     fn reset_stale_spawn_loops(&self, _b: &str, n: u64, current: Status) {
         let mut g = self.0.lock().unwrap();
         g.resets.push((n, current));
@@ -835,11 +857,12 @@ fn usecase_with_state(
     state: Arc<MemState>,
 ) -> (TickUseCase, Arc<FakeBoard>, Arc<FakeSessions>, Arc<FakePrs>) {
     let board = Arc::new(FakeBoard {
-        rows,
+        rows: rows.into(),
         log: Mutex::default(),
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
     let sessions = Arc::new(FakeSessions::new());
@@ -883,11 +906,12 @@ fn peak_usecase(
     state: Arc<MemState>,
 ) -> (TickUseCase, Arc<FakeBoard>, Arc<FakeSessions>, Arc<FakePrs>) {
     let board = Arc::new(FakeBoard {
-        rows,
+        rows: rows.into(),
         log: Mutex::default(),
         comments,
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
     let sessions = Arc::new(FakeSessions {
@@ -937,11 +961,12 @@ fn usecase_with_sessions(
     state: Arc<MemState>,
 ) -> (TickUseCase, Arc<FakeBoard>, Arc<FakeSessions>, Arc<FakePrs>) {
     let board = Arc::new(FakeBoard {
-        rows,
+        rows: rows.into(),
         log: Mutex::default(),
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
     let sessions = Arc::new(sessions);
@@ -992,11 +1017,12 @@ fn routed_usecase(
 ) -> TickUseCase {
     TickUseCase {
         board: Arc::new(FakeBoard {
-            rows,
+            rows: rows.into(),
             log: Mutex::default(),
             comments,
             fields_fails: false,
             set_session_fails: false,
+            clear_session_fails: AtomicBool::new(false),
             status_fails: AtomicBool::new(false),
         }),
         sessions: Arc::new(SessionRouter::new(
@@ -1203,11 +1229,12 @@ fn wake_usecase(
     state: Arc<MemState>,
 ) -> (TickUseCase, Arc<FakeSessions>, Arc<MemState>) {
     let board = Arc::new(FakeBoard {
-        rows,
+        rows: rows.into(),
         log: Mutex::default(),
         comments,
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
     let sessions = Arc::new(FakeSessions {
@@ -1638,11 +1665,12 @@ async fn dev_spawn_pins_the_developer_agent() {
     // Кастомная карта с разведёнными ключами default/developer — пин
     // перехода модели: рабочая дев-сессия берёт developer-ключ.
     let board = Arc::new(FakeBoard {
-        rows: vec![task(1, Status::InProgress)],
+        rows: std::sync::Mutex::new(vec![task(1, Status::InProgress)]),
         log: Mutex::default(),
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
     let sessions = Arc::new(FakeSessions::new());
@@ -2670,11 +2698,12 @@ async fn mixed_health_candidate_decided_by_status_fallback_at_cup_gate() {
             by_project,
         );
         let board = Arc::new(FakeBoard {
-            rows: rows(),
+            rows: std::sync::Mutex::new(rows()),
             log: Mutex::default(),
             comments: Vec::default(),
             fields_fails: false,
             set_session_fails: false,
+            clear_session_fails: AtomicBool::new(false),
             status_fails: AtomicBool::new(false),
         });
         // master-break #1155 x #1263: struct вырос probes, оба новых
@@ -2732,11 +2761,12 @@ async fn foreign_executor_failure_does_not_blind_project_guard() {
     );
     let state = Arc::new(MemState(Mutex::default()));
     let board = Arc::new(FakeBoard {
-        rows: vec![task(65, Status::InProgress)],
+        rows: std::sync::Mutex::new(vec![task(65, Status::InProgress)]),
         log: Mutex::default(),
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
     // master-break #1155×#1263 (см. соседний тест): probes не догнали
@@ -2873,7 +2903,7 @@ async fn wakeup_held_when_cup_full() {
     );
     t.apply_fields(f);
     let board = Arc::new(FakeBoard {
-        rows: vec![t],
+        rows: std::sync::Mutex::new(vec![t]),
         log: Mutex::default(),
         comments: vec![CommentRef {
             id: "c1".into(),
@@ -2882,6 +2912,7 @@ async fn wakeup_held_when_cup_full() {
         }],
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
     let sessions = Arc::new(FakeSessions {
@@ -2946,7 +2977,7 @@ async fn wakeup_delivery_occupies_cup_slot() {
     woken.apply_fields(fw);
     let candidate = task(181, Status::InProgress);
     let board = Arc::new(FakeBoard {
-        rows: vec![woken, candidate],
+        rows: std::sync::Mutex::new(vec![woken, candidate]),
         log: Mutex::default(),
         comments: vec![CommentRef {
             id: "c180".into(),
@@ -2955,6 +2986,7 @@ async fn wakeup_delivery_occupies_cup_slot() {
         }],
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
     let sessions = Arc::new(FakeSessions {
@@ -3258,10 +3290,11 @@ async fn undelivered_comment_is_not_marked_seen() {
     let state = Arc::new(MemState(Mutex::default()));
     let (u, _, sessions, _) = {
         let board = Arc::new(FakeBoard {
-            rows: vec![t],
+            rows: std::sync::Mutex::new(vec![t]),
             log: Mutex::default(),
             fields_fails: false,
             set_session_fails: false,
+            clear_session_fails: AtomicBool::new(false),
             status_fails: AtomicBool::new(false),
             comments: vec![CommentRef {
                 id: "verdict".into(),
@@ -3327,10 +3360,11 @@ async fn undelivered_comment_is_not_marked_seen() {
     );
     t2.apply_fields(f2);
     let board = Arc::new(FakeBoard {
-        rows: vec![t2],
+        rows: std::sync::Mutex::new(vec![t2]),
         log: Mutex::default(),
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
         comments: vec![CommentRef {
             id: "verdict".into(),
@@ -3394,10 +3428,11 @@ async fn multi_comment_tail_delivered_together() {
     let state = Arc::new(MemState(Mutex::default()));
     state.0.lock().unwrap().comments.push("A".into());
     let board = Arc::new(FakeBoard {
-        rows: vec![t],
+        rows: std::sync::Mutex::new(vec![t]),
         log: Mutex::default(),
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
         comments: vec![
             CommentRef {
@@ -3483,10 +3518,11 @@ async fn inflight_comment_delivered_after_agent_reply() {
     let state = Arc::new(MemState(Mutex::default()));
     state.0.lock().unwrap().comments.push("A".into());
     let board = Arc::new(FakeBoard {
-        rows: vec![t],
+        rows: std::sync::Mutex::new(vec![t]),
         log: Mutex::default(),
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
         comments: vec![CommentRef {
             id: "verdict".into(),
@@ -3553,11 +3589,12 @@ async fn busy_session_not_pinged_early() {
     );
     t.apply_fields(f);
     let board = Arc::new(FakeBoard {
-        rows: vec![t],
+        rows: std::sync::Mutex::new(vec![t]),
         log: Mutex::default(),
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
     let sess = Arc::new(FakeSessions {
@@ -3620,11 +3657,12 @@ async fn soft_ping_wakes_idle_session_without_transaction() {
     );
     t.apply_fields(f);
     let board = Arc::new(FakeBoard {
-        rows: vec![t],
+        rows: std::sync::Mutex::new(vec![t]),
         log: Mutex::default(),
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
     let sess = Arc::new(FakeSessions {
@@ -3683,11 +3721,12 @@ async fn restored_counters_from_previous_process_do_not_escalate_on_first_tick()
         }
     }
     let board = Arc::new(FakeBoard {
-        rows: vec![dev_task(64, "ses_dev_64")],
+        rows: std::sync::Mutex::new(vec![dev_task(64, "ses_dev_64")]),
         log: Mutex::default(),
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
     let sess = Arc::new(FakeSessions {
@@ -3757,11 +3796,12 @@ async fn counters_earned_by_current_process_still_escalate() {
         }
     }
     let board = Arc::new(FakeBoard {
-        rows: vec![dev_task(64, "ses_dev_64")],
+        rows: std::sync::Mutex::new(vec![dev_task(64, "ses_dev_64")]),
         log: Mutex::default(),
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
     let sess = Arc::new(FakeSessions {
@@ -3835,11 +3875,12 @@ async fn escalation_deferred_when_liveness_probe_unreliable() {
         }
     }
     let board = Arc::new(FakeBoard {
-        rows: vec![dev_task(64, "ses_dev_64")],
+        rows: std::sync::Mutex::new(vec![dev_task(64, "ses_dev_64")]),
         log: Mutex::default(),
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
     let sess = Arc::new(FakeSessions {
@@ -3906,11 +3947,12 @@ async fn probe_failure_records_outcome_without_escalation_or_counters() {
         }
     }
     let board = Arc::new(FakeBoard {
-        rows: vec![dev_task(64, "ses_dev_64")],
+        rows: std::sync::Mutex::new(vec![dev_task(64, "ses_dev_64")]),
         log: Mutex::default(),
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
     let sess = Arc::new(FakeSessions {
@@ -3978,11 +4020,12 @@ async fn probe_failure_isolated_per_row_other_rows_processed() {
         rows.push(dev_task(n, &format!("ses_dev_{n}")));
     }
     let board = Arc::new(FakeBoard {
-        rows,
+        rows: rows.into(),
         log: Mutex::default(),
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
     let sess = Arc::new(FakeSessions {
@@ -4054,11 +4097,12 @@ async fn probe_degradation_strip_reaches_threshold_signal() {
         rows.push(dev_task(n, &format!("ses_dev_{n}")));
     }
     let board = Arc::new(FakeBoard {
-        rows,
+        rows: rows.into(),
         log: Mutex::default(),
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
     let sess = Arc::new(FakeSessions {
@@ -4148,11 +4192,12 @@ async fn idle_sessions_do_not_hold_cup() {
     rows.push(task(99, Status::InProgress)); // кандидат на спавн
     let state = Arc::new(MemState(Mutex::default()));
     let board = Arc::new(FakeBoard {
-        rows,
+        rows: rows.into(),
         log: Mutex::default(),
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
     // все спящие сессии — живые в API (spawned), но idle (ход завершён)
@@ -4306,14 +4351,15 @@ async fn analyst_multiboard_no_oversell_within_tick() {
         .unwrap()
         .push(fake_session("ses_stage", "developer", "", 100, true));
     let board = Arc::new(FakeBoard {
-        rows: vec![
+        rows: std::sync::Mutex::new(vec![
             titled(400, "заявка 1", Status::Analys),
             titled(401, "заявка 2", Status::Analys),
-        ],
+        ]),
         log: Mutex::default(),
         comments: vec![],
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
     let u = AnalystUseCase {
@@ -4354,11 +4400,12 @@ macro_rules! sidecar_uc_with_cup {
             cup: usize,
         ) -> ($ty, Arc<FakeBoard>) {
             let board = Arc::new(FakeBoard {
-                rows,
+                rows: rows.into(),
                 log: Mutex::default(),
                 comments: vec![],
                 fields_fails: false,
                 set_session_fails: false,
+                clear_session_fails: AtomicBool::new(false),
                 status_fails: AtomicBool::new(false),
             });
             let u = $ty {
@@ -5007,11 +5054,12 @@ async fn analyst_verdictless_waves_do_not_burn_cycles() {
     let state = Arc::new(MemState(Mutex::default()));
     let sessions = Arc::new(FakeSessions::new());
     let board = Arc::new(FakeBoard {
-        rows: vec![titled(1, "заявка", Status::Analys)],
+        rows: std::sync::Mutex::new(vec![titled(1, "заявка", Status::Analys)]),
         log: Mutex::default(),
         comments: vec![],
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
     let clock = Arc::new(AdvClock(AtomicU64::new(2000)));
@@ -5122,11 +5170,12 @@ async fn analyst_three_real_rounds_escalate_with_honest_message() {
     let clock = Arc::new(AdvClock(AtomicU64::new(2000)));
     let board = |status: Status| {
         Arc::new(FakeBoard {
-            rows: row(status),
+            rows: std::sync::Mutex::new(row(status)),
             log: Mutex::default(),
             comments: vec![],
             fields_fails: false,
             set_session_fails: false,
+            clear_session_fails: AtomicBool::new(false),
             status_fails: AtomicBool::new(false),
         })
     };
@@ -6078,11 +6127,12 @@ fn tick_with_clock(
     clock: Arc<dyn Clock>,
 ) -> (TickUseCase, Arc<FakeBoard>, Arc<FakeSessions>, Arc<FakePrs>) {
     let board = Arc::new(FakeBoard {
-        rows,
+        rows: rows.into(),
         log: Mutex::default(),
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
     let sessions = Arc::new(sessions);
@@ -6275,11 +6325,12 @@ async fn enrichment_failure_skips_row() {
     // отказ enrichment (#1163): строка пропущена тиком — решение по
     // невидимым ячейкам не принимается, дубль-спавн не случается
     let board = Arc::new(FakeBoard {
-        rows: vec![task(57, Status::InProgress)],
+        rows: std::sync::Mutex::new(vec![task(57, Status::InProgress)]),
         log: Mutex::default(),
         comments: Vec::default(),
         fields_fails: true,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
     let sessions = Arc::new(FakeSessions::new());
@@ -6313,11 +6364,12 @@ async fn orphan_deleted_when_set_session_fails() {
     // спавн состоялся, запись ячейки упала: сеанс гасится — иначе живой
     // сеанс вне ячейки вечно держит гард, а будить его некому (#1163)
     let board = Arc::new(FakeBoard {
-        rows: vec![task(58, Status::InProgress)],
+        rows: std::sync::Mutex::new(vec![task(58, Status::InProgress)]),
         log: Mutex::default(),
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: true,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
     let sessions = Arc::new(FakeSessions::new());
@@ -6664,11 +6716,12 @@ async fn round_stale_reset_gives_true_fresh_round_two_pings_before_escalation() 
     }
     let now = Arc::new(Mutex::new(BOOT));
     let board = Arc::new(FakeBoard {
-        rows: vec![dev_task(64, "ses_dev_64")],
+        rows: std::sync::Mutex::new(vec![dev_task(64, "ses_dev_64")]),
         log: Mutex::default(),
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
     let sess = Arc::new(FakeSessions {
@@ -7052,6 +7105,256 @@ async fn cup_preempt_empty_victim_by_medium_waiter() {
     assert_eq!(victims, ["ses_v1"]);
 }
 
+// ---- преемпшен × луп-гвард: гашение не смерть (#1412) ----
+
+/// Полная метка busy-хвоста исполнителя (union-скан тика).
+fn busy_exactly(sessions: &FakeSessions, ids: &[String]) {
+    *sessions.busy_ids.lock().unwrap() = ids.to_vec();
+}
+
+/// Погасить сессию в db-смысле: после delete исполнителя serve 404-ит
+/// GET сессии (liveness Dead), сессия не в списке (second source чист).
+fn mark_dead(sessions: &FakeSessions, id: &str) {
+    sessions.dead_sessions.lock().unwrap().push(id.into());
+}
+
+/// Ячейка жертвы по доске (Mutex rows — фидельность hub).
+fn victim_cell(board: &FakeBoard) -> Option<String> {
+    let rows = board.rows.lock().unwrap();
+    rows.iter()
+        .find(|t| t.number() == 1)
+        .and_then(|t| t.session_of(Slot::Dev))
+        .map(|s| s.to_string())
+}
+
+/// Доска между тиками: гашение сняло ячейку, спавн вернул (как hub).
+fn set_row_cell(board: &FakeBoard, n: u64, slot: Slot, s: Option<&str>) {
+    let mut rows = board.rows.lock().unwrap();
+    if let Some(t) = rows.iter_mut().find(|t| t.number() == n) {
+        let mut f = TaskFields::default();
+        if let Some(s) = s {
+            f.set_session(slot, uwuwu_domain::SessionRef::parse(s).unwrap());
+        } else {
+            f.clear_session(slot);
+        }
+        t.apply_fields(f);
+    }
+}
+
+fn set_victim_cell(board: &FakeBoard, s: Option<&str>) {
+    set_row_cell(board, 1, Slot::Dev, s);
+}
+
+/// Движущиеся часы (#1412): now_ms растёт с каждым тиком (шаг 20 мин —
+/// больше кулдауна спавна), utc_minute фиксирован вне пик-окна — кулдаун
+/// не стопорит возвраты жертвы, пик-окно не вмешивается.
+struct AdvancingClock(std::sync::Mutex<u64>);
+impl crate::ports::Clock for AdvancingClock {
+    fn utc_minute(&self) -> UtcMinute {
+        UtcMinute {
+            minute_of_day: 100,
+            weekday: 3,
+        }
+    }
+    fn now_ms(&self) -> u64 {
+        *self.0.lock().unwrap()
+    }
+}
+
+#[tokio::test]
+async fn cup_preempt_wave_does_not_escalate_victim_loop() {
+    // #1412, класс: волна medium-кандидатов × low-жертва — каждое
+    // гашение сбрасывает луп-гвард и кулдаун слота жертвы, ячейка
+    // снимается: строка возвращается в очередь plain-спавном. Пять
+    // циклов «гашение → возврат жертвы → гашение» — ни одной эскалации.
+    // До фикса пятый возврат жертвы эскалирует «Респавн-петля» (гашение
+    // не отличалось от смерти, счётчик рос без прогресса статуса).
+    let victim = row_with_session(1, "ses_a", Priority::Low);
+    let mut rows = vec![victim];
+    rows.push(row_with_session(7, "ses_x", Priority::Medium)); // busy-фон
+    let board = Arc::new(FakeBoard {
+        rows: std::sync::Mutex::new(rows),
+        log: Mutex::default(),
+        comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
+        status_fails: AtomicBool::new(false),
+    });
+    let sessions = Arc::new(FakeSessions::new());
+    let clock = Arc::new(AdvancingClock(std::sync::Mutex::new(2000)));
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+            probes: Mutex::default(),
+        }),
+        clock: clock.clone(),
+        state: Arc::new(MemState(Mutex::default())),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        boot_ms: 0,
+    };
+    live_busy(&sessions, "ses_a");
+    live_busy(&sessions, "ses_x");
+
+    // Кандидаты приходят волнами (как ночные волны конвейера 19.11):
+    // тик волны — кап полон (фон + рабочая жертва), кандидат held гасит
+    // жертву под свой спавн; тик затишья — ход кандидата доведён (сессия
+    // ушла из busy), слот свободен, жертва возвращается. Часы движутся
+    // на 20 мин/тик (кулдаун 15 мин не стопорит возвраты).
+    fn advance_tick(clock: &AdvancingClock) {
+        *clock.0.lock().unwrap() += 20 * 60_000;
+    }
+    let mut preempts_total = 0;
+    for wave in 0..5 {
+        // волна: новый кандидат при полном капе — гашение жертвы
+        board.rows.lock().unwrap().push({
+            let mut t = task(2 + wave, Status::InProgress);
+            t.set_priority(Priority::Medium);
+            t
+        });
+        let out = u.run(&plan(Mode::Live, 2)).await.unwrap();
+        assert_eq!(
+            out.preempts, 1,
+            "волна {}: жертва гасится кандидатом",
+            wave + 1
+        );
+        preempts_total += out.preempts;
+        let victim_session = victim_cell(&board).expect("ячейка жертвы от спавна");
+        // доска: кандидат получил свою ячейку (последний спавн исполнителя)
+        let cand_session = sessions
+            .spawned
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("спавн кандидата в тике волны");
+        set_row_cell(
+            &board,
+            2 + wave,
+            Slot::Dev,
+            Some(&cand_session),
+        );
+        busy_exactly(&sessions, &["ses_x".to_string()]); // ход кандидата доведён
+        mark_dead(&sessions, &victim_session);
+        sessions
+            .live
+            .lock()
+            .unwrap()
+            .retain(|s| s.id != victim_session && s.id != "ses_a");
+        // доска: гашение сняло ячейку жертвы (set_victim_cell(None))
+        set_victim_cell(&board, None);
+        advance_tick(&clock);
+
+        // затишье: слот свободен — жертва возвращается в работу
+        let out = u.run(&plan(Mode::Live, 2)).await.unwrap();
+        assert_eq!(
+            out.spawns_done, 1,
+            "волна {}: жертва возвращается штатным спавном",
+            wave + 1
+        );
+        // доска: спавн вернул ячейку жертвы (последний спавн исполнителя)
+        let returned = sessions
+            .spawned
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("спавн жертвы в тике затишья");
+        set_victim_cell(&board, Some(&returned));
+        assert_eq!(
+            victim_cell(&board).as_deref(),
+            Some(returned.as_str()),
+            "волна {}: ячейка жертвы указывает на свежую сессию",
+            wave + 1
+        );
+        busy_exactly(&sessions, &["ses_x".to_string(), returned]);
+        advance_tick(&clock);
+    }
+    assert_eq!(preempts_total, 5, "пять гашений жертвы волной кандидатов");
+    let log = board.log.lock().unwrap();
+    assert!(
+        !log.iter().any(|l| l.contains("status#")),
+        "ни одной эскалации за пять циклов гашений: ни жертве, ни кандидатам"
+    );
+    assert_eq!(
+        log.iter().filter(|l| l.starts_with("clear#1=Dev")).count(),
+        5,
+        "каждое из пяти гашений сняло ячейку жертвы"
+    );
+}
+
+#[tokio::test]
+async fn cup_preempt_resets_victim_loop_guard_and_cooldown() {
+    // Контракт сброса на месте гашения: луп-гвард слота жертвы и
+    // кулдаун спавна чистятся, ячейка снимается (clear_session) —
+    // строка возвращается в очередь с нулевым счётчиком.
+    let victim = row_with_session(1, "ses_a", Priority::Low);
+    let mut waiter = task(2, Status::InProgress);
+    waiter.set_priority(Priority::Medium);
+    let state = Arc::new(MemState(Mutex::default()));
+    {
+        let mut g = state.0.lock().unwrap();
+        // «прошлая жизнь» жертвы: счётчик петли и кулдаун от старых спавнов
+        g.loops.push((1, Slot::Dev, Status::InProgress, 3));
+        g.spawn_ms = vec![(1, Slot::Dev, 1000)];
+    }
+    let (u, board, sessions, _) =
+        usecase_with_state(vec![victim, waiter], PrState::Missing, state.clone());
+    live_busy(&sessions, "ses_a");
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(out.preempts, 1, "жертва погашена");
+    let log = board.log.lock().unwrap();
+    assert!(
+        log.iter().any(|l| l == "clear#1=Dev"),
+        "ячейка жертвы снята гашением (clear_session)"
+    );
+    let loops = state.0.lock().unwrap().loops.clone();
+    assert!(
+        !loops.iter().any(|(n, s, _, _)| *n == 1 && *s == Slot::Dev),
+        "луп-гвард слота жертвы сброшен гашением"
+    );
+    let ms = state.0.lock().unwrap().spawn_ms.clone();
+    assert!(
+        !ms.iter().any(|(n, s, _)| *n == 1 && *s == Slot::Dev),
+        "кулдаун спавна слота жертвы сброшен — возврат в очередь не ждёт 15 мин"
+    );
+}
+
+#[tokio::test]
+async fn cup_preempt_clear_session_failure_degrades_to_respawn() {
+    // Краш-окно: гашение исполнителя удалось, запись на доску (снятие
+    // ячейки) упала → гашение засчитано, строка остаётся с мёртвым id
+    // и деградирует к прежнему поведению: dead-ветка → respawn с
+    // луп-гвардом (не хуже status quo).
+    let victim = row_with_session(1, "ses_a", Priority::Low);
+    let mut waiter = task(2, Status::InProgress);
+    waiter.set_priority(Priority::Medium);
+    let (u, board, sessions, _) = usecase(vec![victim, waiter], PrState::Missing);
+    board.clear_session_fails.store(true, Ordering::Relaxed);
+    live_busy(&sessions, "ses_a");
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(out.preempts, 1, "гашение засчитано — слот освобождён");
+    {
+        let log = board.log.lock().unwrap();
+        assert!(
+            !log.iter().any(|l| l == "clear#1=Dev"),
+            "снятие ячейки не удалось — путь деградации"
+        );
+    }
+    // строка осталась с мёртвым id → следующий свободный тик забирает
+    // её dead-веткой (respawn с луп-гвардом), как до фикса
+    busy_exactly(&sessions, &[]);
+    mark_dead(&sessions, "ses_a");
+    let out2 = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(
+        out2.spawns_done, 1,
+        "мёртвая ячейка обслужена respawn'ом — прежняя механика"
+    );
+}
+
 #[tokio::test]
 async fn cup_no_preempt_in_peak_for_low_waiter() {
     // Пин порядка гейтов: DeferredPeak раньше HeldCup — не-high
@@ -7138,11 +7441,12 @@ async fn cup_idle_low_row_not_preempted_when_cap_held_by_others() {
 #[tokio::test]
 async fn executor_failure_lands_in_outcome_by_name() {
     let board = Arc::new(FakeBoard {
-        rows: vec![],
+        rows: std::sync::Mutex::new(vec![]),
         log: Mutex::default(),
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
     let sessions = Arc::new(FakeSessions {
@@ -7182,11 +7486,12 @@ async fn named_executor_failure_is_isolated_from_healthy_peer() {
     });
     let u = TickUseCase {
         board: Arc::new(FakeBoard {
-            rows: vec![],
+            rows: std::sync::Mutex::new(vec![]),
             log: Mutex::default(),
             comments: Vec::default(),
             fields_fails: false,
             set_session_fails: false,
+            clear_session_fails: AtomicBool::new(false),
             status_fails: AtomicBool::new(false),
         }),
         sessions: Arc::new(SessionRouter::new(
@@ -7243,11 +7548,12 @@ fn lost_usecase(
     clock: Arc<dyn Clock>,
 ) -> (TickUseCase, Arc<FakeBoard>, Arc<FakeSessions>) {
     let board = Arc::new(FakeBoard {
-        rows: vec![dev_task(16, "ses_dev_16")],
+        rows: std::sync::Mutex::new(vec![dev_task(16, "ses_dev_16")]),
         log: Mutex::default(),
         comments,
         fields_fails: false,
         set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
     let sessions = Arc::new(sessions);
