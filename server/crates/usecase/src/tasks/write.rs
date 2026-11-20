@@ -359,16 +359,7 @@ impl TaskWriter for TaskWriteUseCase {
             // только строке с флагом — флаг добывается свежим чтением
             // носителя (семейство стейл-багов #1258/#1346: снапшоту
             // здесь не верим), остальным рёбрам флаг не нужен
-            let direct = if current == Status::InProgress && status == Status::UserReview {
-                self.fields
-                    .load(number)
-                    .await?
-                    .get(naming::F_DIRECT)
-                    .map(|v| v == "on")
-                    .unwrap_or(false)
-            } else {
-                false
-            };
+            let direct = self.carrier_direct(number, current, status).await;
             if !uwuwu_domain::Status::can_transition_with(current, status, direct) {
                 tracing::warn!(
                     event = "board.guard_rejected",
@@ -821,6 +812,33 @@ impl EditExpectations {
 }
 
 impl TaskWriteUseCase {
+    /// direct-флаг с носителя (#1357): ребро In Progress → Review гвардится
+    /// флагом — на этом ребре (и только на нём) флаг читается свежим
+    /// fields.load, на остальных false. Отдельный метод: edit не несёт
+    /// редкой читающей ветки (smell-гигиена дельты).
+    async fn carrier_direct(&self, number: u64, current: Status, to: Status) -> bool {
+        if !(current == Status::InProgress && to == Status::UserReview) {
+            return false;
+        }
+        match self.fields.load(number).await {
+            Ok(fields) => fields
+                .get(naming::F_DIRECT)
+                .map(|v| v == "on")
+                .unwrap_or(false),
+            // чтение полей упало — флаг неизвестен: ребро закрыто
+            // (консервативно), отказ громкий на следующем гарде канона
+            Err(e) => {
+                tracing::warn!(
+                    event = "board.direct_flag_unreadable",
+                    number,
+                    error = %e,
+                    "Direct-флаг не прочитан — ребро In Progress → Review закрыто"
+                );
+                false
+            }
+        }
+    }
+
     /// Контрольное чтение носителя после успешного edit (#1331): одно
     /// read_issue сверяет все записанные значения (тайтл/ветка/PR/приоритет/
     /// automerge). Stale — громкая ошибка с перечнем несошедших; Blind —
