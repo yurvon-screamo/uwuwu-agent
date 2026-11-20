@@ -130,8 +130,11 @@ fn stage_action_of_prompt(prompt: &str) -> Option<(&'static str, &'static str, &
         ("dev", "Ревью результата", "реализация завершена (мок)")
     } else if prompt.contains("ревью результата") {
         ("result", "Тестирование", "ревью approve (мок)")
-    } else if prompt.contains("ревью тестирования") {
-        // #1413: до «тестирование» — подстрока промпта тест-ревьювера
+    } else if prompt.contains("тестовая дельта ветки") {
+        // #1413: уникальный stage-маркер тест-ревьювера, не подстрока
+        // имени статуса «Ревью тестирования» — она живёт и в
+        // finish-инструкции тестировщика (чекпойнт pass), матч по имени
+        // статуса классифицировал бы tester-промпт как test-review
         ("test-review", "Review", "тест-ревью: чисто (мок)")
     } else if prompt.contains("тестирование") {
         // дефолт стенда — pass с тест-коммитами: полный цикл конвейера
@@ -1205,7 +1208,7 @@ mod tests {
             ("ревью результата: код/CI", "Тестирование"),
             // дефолт стенда: pass с тест-коммитами — полный цикл (#1413)
             ("тестирование: качество фичи", "Ревью тестирования"),
-            ("ревью тестирования: тестовая дельта", "Review"),
+            ("ревью тестирования: тестовая дельта ветки", "Review"),
             (
                 "Аналитика волны (проект p) — строки в Analys",
                 "Review Analys",
@@ -1219,12 +1222,21 @@ mod tests {
             let (_, status, _) = stage_action_of_prompt(prompt).unwrap();
             assert_eq!(status, want, "промпт «{prompt}»");
         }
-        // тест-ревью-маркер не перехватывается тест-стадией: порядок веток
+        // тест-ревьювер классифицируется по уникальному stage-маркеру
         let (test_review_stage, _, _) =
             stage_action_of_prompt("ревью тестирования: тестовая дельта ветки").unwrap();
         assert_eq!(test_review_stage, "test-review");
-        let (test_stage, _, _) = stage_action_of_prompt("тестирование: качество фичи").unwrap();
-        assert_eq!(test_stage, "test");
+        // дизамбигуация (#1413 ревью 2): tester-промпт с именем статуса
+        // «Ревью тестирования» в finish-инструкции — НЕ test-review
+        let tester_prompt = "Задача #42 «t» — тестирование: качество фичи, вердикт pass/fail \
+             с шагами. … вердикт pass/fail комментом → pass: есть (tester)-коммиты — статус \
+             «Ревью тестирования», нет — «Review»; fail — In Progress";
+        let (test_stage, test_status, _) = stage_action_of_prompt(tester_prompt).unwrap();
+        assert_eq!(
+            (test_stage, test_status),
+            ("test", "Ревью тестирования"),
+            "tester-промпт не перехватывается test-review-маркером"
+        );
         // триаж выведен (#1135): старого маркера нет
         assert_ne!(
             stage_action_of_prompt("Триаж черновика #5").unwrap().0,
@@ -1244,7 +1256,7 @@ mod tests {
         let (stage, status, _) = stage_action_of_prompt("тестирование: качество фичи").unwrap();
         assert_eq!((stage, status), ("test", "Ревью тестирования"));
         let (stage, status, _) =
-            stage_action_of_prompt("ревью тестирования: тестовая дельта").unwrap();
+            stage_action_of_prompt("ревью тестирования: тестовая дельта ветки").unwrap();
         assert_eq!((stage, status), ("test-review", "Review"));
         // action_for_status: wakeup-путь по текущему статусу строки
         let (next, _) = action_for_status("Тестирование");
