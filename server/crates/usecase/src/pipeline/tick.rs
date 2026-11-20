@@ -177,6 +177,10 @@ pub(crate) enum SpawnHold {
 pub(crate) struct PreemptCandidate {
     /// Проект-исполнитель жертвы (abort/delete — через её гейтвей).
     pub project: String,
+    /// Доска и слот жертвы: сброс луп-гварда/кулдауна и снятие ячейки
+    /// на месте гашения (#1412).
+    pub board: String,
+    pub slot: Slot,
     pub number: u64,
     pub session: String,
     pub priority: Priority,
@@ -394,6 +398,8 @@ impl TickUseCase {
                         .unwrap_or(0);
                     preempt_pool.push(PreemptCandidate {
                         project: bp.project.clone(),
+                        board: bp.board.clone(),
+                        slot,
                         number: t.number(),
                         session: session.to_string(),
                         priority: t.priority(),
@@ -809,12 +815,37 @@ impl TickUseCase {
                 // снапшота и счётчика (спавны тика поверх busy).
                 *active_now = active_now.saturating_sub(1);
                 out.preempts += 1;
+                // Гашение — не смерть (#1412): слот отобран штатно, и
+                // возврат жертвы не «спавн без прогресса». Сброс на месте
+                // гашения: луп-гвард слота (иначе повторные гашения волной
+                // дают 5 циклов → ложная «Респавн-петля»), кулдаун спавна
+                // (возврат в очередь не ждёт 15 мин) и ячейка (мёртвый id
+                // не остаётся — plain-путь подхватит строку по гейту).
+                // Отказ записи на доску — краш-окно: строка остаётся со
+                // старым id и деградирует к прежнему dead-respawn-пути.
+                self.state
+                    .clear_spawn_loop(&victim.board, victim.number, victim.slot);
+                self.state
+                    .clear_spawn_ms(&victim.board, victim.number, victim.slot);
+                if let Err(e) = self
+                    .board
+                    .clear_session(&victim.board, victim.number, victim.slot)
+                    .await
+                {
+                    out.actions_failed += 1;
+                    tracing::warn!(
+                        event = "cup.preempt.clear_failed",
+                        victim = victim.number,
+                        error = %e,
+                        "Гашение состоялось, снятие ячейки не удалось — строка обслужится dead-веткой (прежняя механика)"
+                    );
+                }
                 tracing::info!(
                     event = "cup.preempt",
                     waiter = task.number(),
                     victim = victim.number,
                     victim_session = %victim.session,
-                    "CUP: слот отдан — low-актив погашен (abort+delete), возобновление штатным respawn'ом"
+                    "CUP: слот отдан — low-актив погашен (abort+delete), возобновление — возврат в очередь спавна с чистым счётчиком"
                 );
                 true
             }

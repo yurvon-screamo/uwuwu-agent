@@ -486,7 +486,7 @@ sleep 1
 UWUWU_SERVER_CONFIG=$CONFIG_PREEMPT UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
   UWUWU_SERVER_MODE=live \
   UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
-  UWUWU_MOCK_SEED="2046:In Progress:High;2048:In Progress:High" \
+  UWUWU_MOCK_SEED="2046:In Progress:High;2048:In Progress:High;2049:In Progress:High" \
   RUST_LOG=info "$BIN_SRV" >"$LOG_SRV_PRE" 2>&1 &
 SRV_PID=$!
 # тики до HeldCup: жертва 2046 спавнится и busy (не отвечает), кандидат
@@ -522,11 +522,37 @@ LEFT=$(curl -s --max-time 5 "http://127.0.0.1:$PORT_MOCK/api/session" | grep -c 
 [ "$LEFT" -eq 0 ] || fail "жертва 2046 не удалена с исполнителя (delete пропущен?)"
 grep -q '"preempts":1,' "$LOG_SRV_PRE" || fail "tick.completed не несёт preempts=1"
 grep -q 'loop_escalated' "$LOG_SRV_PRE" && fail "луп-гвард эскалировал"
+# #1412: гашение — не смерть: ячейка жертвы снята, слот свободен —
+# 2046 возвращается plain-спавном (второй spawn.done)
+SEEN=0
+while [ $SEEN -lt 12 ]; do
+  SEEN=$((SEEN + 1)); sleep 5
+  SPAWN2046_TOTAL=$(grep -oE '"event":"spawn.done","number":2046,"slot":"Dev"' "$LOG_SRV_PRE" | wc -l || true)
+  [ "$SPAWN2046_TOTAL" -ge 2 ] && break
+done
+[ "$(grep -oE '"event":"spawn.done","number":2046,"slot":"Dev"' "$LOG_SRV_PRE" | wc -l)" -ge 2 ] \
+  || fail "жертва 2046 не вернулась после гашения (возврат в очередь сломан)"
+say "#1412: гашение вернуло жертву в очередь (2046 спавнен повторно)"
+# волна 2: кандидат 2048 сам становится жертвой — 2049 High гасит его;
+# счётчик луп-гварда 2048 сброшен гашением (не эскалирует), ячейка снята
+mcp task_edit '{"number":2048,"project":"uwuwu","priority":"low"}' | grep -q '"isError":false' \
+  || fail "task_edit 2048 low не применился"
+SEEN=0
+while [ $SEEN -lt 12 ]; do
+  SEEN=$((SEEN + 1)); sleep 5
+  grep -q '"event":"cup.preempt","waiter":2049,"victim":2048' "$LOG_SRV_PRE" && break
+done
+grep -q '"event":"cup.preempt","waiter":2049,"victim":2048' "$LOG_SRV_PRE" \
+  || fail "вторая волна: 2049 не гасит 2048"
+grep -q '"event":"spawn.done","number":2049,"slot":"Dev"' "$LOG_SRV_PRE" \
+  || fail "кандидат 2049 не получил слот после второй волны"
+grep -q '"preempts":2,' "$LOG_SRV_PRE" || fail "tick.completed не несёт preempts=2"
+grep -q 'loop_escalated' "$LOG_SRV_PRE" && fail "луп-гвард эскалировал на второй волне"
 # pid-scoped зачистка (конвенция #1263): чужие стенды не трогаем
 kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
 wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
 SRV_PID=""; MOCK_PID=""
-say "фаза 8 ок: понижение приоритета отдало слот (2046 abort+delete, 2048 заспавнен)"
+say "фаза 8 ок: понижение приоритета отдало слот (2046 abort+delete, 2048 заспавнен); #1412: волна 2 (2048 гасится 2049), жертва возвращается plain-спавном, эскалаций нет"
 
 say "фаза 9: клин холодного ящика #1293 — observe логирует кандидатов, live архивирует"
 CONFIG_SWEEP="$RUN_DIR/config.sweep.toml"
@@ -962,4 +988,4 @@ sleep 1
 say "фаза 13 ок: lost-resurrection через lost-руку, луп-гвард парковал, сироты чисты, попытка одна за тик"
 
 
-say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + мульти-экзекьютор + гард #1163 + self-эхо + слепой hold #1263 + преемпшен CUP #1259 + клин #1293 + дример #1306 + phantom-квитанции #1331 + lost-сессия #1288: десинк-парковка + lost-resurrection); логи: $RUN_DIR"
+say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + мульти-экзекьютор + гард #1163 + self-эхо + слепой hold #1263 + преемпшен CUP #1259 + давка-волна #1412 + клин #1293 + дример #1306 + phantom-квитанции #1331 + lost-сессия #1288: десинк-парковка + lost-resurrection); логи: $RUN_DIR"

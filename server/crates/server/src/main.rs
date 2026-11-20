@@ -36,8 +36,7 @@ use tracing_subscriber::EnvFilter;
 use uwuwu_usecase::{
     Clock as _, ExecutorLoudness, IncidentLoudness, TickOutcome, TickUseCase,
     EXECUTOR_UNAVAILABLE_COOLDOWN_MS, EXECUTOR_UNAVAILABLE_THRESHOLD,
-    EXECUTOR_UNAVAILABLE_WINDOW_MS, STALL_INCIDENT_COOLDOWN_MS, STALL_INCIDENT_THRESHOLD,
-    STALL_INCIDENT_WINDOW_MS,
+    EXECUTOR_UNAVAILABLE_WINDOW_MS, INCIDENT_COOLDOWN_MS, INCIDENT_THRESHOLD, INCIDENT_WINDOW_MS,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -851,7 +850,7 @@ async fn incident_signal(
          ({} мин): массовая парковка stage-сессий в Needs attention. \
          Разбор — на доске.",
         loudness.escalations_in_window(),
-        STALL_INCIDENT_WINDOW_MS / 60_000,
+        INCIDENT_WINDOW_MS / 60_000,
     );
     match notify {
         Some((tg, chat)) => match tg.send_message(*chat, &text).await {
@@ -917,6 +916,47 @@ async fn executor_unavailable_signal(
     }
 }
 
+/// Давка CUP (#1412): серия гашений low/empty-жертв за скользящее окно —
+/// один ТГ-сигнал владельцу через тот же инцидент-контур #1281. Гашение
+/// перестало быть «смертью» для луп-гварда (#1412), серия гашений —
+/// сигнал ёмкости: очереди кандидатов гасят волной. [notify] не настроен
+/// — громкий лог.
+async fn preempt_pressure_signal(
+    notify: &Option<(Arc<dyn uwuwu_usecase::bots::TelegramGateway>, i64)>,
+    loudness: &mut IncidentLoudness,
+    now_ms: u64,
+) {
+    if !loudness.register(now_ms) {
+        return;
+    }
+    let text = format!(
+        "⚠︎ uwuwu: давка CUP — {} гашений low/empty-активов за {} мин: \
+         очереди кандидатов гасят волной, строки возвращаются в очередь. \
+         Проверить ёмкость капа и приоритеты строк.",
+        loudness.escalations_in_window(),
+        INCIDENT_WINDOW_MS / 60_000,
+    );
+    match notify {
+        Some((tg, chat)) => match tg.send_message(*chat, &text).await {
+            Ok(()) => tracing::warn!(
+                event = "cup.preempt_incident_signal",
+                escalations = loudness.escalations_in_window(),
+                "Сигнал давки CUP отправлен владельцу"
+            ),
+            Err(e) => tracing::error!(
+                event = "cup.preempt_incident_failed",
+                error = %e,
+                "Сигнал давки CUP не отправлен"
+            ),
+        },
+        None => tracing::warn!(
+            event = "cup.preempt_unnotified",
+            escalations = loudness.escalations_in_window(),
+            "Давка CUP: [notify] не настроен — сигнала нет"
+        ),
+    }
+}
+
 async fn tick_loop(args: TickLoopArgs) {
     let TickLoopArgs {
         poll_sec,
@@ -932,11 +972,8 @@ async fn tick_loop(args: TickLoopArgs) {
     // осознанно: волна эскалаций, разнесённая через рестарт, одного сигнала
     // не даст — «рестарт = свежее окно» (философия ADR-107), персистентность
     // планом не требовалась.
-    let mut loudness = IncidentLoudness::new(
-        STALL_INCIDENT_THRESHOLD,
-        STALL_INCIDENT_WINDOW_MS,
-        STALL_INCIDENT_COOLDOWN_MS,
-    );
+    let mut loudness =
+        IncidentLoudness::new(INCIDENT_THRESHOLD, INCIDENT_WINDOW_MS, INCIDENT_COOLDOWN_MS);
     // Громкость деградации executor'ов (#1312): per-executor инциденты —
     // те же параметры окна, что у сталла; окно неперсистентно осознанно
     // («рестарт = свежее окно», философия ADR-107).
@@ -945,12 +982,21 @@ async fn tick_loop(args: TickLoopArgs) {
         EXECUTOR_UNAVAILABLE_WINDOW_MS,
         EXECUTOR_UNAVAILABLE_COOLDOWN_MS,
     );
+    // Громкость давки CUP (#1412): глобальная размерность (давка — явление
+    // всех исполнителей сразу, per-executor не подходит) — отдельный
+    // инстанс того же IncidentLoudness; окно неперсистентно — философия
+    // ADR-107.
+    let mut preempt_loudness =
+        IncidentLoudness::new(INCIDENT_THRESHOLD, INCIDENT_WINDOW_MS, INCIDENT_COOLDOWN_MS);
     loop {
         let started = std::time::Instant::now();
         match usecase.run(&plan).await {
             Ok(outcome) => {
                 for _ in 0..outcome.stall_flagged {
                     incident_signal(&notify, &mut loudness, clock.now_ms()).await;
+                }
+                for _ in 0..outcome.preempts {
+                    preempt_pressure_signal(&notify, &mut preempt_loudness, clock.now_ms()).await;
                 }
                 for executor in &outcome.executors_failed {
                     executor_unavailable_signal(

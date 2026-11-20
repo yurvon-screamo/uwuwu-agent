@@ -37,10 +37,9 @@ pub use pipeline::sweeper;
 pub use pipeline::{
     executor::ExecutorLoudness, executor::EXECUTOR_UNAVAILABLE_COOLDOWN_MS,
     executor::EXECUTOR_UNAVAILABLE_THRESHOLD, executor::EXECUTOR_UNAVAILABLE_WINDOW_MS,
-    incident::IncidentLoudness, incident::STALL_INCIDENT_COOLDOWN_MS,
-    incident::STALL_INCIDENT_THRESHOLD, incident::STALL_INCIDENT_WINDOW_MS, AnalystBoard,
-    AnalystReviewUseCase, AnalystUseCase, BoardPlan, DreamerUseCase, Mode, TickOutcome, TickPlan,
-    TickUseCase,
+    incident::IncidentLoudness, incident::INCIDENT_COOLDOWN_MS, incident::INCIDENT_THRESHOLD,
+    incident::INCIDENT_WINDOW_MS, AnalystBoard, AnalystReviewUseCase, AnalystUseCase, BoardPlan,
+    DreamerUseCase, Mode, TickOutcome, TickPlan, TickUseCase,
 };
 pub use ports::{
     AgentSessionGateway, AppendDocOutcome, AssistantReply, Clock, CommentRef, DreamerMark,
