@@ -256,4 +256,39 @@ mod tests {
         assert!(encode_path("docs/Projects/uwuwu/Домены.md").contains('%'));
         assert_eq!(encode_path("docs/a/b.md"), "docs/a/b.md");
     }
+
+    // --- живые пробы (#[ignore]: GH_TOKEN + сеть, read-only) ---
+
+    #[tokio::test]
+    #[ignore] // живой прогон: GH_TOKEN + сеть к api.github.com (read-only, #1385)
+    async fn docs_ls_live_hub_marks_file_dir_collisions() {
+        let token = std::env::var("GH_TOKEN").expect("GH_TOKEN");
+        let wiki = std::sync::Arc::new(GitHubWiki::with_writer(
+            "yurvon-screamo/uwuwu-hub".into(),
+            "main".into(),
+            token,
+            None,
+        ));
+        let view = uwuwu_usecase::DocsView::new(wiki);
+        let out = view.list("Projects/uwuwu").await.expect("живой листинг");
+        // Живая пара «ADR.md + ADR/» в Projects/uwuwu: строка ADR обязана
+        // различимо помечать оба носителя — тихая слепота устранена
+        let adr = out
+            .iter()
+            .find(|l| l.starts_with("Projects/uwuwu/ADR (неоднозначно:"))
+            .expect("строка ADR с пометкой коллизии в живом листинге");
+        assert!(
+            adr.contains("файл «Projects/uwuwu/ADR.md» + папка «Projects/uwuwu/ADR/»"),
+            "оба носителя названы: {adr}"
+        );
+        // Дети папки без изменений; неколлизионный файл без пометки
+        assert!(
+            out.iter().any(|l| l.starts_with("Projects/uwuwu/ADR/ADR-001")),
+            "дети папки на месте"
+        );
+        assert!(
+            out.iter().any(|l| l == "Projects/uwuwu/README"),
+            "неколлизионный файл — голый слаг без пометки"
+        );
+    }
 }
