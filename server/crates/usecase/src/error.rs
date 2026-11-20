@@ -55,3 +55,27 @@ impl fmt::Display for UsecaseError {
 impl std::error::Error for UsecaseError {}
 
 pub type UsecaseResult<T> = Result<T, UsecaseError>;
+
+/// Отказ чтения (MCP-вьюхи): нет такой доски/дока — честное «не найдено»,
+/// транспортные отказы — контекст источника. Нейтральный дом: тип общий
+/// для вьюх задач и целей, не собственность неймспейса tasks (#1216).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewError {
+    NotFound(String),
+    Source(UsecaseError),
+}
+
+impl From<UsecaseError> for ViewError {
+    fn from(e: UsecaseError) -> Self {
+        Self::Source(e)
+    }
+}
+
+impl std::fmt::Display for ViewError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound(what) => write!(f, "не найдено: {what}"),
+            Self::Source(e) => write!(f, "{e}"),
+        }
+    }
+}

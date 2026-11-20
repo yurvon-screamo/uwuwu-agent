@@ -3,7 +3,7 @@
 //! closed = достигнута; пишет владелец в UI, агент читает перед работой
 //! над задачей (правило AGENTS.md).
 
-use crate::tasks::views::ViewError;
+use crate::error::ViewError;
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -46,7 +46,7 @@ pub fn gist_of(body: &str) -> String {
 pub struct GoalsView {
     repo: Arc<dyn GoalsRepo>,
     /// Проекты конвейера (конфиг сервера).
-    pub projects: Vec<String>,
+    projects: Vec<String>,
     /// Шаблон URL фильтра open-целей в UI носителя, `{project}` —
     /// плейсхолдер имени проекта.
     filter_url_tpl: String,

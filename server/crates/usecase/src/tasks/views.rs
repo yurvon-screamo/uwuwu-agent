@@ -1,33 +1,10 @@
 //! Query-юзкейсы (чтения для MCP-инструментов): тонкая оркестрация
 //! портов без мутаций. Презентация (MCP) зовёт только их.
 
-use crate::error::UsecaseError;
+use crate::error::{UsecaseError, ViewError};
 use crate::ports::{IssueView, TaskBoardRepo, WikiRepo};
 use std::sync::Arc;
 use uwuwu_domain::Task;
-
-/// Отказ чтения: нет такой доски/дока — честное «не найдено»,
-/// транспортные отказы — контекст источника.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ViewError {
-    NotFound(String),
-    Source(UsecaseError),
-}
-
-impl From<UsecaseError> for ViewError {
-    fn from(e: UsecaseError) -> Self {
-        Self::Source(e)
-    }
-}
-
-impl std::fmt::Display for ViewError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotFound(what) => write!(f, "не найдено: {what}"),
-            Self::Source(e) => write!(f, "{e}"),
-        }
-    }
-}
 
 /// Сколько последних комментов несёт карточка задачи.
 const CARD_COMMENTS: usize = 10;

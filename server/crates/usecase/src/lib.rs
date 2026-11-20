@@ -29,7 +29,7 @@ pub use bots::{
     TelegramGateway, TgMessage, TgUpdate,
 };
 pub use crons::{parse_schedule_text, CronUseCase, FireOutcome, CRON_DIR};
-pub use error::{UsecaseError, UsecaseResult};
+pub use error::{UsecaseError, UsecaseResult, ViewError};
 pub use goals::{gist_of, GoalIssue, GoalsRepo, GoalsView};
 pub use naming::{
     agent_name, parse_agent, parse_priority, parse_status, parse_task_type, priority_name,
@@ -53,7 +53,7 @@ pub use router::SessionRouter;
 pub use search::{sync_allowed, SearchHit, SearchUseCase, SemanticBackend};
 pub use spawn_models::SpawnModels;
 pub use tasks::body_hash;
-pub use tasks::views::{DocsView, PersonView, TaskView, ViewError};
+pub use tasks::views::{DocsView, PersonView, TaskView};
 pub use tasks::write::{
     BodyWriteReceipt, NewTask, SectionAction, SectionEditReport, TaskPatch, TaskWriteUseCase,
     TaskWriter,

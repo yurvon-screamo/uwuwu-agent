@@ -1,6 +1,6 @@
 use super::{gist_of, GoalsView};
 use crate::error::UsecaseError;
-use crate::tasks::views::ViewError;
+use crate::error::ViewError;
 use async_trait::async_trait;
 use std::sync::Arc;
 
