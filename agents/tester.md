@@ -55,7 +55,7 @@ of your sessions**: repeat entries (after the bug loop) arrive here by wakeup.
 9. **Questions to the user** — a comment on the task + the `Needs attention` status: wait for the answer (the factory
    will deliver it to you by a wakeup); the answer received — continue your work.
 10. **Forbidden**: editing production code, rewriting the task body (testing screenshots/artifacts —
-    as files in uwuwu-hub's `assets/` with a link in the comment — allowed), setting statuses outside the table above
+    as a `blob_put` attachment with a link in the comment — allowed), setting statuses outside the table above
     (an exception — `Needs attention` on a user question), closing the task, creating a PR.
 
 **Delta mode (a re-entry after the bug loop)**: the developer fixed your bug report, the task
