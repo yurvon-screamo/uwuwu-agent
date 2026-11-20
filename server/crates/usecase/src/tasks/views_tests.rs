@@ -2,7 +2,7 @@
 //! (#1214). Пины на слаг — переезд носителя закреплён: неверный слаг
 //! персоны ломает person_show для всех агентских сессий.
 
-use super::views::{PersonView, PERSON_SLUG};
+use super::views::{DocsView, PersonView, PERSON_SLUG};
 use crate::error::UsecaseResult;
 use crate::error::ViewError;
 use crate::ports::{AppendDocOutcome, WikiRepo};
@@ -16,12 +16,15 @@ impl WikiRepo for MemWiki {
         Ok(self.0.lock().unwrap().get(slug).cloned())
     }
     async fn list_docs(&self, prefix: &str) -> UsecaseResult<Vec<String>> {
+        // Граница префикса — как адаптер (github_wiki): «{norm}/» или p == norm;
+        // голый starts_with ловит соседей по стему и врёт в тестах (#1385)
+        let norm = prefix.trim_matches('/');
         Ok(self
             .0
             .lock()
             .unwrap()
             .keys()
-            .filter(|s| s.starts_with(prefix))
+            .filter(|s| norm.is_empty() || s.starts_with(&format!("{norm}/")) || *s == norm)
             .cloned()
             .collect())
     }
@@ -83,4 +86,122 @@ async fn person_show_without_doc_is_loud_not_found() {
         ),
         other => panic!("ожидается NotFound, получено: {other:?}"),
     }
+}
+
+// --- DocsView::list: file/dir-коллизия носителей (#1385) ---
+
+fn docs_wiki(slugs: &[&str]) -> Arc<MemWiki> {
+    Arc::new(MemWiki(Mutex::new(
+        slugs
+            .iter()
+            .map(|s| ((*s).to_string(), String::new()))
+            .collect(),
+    )))
+}
+
+fn sorted(mut out: Vec<String>) -> Vec<String> {
+    out.sort();
+    out
+}
+
+#[tokio::test]
+async fn docs_ls_collision_marks_both_carriers() {
+    // Пара «файл X.md + папка X/» в одном каталоге (#1385): строка X обязана
+    // различимо помечать оба носителя — тихая слепота листинга запрещена.
+    // Формат пометки закреплён контрактом: якорь « (неоднозначно:».
+    let view = DocsView::new(docs_wiki(&["X", "X/a", "X/b"]));
+    let out = sorted(view.list("X").await.unwrap());
+    assert_eq!(
+        out,
+        vec![
+            "X (неоднозначно: файл «X.md» + папка «X/»)".to_string(),
+            "X/a".to_string(),
+            "X/b".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn docs_ls_collision_dash_stem_stays_parseable() {
+    // Стемы с « — » в вики реальны (ADR-тайтлы): пометка не должна ломать
+    // слаг-префикс — якорь реза « (неоднозначно:» уникален и не встречается
+    // в слаге.
+    let view = DocsView::new(docs_wiki(&["A — B", "A — B/c"]));
+    let out = sorted(view.list("A — B").await.unwrap());
+    assert_eq!(
+        out,
+        vec![
+            "A — B (неоднозначно: файл «A — B.md» + папка «A — B/»)".to_string(),
+            "A — B/c".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn docs_ls_nested_collision_annotates_stem_only() {
+    // Коллизия на глубине: файл a/b.md + папка a/b/ — помечается ровно
+    // строка a/b, дети без изменений.
+    let view = DocsView::new(docs_wiki(&["a/b", "a/b/c"]));
+    let out = sorted(view.list("a").await.unwrap());
+    assert_eq!(
+        out,
+        vec![
+            "a/b (неоднозначно: файл «a/b.md» + папка «a/b/»)".to_string(),
+            "a/b/c".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn docs_ls_file_without_dir_unchanged() {
+    // Файл без папки-тёзки: листинг не меняется (регрессия формата).
+    let view = DocsView::new(docs_wiki(&["Y"]));
+    let out = view.list("Y").await.unwrap();
+    assert_eq!(out, vec!["Y".to_string()]);
+}
+
+#[tokio::test]
+async fn docs_ls_dir_without_stab_has_no_stem_line() {
+    // Папка без файла-стаба: дети без изменений, строки-стема нет
+    // (дир-узлы строк не создают — известный квирк md-слаг-листинга,
+    // вне скоупа #1385; здесь пин на отсутствие ложной пометки).
+    let view = DocsView::new(docs_wiki(&["Z/a", "Z/b"]));
+    let out = sorted(view.list("Z").await.unwrap());
+    assert_eq!(out, vec!["Z/a".to_string(), "Z/b".to_string()]);
+}
+
+#[tokio::test]
+async fn docs_ls_clean_listing_unchanged() {
+    // Неколлизионный каталог: вывод байт-в-байт как раньше.
+    let view = DocsView::new(docs_wiki(&["P/README", "P/Design Spec"]));
+    let out = sorted(view.list("P").await.unwrap());
+    assert_eq!(
+        out,
+        vec!["P/Design Spec".to_string(), "P/README".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn docs_ls_empty_wiki_yields_empty_listing() {
+    // Пустая вики: dirs-вычисление на пустом входе — пустой листинг без
+    // паники (граничный вход коллизии-постобработки).
+    let view = DocsView::new(docs_wiki(&[]));
+    let out = view.list("").await.unwrap();
+    assert!(out.is_empty());
+}
+
+#[tokio::test]
+async fn docs_ls_stem_neighbor_not_leaked_into_listing() {
+    // Сосед по стему («XY» при запросе «X»): граница префикса — «{norm}/»
+    // или p == norm (выравнивание MemWiki с адаптером github_wiki, Low
+    // ревью #1385) — сосед не попадает в листинг, коллизия X помечена.
+    let view = DocsView::new(docs_wiki(&["X", "X/a", "XY"]));
+    let out = sorted(view.list("X").await.unwrap());
+    assert_eq!(
+        out,
+        vec![
+            "X (неоднозначно: файл «X.md» + папка «X/»)".to_string(),
+            "X/a".to_string(),
+        ]
+    );
 }
