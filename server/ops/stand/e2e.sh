@@ -135,12 +135,12 @@ while [ $SEEN_OK -lt 60 ]; do   # до 5 минут
   sleep 5
   S="$(task_status || true)"
   case "$S" in
-    *Review*) say "цикл замкнут: $S"; break ;;
+    *Review) say "цикл замкнут: $S"; break ;;
     *attention*|*Needs*) fail "строка в $S (луп-гвард эскалировал?)" ;;
   esac
 done
 [ "${S:-}" = "" ] && fail "seed-строка не читается (сервер жив? лог: $LOG_SRV_LIVE)"
-case "$S" in *Review*) ;; *) fail "цикл не замкнут за 5 мин, статус: $S";; esac
+case "$S" in *Review) ;; *) fail "цикл не замкнут за 5 мин, статус: $S";; esac
 
 grep -q "loop_escalated" "$LOG_SRV_LIVE" && fail "loop_escalated в live-логе"
 # ре-энти был: два dev-спавна (круг 1 + после request_changes)
@@ -357,11 +357,11 @@ while [ $SEEN_OK -lt 72 ]; do
   sleep 5
   S="$(task_status || true)"
   case "$S" in
-    *Review*) say "цикл замкнут: $S"; break ;;
+    *Review) say "цикл замкнут: $S"; break ;;
     *attention*|*Needs*) fail "строка в $S" ;;
   esac
 done
-case "$S" in *Review*) ;; *) fail "цикл не замкнут за 6 мин, статус: $S";; esac
+case "$S" in *Review) ;; *) fail "цикл не замкнут за 6 мин, статус: $S";; esac
 sleep 12   # окно эха: тик после idle-фазы последних актов
 DELIVERED=$(grep -c '"event":"wakeup.delivered"' "$LOG_SRV_ECHO" || true)
 SLICED=$(grep -c '"event":"wakeup.self_echo_sliced"' "$LOG_SRV_ECHO" || true)
