@@ -900,11 +900,14 @@ fn peak_plan(mode: Mode, cup: usize) -> TickPlan {
     }
 }
 
-/// Юзкейс в пик-окне с настраиваемыми комментами (будильник-сценарии).
-fn peak_usecase(
+/// Общий билдер тик-фикстуры: fake-компоненты + юзкейс (дедуп семейства
+/// билдеров — ревью #1310 Low; в поле TickUseCase меняется одно место).
+fn fixture_usecase(
     rows: Vec<Task>,
     comments: Vec<CommentRef>,
     state: Arc<MemState>,
+    clock: Arc<dyn Clock>,
+    sessions: FakeSessions,
 ) -> (TickUseCase, Arc<FakeBoard>, Arc<FakeSessions>, Arc<FakePrs>) {
     let board = Arc::new(FakeBoard {
         rows: rows.into(),
@@ -915,28 +918,7 @@ fn peak_usecase(
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
-    let sessions = Arc::new(FakeSessions {
-        switched: Mutex::default(),
-        prompts: Mutex::default(),
-        spawned: Mutex::default(),
-        activity_ms: Some(1000),
-        dead_sessions: Mutex::default(),
-        list_fails: false,
-        idle_reply: false,
-        specs: Mutex::default(),
-        live: Mutex::default(),
-        busy_ids: Mutex::default(),
-        extra: Mutex::default(),
-        prompt_fails: false,
-        prompt_lost: Mutex::default(),
-        prompt_lost_all: false,
-        deleted: Mutex::default(),
-        activity_fails_sessions: Mutex::default(),
-        liveness_unknown: false,
-        aborted: Mutex::default(),
-        abort_fails: AtomicBool::new(false),
-        spawn_probe: AtomicBool::new(true),
-    });
+    let sessions = Arc::new(sessions);
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
         merges: Mutex::default(),
@@ -946,12 +928,27 @@ fn peak_usecase(
         board: board.clone(),
         sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
         prs: prs.clone(),
-        clock: Arc::new(PeakClock),
+        clock,
         state,
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
     };
     (u, board, sessions, prs)
+}
+
+/// Юзкейс в пик-окне с настраиваемыми комментами (будильник-сценарии).
+fn peak_usecase(
+    rows: Vec<Task>,
+    comments: Vec<CommentRef>,
+    state: Arc<MemState>,
+) -> (TickUseCase, Arc<FakeBoard>, Arc<FakeSessions>, Arc<FakePrs>) {
+    fixture_usecase(
+        rows,
+        comments,
+        state,
+        Arc::new(PeakClock),
+        FakeSessions::new(),
+    )
 }
 
 /// Юзкейс с готовым моком сессий (сценарии list_fails и пр.).
@@ -7848,34 +7845,17 @@ fn matrix_usecase(
     Arc<FakePrs>,
     Arc<MatrixClock>,
 ) {
-    let board = Arc::new(FakeBoard {
-        rows: rows.into(),
-        log: Mutex::default(),
-        comments,
-        fields_fails: false,
-        set_session_fails: false,
-        clear_session_fails: AtomicBool::new(false),
-        status_fails: AtomicBool::new(false),
-    });
-    let sessions = Arc::new(FakeSessions {
-        idle_reply,
-        ..FakeSessions::new()
-    });
-    let prs = Arc::new(FakePrs {
-        state: PrState::Missing,
-        merges: Mutex::default(),
-        probes: Mutex::default(),
-    });
     let clock = Arc::new(MatrixClock::new());
-    let u = TickUseCase {
-        board: board.clone(),
-        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
-        prs: prs.clone(),
-        clock: clock.clone(),
+    let (u, board, sessions, prs) = fixture_usecase(
+        rows,
+        comments,
         state,
-        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
-        boot_ms: 0,
-    };
+        clock.clone(),
+        FakeSessions {
+            idle_reply,
+            ..FakeSessions::new()
+        },
+    );
     (u, board, sessions, prs, clock)
 }
 

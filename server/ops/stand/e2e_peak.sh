@@ -51,12 +51,8 @@ cleanup() {
   [ "${KEEP:-0}" = "1" ] || rm -rf "$RUN_DIR"
 }
 trap cleanup EXIT
-
-mcp() {
-  curl -s --max-time 10 -X POST "http://127.0.0.1:$PORT_SRV/mcp" \
-    -H "Authorization: Bearer $BEARER" -H 'Content-Type: application/json' \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"$1\",\"arguments\":$2}}"
-}
+# Ассерты — по логам сервера/мока (grep событий): MCP-вызовы здесь не нужны
+# (в отличие от e2e.sh, где mcp() — основной инструмент).
 
 # Пик реален: PeakWindow держит только будни (weekday 1..=5). Выходной —
 # громкий отказ с причиной (детерминизм прогона важнее автоскипа).
