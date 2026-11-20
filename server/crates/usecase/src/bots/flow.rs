@@ -105,6 +105,7 @@ mod tests {
             text: text.map(String::from),
             caption: None,
             media: None,
+            forward: None,
         }
     }
 
@@ -122,6 +123,7 @@ mod tests {
                 file_size: Some(10_000),
                 mime: Some("image/jpeg".into()),
             }),
+            forward: None,
         }
     }
 

@@ -101,8 +101,37 @@ impl TelegramClient {
                 text: m["text"].as_str().map(String::from),
                 caption: m["caption"].as_str().map(String::from),
                 media: Self::parse_media(m),
+                forward: Self::parse_forward(m),
             }),
         }
+    }
+
+    /// Форвард-факт (#1416): Bot API `forward_origin` — 4 типа
+    /// (user/hidden_user/chat/channel), каждый сворачивается в
+    /// человекочитаемую метку источника для маркера промпта бот-сессии.
+    /// Legacy-поля (forward_from, пре-Bot API 7.0) не читаются: живой
+    /// форвард приходит только через forward_origin.
+    fn parse_forward(m: &Value) -> Option<String> {
+        let origin = &m["forward_origin"];
+        match origin["type"].as_str()? {
+            "user" => Some(match origin["sender_user"]["username"].as_str() {
+                Some(u) => format!("юзер @{u}"),
+                None => "юзер".to_string(),
+            }),
+            "hidden_user" => Some("скрытый источник".to_string()),
+            "chat" => Self::chat_forward_label(&origin["sender_chat"], "чат"),
+            "channel" => Self::chat_forward_label(&origin["chat"], "канал"),
+            _ => None,
+        }
+    }
+
+    /// Метка chat/channel-источника: username предпочтительнее тайтла
+    /// (короткий и стабильный); без обоих — форвард не размечается.
+    fn chat_forward_label(chat: &Value, kind: &str) -> Option<String> {
+        if let Some(u) = chat["username"].as_str() {
+            return Some(format!("{kind} @{u}"));
+        }
+        chat["title"].as_str().map(|t| format!("{kind} «{t}»"))
     }
 
     /// Media-факт сообщения (#1171): photo — массив PhotoSize, последний
@@ -348,6 +377,116 @@ mod tests {
         let m = TelegramClient::parse_update(&raw).message.expect("message");
         assert!(m.media.is_none());
         assert!(m.caption.is_none());
+    }
+
+    /// #1416: forward_origin.channel — метка «канал @username»
+    /// (username предпочтительнее тайтла).
+    #[test]
+    fn parses_channel_forward_origin_username_label() {
+        let raw = json!({
+            "update_id": 13,
+            "message": {
+                "from": {"username": "yurvon"},
+                "chat": {"id": 42, "type": "private"},
+                "text": "пост про nginx",
+                "forward_origin": {
+                    "type": "channel",
+                    "chat": {"id": -100123, "type": "channel", "title": "Nginx Gems", "username": "nginx"}
+                }
+            }
+        });
+        let m = TelegramClient::parse_update(&raw).message.expect("message");
+        assert_eq!(m.forward.as_deref(), Some("канал @nginx"));
+    }
+
+    /// #1416: user-origin — username в метку; без username — просто
+    /// «юзер» (имя/фамилия в промпт не едут); hidden_user — «скрытый
+    /// источник».
+    #[test]
+    fn parses_user_and_hidden_forward_origins() {
+        let with_username = json!({
+            "update_id": 14,
+            "message": {
+                "from": {"username": "yurvon"},
+                "chat": {"id": 42, "type": "private"},
+                "text": "x",
+                "forward_origin": {
+                    "type": "user",
+                    "sender_user": {"id": 7, "first_name": "Иван", "username": "ivanov"}
+                }
+            }
+        });
+        let m = TelegramClient::parse_update(&with_username)
+            .message
+            .expect("message");
+        assert_eq!(m.forward.as_deref(), Some("юзер @ivanov"));
+
+        let without_username = json!({
+            "update_id": 15,
+            "message": {
+                "from": {"username": "yurvon"},
+                "chat": {"id": 42, "type": "private"},
+                "text": "x",
+                "forward_origin": {
+                    "type": "user",
+                    "sender_user": {"id": 8, "first_name": "Пётр"}
+                }
+            }
+        });
+        let m = TelegramClient::parse_update(&without_username)
+            .message
+            .expect("message");
+        assert_eq!(m.forward.as_deref(), Some("юзер"));
+
+        let hidden = json!({
+            "update_id": 16,
+            "message": {
+                "from": {"username": "yurvon"},
+                "chat": {"id": 42, "type": "private"},
+                "text": "x",
+                "forward_origin": {"type": "hidden_user", "sender_user_name": "Кто-то"}
+            }
+        });
+        let m = TelegramClient::parse_update(&hidden)
+            .message
+            .expect("message");
+        assert_eq!(m.forward.as_deref(), Some("скрытый источник"));
+    }
+
+    /// #1416: chat-origin — fallback на тайтл группы без username;
+    /// MessageOriginChat несёт чат в поле sender_chat.
+    #[test]
+    fn parses_chat_forward_origin_title_fallback() {
+        let raw = json!({
+            "update_id": 17,
+            "message": {
+                "from": {"username": "yurvon"},
+                "chat": {"id": 42, "type": "private"},
+                "text": "x",
+                "forward_origin": {
+                    "type": "chat",
+                    "sender_chat": {"id": -100999, "type": "supergroup", "title": "Рабочий чат"}
+                }
+            }
+        });
+        let m = TelegramClient::parse_update(&raw).message.expect("message");
+        assert_eq!(m.forward.as_deref(), Some("чат «Рабочий чат»"));
+    }
+
+    /// #1416: не-форвард — forward пуст (регресс поля): обычный текст
+    /// не размечается маркером.
+    #[test]
+    fn plain_message_has_no_forward() {
+        let raw = json!({
+            "update_id": 18,
+            "message": {
+                "from": {"username": "yurvon"},
+                "chat": {"id": 42, "type": "private"},
+                "text": "привет"
+            }
+        });
+        let m = TelegramClient::parse_update(&raw).message.expect("message");
+        assert!(m.forward.is_none());
     }
 
     /// Перманентный oversize-отказ getFile — типизированный маршрут

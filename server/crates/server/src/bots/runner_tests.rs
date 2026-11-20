@@ -723,6 +723,7 @@ fn private_update(id: u64, username: &str, text: &str) -> TgUpdate {
             text: Some(text.into()),
             caption: None,
             media: None,
+            forward: None,
         }),
     }
 }
@@ -755,6 +756,7 @@ fn media_update(
                 file_size: size,
                 mime: None,
             }),
+            forward: None,
         }),
     }
 }
@@ -769,6 +771,7 @@ fn group_update(id: u64) -> TgUpdate {
             text: Some("из группы".into()),
             caption: None,
             media: None,
+            forward: None,
         }),
     }
 }
@@ -1889,6 +1892,92 @@ async fn photo_without_caption_gets_no_caption_marker() {
         "media-шапка в промпте: {p}"
     );
     assert!(p.contains("вложи эту ссылку"), "инструкция в промпте: {p}");
+    let _ = s;
+}
+
+/// #1416: форвард владельца доезжает в промпт с маркером источника —
+/// пересланный пост перестаёт быть неотличимым от набранного текста
+/// (тихое оседание в бот-сессии без факта пересылки).
+#[tokio::test]
+async fn forward_text_prompt_carries_origin_marker() {
+    let tg = FakeTg::new(vec![private_update(31, "yurvon", "риски nginx")]);
+    tg.queue.lock().expect("l")[0]
+        .message
+        .as_mut()
+        .expect("message")
+        .forward = Some("канал @nginx".into());
+    let sessions = FakeSessions::new();
+    let d = deps_with_assets(tg.clone(), sessions.clone(), FakeAssets::new());
+    let m = tg.queue.lock().expect("l")[0].message.clone().unwrap();
+    process_message(&d, &m).await.unwrap();
+
+    let ps = sessions.prompts_snapshot();
+    let [(s, p)] = ps.as_slice() else {
+        panic!("промпт не отправлен: {ps:?}")
+    };
+    assert!(
+        p.contains("[Пересланный пост — канал @nginx]"),
+        "форвард-маркер потерян: {p}"
+    );
+    assert!(p.contains("риски nginx"), "текст форварда в промпте: {p}");
+    let _ = s;
+}
+
+/// #1416: форвард-факт в media-ветке — маркер прежде шапки файла,
+/// форвард-фото тоже факт пересылки, не только текстовые посты.
+#[tokio::test]
+async fn forward_media_prompt_carries_origin_marker() {
+    let tg = FakeTg::new(vec![media_update(
+        32,
+        "yurvon",
+        MediaKind::Photo,
+        "agg-fw",
+        Some("скрин канала"),
+        Some(10),
+    )]);
+    tg.with_file("agg-fw", b"px");
+    tg.queue.lock().expect("l")[0]
+        .message
+        .as_mut()
+        .expect("message")
+        .forward = Some("юзер @nginx".into());
+    let sessions = FakeSessions::new();
+    let d = deps_with_assets(tg.clone(), sessions.clone(), FakeAssets::new());
+    let m = tg.queue.lock().expect("l")[0].message.clone().unwrap();
+    process_message(&d, &m).await.unwrap();
+
+    let ps = sessions.prompts_snapshot();
+    let [(s, p)] = ps.as_slice() else {
+        panic!("промпт не отправлен: {ps:?}")
+    };
+    assert!(
+        p.contains("[Пересланный пост — юзер @nginx]"),
+        "форвард-маркер потерян в media-ветке: {p}"
+    );
+    let marker_at = p.find("[Пересланный пост").expect("маркер");
+    let file_at = p.find("Владелец прислал файл").expect("шапка файла");
+    assert!(marker_at < file_at, "маркер не прежде шапки файла: {p}");
+    let _ = s;
+}
+
+/// #1416 инвариант: не-форвард — промпт без маркера; существующие
+/// диалоги бота байт-в-байт прежние.
+#[tokio::test]
+async fn plain_text_prompt_has_no_forward_marker() {
+    let tg = FakeTg::new(vec![private_update(33, "yurvon", "обычная заявка")]);
+    let sessions = FakeSessions::new();
+    let d = deps_with_assets(tg.clone(), sessions.clone(), FakeAssets::new());
+    let m = tg.queue.lock().expect("l")[0].message.clone().unwrap();
+    process_message(&d, &m).await.unwrap();
+
+    let ps = sessions.prompts_snapshot();
+    let [(s, p)] = ps.as_slice() else {
+        panic!("промпт не отправлен: {ps:?}")
+    };
+    assert!(
+        !p.contains("Пересланный пост"),
+        "маркер на не-форварде: {p}"
+    );
     let _ = s;
 }
 

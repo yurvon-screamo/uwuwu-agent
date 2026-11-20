@@ -125,9 +125,20 @@ pub(crate) async fn process_message(deps: &BotDeps, m: &TgMessage) -> UsecaseRes
                     return send(deps, m.chat_id, &greeting).await;
                 }
             }
-            run_turn(deps, m.chat_id, &text).await
+            run_turn(deps, m.chat_id, &format!("{}{text}", forward_line(m))).await
         }
-        Incoming::Media { caption, media } => process_media(deps, m.chat_id, caption, media).await,
+        Incoming::Media { caption, media } => {
+            process_media(deps, m.chat_id, caption, media, &m.forward).await
+        }
+    }
+}
+
+/// Форвард-маркер промпта (#1416): строка-префикс с источником; для
+/// обычного сообщения — пустая строка, промпт байт-в-байт прежний.
+fn forward_line(m: &TgMessage) -> String {
+    match &m.forward {
+        Some(origin) => format!("[Пересланный пост — {origin}]\n"),
+        None => String::new(),
     }
 }
 
@@ -140,6 +151,7 @@ async fn process_media(
     chat_id: i64,
     caption: Option<String>,
     media: TgMedia,
+    forward: &Option<String>,
 ) -> UsecaseResult<()> {
     if media.kind == MediaKind::Other {
         tracing::info!(event = "bot.media_refused", slug = %deps.slug,
@@ -179,8 +191,12 @@ async fn process_media(
     tracing::info!(event = "bot.media_delivered", slug = %deps.slug,
         kind = ?media.kind, "Файл забран и приложен к контексту сессии");
     let caption_line = caption.unwrap_or_else(|| "Подписи нет".into());
+    let forward_line = match forward {
+        Some(origin) => format!("[Пересланный пост — {origin}]\n"),
+        None => String::new(),
+    };
     let media_text = format!(
-        "Владелец прислал файл: {url}\n{caption_line}\n\
+        "{forward_line}Владелец прислал файл: {url}\n{caption_line}\n\
 Если оформляешь заявку — вложи эту ссылку в тело задачи (markdown), \
 чтобы контент попал в разбор."
     );
