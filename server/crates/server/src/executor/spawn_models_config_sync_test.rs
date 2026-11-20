@@ -54,6 +54,7 @@ fn canonical_matches_config_example_verbatim() {
         uwuwu_domain::Agent::PlanReviewer,
         uwuwu_domain::Agent::CodeQualityReviewer,
         uwuwu_domain::Agent::Tester,
+        uwuwu_domain::Agent::TestReviewer,
         uwuwu_domain::Agent::Analyst,
         uwuwu_domain::Agent::AnalystReviewer,
         uwuwu_domain::Agent::Dreamer,

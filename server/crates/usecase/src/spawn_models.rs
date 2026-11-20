@@ -38,6 +38,7 @@ impl SpawnModels {
         put("plan-reviewer", "zai-coding-plan/glm-5.3#high");
         put("code-quality-reviewer", "zai-coding-plan/glm-5.3#high");
         put("tester", "zai-coding-plan/glm-5.3-flash#high");
+        put("test-reviewer", "zai-coding-plan/glm-5.3#high");
         put("analyst", "zai-coding-plan/glm-5.3-flash#high");
         put("analyst-reviewer", "zai-coding-plan/glm-5.3#high");
         put("dreamer", "zai-coding-plan/glm-5.3-flash#high");
