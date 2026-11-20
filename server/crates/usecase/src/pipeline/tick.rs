@@ -258,6 +258,19 @@ pub(crate) struct RowContext<'a> {
     pub(crate) preempts: &'a PreemptPool,
 }
 
+/// Цель судьи на тике: строка+слот+сессия и факты сталл-точки. Свёртка
+/// параметров (qlty function-parameters: judge_apply/judge_stall_action).
+struct JudgeCall<'a> {
+    board: &'a BoardPlan,
+    task: &'a Task,
+    slot: Slot,
+    session: &'a str,
+    /// Тишина stage-сессии (ms) и вызовов без смены статуса на момент
+    /// решения.
+    silence: u64,
+    calls: u32,
+}
+
 /// Char-safe обрезка строки до `max` символов (UTF-8: индексация байтами
 /// рвёт многобайтовые символы — русский текст контекста судьи).
 fn trim_chars(s: &str, max: usize) -> String {
@@ -1253,9 +1266,15 @@ impl TickUseCase {
         // decision-модели вместо пингов/автопаркинга. Err вызова — fallback
         // на старую механику ниже: судья — улучшение, не зависимость.
         if self.judge_enabled() {
-            return self
-                .judge_stall_action(board, task, slot, &session, soft, silence, count, now, out)
-                .await;
+            let call = JudgeCall {
+                board,
+                task,
+                slot,
+                session: &session,
+                silence,
+                calls: count,
+            };
+            return self.judge_stall_action(&call, soft, now, out).await;
         }
         self.stall_action(board, task, slot, &session, soft, silence, count, now)
             .await
@@ -1352,33 +1371,25 @@ impl TickUseCase {
     /// принудительный паркинг без нового вызова модели (слово владельца
     /// «порог 3 сверху судьи»; спайковый урок C7 — судья-«hold на всём»
     /// не глушит страховку). Err вердикта — fallback на старую механику.
-    #[allow(clippy::too_many_arguments)]
     async fn judge_stall_action(
         &self,
-        board: &BoardPlan,
-        task: &Task,
-        slot: Slot,
-        session: &str,
+        call: &JudgeCall<'_>,
         soft: bool,
-        silence: u64,
-        count: u32,
         now: u64,
         out: &mut TickOutcome,
     ) -> UsecaseResult<StallAct> {
-        if uwuwu_domain::judge_step(count, self.judge_cfg.escalate_after)
+        if uwuwu_domain::judge_step(call.calls, self.judge_cfg.escalate_after)
             == uwuwu_domain::JudgeStep::ForceEscalate
         {
             return self
                 .judge_park(
-                    board,
-                    task,
-                    session,
+                    call,
                     now,
                     &format!(
-                        "⚖︎ Судья: гвард — {count} вызовов подряд без смены статуса \
+                        "⚖︎ Судья: гвард — {} вызовов подряд без смены статуса \
                          строки (порог {}). Строка в Needs attention без нового \
                          вызова модели. Разбор владельца.",
-                        self.judge_cfg.escalate_after
+                        call.calls, self.judge_cfg.escalate_after
                     ),
                     out,
                 )
@@ -1387,24 +1398,32 @@ impl TickUseCase {
         let Some(judge) = self.judge.as_ref() else {
             return Ok(StallAct::None);
         };
-        let ctx = self.judge_context(board, task, silence, count, 0).await;
+        let ctx = self
+            .judge_context(call.board, call.task, call.silence, call.calls, 0)
+            .await;
         match judge.decide(&ctx).await {
             Ok(verdict) => {
                 out.judge_calls += 1;
-                self.judge_apply(
-                    board, task, slot, session, &verdict, silence, count, now, out,
-                )
-                .await
+                self.judge_apply(call, &verdict, now, out).await
             }
             Err(e) => {
                 tracing::warn!(
                     event = "judge.err",
-                    number = task.number(),
+                    number = call.task.number(),
                     error = %e,
                     "Судья недоступна — fallback на старую механику сталл-детекта"
                 );
-                self.stall_action(board, task, slot, session, soft, silence, count, now)
-                    .await
+                self.stall_action(
+                    call.board,
+                    call.task,
+                    call.slot,
+                    call.session,
+                    soft,
+                    call.silence,
+                    call.calls,
+                    now,
+                )
+                .await
             }
         }
     }
@@ -1464,18 +1483,16 @@ impl TickUseCase {
         match judge.decide(&ctx).await {
             Ok(verdict) => {
                 out.judge_calls += 1;
+                let call = JudgeCall {
+                    board,
+                    task,
+                    slot: round_slot,
+                    session: task.session_of(round_slot).unwrap_or(""),
+                    silence: 0,
+                    calls: 0,
+                };
                 match self
-                    .judge_apply(
-                        board,
-                        task,
-                        round_slot,
-                        task.session_of(round_slot).unwrap_or(""),
-                        &verdict,
-                        0,
-                        0,
-                        self.clock.now_ms(),
-                        out,
-                    )
+                    .judge_apply(&call, &verdict, self.clock.now_ms(), out)
                     .await
                 {
                     // паркинг вердиктом — раунд N+1 не назначается
@@ -1560,19 +1577,19 @@ impl TickUseCase {
     /// счётчик гварда растёт). Вердикт = текущий статус — пробуждение
     /// агента без переноса. Race-чек (L2): статус строки сверяется перед
     /// set_status — вердикт не перетирает свежую агентскую транзакцию.
-    #[allow(clippy::too_many_arguments)]
     async fn judge_apply(
         &self,
-        board: &BoardPlan,
-        task: &Task,
-        slot: Slot,
-        session: &str,
+        call: &JudgeCall<'_>,
         verdict: &uwuwu_domain::JudgeVerdict,
-        silence: u64,
-        calls: u32,
         now: u64,
         out: &mut TickOutcome,
     ) -> UsecaseResult<StallAct> {
+        let board = call.board;
+        let task = call.task;
+        let slot = call.slot;
+        let session = call.session;
+        let silence = call.silence;
+        let calls = call.calls;
         let current = task.status();
         let Some(target) = uwuwu_domain::verdict_target(current, verdict.status) else {
             out.judge_rejected += 1;
@@ -1673,13 +1690,14 @@ impl TickUseCase {
     /// Принудительный паркинг гварда судьи (без вызова модели).
     async fn judge_park(
         &self,
-        board: &BoardPlan,
-        task: &Task,
-        session: &str,
+        call: &JudgeCall<'_>,
         now: u64,
         digest: &str,
         out: &mut TickOutcome,
     ) -> UsecaseResult<StallAct> {
+        let board = call.board;
+        let task = call.task;
+        let session = call.session;
         tracing::warn!(
             event = "judge.forced",
             number = task.number(),

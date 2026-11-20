@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 use uwuwu_domain::{JudgeStatus, JudgeVerdict};
-use uwuwu_usecase::{Clock, DecisionJudge, JudgeContext};
+use uwuwu_usecase::{slot_key, status_name, Clock, DecisionJudge, JudgeContext};
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 const API_ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta/decisions";
@@ -91,8 +91,8 @@ impl GeminiJudge {
             "ЗАДАЧА #{} «{}» — статус «{}», стадия «{}».",
             ctx.number,
             ctx.title,
-            naming_status(ctx.status),
-            naming_slot(ctx.slot)
+            status_name(ctx.status),
+            slot_key(ctx.slot)
         );
         if let Some(branch) = &ctx.branch {
             let _ = writeln!(s, "Ветка: {branch}.");
@@ -134,7 +134,7 @@ impl GeminiJudge {
                 let _ = writeln!(
                     s,
                     "- [{}] (ход завершён: {}): {}",
-                    naming_slot(tail.slot),
+                    slot_key(tail.slot),
                     if tail.finished { "да" } else { "нет" },
                     tail.text
                 );
@@ -176,40 +176,6 @@ impl GeminiJudge {
                 }
             }
         })
-    }
-}
-
-/// Имя статуса для промпта (канон доски; дубль naming — домен не знает
-/// носителей, а крейт server не тянет usecase::naming в домен).
-fn naming_status(s: uwuwu_domain::Status) -> &'static str {
-    use uwuwu_domain::Status as S;
-    match s {
-        S::Draft => "Draft",
-        S::Analys => "Analys",
-        S::ReviewAnalys => "Review Analys",
-        S::Todo => "Todo",
-        S::Design => "Design",
-        S::ReviewPlan => "Ревью плана",
-        S::InProgress => "In Progress",
-        S::ReviewResult => "Ревью результата",
-        S::Testing => "Тестирование",
-        S::UserReview => "Review",
-        S::Done => "Done",
-        S::NeedsAttention => "Needs attention",
-        S::Wait => "Вейт",
-        S::Deleted => "Deleted",
-        S::Empty => "",
-    }
-}
-
-fn naming_slot(slot: uwuwu_domain::Slot) -> &'static str {
-    use uwuwu_domain::Slot as Sl;
-    match slot {
-        Sl::Design => "design",
-        Sl::Dev => "dev",
-        Sl::PlanReview => "plan-review",
-        Sl::ResultReview => "result-review",
-        Sl::Test => "test",
     }
 }
 

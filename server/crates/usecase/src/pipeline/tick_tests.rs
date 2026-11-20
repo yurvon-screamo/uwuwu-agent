@@ -8362,25 +8362,23 @@ impl DecisionJudge for FakeJudge {
 
 /// Юзкейс с судьёй: rows на доске, judge-конфиг включён, тишина сессии
 /// управляется activity_ms (ms), idle-фаза — idle_reply.
-#[allow(clippy::too_many_arguments)]
 fn judge_usecase(
     rows: Vec<Task>,
-    comments: Vec<CommentRef>,
     activity_ms: Option<u64>,
     idle_reply: bool,
     state: Arc<MemState>,
-    judge: Option<Arc<dyn DecisionJudge>>,
-    cfg: JudgeCfg,
+    judge_cfg: (Option<Arc<dyn DecisionJudge>>, JudgeCfg),
 ) -> (
     TickUseCase,
     Arc<FakeBoard>,
     Arc<FakeSessions>,
     Arc<MemState>,
 ) {
+    let (judge, cfg) = judge_cfg;
     let board = Arc::new(FakeBoard {
         rows: rows.into(),
         log: Mutex::default(),
-        comments,
+        comments: Vec::new(),
         fields_fails: false,
         set_session_fails: false,
         clear_session_fails: AtomicBool::new(false),
@@ -8448,12 +8446,10 @@ async fn judge_noise_state_wakes_without_transition() {
     };
     let (u, board, sessions, _) = judge_usecase(
         vec![judge_row(41, Status::InProgress, "ses_dev", Slot::Dev)],
-        Vec::new(),
         Some(NOW - 40 * 60_000), // тишина 40 мин, idle
         true,
         Arc::new(MemState(Mutex::default())),
-        Some(judge.clone()),
-        cfg,
+        (Some(judge.clone() as Arc<dyn DecisionJudge>), cfg),
     );
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.judge_calls, 1, "вызов судьи был");
@@ -8514,12 +8510,10 @@ async fn judge_verdict_transitions_row_with_race_check_passing() {
             "ses_rev",
             Slot::ResultReview,
         )],
-        Vec::new(),
         Some(NOW - 90 * 60_000),
         true,
         state,
-        Some(judge),
-        cfg,
+        (Some(judge), cfg),
     );
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.judge_transitions, 1);
@@ -8561,12 +8555,10 @@ async fn judge_rejects_illegal_verdict_as_hold() {
     };
     let (u, board, sessions, _) = judge_usecase(
         vec![judge_row(43, Status::Design, "ses_design", Slot::Design)],
-        Vec::new(),
         Some(NOW - 20 * 60_000),
         true,
         Arc::new(MemState(Mutex::default())),
-        Some(judge),
-        cfg,
+        (Some(judge), cfg),
     );
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.judge_rejected, 1, "гард отклонил вердикт");
@@ -8596,12 +8588,10 @@ async fn judge_err_falls_back_to_classic_soft_ping() {
     };
     let (u, _, sessions, _) = judge_usecase(
         vec![judge_row(44, Status::InProgress, "ses_dev", Slot::Dev)],
-        Vec::new(),
         Some(NOW - 16 * 60_000),
         true,
         Arc::new(MemState(Mutex::default())),
-        Some(FakeJudge::down()),
-        cfg,
+        (Some(FakeJudge::down()), cfg),
     );
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.judge_calls, 0, "вызова судьи не было");
@@ -8651,12 +8641,10 @@ async fn judge_guard_forces_park_without_call() {
         .push((45, Status::InProgress, NOW - 3 * 60 * 60_000));
     let (u, board, sessions, _) = judge_usecase(
         vec![judge_row(45, Status::InProgress, "ses_dev", Slot::Dev)],
-        Vec::new(),
         Some(NOW - 61 * 60_000),
         false, // не idle: классический гейт 60 мин
         state,
-        Some(judge.clone()),
-        cfg,
+        (Some(judge.clone() as Arc<dyn DecisionJudge>), cfg),
     );
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.judge_forced, 1, "паркинг гвардом");
@@ -8693,12 +8681,10 @@ async fn judge_cap_verdict_parks_row_on_needs_attention() {
     state.0.lock().unwrap().review_rounds.push((46, 3));
     let (u, board, _, _) = judge_usecase(
         vec![judge_row(46, Status::InProgress, "ses_dev", Slot::Dev)],
-        Vec::new(),
         Some(1000),
         true,
         state,
-        Some(judge),
-        cfg,
+        (Some(judge), cfg),
     );
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.judge_calls, 1, "судья вызван на кап-точке");
@@ -8735,12 +8721,10 @@ async fn judge_cap_verdict_continues_row_without_park() {
     state.0.lock().unwrap().review_rounds.push((47, 3));
     let (u, board, sessions, _) = judge_usecase(
         vec![judge_row(47, Status::InProgress, "ses_dev", Slot::Dev)],
-        Vec::new(),
         Some(1000),
         true,
         state,
-        Some(judge.clone()),
-        cfg,
+        (Some(judge.clone() as Arc<dyn DecisionJudge>), cfg),
     );
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.judge_calls, 1, "судья вызван на кап-точке");
