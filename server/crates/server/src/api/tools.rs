@@ -478,18 +478,28 @@ impl ToolHub {
             .get("direct")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // direct-строке дефолт off (план #1357, развилка 5): мерж только по
+        // явному мандату владельца (automerge: true в create-вызове), не по
+        // умолчанию конвейера. Не-boolean значение (null не считается —
+        // клиенты шлют его как «не задано») — громкий отказ: молчаливая
+        // интерпретация мусора как on-мандата противоречит инварианту
+        // «on — только явным мандатом» (ревью #1357 круг 1→2, Low)
+        let automerge_arg = args.get("automerge").or_else(|| args.get("autodone"));
+        let automerge = match automerge_arg {
+            Some(v) if v.is_boolean() => v.as_bool().unwrap_or(true),
+            Some(v) if !v.is_null() => {
+                return Err(format!(
+                    "automerge: жду boolean, пришло {v} — on-мандат не интерпретируется молча"
+                ));
+            }
+            _ => !direct,
+        };
         let spec = uwuwu_usecase::NewTask {
             title: arg_str(args, "title"),
             body_md: arg_str(args, "body"),
             kind: uwuwu_usecase::parse_task_type(&raw_kind),
             priority: arg_str(args, "priority"),
-            automerge: match args.get("automerge").or_else(|| args.get("autodone")) {
-                // direct-строке дефолт off (план #1357, развилка 5):
-                // мерж только по явному мандату владельца (automerge: true
-                // в create-вызове), не по умолчанию конвейера
-                Some(v) => v.as_bool().unwrap_or(true),
-                None => !direct,
-            },
+            automerge,
             direct,
         };
         let n = self

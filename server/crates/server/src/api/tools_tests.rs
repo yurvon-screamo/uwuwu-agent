@@ -746,6 +746,93 @@ async fn task_create_accepts_automerge_and_legacy_key() {
     .expect("выключенный automerge accepted");
 }
 
+/// Не-boolean automerge (мусор против boolean-схемы) — громкий отказ:
+/// on-мандат не интерпретируется молча (ревью #1357 Low, круг 1→2).
+/// Явный null — «не задано» (клиенты шлют), дефолт по классу строки:
+/// обычная → on, direct → off.
+#[tokio::test]
+async fn task_create_non_boolean_automerge_is_loud_not_on_mandate() {
+    let (tools, _memory) = hub();
+    let garbage = call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "мусор вместо automerge", "body": "б", "direct": true, "automerge": "on" }),
+    )
+    .await;
+    assert!(
+        garbage.is_err(),
+        "строка-мусор не превращается в on-мандат молча"
+    );
+    let rejected = garbage.unwrap_err();
+    assert!(
+        rejected.contains("boolean"),
+        "отказ называет ожидаемый тип: {rejected}"
+    );
+    // legacy-ключ с мусором — тот же отказ (читается как automerge)
+    let legacy = call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "мусор в legacy", "body": "б", "autodone": 1 }),
+    )
+    .await;
+    assert!(legacy.is_err(), "legacy-ключ — та же честность");
+    // явный null — «не задано»: обычная строка получает дефолт on
+    let null_on = call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "null как не задано", "body": "б", "automerge": null }),
+    )
+    .await
+    .expect("null — не мусор, дефолт конвейера");
+    assert!(null_on.contains("(Analys)"), "{null_on}");
+    // direct + явный null — дефолт класса off, не мандат
+    let created = call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "direct с null", "body": "б", "direct": true, "automerge": null }),
+    )
+    .await
+    .expect("null для direct — off без отказа");
+    let n: u64 = created
+        .trim()
+        .split('#')
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .and_then(|s| s.parse().ok())
+        .expect("номер в ответе");
+    let card = call(
+        &tools,
+        "task_get",
+        json!({ "project": "uwuwu", "number": n }),
+    )
+    .await
+    .expect("task_get ок");
+    assert!(card.contains("automerge: false"), "null не мандат: {card}");
+    // direct + явный true — мандат владельца, on пишется
+    let mandate = call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "direct с явным мандатом", "body": "цитата поручения с мандатом", "direct": true, "automerge": true }),
+    )
+    .await
+    .expect("явный boolean мандат accepted");
+    let n: u64 = mandate
+        .trim()
+        .split('#')
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .and_then(|s| s.parse().ok())
+        .expect("номер в ответе");
+    let card = call(
+        &tools,
+        "task_get",
+        json!({ "project": "uwuwu", "number": n }),
+    )
+    .await
+    .expect("task_get ок");
+    assert!(card.contains("automerge: true"), "мандат жив: {card}");
+}
+
 /// direct-круг (#1357) на MemoryHub-носителе: create(direct) рождает
 /// строку в In Progress (fm несёт direct: true), агент сам финализирует
 /// In Progress → Review; обычной строке то же ребро закрыто.
