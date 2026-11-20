@@ -1108,25 +1108,8 @@ async fn message_tail(store: Arc<Store>, id: String) -> Resp {
     let sessions = store.sessions.lock().expect("store");
     match sessions.get(&id) {
         Some(s) if s.turn_ms.is_some() => {
-            // MOCK_ACTIVITY_AGE_MS (стенд судьи #1364): активность насильно
-            // старая — тишина сессии фиксированно глубока, сталл-контур
-            // (и судья) срабатывает в первых тиках стенда. Стареть должны
-            // ОБА штампа: проба активности читает time.updated (свежий now
-            // в turn_tail обнулял бы тишину — silent None сталл-контура).
-            let age = cfg("MOCK_ACTIVITY_AGE_MS", "0").parse::<u64>().unwrap_or(0);
-            let mut tail = turn_tail(s.turn_ms.expect("turn_ms checked"));
-            if age > 0 {
-                let old = now_ms().saturating_sub(age);
-                if let Some(msgs) = tail.as_array_mut() {
-                    for m in msgs.iter_mut() {
-                        if let Some(t) = m.get_mut("time") {
-                            t["updated"] = json!(old);
-                            t["created"] = json!(old);
-                        }
-                    }
-                }
-            }
-            (StatusCode::OK, Json(tail))
+            let tail = turn_tail(s.turn_ms.expect("turn_ms checked"));
+            (StatusCode::OK, Json(stamp_activity_age(tail)))
         }
         Some(s) => {
             // Форма — живой опенкод 2.3.0 (проба #1150): тип в поле `type`,
@@ -1149,10 +1132,36 @@ async fn message_tail(store: Arc<Store>, id: String) -> Resp {
                     "cache": { "read": 0, "write": 0 }
                 });
             }
-            (StatusCode::OK, Json(json!([msg])))
+            (StatusCode::OK, Json(stamp_activity_age(json!([msg]))))
         }
         None => (StatusCode::NOT_FOUND, Json(json!({ "status": "404" }))),
     }
+}
+
+/// MOCK_ACTIVITY_AGE_MS (стенд судьи #1364): активность насильно старая —
+/// тишина сессии фиксированно глубока, сталл-контур (и судья) срабатывает
+/// в первых тиках стенда. Пост-стамп на ОБА ветвления хвоста (turn-фазы и
+/// idle-реплай): проба активности читает time.updated в первом сообщении,
+/// свежий штамп любого ветвления обнулял бы тишину — silent None
+/// сталл-контура (три красных прогона e2e 14a, 20.11).
+fn stamp_activity_age(mut tail: Value) -> Value {
+    let age = cfg("MOCK_ACTIVITY_AGE_MS", "0").parse::<u64>().unwrap_or(0);
+    if age == 0 {
+        return tail;
+    }
+    let old = now_ms().saturating_sub(age);
+    if let Some(msgs) = tail.as_array_mut() {
+        for m in msgs.iter_mut() {
+            if let Some(t) = m.get_mut("time") {
+                t["updated"] = json!(old);
+                t["created"] = json!(old);
+                if t.get("completed").is_some() {
+                    t["completed"] = json!(old);
+                }
+            }
+        }
+    }
+    tail
 }
 
 async fn export(store: Arc<Store>, id: String) -> Resp {

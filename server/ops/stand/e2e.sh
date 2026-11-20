@@ -1054,7 +1054,7 @@ print(t.split(chr(10))[0].split('— ')[-1])" 2>/dev/null
 }
 # мок-исполнитель: idle-реплаи, активность насильно 90 мин старая — тишина
 # глубока с первого тика, судья срабатывает без ожидания часов
-MOCK_MODE=idle MOCK_STEP_MS=100 MOCK_ACTIVITY_AGE_MS=5400000 \
+MOCK_MODE=idle MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=100 MOCK_ACTIVITY_AGE_MS=5400000 \
   "$BIN_MOCK" >"$LOG_MOCK" 2>&1 &
 MOCK_PID=$!
 sleep 1
