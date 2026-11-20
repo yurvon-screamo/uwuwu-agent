@@ -365,7 +365,7 @@ describe("runReview — оркестрация на fake-deps", () => {
     }
     const r = await runReview({ scope: "commit", directory: "/repo", commit: "feedbac4" }, fakeDeps(repo))
     expect(r.markdown).toContain("scope `commit` (`feedbac4`)")
-    expect(r.markdown).toContain("> ⚠ scope=commit: прогон по рабочей копии")
+    expect(r.markdown).toContain("> ⚠ scope=commit: a run over the working copy")
     expect(r.delta).toBe(2)
   })
 
