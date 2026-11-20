@@ -52,9 +52,9 @@ Apply when the text is in English and must be unambiguous (especially for non-na
 - `npx skills add nuelcyoung/asd-ste100`
 - `npx skills add blagoySimandov/asd-ste100-writer-skill`
 
-### 2.2 Russian → УТР (Упрощённый технический русский)
+### 2.2 Russian → УТР (Simplified Technical Russian)
 
-Apply when the text is in Russian and must be clear and unambiguous (especially technical documentation).
+Apply when the text is in Russian and must be clear and unambiguous (especially technical documentation). The rules below are Russian-grammar specifics — they stay in Russian terminology.
 
 **Core rules (based on ГОСТ Р 58049-2017 §8.2 + УТР-1 practice):**
 - Max **20 words** per sentence.
@@ -74,7 +74,7 @@ Apply when the text is in Russian and must be clear and unambiguous (especially 
 - "Примени УТР (ГОСТ Р 58049-2017)"
 - "Приблизься к УТР на 80–90 %"
 
-**Example prompt block:**
+**Example prompt block (for Russian text):**
 ```
 Пиши строго по правилам Упрощённого технического русского (УТР):
 1. Предложения максимум 20 слов.
