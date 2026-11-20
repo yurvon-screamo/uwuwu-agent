@@ -93,7 +93,7 @@ pub fn tool_descriptors() -> Value {
             object(json!({
                 "number": integer("номер задачи"),
                 "project": string("проект; дефолт uwuwu"),
-                "status": string("статус канона: Draft/Analys/Review Analys/Todo/Design/Ревью плана/In Progress/Ревью результата/Тестирование/Ревью тестирования/Review/Needs attention/Вейт"),
+                "status": string("статус канона: Draft/Analys/Review Analys/Todo/Design/Ревью плана/In Progress/Ревью результата/Тестирование/Ревью тестирования/Review/Needs attention/Wait"),f368e51b (refactor: rename status 'Вейт' -> 'Wait' (keep 'Вейт' alias))
                 "branch": string("имя ветки"),
                 "pr": string("URL PR"),
                 "priority": string("high|medium|low"),

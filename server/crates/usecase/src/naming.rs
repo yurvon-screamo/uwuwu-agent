@@ -21,7 +21,7 @@ pub fn status_name(s: Status) -> &'static str {
         Status::UserReview => "Review",
         Status::Done => "Done",
         Status::NeedsAttention => "Needs attention",
-        Status::Wait => "Вейт",
+        Status::Wait => "Wait",
         Status::Deleted => "Deleted",
         Status::Empty => "",
     }
@@ -44,6 +44,7 @@ pub fn parse_status(raw: &str) -> Status {
         "Review" => Status::UserReview,
         "Done" => Status::Done,
         "Needs attention" => Status::NeedsAttention,
+        "Wait" => Status::Wait,
         "Вейт" => Status::Wait,
         "Deleted" => Status::Deleted,
         _ => Status::Empty,
