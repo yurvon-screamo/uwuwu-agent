@@ -1224,13 +1224,20 @@ impl TickUseCase {
             return Ok(StallAct::None);
         }
         let idle = self.session_idle(board, &session).await;
-        let (gate, every, soft) = if idle {
+        let (gate, mut every, soft) = if idle {
             (STALL_SOFT_SILENCE_MS, STALL_SOFT_EVERY_MS, true)
         } else {
             (STALL_SILENCE_MS, STALL_PING_EVERY_MS, false)
         };
         if silence < gate {
             return Ok(StallAct::None);
+        }
+        // Судья (#1364): пороги тишины старой механики — её гейтинг,
+        // интервал повторных решений — свой ([judge].every_ms; у soft-класса
+        // старый интервал 30 мин держал бы повторный вердикт полчаса —
+        // вскрыто e2e 14b: wake погасил шум, повторный вызов не наступал).
+        if self.judge_enabled() {
+            every = self.judge_cfg.every_ms;
         }
         // раунд = статус: смена статуса обнуляет счётчик пингов
         let (prev_status, last_ping, mut count) = self
