@@ -290,6 +290,8 @@ async fn run(
         state: state.clone(),
         models: spawn_models.clone(),
         boot_ms: clock.now_ms(),
+        judge: None,
+        judge_cfg: Default::default(),
     });
 
     let shared: Arc<std::sync::RwLock<TickOutcome>> = Arc::default();

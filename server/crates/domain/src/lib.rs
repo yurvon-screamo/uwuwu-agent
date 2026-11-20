@@ -35,7 +35,7 @@ pub use task_type::TaskType;
 
 // внутренние виды расписания — параметр Schedule::new (парсер юзкейс-слоя)
 pub use cron::ScheduleKind;
-pub use judge::{judge_step, verdict_target, JudgeStatus, JudgeVerdict};
+pub use judge::{judge_step, verdict_target, JudgeStatus, JudgeStep, JudgeVerdict};
 pub use pipeline::{
     awaits, can_preempt, decide, gate, review_round_step, Action, Awaits, Gate, LoopOutcome,
     PeakWindow, ReviewRoundStep, SpawnLoop, SpawnPolicy, UtcMinute, REVIEW_ROUND_CAP,

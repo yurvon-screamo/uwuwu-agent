@@ -4,7 +4,10 @@
 use super::actions::{LostAct, WakeAct};
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
-use crate::ports::{Clock, Liveness, PrGateway, TaskBoardRepo, TickStateStore};
+use crate::ports::{
+    Clock, DecisionJudge, JudgeCfg, JudgeContext, JudgeSessionTail, Liveness, PrGateway,
+    TaskBoardRepo, TickStateStore,
+};
 use crate::router::SessionRouter;
 use crate::spawn_models::SpawnModels;
 use serde::Serialize;
@@ -91,6 +94,16 @@ pub struct TickOutcome {
     pub stall_flagged: usize,
     /// Строк, снятых с раунда капом ревью-раундов (#1311).
     pub review_flagged: usize,
+    /// Вызовов судьи (#1364): точек сталла/капа, где вердикт запрошен.
+    pub judge_calls: usize,
+    /// Переносов строки вердиктом судьи (set_status, ADR-106 ревизия).
+    pub judge_transitions: usize,
+    /// Пробуждений вердиктом без переноса (вердикт = текущий статус).
+    pub judge_wakeups: usize,
+    /// Принудительных паркингов гвардом судьи (вызовы без прогресса).
+    pub judge_forced: usize,
+    /// Вердиктов, отклонённых гардом каноничности (hold-эквивалент).
+    pub judge_rejected: usize,
     /// Строк, запаркованных порогом потерянных доставок (#1288).
     pub session_lost_flagged: usize,
     /// Отложенные политикой (пик/CUP) respawn'ы потерянных сессий (#1288):
@@ -157,6 +170,13 @@ pub struct TickUseCase {
     /// недействителен (инцидент 18.11 #1281: persisted каунтеры volume
     /// переживают пересоздание контейнера, парковка по чужому раунду).
     pub boot_ms: u64,
+    /// Судья — decision-модель статусных решений (#1364). None — контур
+    /// выключен ([judge].enabled=false или нет ключа): тик живёт старой
+    /// механикой; Err вызова — fallback на неё же (судья — улучшение,
+    /// не зависимость).
+    pub judge: Option<Arc<dyn DecisionJudge>>,
+    /// Конфиг контура судьи (пороги/тримы/гвард — канон плана #1364).
+    pub judge_cfg: JudgeCfg,
 }
 
 /// Причина hold спавна: зрение недоступно или в env живая сестра.
@@ -236,6 +256,16 @@ pub(crate) struct RowContext<'a> {
     pub(crate) enrich_failed: &'a HashSet<u64>,
     /// Кандидаты-жертвы преемпшена (#1259): busy low/empty-активы.
     pub(crate) preempts: &'a PreemptPool,
+}
+
+/// Char-safe обрезка строки до `max` символов (UTF-8: индексация байтами
+/// рвёт многобайтовые символы — русский текст контекста судьи).
+fn trim_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max).collect();
+    format!("{cut}…")
 }
 
 impl TickUseCase {
@@ -907,7 +937,7 @@ impl TickUseCase {
             Ok(WakeAct::Deferred) => out.wakeups_deferred += 1,
             Ok(WakeAct::Guarded) => out.held_live += 1,
             Ok(WakeAct::GuardedBlind) => out.held_blind += 1,
-            Ok(WakeAct::None) => match self.stall_pass(board, task).await {
+            Ok(WakeAct::None) => match self.stall_pass(board, task, out).await {
                 Ok(StallAct::None) => {}
                 Ok(StallAct::Pinged) => out.stall_pings += 1,
                 Ok(StallAct::SoftPinged) => {
@@ -1007,6 +1037,16 @@ impl TickUseCase {
                     .set_review_rounds(&board.board, task.number(), next);
                 if !escalate {
                     return false;
+                }
+                // Контур судьи (#1364): автопаркинг капа заменяется вердиктом
+                // decision-модели (она видит ленту — «цикл не сходится»).
+                // Форс-паркинг без вызова: раунды CAP+escalate_after — гвард
+                // сверху судьи, бесконечных «ещё раунд» нет. Err — fallback
+                // на автопаркинг ниже.
+                if self.judge_enabled() {
+                    return self
+                        .judge_round_action(board, task, out, round_slot, next)
+                        .await;
                 }
                 out.review_flagged += 1;
                 tracing::warn!(
@@ -1130,7 +1170,12 @@ impl TickUseCase {
     /// ход завершён без статусного перевода (паттерн #1151/#1135/#384).
     /// Пинг агенту → повтор → Needs attention. Будит через механизм
     /// wakeup (пинг = коммент, следующий тик доставит его сессии).
-    async fn stall_pass(&self, board: &BoardPlan, task: &Task) -> UsecaseResult<StallAct> {
+    async fn stall_pass(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        out: &mut TickOutcome,
+    ) -> UsecaseResult<StallAct> {
         let Some(slot) = task.stage_slot() else {
             return Ok(StallAct::None);
         };
@@ -1202,6 +1247,15 @@ impl TickUseCase {
         let now = self.clock.now_ms();
         if count > 0 && now.saturating_sub(last_ping) < every {
             return Ok(StallAct::None);
+        }
+        // Контур судьи (#1364): тот же гейтинг (тишина, раунд по статусу,
+        // интервал повторов, рестарт-инвариант #1281), решение — вердикт
+        // decision-модели вместо пингов/автопаркинга. Err вызова — fallback
+        // на старую механику ниже: судья — улучшение, не зависимость.
+        if self.judge_enabled() {
+            return self
+                .judge_stall_action(board, task, slot, &session, soft, silence, count, now, out)
+                .await;
         }
         self.stall_action(board, task, slot, &session, soft, silence, count, now)
             .await
@@ -1284,6 +1338,494 @@ impl TickUseCase {
         self.state
             .mark_stall_ping(&board.board, task.number(), task.status(), now);
         Ok(StallAct::Flagged)
+    }
+
+    // —— Контур судьи (#1364) ——
+
+    /// Судья включён: порт есть и конфиг enabled (opt-in владельца).
+    fn judge_enabled(&self) -> bool {
+        self.judge_cfg.enabled && self.judge.is_some()
+    }
+
+    /// Судья на сталл-точке (#1364): замена пингов/автопаркинга. Гвард
+    /// сверху — escalate_after вызовов без смены статуса строки →
+    /// принудительный паркинг без нового вызова модели (слово владельца
+    /// «порог 3 сверху судьи»; спайковый урок C7 — судья-«hold на всём»
+    /// не глушит страховку). Err вердикта — fallback на старую механику.
+    #[allow(clippy::too_many_arguments)]
+    async fn judge_stall_action(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        slot: Slot,
+        session: &str,
+        soft: bool,
+        silence: u64,
+        count: u32,
+        now: u64,
+        out: &mut TickOutcome,
+    ) -> UsecaseResult<StallAct> {
+        if uwuwu_domain::judge_step(count, self.judge_cfg.escalate_after)
+            == uwuwu_domain::JudgeStep::ForceEscalate
+        {
+            return self
+                .judge_park(
+                    board,
+                    task,
+                    session,
+                    now,
+                    &format!(
+                        "⚖︎ Судья: гвард — {count} вызовов подряд без смены статуса \
+                         строки (порог {}). Строка в Needs attention без нового \
+                         вызова модели. Разбор владельца.",
+                        self.judge_cfg.escalate_after
+                    ),
+                    out,
+                )
+                .await;
+        }
+        let Some(judge) = self.judge.as_ref() else {
+            return Ok(StallAct::None);
+        };
+        let ctx = self.judge_context(board, task, silence, count, 0).await;
+        match judge.decide(&ctx).await {
+            Ok(verdict) => {
+                out.judge_calls += 1;
+                self.judge_apply(
+                    board, task, slot, session, &verdict, silence, count, now, out,
+                )
+                .await
+            }
+            Err(e) => {
+                tracing::warn!(
+                    event = "judge.err",
+                    number = task.number(),
+                    error = %e,
+                    "Судья недоступна — fallback на старую механику сталл-детекта"
+                );
+                self.stall_action(board, task, slot, session, soft, silence, count, now)
+                    .await
+            }
+        }
+    }
+
+    /// Судья на кап-точке ревью-раундов (#1364): автопаркинг заменяется
+    /// вердиктом (судья видит ленту — «цикл не сходится»). Форс-паркинг:
+    /// раунды CAP + escalate_after — бесконечных «ещё раунд» нет. Err —
+    /// fallback на автопаркинг. true — строка снята с тика.
+    async fn judge_round_action(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        out: &mut TickOutcome,
+        round_slot: Slot,
+        rounds: u32,
+    ) -> bool {
+        if rounds >= REVIEW_ROUND_CAP + self.judge_cfg.escalate_after {
+            out.review_flagged += 1;
+            out.judge_calls += 1;
+            out.judge_forced += 1;
+            tracing::warn!(
+                event = "judge.rounds_forced",
+                number = task.number(),
+                rounds = rounds,
+                "Судья: гвард кап-точки — раунды за пределом, паркинг без вызова"
+            );
+            let last = task
+                .session_of(round_slot)
+                .map(str::to_string)
+                .unwrap_or_else(|| "—".into());
+            if let Err(e) = self
+                .board
+                .set_status(&board.board, task.number(), Status::NeedsAttention)
+                .await
+            {
+                out.actions_failed += 1;
+                self.log_action_failed(task, e);
+                return false;
+            }
+            let digest = format!(
+                "⚖︎ Судья: гвард кап-точки — {rounds} подряд request_changes \
+                 (кап {} + порог {}) — паркинг без вызова модели. Раунд не \
+                 назначается, строка в Needs attention, разбор владельца. \
+                 Последняя ревью-сессия: {last}.",
+                REVIEW_ROUND_CAP, self.judge_cfg.escalate_after
+            );
+            if let Err(e) = self.board.post_comment(task.number(), &digest).await {
+                out.actions_failed += 1;
+                self.log_action_failed(task, e);
+            }
+            self.state.set_review_rounds(&board.board, task.number(), 0);
+            return true;
+        }
+        let Some(judge) = self.judge.as_ref() else {
+            return false;
+        };
+        let ctx = self.judge_context(board, task, 0, 0, rounds).await;
+        match judge.decide(&ctx).await {
+            Ok(verdict) => {
+                out.judge_calls += 1;
+                match self
+                    .judge_apply(
+                        board,
+                        task,
+                        round_slot,
+                        task.session_of(round_slot).unwrap_or(""),
+                        &verdict,
+                        0,
+                        0,
+                        self.clock.now_ms(),
+                        out,
+                    )
+                    .await
+                {
+                    // паркинг вердиктом — раунд N+1 не назначается
+                    Ok(StallAct::Flagged) => true,
+                    Ok(_) => false,
+                    Err(e) => {
+                        out.actions_failed += 1;
+                        self.log_action_failed(task, e);
+                        false
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    event = "judge.err",
+                    number = task.number(),
+                    error = %e,
+                    "Судья недоступна на кап-точке — fallback на автопаркинг"
+                );
+                self.review_round_force_park(board, task, out, round_slot, rounds)
+                    .await
+            }
+        }
+    }
+
+    /// Автопаркинг кап-точки (старая механика; fallback судьи): кап
+    /// достигнут — Needs attention + структурный дайджест, счётчик сброс.
+    async fn review_round_force_park(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        out: &mut TickOutcome,
+        round_slot: Slot,
+        next: u32,
+    ) -> bool {
+        out.review_flagged += 1;
+        tracing::warn!(
+            event = "review.rounds_escalated",
+            number = task.number(),
+            rounds = next,
+            cap = REVIEW_ROUND_CAP,
+            "Кап ревью-раундов: подряд request_changes без approve"
+        );
+        // дайджест: id последней ревью-сессии из слота строки
+        // (на счёт-переходе слот ревью ещё не очищен — очистка
+        // идёт при ре-входе в ревью); нет сессии — честное «—»
+        let last = task
+            .session_of(round_slot)
+            .map(str::to_string)
+            .unwrap_or_else(|| "—".into());
+        if let Err(e) = self
+            .board
+            .set_status(&board.board, task.number(), Status::NeedsAttention)
+            .await
+        {
+            // счётчик стоит на капе: эскалация ретраится следующим
+            // count-переходом (раунд N+1 пройдёт — деградация benign)
+            out.actions_failed += 1;
+            self.log_action_failed(task, e);
+            return false;
+        }
+        let digest = format!(
+            "⚠︎ Кап ревью-раундов: {next}-й подряд request_changes без approve \
+             (порог {REVIEW_ROUND_CAP}) — раунд {} не назначается, строка в \
+             Needs attention, разбор владельца. Находки и вердикты — в треде \
+             выше; последняя ревью-сессия: {last}.",
+            next + 1
+        );
+        if let Err(e) = self.board.post_comment(task.number(), &digest).await {
+            out.actions_failed += 1;
+            self.log_action_failed(task, e);
+        }
+        // эскалация состоялась: после разбора владельца — свежий бюджет
+        self.state.set_review_rounds(&board.board, task.number(), 0);
+        true
+    }
+
+    /// Применение вердикта (сталл- и кап-точки; ревизия ADR-106 по санкции
+    /// владельца 20.11 — сервер переносит статус по структурированному
+    /// choice, не по текстам). Каноничность перехода — verdict_target;
+    /// нелегальный вердикт — отклонён, hold-эквивалент (мутаций нет,
+    /// счётчик гварда растёт). Вердикт = текущий статус — пробуждение
+    /// агента без переноса. Race-чек (L2): статус строки сверяется перед
+    /// set_status — вердикт не перетирает свежую агентскую транзакцию.
+    #[allow(clippy::too_many_arguments)]
+    async fn judge_apply(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        slot: Slot,
+        session: &str,
+        verdict: &uwuwu_domain::JudgeVerdict,
+        silence: u64,
+        calls: u32,
+        now: u64,
+        out: &mut TickOutcome,
+    ) -> UsecaseResult<StallAct> {
+        let current = task.status();
+        let Some(target) = uwuwu_domain::verdict_target(current, verdict.status) else {
+            out.judge_rejected += 1;
+            tracing::warn!(
+                event = "judge.rejected",
+                number = task.number(),
+                verdict = verdict.status.key(),
+                current = ?current,
+                "Вердикт судьи отклонён гардом каноничности — hold-эквивалент"
+            );
+            return Ok(StallAct::None);
+        };
+        // вызов записан (без смены статуса): гвард растёт от каждого вызова,
+        // перенос статуса ниже сбрасывает носитель clear_stall'ом
+        self.state
+            .mark_stall_ping(&board.board, task.number(), current, now);
+        if target == current {
+            // пробуждение без переноса — функциональный наследник мягкого
+            // пинга: судья считает, что агент должен продолжить
+            self.judge_prompt(
+                board,
+                slot,
+                session,
+                &format!(
+                    "⚖︎ Судья конвейера: строка молчала {} мин — продолжай работу. \
+                     Заверши ход статусной транзакцией (uwuwu_task_edit).",
+                    silence / 60_000
+                ),
+            )
+            .await?;
+            out.judge_wakeups += 1;
+            tracing::info!(
+                event = "judge.wake",
+                number = task.number(),
+                owner_needed = format!("{:.2}", verdict.owner_needed),
+                confidence = format!("{:.2}", verdict.confidence),
+                "Судья: пробуждение агента без переноса"
+            );
+            return Ok(StallAct::None);
+        }
+        // race-чек (ревью L2): вердикт собирался секунды — статус строки
+        // мог уехать агентской транзакцией; не перетираем свежий переход
+        if self.board.row_status(&board.board, task.number()).await? != Some(current) {
+            tracing::info!(
+                event = "judge.stale",
+                number = task.number(),
+                "Вердикт судьи устарел — статус строки сменился во время вызова"
+            );
+            return Ok(StallAct::None);
+        }
+        self.board
+            .set_status(&board.board, task.number(), target)
+            .await?;
+        let digest = format!(
+            "⚖︎ Судья: строка перенесена в {} (тишина {} мин; «нужен владелец»: \
+             {:.2}; уверенность {:.2}; вызовов без прогресса: {}). Причина — \
+             вердикт decision-модели по контексту задачи (тело, лента, хвосты \
+             сессий). ADR-106 ревизия #1364.",
+            naming::status_name(target),
+            silence / 60_000,
+            verdict.owner_needed,
+            verdict.confidence,
+            calls + 1
+        );
+        if let Err(e) = self.board.post_comment(task.number(), &digest).await {
+            // перенос состоялся; коммент — наблюдаемость, не критичный путь
+            out.actions_failed += 1;
+            self.log_action_failed(task, e);
+        }
+        // будим агента целевой стадии (сессия та же — слот живой)
+        self.judge_prompt(
+            board,
+            slot,
+            session,
+            &format!(
+                "⚖︎ Судья конвейера перевёл строку в «{}». Продолжай по \
+                 контракту новой стадии.",
+                naming::status_name(target)
+            ),
+        )
+        .await?;
+        self.state.clear_stall(&board.board, task.number());
+        out.judge_transitions += 1;
+        tracing::info!(
+            event = "judge.moved",
+            number = task.number(),
+            target = ?target,
+            owner_needed = format!("{:.2}", verdict.owner_needed),
+            confidence = format!("{:.2}", verdict.confidence),
+            "Судья: перенос строки вердиктом"
+        );
+        if target == Status::NeedsAttention {
+            out.stall_flagged += 1;
+            return Ok(StallAct::Flagged);
+        }
+        Ok(StallAct::None)
+    }
+
+    /// Принудительный паркинг гварда судьи (без вызова модели).
+    async fn judge_park(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        session: &str,
+        now: u64,
+        digest: &str,
+        out: &mut TickOutcome,
+    ) -> UsecaseResult<StallAct> {
+        tracing::warn!(
+            event = "judge.forced",
+            number = task.number(),
+            "Судья: гвард вызовов без прогресса — принудительный паркинг"
+        );
+        self.board
+            .set_status(&board.board, task.number(), Status::NeedsAttention)
+            .await?;
+        if let Err(e) = self.board.post_comment(task.number(), digest).await {
+            out.actions_failed += 1;
+            self.log_action_failed(task, e);
+        }
+        // будим агента: строка покидает активную стадию
+        self.judge_prompt(
+            board,
+            task.stage_slot().unwrap_or(Slot::Dev),
+            session,
+            "⚖︎ Судья конвейера: строка переведена в Needs attention — ход \
+             завершён, работа приостановлена до разбора владельца.",
+        )
+        .await?;
+        self.state.clear_stall(&board.board, task.number());
+        out.judge_calls += 1;
+        out.judge_forced += 1;
+        out.stall_flagged += 1;
+        let _ = now;
+        Ok(StallAct::Flagged)
+    }
+
+    /// Промпт агенту слота от судьи: пин агента слота (#1300) + прямой
+    /// промпт — механика мягкого пинга. Ошибка доставки — Err вызывающему
+    /// (тик переживёт: вердикт применён до промпта).
+    async fn judge_prompt(
+        &self,
+        board: &BoardPlan,
+        slot: Slot,
+        session: &str,
+        text: &str,
+    ) -> UsecaseResult<()> {
+        let gw = self.sessions.project(&board.project);
+        if let Some(agent) = Agent::of_slot(slot) {
+            gw.switch_agent(session, agent).await?;
+        }
+        gw.prompt(session, text).await
+    }
+
+    /// Сборка JudgeContext (#1364): тело, хвост ленты, серверные факты,
+    /// хвосты сессий слотов. Отказы чтений — не блокируют вердикт:
+    /// контекст неполон, warn-лог (судья решает по тому, что есть).
+    async fn judge_context(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        silence: u64,
+        calls: u32,
+        rounds: u32,
+    ) -> JudgeContext {
+        let cfg = self.judge_cfg.clone();
+        let body = match self.board.read_issue(&board.board, task.number()).await {
+            Ok(view) => trim_chars(&view.body, cfg.body_max_chars),
+            Err(e) => {
+                tracing::warn!(
+                    event = "judge.ctx_body_err",
+                    number = task.number(),
+                    error = %e,
+                    "Тело задачи в контекст судьи не попало"
+                );
+                String::new()
+            }
+        };
+        let comments: Vec<(u64, String)> = match self.board.latest_comments(task.number()).await {
+            Ok(list) => {
+                let mut v: Vec<(u64, String)> = list
+                    .into_iter()
+                    .map(|c| (c.created_ms, trim_chars(&c.body, cfg.comment_max_chars)))
+                    .collect();
+                v.sort_by_key(|(ms, _)| std::cmp::Reverse(*ms));
+                v.truncate(cfg.comments_tail);
+                v
+            }
+            Err(e) => {
+                tracing::warn!(
+                    event = "judge.ctx_comments_err",
+                    number = task.number(),
+                    error = %e,
+                    "Лента комментов в контекст судьи не попала"
+                );
+                Vec::new()
+            }
+        };
+        let mut sessions = Vec::new();
+        for slot in [
+            Slot::Design,
+            Slot::Dev,
+            Slot::PlanReview,
+            Slot::ResultReview,
+            Slot::Test,
+        ] {
+            let Some(session) = task.session_of(slot) else {
+                continue;
+            };
+            match self
+                .sessions
+                .project(&board.project)
+                .last_assistant_reply(session)
+                .await
+            {
+                Ok(Some(reply)) => sessions.push(JudgeSessionTail {
+                    slot,
+                    text: trim_chars(&reply.text, cfg.msg_max_chars),
+                    finished: reply.finished,
+                }),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        event = "judge.ctx_session_err",
+                        number = task.number(),
+                        slot = naming::slot_key(slot),
+                        error = %e,
+                        "Хвост сессии в контекст судьи не попал"
+                    );
+                }
+            }
+        }
+        let now = self.clock.now_ms();
+        let restart_recent_min = (now.saturating_sub(self.boot_ms) < 60 * 60_000)
+            .then_some((now.saturating_sub(self.boot_ms)) / 60_000);
+        JudgeContext {
+            board: board.board.clone(),
+            number: task.number(),
+            title: task.title().to_string(),
+            status: task.status(),
+            slot: task.stage_slot().unwrap_or(Slot::Dev),
+            silence_min: silence / 60_000,
+            idle: !sessions.iter().any(|s| !s.finished),
+            judge_calls_no_progress: calls,
+            review_rounds: rounds,
+            branch: task.branch().map(|b| b.as_str().to_string()),
+            pr_url: task.pr().map(|p| p.as_str().to_string()),
+            restart_recent_min,
+            body,
+            comments,
+            sessions,
+        }
     }
 
     /// Один раунд пинга: мягкий — прямым промптом в сессию (мгновенное
