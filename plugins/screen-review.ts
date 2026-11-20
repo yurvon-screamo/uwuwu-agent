@@ -40,7 +40,7 @@ export default Plugin.define({
       editor.add({
         name: "review",
         description:
-          "Run screenshots through the quality checklist (default ui-slop: double frame, card-in-card, alignment, overlaps/clipping, contrast + main defect + severity). One model call per screenshot — verdicts attributed to the screenshot. Returns a markdown report: a probability table with P>threshold flags (default 0.6) and a "where to look" digest. Honest limits: the model misses some real faults — the flags are an aim, the final judgment is yours (with your own eyes/hands). Question constraints: id [A-Za-z0-9_-]{1,64}; criteria are required for choice (a map of 2–255 options) and score (an array of levels).",
+          "Run screenshots through the quality checklist (default ui-slop: double frame, card-in-card, alignment, overlaps/clipping, contrast + main defect + severity). One model call per screenshot — verdicts attributed to the screenshot. Returns a markdown report: a probability table with P>threshold flags (default 0.6) and a «where to look» digest. Honest limits: the model misses some real faults — the flags are an aim, the final judgment is yours (with your own eyes/hands). Question constraints: id [A-Za-z0-9_-]{1,64}; criteria are required for choice (a map of 2–255 options) and score (an array of levels).",
         input: {
           type: "object",
           properties: {
