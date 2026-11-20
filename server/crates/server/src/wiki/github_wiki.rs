@@ -283,7 +283,8 @@ mod tests {
         );
         // Дети папки без изменений; неколлизионный файл без пометки
         assert!(
-            out.iter().any(|l| l.starts_with("Projects/uwuwu/ADR/ADR-001")),
+            out.iter()
+                .any(|l| l.starts_with("Projects/uwuwu/ADR/ADR-001")),
             "дети папки на месте"
         );
         assert!(
