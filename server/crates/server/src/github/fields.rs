@@ -291,6 +291,35 @@ impl IssueFieldStore for IssueFields {
 mod tests {
     use super::*;
 
+    /// REST-путь чтения direct (#1357, тестировщик): issue_field_values
+    /// с Direct читается в карту, read_issue поверх мапит «on» → флаг.
+    #[test]
+    fn parse_field_values_direct_on_off() {
+        let issue = json!({
+            "issue_field_values": [
+                { "issue_field_name": "Direct", "single_select_option": { "name": "on" } },
+            ]
+        });
+        let f = parse_field_values(&issue);
+        assert_eq!(
+            f.get(uwuwu_usecase::F_DIRECT).map(String::as_str),
+            Some("on")
+        );
+        let issue_off = json!({
+            "issue_field_values": [
+                { "issue_field_name": "Direct", "single_select_option": { "name": "off" } },
+            ]
+        });
+        let f = parse_field_values(&issue_off);
+        assert_eq!(
+            f.get(uwuwu_usecase::F_DIRECT).map(String::as_str),
+            Some("off")
+        );
+        // отсутствующее поле — ключа нет (внутри read_issue → direct=false)
+        let bare = parse_field_values(&json!({ "issue_field_values": [] }));
+        assert!(!bare.contains_key(uwuwu_usecase::F_DIRECT));
+    }
+
     #[test]
     fn parses_inline_values() {
         let issue = json!({

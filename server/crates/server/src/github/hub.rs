@@ -1899,6 +1899,53 @@ mod tests {
         );
     }
 
+    /// Строковый контракт Direct на тик-пути снапшота (#1357, тестировщик):
+    /// issue-backed шейп каталога /user/issue-fields — «on» поднимает флаг,
+    /// «off» и чужая опция — нет; отсутствие поля — обычная строка.
+    /// Мок-контур хранит булевы и этот парсинг минует — пин здесь.
+    #[test]
+    fn item_values_direct_flag_string_contract() {
+        let item = |direct: &str| {
+            json!({
+                "content": { "__typename": "Issue", "number": 1357, "title": "t", "state": "open" },
+                "fieldValues": { "nodes": [
+                    { "__typename": "ProjectV2ItemIssueFieldValue",
+                      "field": { "__typename": "ProjectV2SingleSelectField", "name": "Direct" },
+                      "issueFieldValue": {
+                          "__typename": "IssueFieldSingleSelectValue",
+                          "name": direct, "value": direct, "optionId": "IFSSO_d"
+                      } },
+                ]}
+            })
+        };
+        assert!(item_values(&item("on")).direct, "«on» — флаг поднят");
+        assert!(!item_values(&item("off")).direct, "«off» — флаг опущен");
+        assert!(
+            !item_values(&item("true")).direct,
+            "чужая опция флаг не поднимает (парсинг строгий)"
+        );
+        let bare = json!({
+            "content": { "__typename": "Issue", "number": 1, "title": "t", "state": "open" },
+            "fieldValues": { "nodes": [
+                { "name": "In Progress", "field": { "name": "Status" } },
+            ]}
+        });
+        assert!(!item_values(&bare).direct, "нет поля — обычная строка");
+    }
+
+    /// Pv2-own шейп (значение на верхнем уровне узла): Direct=on читается
+    /// и оттуда — шейп колонок доски (#1357, тестировщик).
+    #[test]
+    fn item_values_direct_board_column_shape() {
+        let item = json!({
+            "content": { "__typename": "Issue", "number": 2, "title": "t", "state": "open" },
+            "fieldValues": { "nodes": [
+                { "name": "on", "field": { "name": "Direct" } },
+            ]}
+        });
+        assert!(item_values(&item).direct);
+    }
+
     #[test]
     fn item_values_parses_issue_backed_cells() {
         // #1174: поля каталога /user/issue-fields («Приоритет», «Autodone»)
