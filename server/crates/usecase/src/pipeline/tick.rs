@@ -827,7 +827,7 @@ impl TickUseCase {
                     .clear_spawn_loop(&victim.board, victim.number, victim.slot);
                 self.state
                     .clear_spawn_ms(&victim.board, victim.number, victim.slot);
-                let cleared = match self
+                match self
                     .board
                     .clear_session(&victim.board, victim.number, victim.slot)
                     .await
@@ -838,7 +838,6 @@ impl TickUseCase {
                             victim = victim.number,
                             "Гашение — не смерть (#1412): ячейка снята, слот в очередь"
                         );
-                        true
                     }
                     Err(e) => {
                         out.actions_failed += 1;
@@ -848,9 +847,8 @@ impl TickUseCase {
                             error = %e,
                             "Гашение состоялось, снятие ячейки не удалось — строка обслужится dead-веткой (прежняя механика)"
                         );
-                        false
                     }
-                };
+                }
                 tracing::info!(
                     event = "cup.preempt",
                     waiter = task.number(),
@@ -858,7 +856,6 @@ impl TickUseCase {
                     victim_session = %victim.session,
                     "CUP: слот отдан — low-актив погашен (abort+delete), возобновление — возврат в очередь спавна с чистым счётчиком"
                 );
-                let _ = cleared;
                 true
             }
             (abort_r, delete_r) => {

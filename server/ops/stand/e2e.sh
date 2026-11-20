@@ -525,8 +525,9 @@ LEFT=$(curl -s --max-time 5 "http://127.0.0.1:$PORT_MOCK/api/session" | grep -c 
 grep -q '"preempts":1,' "$LOG_SRV_PRE" || fail "tick.completed не несёт preempts=1"
 grep -q 'loop_escalated' "$LOG_SRV_PRE" && fail "луп-гвард эскалировал"
 say "#1412: гашение — сброс ячейки и луп-гварда (cup.preempt.cleared_cell), 2048 заспавнена; ×5-цикл — unit-тест cup_preempt_wave"
-# Волна 2 (#1412): 2049 High гасит 2048 (can_preempt High/Low) — луп-гвард
-# 2048 был сброшен при первом гашении (эскалации нет)
+# Волна 2 (#1412): 2049 High гасит 2048 (can_preempt High/Low). Гвард 2048
+# к этому моменту = 1 (один спавн), поэтому эскалации нет; сброс гварда
+# 2046 произошёл в первой волне. ×5-контракт — unit-тест cup_preempt_wave.
 mcp task_edit '{"number":2048,"project":"uwuwu","priority":"low"}' | grep -q '"isError":false' \
   || fail "task_edit priority 2048 не применился"
 SEEN=0
