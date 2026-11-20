@@ -260,9 +260,9 @@ impl AnalystUseCase {
             .post_comment(
                 task.number(),
                 &format!(
-                    "⚠︎ Цикл-гвард аналитики: {rounds} реальных круга (Review Analys → Analys) \
-                     без выхода в Todo — строка ходила на ревью и возвращалась. Строка переведена \
-                     в Needs attention — разбор владельца."
+                    "⚠︎ Analytics loop guard: {rounds} full rounds (Review Analys → Analys) \
+                     without reaching Todo — the row went through review and came back. The row moved \
+                     to Needs attention — owner's triage."
                 ),
             )
             .await

@@ -437,8 +437,8 @@ impl TickUseCase {
                 .post_comment(
                     task.number(),
                     &format!(
-                        "⚠︎ Респавн-петля: сессия стадии `{}` умирает и респавнится \
-                         >2 раз без прогресса статуса ({:?}). Разбор владельца.",
+                        "⚠︎ Respawn loop: the `{}` stage session dies and respawns \
+                         >2 times without status progress ({:?}). Owner's triage.",
                         naming::slot_key(slot),
                         task.status()
                     ),
