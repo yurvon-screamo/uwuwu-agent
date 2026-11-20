@@ -100,8 +100,20 @@ fn lance_dir() -> PathBuf {
     ))
 }
 
-async fn backend_with_quoted_doc() -> (LanceSemanticBackend, PathBuf) {
-    let dir = lance_dir();
+/// Lance-том в уникальной временной папке (без новой dev-dep tempfile).
+/// Guard чистит папку при любом исходе теста, паника включительно —
+/// падающие прогоны не копят мусор в /tmp (замечание ревью #1392).
+struct TempDirGuard(PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+async fn backend_with_quoted_doc() -> (LanceSemanticBackend, TempDirGuard) {
+    let guard = TempDirGuard(lance_dir());
+    let dir = guard.0.clone();
     let wiki = Arc::new(FakeWiki {
         docs: HashMap::from([(
             QUOTED_SLUG.to_string(),
@@ -112,40 +124,39 @@ async fn backend_with_quoted_doc() -> (LanceSemanticBackend, PathBuf) {
         embed_stub_url().await,
         EMBED_MODEL.into(),
     ));
-    let backend = LanceSemanticBackend::open(dir.clone(), wiki, None, embeddings)
+    let backend = LanceSemanticBackend::open(dir, wiki, None, embeddings)
         .await
         .expect("open lance backend");
-    (backend, dir)
+    (backend, guard)
 }
 
 #[tokio::test]
 async fn sync_indexes_doc_with_quotes_in_slug() {
-    let (backend, dir) = backend_with_quoted_doc().await;
+    let (backend, _dir) = backend_with_quoted_doc().await;
 
     let indexed = backend.sync_index(10).await.expect("sync ok");
 
     assert_eq!(indexed, 1);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[tokio::test]
 async fn synced_doc_with_quotes_in_slug_is_found_by_search() {
-    let (backend, dir) = backend_with_quoted_doc().await;
+    let (backend, _dir) = backend_with_quoted_doc().await;
     backend.sync_index(10).await.expect("sync ok");
 
+    // Текст запроса произволен: стаб отдаёт константный нулевой вектор,
+    // матчинг идёт по векторам, не по лексике (замечание ревью #1392).
     let hits = backend.search("аменд", 5).await.expect("search ok");
 
     assert!(hits.iter().any(|(_, slug)| slug == QUOTED_SLUG));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[tokio::test]
 async fn resync_of_unchanged_corpus_indexes_nothing() {
-    let (backend, dir) = backend_with_quoted_doc().await;
+    let (backend, _dir) = backend_with_quoted_doc().await;
     backend.sync_index(10).await.expect("first sync ok");
 
     let indexed = backend.sync_index(10).await.expect("resync ok");
 
     assert_eq!(indexed, 0);
-    let _ = std::fs::remove_dir_all(dir);
 }
