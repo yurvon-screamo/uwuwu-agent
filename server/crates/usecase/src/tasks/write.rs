@@ -21,6 +21,10 @@ pub struct NewTask {
     /// Автомерж: мерж PR при входе в Review, строка остаётся в Review (#1232).
     /// Дефолт true — пишется на носитель явно (create-письмо, не умолчание чтения).
     pub automerge: bool,
+    /// direct-класс (#1357): прямое поручение владельца — строка рождается
+    /// сразу в In Progress (поля разбора create пишет явно), финализируется
+    /// агентом в Review. Create-only: task_edit флаг не принимает.
+    pub direct: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,18 +275,42 @@ impl TaskWriter for TaskWriteUseCase {
                 &[("Тип", Some(naming::task_type_name(kind).to_string()))],
             )
             .await?;
-        // Приоритет/Automerge — ячейки снапшота доски: единая точка записи
-        // board-адаптера с кеш-гигиеной (#1258; add_to_board инвалидирует
-        // ДО записи полей — окно кеша без полей закрывается адаптером).
-        // Автомерж пишется всегда — состояние на носителе явно (канон #1232)
+        // Приоритет/Automerge/Direct — ячейки снапшота доски: единая точка
+        // записи board-адаптера с кеш-гигиеной (#1258; add_to_board
+        // инвалидирует ДО записи полей — окно кеша без полей закрывается
+        // адаптером). Автомерж пишется всегда — состояние на носителе явно
+        // (канон #1232); direct тоже всегда (#1357: on/off, не умолчание
+        // чтения).
         let priority = if spec.priority.is_empty() {
-            None
+            // direct-строке поля разбора пишет create (развилка 2 плана):
+            // пустой priority → medium (дефолт владельца 13.11); обычная
+            // create-строка — None (гейт выхода из Analys требует явности)
+            if spec.direct {
+                Some("medium")
+            } else {
+                None
+            }
         } else {
             Some(spec.priority.as_str())
         };
         self.board
-            .set_board_cells(&board, number, priority, Some(spec.automerge))
+            .set_board_cells(
+                &board,
+                number,
+                priority,
+                Some(spec.automerge),
+                Some(spec.direct),
+            )
             .await?;
+        // direct (#1357): строка рождается в In Progress — фабрика по ней
+        // не спавнит (decide гасит спавн-ветку), работу ведёт сессия
+        // поручения. Аналитик-гейт не ветвится: это не edit-переход из
+        // Analys; окно Analys — запросы одного usecase-вызова (риски плана)
+        if spec.direct {
+            self.board
+                .set_status(&board, number, Status::InProgress)
+                .await?;
+        }
         Ok(number)
     }
 
@@ -327,7 +355,21 @@ impl TaskWriter for TaskWriteUseCase {
                 }
                 Some(current) => current,
             };
-            if !uwuwu_domain::Status::can_transition(current, status) {
+            // direct-класс (#1357): ребро In Progress → Review открыто
+            // только строке с флагом — флаг добывается свежим чтением
+            // носителя (семейство стейл-багов #1258/#1346: снапшоту
+            // здесь не верим), остальным рёбрам флаг не нужен
+            let direct = if current == Status::InProgress && status == Status::UserReview {
+                self.fields
+                    .load(number)
+                    .await?
+                    .get(naming::F_DIRECT)
+                    .map(|v| v == "on")
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            if !uwuwu_domain::Status::can_transition_with(current, status, direct) {
                 tracing::warn!(
                     event = "board.guard_rejected",
                     number,
@@ -414,7 +456,13 @@ impl TaskWriter for TaskWriteUseCase {
         // значения протухали в снапшоте до TTL (проба на проде 18.11)
         if patch.priority.is_some() || patch.automerge.is_some() {
             self.board
-                .set_board_cells(&board, number, patch.priority.as_deref(), patch.automerge)
+                .set_board_cells(
+                    &board,
+                    number,
+                    patch.priority.as_deref(),
+                    patch.automerge,
+                    None,
+                )
                 .await?;
             want_priority = patch.priority.clone();
             want_automerge = patch.automerge;
@@ -698,7 +746,7 @@ where
 /// Консервативно: строго набор/порядок ключей рендера, любой посторонний
 /// контент («--- fm ---» внутри текста) не трогается.
 fn strip_task_get_header(md: &str) -> &str {
-    const KEYS: [&str; 4] = ["branch: ", "pr: ", "automerge: ", "body_hash: "];
+    const KEYS: [&str; 5] = ["branch: ", "pr: ", "automerge: ", "direct: ", "body_hash: "];
     let Some(rest) = md.strip_prefix("--- fm ---\n") else {
         return md;
     };
@@ -876,6 +924,7 @@ mod tests {
             kind: None,
             priority: String::new(),
             automerge: true,
+            direct: false,
         }
     }
 
@@ -902,7 +951,8 @@ mod tests {
     }
 
     /// Носитель контрольного чтения фейка: мутации пишут, чтения отдают.
-    #[derive(Default, Clone)]
+    /// Default вручную: Status без derive Default — Empty как «не ставился».
+    #[derive(Clone)]
     struct Carrier {
         title: String,
         body: String,
@@ -911,13 +961,31 @@ mod tests {
         pr: Option<String>,
         priority: Option<String>,
         automerge: bool,
+        direct: bool,
+        status: Status,
+    }
+
+    impl Default for Carrier {
+        fn default() -> Self {
+            Self {
+                title: String::new(),
+                body: String::new(),
+                comments: Vec::new(),
+                branch: None,
+                pr: None,
+                priority: None,
+                automerge: false,
+                direct: false,
+                status: Status::Empty,
+            }
+        }
     }
 
     impl Carrier {
         /// Агрегат для IssueView: поля собираются так же, как адаптер
         /// собирает их из issue-носителя (map_task_fields-семантика).
         fn view(&self, number: u64) -> IssueView {
-            let mut task = Task::new(number, self.title.clone(), Status::Empty);
+            let mut task = Task::new(number, self.title.clone(), self.status);
             let branch = self
                 .branch
                 .as_deref()
@@ -940,6 +1008,7 @@ mod tests {
                 priority,
             ));
             task.set_automerge(self.automerge);
+            task.set_direct(self.direct);
             IssueView {
                 task,
                 body: self.body.clone(),
@@ -948,8 +1017,8 @@ mod tests {
         }
     }
 
-    /// Запись ячеек снапшота: номер + приоритет + automerge (#1258).
-    type CellWrite = (u64, Option<String>, Option<bool>);
+    /// Запись ячеек снапшота: номер + приоритет + automerge + direct (#1258).
+    type CellWrite = (u64, Option<String>, Option<bool>, Option<bool>);
 
     #[async_trait]
     impl TaskBoardRepo for FakeBoard {
@@ -970,21 +1039,26 @@ mod tests {
             n: u64,
             p: Option<&str>,
             a: Option<bool>,
+            d: Option<bool>,
         ) -> UsecaseResult<()> {
             self.cells
                 .lock()
                 .expect("fake board")
-                .push((n, p.map(str::to_string), a));
+                .push((n, p.map(str::to_string), a, d));
             if !self.phantom {
                 let mut c = self.carrier.lock().expect("fake carrier");
                 c.priority = p.map(str::to_string);
                 if let Some(a) = a {
                     c.automerge = a;
                 }
+                if let Some(d) = d {
+                    c.direct = d;
+                }
             }
             Ok(())
         }
-        async fn set_status(&self, _b: &str, _n: u64, _s: Status) -> UsecaseResult<()> {
+        async fn set_status(&self, _b: &str, _n: u64, s: Status) -> UsecaseResult<()> {
+            self.carrier.lock().expect("fake carrier").status = s;
             Ok(())
         }
         async fn set_session(&self, _b: &str, _n: u64, _slot: Slot, _s: &str) -> UsecaseResult<()> {
@@ -1262,7 +1336,7 @@ mod tests {
         let cells = board.cells.lock().expect("fake board").clone();
         assert_eq!(
             cells,
-            vec![(1, None, Some(true))],
+            vec![(1, None, Some(true), Some(false))],
             "create потерял automerge (мимо board-порта)"
         );
         // fields.store больше не несёт ячейку снапшота (Приоритет/Automerge —
@@ -1284,7 +1358,7 @@ mod tests {
         u.create("uwuwu", s).await.unwrap();
         assert_eq!(
             board.cells.lock().expect("fake board").clone(),
-            vec![(1, None, Some(false))],
+            vec![(1, None, Some(false), Some(false))],
         );
     }
 
@@ -1298,7 +1372,51 @@ mod tests {
         u.create("uwuwu", s).await.unwrap();
         assert_eq!(
             board.cells.lock().expect("fake board").clone(),
-            vec![(1, Some("low".into()), Some(true))],
+            vec![(1, Some("low".into()), Some(true), Some(false))],
+        );
+    }
+
+    /// direct-create (#1357): строка рождается в In Progress, поля разбора
+    /// create пишет явно (пустой priority → medium, automerge off — тул
+    /// прокидывает), direct=on на board-порту (кеш-гигиена #1258).
+    #[tokio::test]
+    async fn create_direct_puts_row_in_progress_with_defaults() {
+        let fields = Arc::new(FakeFields::default());
+        let (u, board) = writecase(fields);
+        let mut s = spec("прямое поручение");
+        s.direct = true;
+        s.automerge = false;
+        u.create("uwuwu", s).await.unwrap();
+        assert_eq!(
+            board.cells.lock().expect("fake board").clone(),
+            vec![(1, Some("medium".into()), Some(false), Some(true))],
+            "direct: medium/off/on — решение разбора на носителе явно"
+        );
+        let carrier = board.carrier.lock().expect("fake carrier");
+        assert_eq!(
+            carrier.status,
+            Status::InProgress,
+            "direct-строка не застревает в Analys"
+        );
+        assert!(carrier.direct);
+    }
+
+    /// Обычная create-строка — канон как был: Analys (set_status не звался),
+    /// direct off на носителе, priority не пишется (гейт требует явности).
+    #[tokio::test]
+    async fn create_ordinary_row_stays_in_analys() {
+        let fields = Arc::new(FakeFields::default());
+        let (u, board) = writecase(fields);
+        u.create("uwuwu", spec("тело")).await.unwrap();
+        assert_eq!(
+            board.cells.lock().expect("fake board").clone(),
+            vec![(1, None, Some(true), Some(false))],
+            "direct off пишется явно — состояние на носителе"
+        );
+        assert_eq!(
+            board.carrier.lock().expect("fake carrier").status,
+            Status::Empty,
+            "set_status для обычной строки не вызывается"
         );
     }
 
@@ -1320,7 +1438,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             board.cells.lock().expect("fake board").clone(),
-            vec![(1, None, Some(false))],
+            vec![(1, None, Some(false), None)],
+            "edit direct не пишет — флаг create-only (#1357)"
         );
     }
 
@@ -1341,7 +1460,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             board.cells.lock().expect("fake board").clone(),
-            vec![(1, Some("high".into()), None)],
+            vec![(1, Some("high".into()), None, None)],
         );
     }
 
@@ -1424,14 +1543,14 @@ mod tests {
     /// инцидента #1331: агент копирует вывод task_get назад в task_body).
     #[test]
     fn task_get_display_header_is_stripped() {
-        let md = "--- fm ---\nbranch: work/task-1331\npr: —\nautomerge: true\nbody_hash: 9de430c691c92328\n\n## Постановка\nтекст";
+        let md = "--- fm ---\nbranch: work/task-1331\npr: —\nautomerge: true\ndirect: false\nbody_hash: 9de430c691c92328\n\n## Постановка\nтекст";
         assert_eq!(strip_task_get_header(md), "## Постановка\nтекст");
     }
 
     #[test]
     fn task_get_header_in_middle_is_kept() {
         let md =
-            "## Секция\n\n--- fm ---\nbranch: x\npr: y\nautomerge: true\nbody_hash: h\n\nтекст";
+            "## Секция\n\n--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\nbody_hash: h\n\nтекст";
         assert_eq!(
             strip_task_get_header(md),
             md,

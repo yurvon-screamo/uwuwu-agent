@@ -535,6 +535,7 @@ impl GitHubHub {
         number: u64,
         priority: Option<&str>,
         automerge: Option<bool>,
+        direct: Option<bool>,
     ) {
         let now = std::time::Instant::now();
         let Some(hit) = self.snap_cache.get(board, now) else {
@@ -554,6 +555,9 @@ impl GitHubHub {
             }
             if let Some(a) = automerge {
                 task.set_automerge(a);
+            }
+            if let Some(d) = direct {
+                task.set_direct(d);
             }
         }
         self.snap_cache.put(board, (rows, meta), now);
@@ -695,6 +699,7 @@ fn parse_page(items: &[Value], meta: &mut BoardMeta) -> Vec<Task> {
             }
             task.set_priority(uwuwu_usecase::parse_priority(&v.priority));
             task.set_automerge(v.automerge);
+            task.set_direct(v.direct);
             meta.items
                 .insert(number, item["id"].as_str().unwrap_or_default().to_string());
             Some(task)
@@ -707,6 +712,7 @@ struct ItemValues {
     status: String,
     priority: String,
     automerge: bool,
+    direct: bool,
 }
 
 fn item_values(item: &Value) -> ItemValues {
@@ -714,6 +720,7 @@ fn item_values(item: &Value) -> ItemValues {
         status: String::new(),
         priority: String::new(),
         automerge: false,
+        direct: false,
     };
     if let Some(vals) = item["fieldValues"]["nodes"].as_array() {
         for v in vals {
@@ -730,6 +737,7 @@ fn item_values(item: &Value) -> ItemValues {
                 crate::github::fields::F_PRIORITY | "Priority" => out.priority = value.to_string(),
                 // автомерж (#1232): новое имя, legacy «Autodone» — back-compat
                 "Automerge" | "Autodone" => out.automerge = value == "on" || value == "true",
+                uwuwu_usecase::F_DIRECT => out.direct = value == "on",
                 _ => {}
             }
         }
@@ -897,6 +905,7 @@ impl TaskBoardRepo for GitHubHub {
         number: u64,
         priority: Option<&str>,
         automerge: Option<bool>,
+        direct: Option<bool>,
     ) -> UsecaseResult<()> {
         // поля — нативные issue (REST), как и у set_branch
         let mut patch: Vec<(&str, Option<String>)> = Vec::new();
@@ -912,12 +921,18 @@ impl TaskBoardRepo for GitHubHub {
                 Some(if a { "on" } else { "off" }.to_string()),
             ));
         }
+        if let Some(d) = direct {
+            patch.push((
+                uwuwu_usecase::F_DIRECT,
+                Some(if d { "on" } else { "off" }.to_string()),
+            ));
+        }
         if !patch.is_empty() {
             self.fields.store(number, &patch).await?;
         }
         // read-your-writes (#1258): кеш-гигиена снапшота — write-through
         // записанных значений при живой строке, инвалидация при отсутствующей
-        self.settle_board_cells(board, number, priority, automerge);
+        self.settle_board_cells(board, number, priority, automerge, direct);
         Ok(())
     }
 
@@ -992,6 +1007,13 @@ impl TaskBoardRepo for GitHubHub {
             .map(|v| v == "on" || v == "true")
             .unwrap_or(false);
         task.set_automerge(automerge);
+        // direct с носителя (#1357) — симметрично automerge: REST-путь MCP
+        // обязан быть честен, тик-путь читает item_values
+        let direct = raw
+            .get(uwuwu_usecase::F_DIRECT)
+            .map(|v| v == "on")
+            .unwrap_or(false);
+        task.set_direct(direct);
         let comments = self.all_comments(number).await?;
         Ok(IssueView {
             task,
@@ -1460,7 +1482,7 @@ mod tests {
             ),
             std::time::Instant::now(),
         );
-        hub.settle_board_cells("B", 7, Some("high"), Some(true));
+        hub.settle_board_cells("B", 7, Some("high"), Some(true), None);
         let snap = hub
             .snap_cache
             .get("B", std::time::Instant::now())
@@ -1487,7 +1509,7 @@ mod tests {
             ),
             std::time::Instant::now(),
         );
-        hub.settle_board_cells("B", 7, Some("high"), None);
+        hub.settle_board_cells("B", 7, Some("high"), None, None);
         assert!(
             hub.snap_cache.get("B", std::time::Instant::now()).is_none(),
             "снимок без строки сброшен"
@@ -1498,7 +1520,7 @@ mod tests {
     #[test]
     fn board_cells_without_snapshot_is_clean_noop() {
         let hub = GitHubHub::new("o/r".into(), "t".into());
-        hub.settle_board_cells("B", 7, Some("high"), None);
+        hub.settle_board_cells("B", 7, Some("high"), None, None);
         assert!(hub.snap_cache.get("B", std::time::Instant::now()).is_none());
     }
 
@@ -1540,7 +1562,7 @@ mod tests {
             };
             let probe_automerge = !base_automerge;
             // 2. контракт фикса: запись → СРАЗУ чтение тем же хабом
-            hub.set_board_cells(board, n, Some(probe_priority), Some(probe_automerge))
+            hub.set_board_cells(board, n, Some(probe_priority), Some(probe_automerge), None)
                 .await
                 .expect("set_board_cells");
             let after = hub
@@ -1593,9 +1615,15 @@ mod tests {
                 Priority::Low => "low",
                 Priority::Empty => "", // очистка ячейки
             };
-            hub.set_board_cells(board, n, Some(base_priority_arg), Some(base_automerge))
-                .await
-                .expect("восстановление базлайна");
+            hub.set_board_cells(
+                board,
+                n,
+                Some(base_priority_arg),
+                Some(base_automerge),
+                None,
+            )
+            .await
+            .expect("восстановление базлайна");
             let restored = hub
                 .read_board(board)
                 .await

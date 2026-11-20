@@ -104,8 +104,7 @@ impl Status {
     /// `can_transition` и его пин-тесты не тронуты.
     pub fn can_transition_with(from: Self, to: Self, direct: bool) -> bool {
         use Status as S;
-        (direct && from == S::InProgress && to == S::UserReview)
-            || Self::can_transition(from, to)
+        (direct && from == S::InProgress && to == S::UserReview) || Self::can_transition(from, to)
     }
 }
 

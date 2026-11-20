@@ -78,6 +78,7 @@ impl TaskBoardRepo for FakeBoard {
         _n: u64,
         _p: Option<&str>,
         _a: Option<bool>,
+        _d: Option<bool>,
     ) -> UsecaseResult<()> {
         Ok(())
     }
@@ -1475,6 +1476,7 @@ impl TaskBoardRepo for CommentBoard {
         _n: u64,
         _p: Option<&str>,
         _a: Option<bool>,
+        _d: Option<bool>,
     ) -> UsecaseResult<()> {
         Ok(())
     }
@@ -5405,6 +5407,7 @@ impl TaskBoardRepo for FakeMultiBoard {
         _n: u64,
         _p: Option<&str>,
         _a: Option<bool>,
+        _d: Option<bool>,
     ) -> UsecaseResult<()> {
         Ok(())
     }
@@ -5829,6 +5832,7 @@ impl TaskBoardRepo for CloseBoard {
         _n: u64,
         _p: Option<&str>,
         _a: Option<bool>,
+        _d: Option<bool>,
     ) -> UsecaseResult<()> {
         Ok(())
     }

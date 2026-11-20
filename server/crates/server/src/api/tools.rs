@@ -74,14 +74,15 @@ pub fn tool_descriptors() -> Value {
         ),
         tool(
             "task_create",
-            "Создать задачу на доске проекта (Analys; тайтл уникален)",
+            "Создать задачу на доске проекта (Analys; тайтл уникален; direct — сразу In Progress)",
             object(json!({
                 "title": string("тайтл (уникален на доске)"),
                 "project": string("проект; дефолт uwuwu"),
                 "body": string("markdown-тело (Постановка…)"),
                 "type": string("bug|spike|docs|other|feature|refactoring|legacy|qa|infrastructure"),
                 "priority": string("high|medium|low; дефолт medium"),
-                "automerge": json!({"type":"boolean","description":"автомерж: мерж PR при входе в Review, строка остаётся в Review; дефолт true"})
+                "automerge": json!({"type":"boolean","description":"автомерж: мерж PR при входе в Review, строка остаётся в Review; дефолт true (у direct — false)"}),
+                "direct": json!({"type":"boolean","description":"direct-задача (#1357): строка сразу In Progress, агент сам финализирует в Review мимо фабричных стадий. Только по прямому поручению владельца — дословная цитата поручения в теле; дефолт false"})
             }))
         ),
         tool(
@@ -314,13 +315,14 @@ impl ToolHub {
         let number = need_number(args)?;
         let view = self.tasks.card(project, number).await.map_err(view_err)?;
         let mut out = format!(
-            "#{} {} — {}\n\n--- fm ---\nbranch: {}\npr: {}\nautomerge: {}\nbody_hash: {}\n\n",
+            "#{} {} — {}\n\n--- fm ---\nbranch: {}\npr: {}\nautomerge: {}\ndirect: {}\nbody_hash: {}\n\n",
             view.task.number(),
             view.task.title(),
             uwuwu_usecase::status_name(view.task.status()),
             view.task.branch().map(|b| b.as_str()).unwrap_or("—"),
             view.task.pr().map(|u| u.as_str()).unwrap_or("—"),
             view.task.automerge(),
+            view.task.direct(),
             uwuwu_usecase::body_hash(&view.body),
         );
         out.push_str(&view.body);
@@ -472,24 +474,34 @@ impl ToolHub {
                 "неизвестный тип «{raw_kind}»: bug|spike|docs|feature|refactoring|legacy|qa|infrastructure|other"
             ));
         }
+        let direct = args
+            .get("direct")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let spec = uwuwu_usecase::NewTask {
             title: arg_str(args, "title"),
             body_md: arg_str(args, "body"),
             kind: uwuwu_usecase::parse_task_type(&raw_kind),
             priority: arg_str(args, "priority"),
             automerge: match args.get("automerge").or_else(|| args.get("autodone")) {
+                // direct-строке дефолт off (план #1357, развилка 5):
+                // мерж только по явному мандату владельца (automerge: true
+                // в create-вызове), не по умолчанию конвейера
                 Some(v) => v.as_bool().unwrap_or(true),
-                None => true,
+                None => !direct,
             },
+            direct,
         };
         let n = self
             .writer
             .create(project, spec)
             .await
             .map_err(|e| e.to_string())?;
-        ok_text(format!(
-            "создана задача #{n} (Analys) на доске проекта {project}"
-        ))
+        ok_text(if direct {
+            format!("создана direct-задача #{n} (In Progress) на доске проекта {project}")
+        } else {
+            format!("создана задача #{n} (Analys) на доске проекта {project}")
+        })
     }
 
     async fn task_edit(&self, project: &str, args: &Value) -> Result<Value, String> {

@@ -746,6 +746,96 @@ async fn task_create_accepts_automerge_and_legacy_key() {
     .expect("выключенный automerge accepted");
 }
 
+/// direct-круг (#1357) на MemoryHub-носителе: create(direct) рождает
+/// строку в In Progress (fm несёт direct: true), агент сам финализирует
+/// In Progress → Review; обычной строке то же ребро закрыто.
+#[tokio::test]
+async fn task_create_direct_is_in_progress_and_finishes_to_review() {
+    let (tools, _memory) = hub();
+    let created = call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "direct: сделать в моменте", "body": "цитата поручения", "direct": true }),
+    )
+    .await
+    .expect("direct-create accepted");
+    assert!(
+        created.contains("In Progress"),
+        "ответ тула честен: {created}"
+    );
+    let n: u64 = created
+        .trim()
+        .split('#')
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .and_then(|s| s.parse().ok())
+        .expect("номер в ответе");
+    let card = call(
+        &tools,
+        "task_get",
+        json!({ "project": "uwuwu", "number": n }),
+    )
+    .await
+    .expect("task_get ок");
+    assert!(card.contains("— In Progress"), "статус в fm: {card}");
+    assert!(card.contains("direct: true"), "fm direct: {card}");
+    assert!(
+        card.contains("automerge: false"),
+        "direct-дефолт automerge off: {card}"
+    );
+    // агент финализирует сам
+    call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": n, "status": "Review" }),
+    )
+    .await
+    .expect("direct-ребро In Progress → Review открыто");
+}
+
+/// Обычная строка не может прыгнуть In Progress → Review (#1357-регресс:
+/// канон финализации через ревью-конвейер не ослаблен).
+#[tokio::test]
+async fn task_edit_in_progress_to_review_rejected_without_direct() {
+    let (tools, _memory) = hub();
+    let created = call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "обычная строка", "body": "б" }),
+    )
+    .await
+    .expect("create ок");
+    let n: u64 = created
+        .trim()
+        .split('#')
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .and_then(|s| s.parse().ok())
+        .expect("номер в ответе");
+    // Analys → In Progress (fast-track легален), затем прыжок в Review
+    call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": n, "priority": "medium", "automerge": true }),
+    )
+    .await
+    .expect("поля разбора заполнены (гейт Analys)");
+    call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": n, "status": "In Progress" }),
+    )
+    .await
+    .expect("fast-track легален");
+    let res = call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": n, "status": "Review" }),
+    )
+    .await;
+    assert!(res.is_err(), "без direct-флага ребро закрыто каноном");
+}
+
 /// task_edit с одним automerge — непустой патч: до фикса edit не нёс
 /// automerge и патч падал «пустой патч» (инструмент до-пометки старых строк).
 #[tokio::test]

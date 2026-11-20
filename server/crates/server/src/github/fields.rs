@@ -224,6 +224,14 @@ impl IssueFields {
                     { "name": "on", "color": "green" },
                 ]
             }),
+            // direct-класс (#1357): тот же носитель-паттерн, legacy-алиаса нет
+            uwuwu_usecase::F_DIRECT => json!({
+                "name": name, "data_type": "single_select",
+                "options": [
+                    { "name": "off", "color": "gray" },
+                    { "name": "on", "color": "orange" },
+                ]
+            }),
             _ => json!({ "name": name, "data_type": "text" }),
         };
         let (status, _resp) = self
