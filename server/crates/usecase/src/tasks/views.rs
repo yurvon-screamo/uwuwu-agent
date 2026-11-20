@@ -101,9 +101,38 @@ impl DocsView {
             .ok_or_else(|| ViewError::NotFound(format!("док «{slug}»")))
     }
 
-    /// Пути .md под префиксом.
+    /// Пути .md под префиксом. Коллизия носителей (#1385): слаг X существует
+    /// и есть дети X/… (в одном каталоге файл X.md и папка X/) — строка X
+    /// получает честную пометку обоих носителей (канон «не тихая слепота»);
+    /// якорь пометки « (неоднозначно:» не встречается в слагах, префикс
+    /// строки остаётся парсибельным.
     pub async fn list(&self, prefix: &str) -> Result<Vec<String>, ViewError> {
-        Ok(self.wiki.list_docs(&sanitize_slug(prefix)).await?)
+        let slugs = self.wiki.list_docs(&sanitize_slug(prefix)).await?;
+        // Собственные префиксы всех путей = неявные дир-узлы дерева;
+        // коллизия — файловый слаг, совпавший с дир-предком
+        // (O(суммы сегментов), не O(n²) попарных сравнений)
+        let mut dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for s in &slugs {
+            let parts: Vec<&str> = s.split('/').collect();
+            let mut cur = String::new();
+            for part in &parts[..parts.len() - 1] {
+                if !cur.is_empty() {
+                    cur.push('/');
+                }
+                cur.push_str(part);
+                dirs.insert(cur.clone());
+            }
+        }
+        Ok(slugs
+            .into_iter()
+            .map(|s| {
+                if dirs.contains(&s) {
+                    format!("{s} (неоднозначно: файл «{s}.md» + папка «{s}/»)")
+                } else {
+                    s
+                }
+            })
+            .collect())
     }
 }
 
