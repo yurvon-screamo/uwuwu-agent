@@ -331,7 +331,11 @@ impl ToolHub {
         if !view.comments.is_empty() {
             out.push_str("\n\n--- комменты (последние) ---\n");
             for c in &view.comments {
-                out.push_str(&format!("---\n{}\n", c.body));
+                out.push_str(&format!(
+                    "---\n{}\n{}\n",
+                    iso_utc_stamp(c.created_ms),
+                    c.body
+                ));
             }
         }
         ok_text(out)
@@ -806,6 +810,15 @@ fn delivery_unverified_marker() -> &'static str {
 
 fn ok_text(text: String) -> Result<Value, String> {
     Ok(json!([{ "type": "text", "text": text }]))
+}
+
+/// Метка коммента в выводе task_get (#1432): created_ms → ISO 8601 UTC
+/// (формат-контракт для тайминг-разборов агентов). Недостижимый ms
+/// (вне часов chrono) — «—» по конвенции пустых ячеек.
+fn iso_utc_stamp(ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms as i64)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| "—".into())
 }
 
 /// Dry-run чистки: вердикты и подсказки, ноль мутаций.
