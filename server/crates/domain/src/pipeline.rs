@@ -100,8 +100,11 @@ pub enum Gate {
 }
 
 /// Решение по задаче: какой актёр стадии нужен тикум.
+/// direct-строка (#1357) гасит только спавн-ветку: фабрика по ней никого
+/// не спавнит (работа идёт в сессии поручения); automerge-ветка живёт
+/// без изменений — ручной Automerge on мержит direct-строку как обычную.
 pub fn decide(task: &Task) -> Action {
-    if let Some(slot) = task.stage_needs_spawn() {
+    if let Some(slot) = task.stage_needs_spawn().filter(|_| !task.direct()) {
         return Action::Spawn { slot };
     }
     if task.automerge_ready() {
@@ -421,6 +424,43 @@ mod tests {
         t.claim(Slot::Dev, crate::task::SessionRef::parse("ses_1").unwrap())
             .unwrap();
         assert!(matches!(decide(&t), Action::Observe { .. }));
+    }
+
+    #[test]
+    fn decide_direct_suppresses_spawn_only() {
+        // #1357: direct гасит только спавн-ветку — фабрика никого
+        // не спавнит по direct-строке; automerge-ветка жива
+        for status in [
+            Status::Design,
+            Status::ReviewPlan,
+            Status::InProgress,
+            Status::ReviewResult,
+            Status::Testing,
+        ] {
+            let mut t = task(status);
+            t.set_direct(true);
+            assert!(
+                matches!(decide(&t), Action::Observe { .. }),
+                "direct {status:?}: спавна нет"
+            );
+        }
+        // мандат-кейс: direct в Review с automerge и PR — мерж как обычно
+        let mut t = task(Status::UserReview);
+        t.set_direct(true);
+        t.set_automerge(true);
+        t.apply_fields(crate::task::TaskFields::new(
+            std::collections::BTreeMap::new(),
+            crate::task::Vcs::PullRequest {
+                branch: crate::task::BranchName::parse("work/task-7").unwrap(),
+                url: crate::task::PrUrl::parse("https://github.com/o/r/pull/7").unwrap(),
+            },
+            crate::task::Priority::Empty,
+        ));
+        assert_eq!(
+            decide(&t),
+            Action::Automerge,
+            "автомерж direct-строки не гасится флагом"
+        );
     }
 
     #[test]

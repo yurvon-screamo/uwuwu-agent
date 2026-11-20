@@ -96,6 +96,17 @@ impl Status {
                 | (S::NeedsAttention, S::InProgress | S::Analys)
         )
     }
+
+    /// Канон + direct-класс (#1357): единственное новое ребро
+    /// In Progress → Review открыто строке с флагом direct (прямое
+    /// поручение владельца — «сразу в ревью»). Обычные строки финализирует
+    /// ревью-конвейер (Ревью результата → Тестирование → Review); базовый
+    /// `can_transition` и его пин-тесты не тронуты.
+    pub fn can_transition_with(from: Self, to: Self, direct: bool) -> bool {
+        use Status as S;
+        (direct && from == S::InProgress && to == S::UserReview)
+            || Self::can_transition(from, to)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -359,6 +370,11 @@ pub struct Task {
     status: Status,
     priority: Priority,
     automerge: bool,
+    /// Прямое поручение владельца (#1357): строка рождается сразу в
+    /// In Progress и финализируется агентом в Review, мимо фабричных
+    /// стадий. По образцу automerge: пишется на носитель явно (create),
+    /// читается с колонки доски.
+    direct: bool,
     /// Дата закрытия issue (unix ms): None — issue открыт либо носитель
     /// дату не сообщает. Клин холодного ящика (#1293) отбирает
     /// терминальные строки по возрасту закрытия.
@@ -374,15 +390,17 @@ impl Task {
             status,
             priority: Priority::Empty,
             automerge: false,
+            direct: false,
             closed_at: None,
             fields: TaskFields::default(),
         }
     }
 
     /// Переход статуса с каноном рёбер (см. Status::can_transition):
-    /// запрещённый ребро — громкая ошибка, мутации нет.
+    /// запрещённый ребро — громкая ошибка, мутации нет. direct-строка
+    /// (#1357) несёт собственный флаг — гвард через can_transition_with.
     pub fn transition(&mut self, to: Status) -> Result<(), String> {
-        if !Status::can_transition(self.status, to) {
+        if !Status::can_transition_with(self.status, to, self.direct) {
             return Err(format!(
                 "переход {:?} → {:?} вне канона конвейера (см. Status::can_transition)",
                 self.status, to
@@ -420,6 +438,11 @@ impl Task {
         self.automerge
     }
 
+    /// Флаг direct (create-only, #1357): строка прямого поручения.
+    pub fn direct(&self) -> bool {
+        self.direct
+    }
+
     pub fn branch(&self) -> Option<&BranchName> {
         self.fields.branch()
     }
@@ -436,6 +459,11 @@ impl Task {
     /// Управление автомержем (владелец/триаж).
     pub fn set_automerge(&mut self, on: bool) {
         self.automerge = on;
+    }
+
+    /// Запись флага direct с носителя (parse колонки доски).
+    pub fn set_direct(&mut self, on: bool) {
+        self.direct = on;
     }
 
     /// Дата закрытия issue (unix ms): None — открыт либо не сообщена.
@@ -810,6 +838,30 @@ mod tests {
             S::ReviewResult,
             "запрещённый переход не мутировал"
         );
+    }
+
+    #[test]
+    fn direct_review_edge_is_flag_gated() {
+        use Status as S;
+        // direct-ребро (#1357): In Progress → Review только с флагом
+        assert!(
+            S::can_transition_with(S::InProgress, S::UserReview, true),
+            "direct-строка финализируется агентом сам"
+        );
+        assert!(
+            !S::can_transition_with(S::InProgress, S::UserReview, false),
+            "без флага — «Ревью результата» обязателен (канон)"
+        );
+        // флаг не открывает лишнего: остальные прямые — по канону
+        assert!(!S::can_transition_with(S::InProgress, S::Done, true));
+        assert!(!S::can_transition_with(S::Analys, S::UserReview, true));
+        // мутация на агрегате: флаг default false, сеттер пишет
+        let mut t = Task::new(7, "direct-строка".into(), S::InProgress);
+        assert!(!t.direct(), "по умолчанию строка не direct");
+        assert!(t.transition(S::UserReview).is_err());
+        t.set_direct(true);
+        assert!(t.transition(S::UserReview).is_ok());
+        assert_eq!(t.status(), S::UserReview);
     }
 
     #[test]
