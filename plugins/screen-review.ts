@@ -35,12 +35,12 @@ export default Plugin.define({
       editor.namespace({
         name: "screen",
         description:
-          "Ревью скринов через decision-модель Gemini Decision 1 (Google Decisions API): чек-лист качества — вероятности и severity по каждому пункту. Скринер/прицел, не судья.",
+          "Screenshot review via the Gemini Decision 1 decision model (Google Decisions API): a quality checklist — probabilities and severity per item. A screener/aimer, not a judge.",
       })
       editor.add({
         name: "review",
         description:
-          "Прогнать скрины через чек-лист качества (дефолт ui-slop: двойная рамка, карточка-в-карточке, выравнивание, налезания/обрезка, контраст + главный дефект + severity). Один вызов модели на скрин — вердикты атрибутированы к скрину. Возвращает markdown-отчёт: таблица вероятностей с флагами P>threshold (дефолт 0.6) и сводка «куда смотреть». Честные границы: модель пропускает часть реальных косяков — флаги это прицел, финальное суждение за тобой (своими глазами/руками). Ограничения вопросов: id [A-Za-z0-9_-]{1,64}; criteria обязательны у choice (map 2–255 опций) и score (массив уровней).",
+          "Run screenshots through the quality checklist (default ui-slop: double frame, card-in-card, alignment, overlaps/clipping, contrast + main defect + severity). One model call per screenshot — verdicts attributed to the screenshot. Returns a markdown report: a probability table with P>threshold flags (default 0.6) and a "where to look" digest. Honest limits: the model misses some real faults — the flags are an aim, the final judgment is yours (with your own eyes/hands). Question constraints: id [A-Za-z0-9_-]{1,64}; criteria are required for choice (a map of 2–255 options) and score (an array of levels).",
         input: {
           type: "object",
           properties: {
@@ -48,20 +48,20 @@ export default Plugin.define({
               type: "array",
               items: { type: "string" },
               description:
-                "Абсолютные пути к файлам скринов (PNG/JPEG/WebP) на машине сервера opencode (cwd тула — сервер, не сессия агента). Минимум один.",
+                "Absolute paths to screenshot files (PNG/JPEG/WebP) on the opencode server's machine (the tool's cwd is the server, not the agent's session). At least one.",
             },
             state: {
               type: "string",
-              description: "Описание контекста экрана для модели (что за экран, что проверяем).",
+              description: "The screen context description for the model (what screen it is, what we are checking).",
             },
             checklist: {
               type: "string",
-              description: "Имя встроенного чек-листа (дефолт ui-slop).",
+              description: "The built-in checklist name (default ui-slop).",
             },
             questions: {
               type: "object",
               description:
-                "Разовые вопросы вместо встроенного чек-листа: map id → {type: noul|choice|score, instructions, criteria?}. id — [A-Za-z0-9_-]{1,64}. criteria у choice — объект label→описание (2–255 опций, обязателен), у score — массив уровней 2–255 от меньшего к большему (обязателен), у noul — опционально {true_description, false_description}. Одновременный checklist и questions — ошибка.",
+                "One-off questions instead of the built-in checklist: a map id → {type: noul|choice|score, instructions, criteria?}. id — [A-Za-z0-9_-]{1,64}. criteria for choice — a label→description object (2–255 options, required), for score — an array of levels 2–255 ascending (required), for noul — optional {true_description, false_description}. checklist and questions at the same time — an error.",
               additionalProperties: {
                 type: "object",
                 properties: {
@@ -74,7 +74,7 @@ export default Plugin.define({
             },
             threshold: {
               type: "number",
-              description: "Порог флага «вероятности проблемы» (дефолт 0.6 — калибровка пилота pblpp97).",
+              description: "The «problem probability» flag threshold (default 0.6 — the pblpp97 pilot calibration).",
             },
           },
           required: ["images"],
@@ -83,7 +83,7 @@ export default Plugin.define({
         options: { namespace: "screen", codemode: true },
         execute: async (input, context) => {
           const i = input as ReviewToolInput
-          await context.progress({ status: `screen_review: ${i.images.length} скрин(ов) через gemini-decision-1` })
+          await context.progress({ status: `screen_review: ${i.images.length} screenshot(s) via gemini-decision-1` })
           try {
             const req: ScreenReviewInput = {
               images: i.images,
@@ -95,11 +95,11 @@ export default Plugin.define({
             const r = await runScreenReview(req, {
               onProgress: (status) => context.progress({ status }),
             })
-            await context.progress({ status: "screen_review: отчёт готов" })
+            await context.progress({ status: "screen_review: the report is ready" })
             return { content: r }
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e)
-            return { content: `screen_review: ошибка — ${msg}` }
+            return { content: `screen_review: error — ${msg}` }
           }
         },
       })

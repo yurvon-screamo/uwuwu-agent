@@ -59,8 +59,8 @@ describe("parseAnswers — контракт ответа Decisions API (анти
   })
 
   test.each([
-    ["не JSON", "{oops", "не JSON"],
-    ["answers отсутствует", JSON.stringify({ usage: { total_input_tokens: 1 } }), "нет map answers"],
+    ["the response body is not JSON", "{oops", "the response body is not JSON"],
+    ["answers отсутствует", JSON.stringify({ usage: { total_input_tokens: 1 } }), "no answers map"],
     ["noul без числа", JSON.stringify({ answers: { q: { type: "noul" } } }), "type=noul без числа noul"],
     [
       "choice без probabilities",
@@ -119,7 +119,7 @@ describe("resolveQuestions — чек-листы, inline-вопросы и га�
   })
 
   test("неизвестное имя чек-листа → громкая ошибка со списком встроенных", () => {
-    expect(() => resolveQuestions({ checklist: "perf" })).toThrow("неизвестный чек-лист «perf»")
+    expect(() => resolveQuestions({ checklist: "perf" })).toThrow("unknown checklist «perf»")
   })
 
   test("inline questions заменяют чек-лист", () => {
@@ -129,7 +129,7 @@ describe("resolveQuestions — чек-листы, inline-вопросы и га�
 
   test("оба источника сразу → громкая ошибка, не молчаливый приоритет", () => {
     expect(() => resolveQuestions({ checklist: "ui-slop", questions: { x: { type: "noul", instructions: "x" } } })).toThrow(
-      "оставьте один источник вопросов",
+      "keep one source of questions",
     )
   })
 
@@ -156,39 +156,39 @@ describe("resolveQuestions — чек-листы, inline-вопросы и га�
 
   test("choice без criteria → громкая ошибка (API отвечает 400 без них)", () => {
     expect(() => resolveQuestions({ questions: { q: { type: "choice", instructions: "x" } } })).toThrow(
-      "criteria обязательны для type=choice",
+      "criteria is required for type=choice",
     )
   })
 
   test("score без criteria → громкая ошибка", () => {
     expect(() => resolveQuestions({ questions: { q: { type: "score", instructions: "x" } } })).toThrow(
-      "criteria обязательны для type=score",
+      "criteria is required for type=score",
     )
   })
 
   test("choice с одной опцией → громкая ошибка минимума 2–255", () => {
     expect(() =>
       resolveQuestions({ questions: { q: { type: "choice", instructions: "x", criteria: { a: "описание" } } } }),
-    ).toThrow("2–255 опций, получено 1")
+    ).toThrow("2–255 options, got 1")
   })
 
   test("choice с ключом длиннее 128 символов → громкая ошибка (400 живьём, проба 20.11)", () => {
     const longKey = "k".repeat(129)
     expect(() =>
       resolveQuestions({ questions: { q: { type: "choice", instructions: "x", criteria: { a: "x", [longKey]: "y" } } } }),
-    ).toThrow("вне лимита 1–128 символов")
+    ).toThrow("is outside the 1–128 character limit")
   })
 
   test("choice с пустым ключом опции → громкая ошибка без вранья про длину", () => {
     expect(() =>
       resolveQuestions({ questions: { q: { type: "choice", instructions: "x", criteria: { "": "описание", a: "x" } } } }),
-    ).toThrow("(пустой)")
+    ).toThrow("(empty)")
   })
 
   test("score с одним уровнем → громкая ошибка минимума 2–255", () => {
     expect(() =>
       resolveQuestions({ questions: { q: { type: "score", instructions: "x", criteria: ["один"] } } }),
-    ).toThrow("2–255 уровней, получено 1")
+    ).toThrow("2–255 levels, got 1")
   })
 
   test("noul с массивом criteria → громкая ошибка shape", () => {
@@ -200,7 +200,7 @@ describe("resolveQuestions — чек-листы, inline-вопросы и га�
   test("noul с чужими ключами criteria → громкая ошибка shape", () => {
     expect(() =>
       resolveQuestions({ questions: { q: { type: "noul", instructions: "x", criteria: { yes: "да", no: "нет" } } } }),
-    ).toThrow("true_description и false_description")
+    ).toThrow("the keys true_description and false_description")
   })
 
   test("noul с правильным shape criteria проходит (принят API живьём, проба 20.11)", () => {
@@ -236,7 +236,7 @@ describe("buildRequest — input-блоки text+image, questions map'ом", () 
   test("ui-slop: choice-критерии содержат none, score-уровни от меньшего к большему", () => {
     const slop = CHECKLISTS["ui-slop"]
     expect(slop.main_defect.criteria).toHaveProperty("none")
-    expect(slop.severity.criteria).toEqual(["чисто", "мелкие огрехи", "явные дефекты", "критично"])
+    expect(slop.severity.criteria).toEqual(["clean", "minor flaws", "obvious defects", "critical"])
   })
 })
 
@@ -359,7 +359,7 @@ describe("runScreenReview — пер-скрин семантика, auth и ва
   })
 
   test("пустой images → громкая ошибка", async () => {
-    await expect(runScreenReview({ images: [] }, okDeps([]))).rejects.toThrow("непустой массив путей")
+    await expect(runScreenReview({ images: [] }, okDeps([]))).rejects.toThrow("a non-empty array of screenshot paths")
   })
 
   test("несуществующий скрин → громкая ошибка с путём, не тихий пропуск", async () => {
@@ -369,7 +369,7 @@ describe("runScreenReview — пер-скрин семантика, auth и ва
   test("нет GEMINI_API_KEY → громкая ошибка конфигурации до сети", async () => {
     const deps = okDeps(["/a.png"])
     deps.config = { apiKey: "", model: "gemini-decision-1" }
-    await expect(runScreenReview({ images: ["/a.png"] }, deps)).rejects.toThrow("GEMINI_API_KEY не задан")
+    await expect(runScreenReview({ images: ["/a.png"] }, deps)).rejects.toThrow("GEMINI_API_KEY is not set")
   })
 
   test("ключ уходит в заголовок x-goog-api-key (не в URL и не в тело)", async () => {
@@ -414,7 +414,7 @@ describe("runScreenReview — пер-скрин семантика, auth и ва
     expect(Object.keys(req.questions)).toEqual(["only"])
     expect(md).toContain("| only | noul |")
     expect(req.input).toEqual([
-      { type: "text", text: "Скриншот пользовательского интерфейса" },
+      { type: "text", text: "Screenshot of a user interface" },
       { type: "image", data: "B64", mime_type: "image/png" },
     ])
   })

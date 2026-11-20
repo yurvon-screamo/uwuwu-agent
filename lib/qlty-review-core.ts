@@ -81,11 +81,11 @@ export function parseSarif(raw: string, label: string): { findings: QltyFinding[
     throw new Error(`${label}: вывод не SARIF/JSON (qlty установлен и рабочий?)`)
   }
   const run = doc.runs?.[0]
-  if (!run) throw contractFail(label, "нет runs[0]")
+  if (!run) throw contractFail(label, "no runs[0]")
   const version = run.tool?.driver?.semanticVersion
-  if (typeof version !== "string" || version === "") throw contractFail(label, "нет tool.driver.semanticVersion")
+  if (typeof version !== "string" || version === "") throw contractFail(label, "no tool.driver.semanticVersion")
   const results = run.results ?? []
-  if (!Array.isArray(results)) throw contractFail(label, "results не массив")
+  if (!Array.isArray(results)) throw contractFail(label, "results is not an array")
 
   const findings: QltyFinding[] = []
   for (let i = 0; i < results.length; i++) {

@@ -68,13 +68,13 @@ export interface ScreenVerdict {
 
 export const ANSWER_CONTRACT_FIELDS = [
   "answers[<id>].type",
-  "answers[<id>].noul — для type=noul",
-  "answers[<id>].choice + answers[<id>].probabilities — для type=choice",
-  "answers[<id>].score — для type=score",
+  "answers[<id>].noul — for type=noul",
+  "answers[<id>].choice + answers[<id>].probabilities — for type=choice",
+  "answers[<id>].score — for type=score",
 ] as const
 
 export const DEFAULT_THRESHOLD = 0.6 // порог флага — из пилота pblpp97
-export const DEFAULT_STATE = "Скриншот пользовательского интерфейса"
+export const DEFAULT_STATE = "Screenshot of a user interface"
 export const DEFAULT_CHECKLIST = "ui-slop"
 export const MAX_QUESTIONS = 64 // кап тула; API принимает до 1000
 
@@ -87,7 +87,7 @@ export const NOUL_CRITERIA_KEYS = ["true_description", "false_description"] as c
 
 const contractFail = (label: string, what: string): Error =>
   new Error(
-    `${label}: контракт ответа Decisions API нарушен — ${what}. Ожидаемые поля: ${ANSWER_CONTRACT_FIELDS.join(", ")}. Gemini сменила формат?`,
+    `${label}: the Decisions API answer contract is broken — ${what}. Expected fields: ${ANSWER_CONTRACT_FIELDS.join(", ")}. Did Gemini change its format?`,
   )
 
 // ——— встроенный чек-лист ui-slop (постановка задачи; источник истины
@@ -97,41 +97,41 @@ export const CHECKLISTS: Record<string, Checklist> = {
   [DEFAULT_CHECKLIST]: {
     double_frame: {
       type: "noul",
-      instructions: "Есть ли двойная рамка у карточек или панелей (контур внутри контура, рамка внутри рамки)?",
+      instructions: "Do cards or panels have a double frame (a contour inside a contour, a frame inside a frame)?",
     },
     card_in_card: {
       type: "noul",
-      instructions: "Есть ли карточка внутри карточки (вложенная панель с рамкой или фоном внутри похожей внешней)?",
+      instructions: "Is there a card inside a card (a nested panel with a frame or background inside a similar outer one)?",
     },
     alignment: {
       type: "noul",
-      instructions: "Нарушено ли выравнивание элементов (элемент выбивается из сетки или строки, неожиданный сдвиг)?",
+      instructions: "Is element alignment broken (an element falls out of the grid or row, an unexpected shift)?",
     },
     overlap: {
       type: "noul",
-      instructions: "Есть ли налезания элементов друг на друга или обрезка контента (текст или блок выходит за границы, перекрыт)?",
+      instructions: "Are there elements overlapping each other or clipped content (text or a block goes beyond bounds, is covered)?",
     },
     contrast: {
       type: "noul",
-      instructions: "Есть ли проблемы контраста (текст плохо читается на фоне, слишком бледный, близкие цвета)?",
+      instructions: "Are there contrast problems (text is hard to read on the background, too pale, close colors)?",
     },
     main_defect: {
       type: "choice",
-      instructions: "Какой главный визуальный дефект экрана?",
+      instructions: "What is the screen's main visual defect?",
       criteria: {
-        none: "дефектов нет",
-        double_frame: "двойные рамки",
-        card_in_card: "карточка внутри карточки",
-        alignment: "нарушенное выравнивание",
-        overlap: "налезания или обрезка",
-        contrast: "проблемы контраста",
-        other: "другой дефект",
+        none: "no defects",
+        double_frame: "double frames",
+        card_in_card: "a card inside a card",
+        alignment: "broken alignment",
+        overlap: "overlaps or clipping",
+        contrast: "contrast problems",
+        other: "another defect",
       },
     },
     severity: {
       type: "score",
-      instructions: "Насколько сильны визуальные дефекты экрана?",
-      criteria: ["чисто", "мелкие огрехи", "явные дефекты", "критично"],
+      instructions: "How severe are the screen's visual defects?",
+      criteria: ["clean", "minor flaws", "obvious defects", "critical"],
     },
   },
 }
@@ -140,49 +140,49 @@ export const CHECKLISTS: Record<string, Checklist> = {
 // ловим честной ошибкой входа до сети (принцип #1362) ———
 
 const inputFail = (id: string, what: string): Error =>
-  new Error(`screen_review: вопрос «${id}» — ${what}`)
+  new Error(`screen_review: question «${id}» — ${what}`)
 
 function validateQuestion(id: string, q: ScreenQuestion): void {
   if (!QUESTION_ID_PATTERN.test(id)) {
     throw new Error(
-      `screen_review: id вопроса «${id}» не подходит под ограничения Decisions API — нужен [A-Za-z0-9_-]{1,64}`,
+      `screen_review: question id «${id}» violates the Decisions API constraints — [A-Za-z0-9_-]{1,64} required`,
     )
   }
   if (!q.instructions || typeof q.instructions !== "string") {
-    throw inputFail(id, "instructions обязателен")
+    throw inputFail(id, "instructions is required")
   }
   if (q.type === "noul") {
     // criteria опциональны; при наличии — shape true_description/false_description
     const criteria = q.criteria
     if (criteria === undefined) return
-    if (Array.isArray(criteria)) throw inputFail(id, "criteria у noul — объект {true_description, false_description}, не массив")
+    if (Array.isArray(criteria)) throw inputFail(id, "criteria for noul — an object {true_description, false_description}, not an array")
     const keys = Object.keys(criteria)
     const ok = keys.length === NOUL_CRITERIA_KEYS.length && NOUL_CRITERIA_KEYS.every((k) => typeof criteria[k] === "string")
     if (!ok) {
-      throw inputFail(id, `criteria у noul — объект с ключами ${NOUL_CRITERIA_KEYS.join(" и ")}`)
+      throw inputFail(id, `criteria for noul — an object with the keys ${NOUL_CRITERIA_KEYS.join(" and ")}`)
     }
     return
   }
   if (q.criteria === undefined) {
-    throw inputFail(id, `criteria обязательны для type=${q.type} (API отвечает 400 без них)`)
+    throw inputFail(id, `criteria is required for type=${q.type} (the API answers 400 without them)`)
   }
   if (q.type === "choice") {
-    if (Array.isArray(q.criteria)) throw inputFail(id, "criteria у choice — map label→описание, не массив")
+    if (Array.isArray(q.criteria)) throw inputFail(id, "criteria for choice — a label→description map, not an array")
     const labels = Object.keys(q.criteria)
     if (labels.length < MIN_OPTIONS || labels.length > MAX_OPTIONS) {
-      throw inputFail(id, `choice — ${MIN_OPTIONS}–${MAX_OPTIONS} опций, получено ${labels.length}`)
+      throw inputFail(id, `choice — ${MIN_OPTIONS}–${MAX_OPTIONS} options, got ${labels.length}`)
     }
     const badKey = labels.find((k) => k.length < 1 || k.length > MAX_OPTION_KEY_LENGTH)
     if (badKey !== undefined) {
-      const shown = badKey.length === 0 ? "«» (пустой)" : `«${badKey.slice(0, 24)}…»`
-      throw inputFail(id, `ключ опции ${shown} вне лимита 1–${MAX_OPTION_KEY_LENGTH} символов (API отвечает 400)`)
+      const shown = badKey.length === 0 ? "«» (empty)" : `«${badKey.slice(0, 24)}…»`
+      throw inputFail(id, `option key ${shown} is outside the 1–${MAX_OPTION_KEY_LENGTH} character limit (the API answers 400)`)
     }
     return
   }
   // score
-  if (!Array.isArray(q.criteria)) throw inputFail(id, "criteria у score — массив уровней от меньшего к большему")
+  if (!Array.isArray(q.criteria)) throw inputFail(id, "criteria for score — an array of levels ascending")
   if (q.criteria.length < MIN_OPTIONS || q.criteria.length > MAX_OPTIONS) {
-    throw inputFail(id, `score — ${MIN_OPTIONS}–${MAX_OPTIONS} уровней, получено ${q.criteria.length}`)
+    throw inputFail(id, `score — ${MIN_OPTIONS}–${MAX_OPTIONS} levels, got ${q.criteria.length}`)
   }
 }
 
@@ -191,17 +191,17 @@ export function resolveQuestions(input: {
   questions?: Checklist
 }): Checklist {
   if (input.questions && input.checklist !== undefined) {
-    throw new Error("screen_review: заданы и checklist, и questions — оставьте один источник вопросов")
+    throw new Error("screen_review: both checklist and questions are set — keep one source of questions")
   }
   const checklistName = input.checklist ?? DEFAULT_CHECKLIST
   const resolved = input.questions ?? CHECKLISTS[checklistName]
   if (!resolved) {
     const known = Object.keys(CHECKLISTS).join(", ")
-    throw new Error(`screen_review: неизвестный чек-лист «${checklistName}» (встроенные: ${known}; свои вопросы — параметр questions)`)
+    throw new Error(`screen_review: unknown checklist «${checklistName}» (built-in: ${known}; your own questions — the questions parameter)`)
   }
   const count = Object.keys(resolved).length
   if (count < 1 || count > MAX_QUESTIONS) {
-    throw new Error(`screen_review: questions должен содержать 1–${MAX_QUESTIONS} вопросов, получено ${count}`)
+    throw new Error(`screen_review: questions must hold 1–${MAX_QUESTIONS} questions, got ${count}`)
   }
   for (const [id, q] of Object.entries(resolved)) validateQuestion(id, q)
   return resolved
@@ -248,10 +248,10 @@ export function parseAnswers(
   try {
     doc = JSON.parse(raw) as typeof doc
   } catch {
-    throw contractFail(label, "тело ответа не JSON")
+    throw contractFail(label, "the response body is not JSON")
   }
   if (typeof doc.answers !== "object" || doc.answers === null || Array.isArray(doc.answers)) {
-    throw contractFail(label, "нет map answers")
+    throw contractFail(label, "no answers map")
   }
   const answers: DecisionAnswers = {}
   for (const [id, value] of Object.entries(doc.answers as Record<string, unknown>)) {

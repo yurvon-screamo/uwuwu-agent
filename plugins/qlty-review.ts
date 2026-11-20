@@ -26,12 +26,12 @@ export default Plugin.define({
       editor.namespace({
         name: "qlty",
         description:
-          "Алгоритмический машинный ревью на движке qlty: линтеры-плагины + smells, нативная строковая дельта против upstream. Не зависит от gh.",
+          "Algorithmic machine review on the qlty engine: linter plugins + smells, a native line-level delta against upstream. Independent of gh.",
       })
       editor.add({
         name: "review",
         description:
-          "Машинный qlty-ревью дифа или коммита: qlty check/smells --upstream — находки только в изменённых строках (pre-existing baseline-долг файла не показывается; незакоммиченный хвост и untracked в дельту входят). Маркетинговый формат атрибуции [plugin:rule] path:line (level) — message; whole-file находка без region.startLine — path (строка неизвестна) (level). Возвращает markdown-отчёт. Дефолтный уровень low отсекает note-шум.",
+          "Machine qlty review of a diff or a commit: qlty check/smells --upstream — findings only in changed lines (a file's pre-existing baseline debt is not shown; the uncommitted tail and untracked files are part of the delta). Attribution format [plugin:rule] path:line (level) — message; a whole-file finding without region.startLine — path (строка неизвестна) (level). Returns a markdown report. The default level low cuts the note noise.",
         input: {
           type: "object",
           properties: {
@@ -39,31 +39,31 @@ export default Plugin.define({
               type: "string",
               enum: ["diff", "commit"],
               description:
-                "diff — рабочая копия против upstream (дельта ветки + untracked + незакоммиченный хвост); commit — дельта одного коммита против его родителя (прогон по рабочей копии).",
+                "diff — the working copy against upstream (the branch delta + untracked + the uncommitted tail); commit — the delta of one commit against its parent (a run over the working copy).",
             },
             directory: {
               type: "string",
               description:
-                "Путь к qlty-репо. Обязателен, если cwd сервера opencode — не целевой репо (cwd тула — сервер, не сессия агента).",
+                "Path to the qlty repo. Required if the opencode server's cwd is not the target repo (the tool's cwd is the server, not the agent's session).",
             },
             commit: {
               type: "string",
-              description: "SHA/реф коммита для scope=commit.",
+              description: "Commit SHA/ref for scope=commit.",
             },
             upstream: {
               type: "string",
-              description: "Базовый реф для строковой дельты (merge-base с ним — база прогона). Дефолт origin/master.",
+              description: "The base ref for the line-level delta (its merge-base is the run's base). Default origin/master.",
             },
             paths: {
               type: "array",
               items: { type: "string" },
-              description: "Глоб-фильтр путей (*, **, ?). Пусто — все изменённые пути.",
+              description: "Glob path filter (*, **, ?). Empty — all changed paths.",
             },
             level: {
               type: "string",
               enum: ["note", "low", "medium", "high"],
               description:
-                "Порог находок: note — показывать всё; low — отсекает SARIF-note (дефолт); medium/high — оставляют только SARIF-error (warning/error в SARIF не различаются по исходной severity, error не отсекается никогда).",
+                "Finding threshold: note — show everything; low — cuts SARIF-note (default); medium/high — keep only SARIF-error (warning/error are not distinguished in SARIF by source severity, error is never cut).",
             },
           },
           required: ["scope"],
@@ -73,7 +73,7 @@ export default Plugin.define({
         execute: async (input, context) => {
           const i = input as ReviewToolInput
           const dir = i.directory ?? process.cwd()
-          await context.progress({ status: `qlty_review: git+check/smells в ${dir}` })
+          await context.progress({ status: `qlty_review: git+check/smells in ${dir}` })
           try {
             const req: ReviewInput = {
               scope: i.scope,
@@ -90,7 +90,7 @@ export default Plugin.define({
             return { content: r.markdown }
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e)
-            return { content: `qlty_review: ошибка — ${msg}` }
+            return { content: `qlty_review: error — ${msg}` }
           }
         },
       })

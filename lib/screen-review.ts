@@ -76,7 +76,7 @@ const defaultReadImageBase64 = async (path: string): Promise<string> => {
 
 export async function runScreenReview(input: ScreenReviewInput, deps: ScreenReviewDeps = {}): Promise<string> {
   if (!Array.isArray(input.images) || input.images.length < 1) {
-    throw new Error("screen_review: images — непустой массив путей к скринам (абсолютные пути на машине сервера)")
+    throw new Error("screen_review: images — a non-empty array of screenshot paths (absolute paths on the server's machine)")
   }
   const notAbsolute = input.images.filter((p) => !isAbsolute(p))
   if (notAbsolute.length > 0) {
@@ -89,7 +89,7 @@ export async function runScreenReview(input: ScreenReviewInput, deps: ScreenRevi
   const config = deps.config ?? resolveConfig()
   if (!config.apiKey) {
     throw new Error(
-      "screen_review: GEMINI_API_KEY не задан — ключ Gemini API (Google AI Studio) нужен в env машины, чистой замены без него нет (#1362)",
+      "screen_review: GEMINI_API_KEY is not set — a Gemini API key (Google AI Studio) must be in the machine's env; there is no clean replacement without it (#1362)",
     )
   }
   const state = input.state ?? DEFAULT_STATE

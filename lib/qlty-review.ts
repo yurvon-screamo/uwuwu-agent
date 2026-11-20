@@ -31,7 +31,7 @@ async function runOut(cmd: string, args: string[], cwd: string): Promise<string>
   } catch (e) {
     const err = e as { stdout?: string; stderr?: string; message?: string }
     if (err.stdout && err.stdout.trim() !== "") return err.stdout
-    throw new Error(`${cmd} ${args.join(" ")} (cwd=${cwd}) — отказ: ${err.stderr?.trim() || err.message || "неизвестная ошибка"}`)
+    throw new Error(`${cmd} ${args.join(" ")} (cwd=${cwd}) — rejected: ${err.stderr?.trim() || err.message || "unknown error"}`)
   }
 }
 
@@ -73,11 +73,11 @@ export async function runReview(input: ReviewInput, deps: ReviewDeps = realDeps)
   let base: string
   const notes: string[] = []
   if (input.scope === "commit") {
-    if (!input.commit) throw new Error("scope=commit требует commit (SHA/реф)")
+    if (!input.commit) throw new Error("scope=commit requires commit (a SHA/ref)")
     base = (await deps.git(["rev-parse", `${input.commit}^`], dir)).trim()
     if (base === "") throw new Error(`у ${input.commit} нет родителя — корневой коммит не имеет дельты`)
     notes.push(
-      "scope=commit: прогон по рабочей копии — корректен, если файлы на диске в состоянии коммита (свежий HEAD в чистом ворктри).",
+      "scope=commit: a run over the working copy — correct only if the files on disk are in the commit's state (a fresh HEAD in a clean worktree).",
     )
   } else {
     base = (await deps.git(["merge-base", upstream, "HEAD"], dir)).trim()
