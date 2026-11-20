@@ -7784,3 +7784,427 @@ async fn dead_probe_with_fresh_404s_resurrects_once_per_tick_and_parks_on_fifth(
     u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert!(parked(&board), "луп-гвард паркует после 5 respawn-попыток");
 }
+
+// ——— Матрица e2e-семантики «peak × ребут × приоритеты» (#1310) ———
+// Сценарий владельца (18.11): пик-окно, ребут ноды и приоритеты сходятся
+// в одном контуре — конвейер переживает комбинацию без потери отложенных
+// спавнов и без ложных сталлов. Якоря семантики: Design Spec UC-05,
+// AGENTS peak-клауза, ADR-034/044/101/107, #1300, #1259. Факт кода
+// (ревизия развилки V4): deferred-носителя нет — гейт пересчитывается
+// временем каждого тика; персистентный TickStateStore deferred не держит.
+
+/// Часы матрицы: фаза «пик / после окна» (тест переключает между тиками —
+/// «время вышло из окна») + монотонный now_ms с шагом 16 мин: реальный
+/// тик ≥ минута, шаг переступает кулдаун спавна 15 мин (`SPAWN_COOLDOWN_MS`).
+struct MatrixClock {
+    in_peak: AtomicBool,
+    now_ms: Mutex<u64>,
+}
+
+impl MatrixClock {
+    fn new() -> Self {
+        Self {
+            in_peak: AtomicBool::new(true),
+            now_ms: Mutex::new(2000),
+        }
+    }
+}
+
+impl Clock for MatrixClock {
+    fn utc_minute(&self) -> UtcMinute {
+        if self.in_peak.load(Ordering::SeqCst) {
+            // будни, внутри окна 360–600 (peak_plan)
+            UtcMinute {
+                minute_of_day: 400,
+                weekday: 3,
+            }
+        } else {
+            // будни, окно кончилось — гейт оценивается временем тика
+            UtcMinute {
+                minute_of_day: 700,
+                weekday: 3,
+            }
+        }
+    }
+    fn now_ms(&self) -> u64 {
+        let mut t = self.now_ms.lock().unwrap();
+        let now = *t;
+        *t += 16 * 60_000;
+        now
+    }
+}
+
+/// Юзкейс матрицы: фейки портов + MatrixClock (в пике). Часы возвращаются
+/// тесту для переключения фазы между тиками.
+fn matrix_usecase(
+    rows: Vec<Task>,
+    comments: Vec<CommentRef>,
+    state: Arc<MemState>,
+    idle_reply: bool,
+) -> (
+    TickUseCase,
+    Arc<FakeBoard>,
+    Arc<FakeSessions>,
+    Arc<FakePrs>,
+    Arc<MatrixClock>,
+) {
+    let board = Arc::new(FakeBoard {
+        rows: rows.into(),
+        log: Mutex::default(),
+        comments,
+        fields_fails: false,
+        set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
+        status_fails: AtomicBool::new(false),
+    });
+    let sessions = Arc::new(FakeSessions {
+        idle_reply,
+        ..FakeSessions::new()
+    });
+    let prs = Arc::new(FakePrs {
+        state: PrState::Missing,
+        merges: Mutex::default(),
+        probes: Mutex::default(),
+    });
+    let clock = Arc::new(MatrixClock::new());
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        prs: prs.clone(),
+        clock: clock.clone(),
+        state,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        boot_ms: 0,
+    };
+    (u, board, sessions, prs, clock)
+}
+
+fn medium_design(n: u64) -> Task {
+    let mut t = task(n, Status::Design);
+    t.set_priority(Priority::Medium);
+    t
+}
+
+fn high_design(n: u64) -> Task {
+    let mut t = task(n, Status::Design);
+    t.set_priority(Priority::High);
+    t
+}
+
+/// V1 — гиркин сценария владельца (18.11): N medium в работе и high-задачи.
+/// Пик: medium-ходы в полёте дорабатывают (пик не абортит), medium-спавны
+/// отложены, high идут. После окна: medium выезжают штатно.
+#[tokio::test]
+async fn owner_scenario_peak_holds_medium_spawns_high_then_releases_medium_after_window() {
+    let state = Arc::new(MemState(Mutex::default()));
+    let busy = row_with_session(300, "ses_dev_busy", Priority::Medium);
+    let (u, board, sessions, _, clock) = matrix_usecase(
+        vec![
+            busy,
+            medium_design(301),
+            medium_design(302),
+            high_design(303),
+            high_design(304),
+        ],
+        Vec::new(),
+        state,
+        false,
+    );
+    live_busy(&sessions, "ses_dev_busy");
+    let out = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.deferred_peak, 2, "medium-спавны отложены пиком");
+    assert_eq!(out.spawns_done, 2, "high идут сквозь пик штатно");
+    assert!(
+        sessions.aborted.lock().unwrap().is_empty(),
+        "ходы в полёте пик не прерывает (гейтится только новый спавн)"
+    );
+    assert_eq!(out.stall_flagged, 0, "ложных эскалаций нет");
+
+    // Пик кончился; high-строки двинулись стадией (агент перевёл сам,
+    // ячейки живы), medium-кандидаты едут после окна.
+    clock.in_peak.store(false, Ordering::SeqCst);
+    *board.rows.lock().unwrap() = vec![
+        row_with_session(300, "ses_dev_busy", Priority::Medium),
+        row_with_session(303, "ses_dev_h303", Priority::High),
+        row_with_session(304, "ses_dev_h304", Priority::High),
+        medium_design(301),
+        medium_design(302),
+    ];
+    let out2 = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out2.spawns_done, 2, "medium запущены штатно после окна");
+    assert_eq!(out2.deferred_peak, 0);
+    assert_eq!(out2.stall_flagged, 0);
+    let log = board.log.lock().unwrap();
+    assert!(
+        log.iter().any(|l| l.starts_with("session#301="))
+            && log.iter().any(|l| l.starts_with("session#302=")),
+        "обе medium-строки заспавнены: {log:?}"
+    );
+}
+
+/// V2: ребут ноды убил ход high-сессии в пике. Респавн high проходит пик
+/// немедленно, роль слота не меняется (#1300: рестарт не подменяет
+/// stage-агента — спавн той же роли).
+#[tokio::test]
+async fn node_reboot_mid_high_turn_respawns_same_developer_role_in_peak() {
+    let state = Arc::new(MemState(Mutex::default()));
+    // тот же раунд (статус не менялся) — путь чистого respawn
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((310, Status::InProgress));
+    let (u, _, sessions, _, _) = matrix_usecase(
+        vec![row_with_session(310, "ses_dev_dead", Priority::High)],
+        Vec::new(),
+        state,
+        false,
+    );
+    sessions
+        .dead_sessions
+        .lock()
+        .unwrap()
+        .push("ses_dev_dead".into());
+    let out = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.spawns_done, 1, "high-респавн в пике немедленный");
+    assert_eq!(out.wakeups_deferred, 0, "пик high-респавн не держит");
+    let specs = sessions.specs.lock().unwrap();
+    let work = specs.last().expect("рабочая сессия респавна");
+    assert!(
+        matches!(work.agent, uwuwu_domain::AgentSlot::Role(Agent::Developer)),
+        "#1300: спавн той же роли слота (developer), получено {:?}",
+        work.agent
+    );
+}
+
+/// V3: окно кончилось, пока нода была выключена. Гейт оценивается временем
+/// тика, не временем постановки — deferred исполняется на первом тике
+/// после окна (UC-05: отложено «до конца окна», не навсегда).
+#[tokio::test]
+async fn deferred_medium_spawn_executes_on_first_tick_after_window() {
+    let state = Arc::new(MemState(Mutex::default()));
+    let (u, _, sessions, _, clock) =
+        matrix_usecase(vec![medium_design(320)], Vec::new(), state, false);
+    let out = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.deferred_peak, 1);
+    assert!(
+        sessions.spawned.lock().unwrap().is_empty(),
+        "в пике спавна нет"
+    );
+    clock.in_peak.store(false, Ordering::SeqCst);
+    let out2 = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out2.spawns_done, 1,
+        "отложенное исполняется на первом тике после окна"
+    );
+    assert_eq!(out2.deferred_peak, 0);
+}
+
+/// V4 (ревизия развилки — факт кода): deferred-носителя нет — откладка
+/// пересчитывается гейтом от времени тика, `deferred_peak` — диагностический
+/// счётчик Out, TickStateStore deferred не держит. Рестарт uwuwu-server
+/// (пустой state) в пике ничего не теряет: после конца окна спавн
+/// исполняется. Бюджет in-memory (ADR-107) не применим: очередь не
+/// материализована вовсе.
+#[tokio::test]
+async fn server_restart_in_peak_loses_nothing_deferred_recomputed_from_clock() {
+    let state = Arc::new(MemState(Mutex::default()));
+    let (u, _, sessions, _, clock) =
+        matrix_usecase(vec![medium_design(330)], Vec::new(), state.clone(), false);
+    let out = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.deferred_peak, 1, "в пике medium отложен");
+    // рестарт: state-носитель пуст (JSON пережил бы, но deferred в нём
+    // и не бывал), время идёт
+    *state.0.lock().unwrap() = MemStateInner::default();
+    clock.in_peak.store(false, Ordering::SeqCst);
+    let out2 = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out2.spawns_done, 1,
+        "отложенный спавн не потерян рестартом — носителя и не требовалось"
+    );
+    assert!(
+        !sessions.spawned.lock().unwrap().is_empty(),
+        "сессия создана после рестарта"
+    );
+}
+
+/// V5: high завершается в пике — следующий спавн high-цепочки (ревьювер
+/// плана) немедленный (AGENTS: «high продолжают работать»).
+#[tokio::test]
+async fn high_chain_next_stage_spawn_is_immediate_in_peak() {
+    let state = Arc::new(MemState(Mutex::default()));
+    let mut t = task(340, Status::ReviewPlan);
+    t.set_priority(Priority::High);
+    let (u, _, sessions, _, _) = matrix_usecase(vec![t], Vec::new(), state, false);
+    let out = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.spawns_done, 1,
+        "следующий спавн high-цепочки не ждёт конца окна"
+    );
+    assert_eq!(out.deferred_peak, 0);
+    let specs = sessions.specs.lock().unwrap();
+    let work = specs.last().expect("сессия ревьювера");
+    assert!(
+        matches!(
+            work.agent,
+            uwuwu_domain::AgentSlot::Role(Agent::PlanReviewer)
+        ),
+        "стадия ревью-плана — агент plan-reviewer, получено {:?}",
+        work.agent
+    );
+}
+
+/// V6: кап полон и пик идёт — HeldCup (high) и DeferredPeak (medium)
+/// сосуществуют (пик проверяется раньше капа); после окна первым выезжает
+/// high из held (очередь rank, sort_by_key), medium ждёт следующий слот.
+#[tokio::test]
+async fn cup_full_and_peak_coexist_high_exits_held_first_after_window() {
+    let state = Arc::new(MemState(Mutex::default()));
+    let busy = row_with_session(350, "ses_dev_busy", Priority::Medium);
+    let (u, board, sessions, _, clock) = matrix_usecase(
+        vec![busy, high_design(351), medium_design(352)],
+        Vec::new(),
+        state,
+        false,
+    );
+    live_busy(&sessions, "ses_dev_busy"); // active = 1 = cup
+    let out = u.run(&peak_plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(out.held_cup, 1, "high держит полный кап");
+    assert_eq!(
+        out.deferred_peak, 1,
+        "medium держит пик — пик проверяется раньше капа"
+    );
+    assert_eq!(out.spawns_done, 0, "в окне спавнов нет");
+    clock.in_peak.store(false, Ordering::SeqCst);
+    sessions.busy_ids.lock().unwrap().clear(); // ход доработался, слот свободен
+    let out2 = u.run(&peak_plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(out2.spawns_done, 1, "за тик ровно кап спавнов");
+    assert_eq!(out2.held_cup, 1, "medium ждёт следующий свободный слот");
+    {
+        let log = board.log.lock().unwrap();
+        assert!(
+            log.iter().any(|l| l.starts_with("session#351=")),
+            "первым из held выехал high: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.starts_with("session#352=")),
+            "medium не перепрыгнул очередь капа"
+        );
+    }
+    // тик записал ячейку high на носитель — строка двинулась стадией
+    *board.rows.lock().unwrap() = vec![
+        row_with_session(350, "ses_dev_busy", Priority::Medium),
+        row_with_session(351, "ses_dev_h351", Priority::High),
+        medium_design(352),
+    ];
+    let out3 = u.run(&peak_plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(out3.spawns_done, 1, "medium выехал на следующем тике");
+    assert!(board
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l.starts_with("session#352=")));
+}
+
+/// V7: накопленный deferred-backlog выезжает после окна батчами по капу,
+/// без потерь, в порядке очереди (ADR-107: пауза — не отмена).
+#[tokio::test]
+async fn deferred_backlog_drains_after_window_in_rank_order_within_cup() {
+    let state = Arc::new(MemState(Mutex::default()));
+    let (u, board, _, _, clock) = matrix_usecase(
+        vec![medium_design(360), medium_design(361), medium_design(362)],
+        Vec::new(),
+        state,
+        false,
+    );
+    let out = u.run(&peak_plan(Mode::Live, 2)).await.unwrap();
+    assert_eq!(out.deferred_peak, 3, "весь backlog отложен окном");
+    clock.in_peak.store(false, Ordering::SeqCst);
+    let out2 = u.run(&peak_plan(Mode::Live, 2)).await.unwrap();
+    assert_eq!(out2.spawns_done, 2, "первый батч — по капу");
+    assert_eq!(out2.held_cup, 1, "хвост backlog ждёт следующий тик");
+    // тик записал ячейки первой пары на носитель — строки в работе
+    *board.rows.lock().unwrap() = vec![
+        row_with_session(360, "ses_dev_h360", Priority::Medium),
+        row_with_session(361, "ses_dev_h361", Priority::Medium),
+        medium_design(362),
+    ];
+    let out3 = u.run(&peak_plan(Mode::Live, 2)).await.unwrap();
+    assert_eq!(out3.spawns_done, 1, "хвост выехал — потерь нет");
+    let log = board.log.lock().unwrap();
+    for n in [360, 361, 362] {
+        assert!(
+            log.iter().any(|l| l.starts_with(&format!("session#{n}="))),
+            "строка {n} исполнена (весь backlog довезён): {log:?}"
+        );
+    }
+}
+
+/// V8 (ревизия 2 — два вида deferred): только medium в пике.
+/// (а) орфан без сессии: спавн-ветка → DeferredPeak, до сталл-пасса не
+/// доходит; (б) живая idle-сессия (ход завершён до окна) с зависшим
+/// будильником: шорт-кат WakeAct::Deferred минует stall_pass. Ни одна
+/// строка не эскалируется (ADR-044/101: сталл — про живую сессию, не про
+/// отложенный спавн; страховка idle-сессии в окне).
+#[tokio::test]
+async fn peak_defers_medium_without_false_stalls_orphans_and_pending_wakeups() {
+    let state = Arc::new(MemState(Mutex::default()));
+    let idle = row_with_session(371, "ses_dev_idle", Priority::Medium);
+    let (u, board, sessions, _, _) = matrix_usecase(
+        vec![medium_design(370), idle],
+        vec![CommentRef {
+            id: "c1".into(),
+            created_ms: 3000,
+            body: "свежий коммент — будильник pendинг до конца окна".into(),
+        }],
+        state,
+        true, // idle_reply: ход завершён (финал) — до сталл-пинга далеко
+    );
+    let out = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.deferred_peak, 1, "орфан-спавн отложен пиком");
+    assert_eq!(
+        out.wakeups_deferred, 1,
+        "будильник живой сессии отложен пиком (шорт-кат мимо сталл-пасса)"
+    );
+    assert_eq!(out.stall_pings, 0, "deferred не пингается сталлом");
+    assert_eq!(out.stall_flagged, 0, "deferred не эскалируется сталлом");
+    assert_eq!(out.soft_pings, 0);
+    assert!(
+        sessions.prompts.lock().unwrap().is_empty(),
+        "доставка будильника не ушла в пике"
+    );
+    let log = board.log.lock().unwrap();
+    assert!(
+        !log.iter().any(|l| l.starts_with("status#")),
+        "статусы строк нетронуты (никаких Needs attention): {log:?}"
+    );
+}
+
+/// Ревизия 2 (находка Low ревью плана): гейт деферрит весь не-high
+/// (`priority != High`) — низкие ранги пинятся явно, дрейф рангов пойман.
+#[tokio::test]
+async fn low_and_empty_priorities_defer_in_peak_same_gate() {
+    let state = Arc::new(MemState(Mutex::default()));
+    let mut low = task(380, Status::Design);
+    low.set_priority(Priority::Low);
+    let empty = task(381, Status::Design); // дефолт Empty — ниже low
+    let (u, board, sessions, _, _) = matrix_usecase(vec![low, empty], Vec::new(), state, false);
+    let out = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.deferred_peak, 2,
+        "low и empty отложены тем же гейтом пика"
+    );
+    assert!(sessions.spawned.lock().unwrap().is_empty());
+    assert_eq!(out.stall_flagged, 0, "эскалаций нет");
+    assert!(
+        !board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("status#")),
+        "статусы нетронуты"
+    );
+}
