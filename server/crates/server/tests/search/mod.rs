@@ -10,3 +10,9 @@ pub mod semantic;
 
 #[path = "../../src/search/semantic_backend.rs"]
 pub mod semantic_backend;
+
+#[path = "dim_migration.rs"]
+pub mod dim_migration;
+
+#[path = "gemini_live.rs"]
+pub mod gemini_live;
