@@ -947,6 +947,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn iso_utc_stamp_renders_iso8601_utc() {
+        // Типичный created_ms: ровно YYYY-MM-DDTHH:MM:SSZ (контракт
+        // тайминг-разборов дримера, #1432).
+        assert_eq!(iso_utc_stamp(1_795_171_645_570), "2026-11-20T10:47:25Z");
+        // Нижняя граница эпохи — валидная метка, не «—».
+        assert_eq!(iso_utc_stamp(0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn iso_utc_stamp_degrades_to_dash_outside_chrono_hours() {
+        // Гард стоит ДО приведения типов: значения > i64::MAX не
+        // заворачиваются в отрицательные (валидно-выглядящая 1969-метка),
+        // а честно дают пустую ячейку. Чувствительное значение — верхний
+        // край u64: без гарда `u64::MAX as i64 = -1` → 1969-12-31T23:59:59Z.
+        assert_eq!(iso_utc_stamp(u64::MAX), "—");
+        assert_eq!(iso_utc_stamp(i64::MAX as u64 + 1), "—");
+        // i64::MAX мс — вне часов chrono (from_timestamp_millis → None).
+        assert_eq!(iso_utc_stamp(i64::MAX as u64), "—");
+    }
+
+    #[test]
     fn descriptors_are_the_real_surface() {
         let list = tool_descriptors();
         let names: Vec<&str> = list
