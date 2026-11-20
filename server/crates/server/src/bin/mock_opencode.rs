@@ -78,6 +78,10 @@ struct MockSession {
     /// Хвост строится фазами пробы: стрим → ловушка (шаг finish='tool-calls')
     /// → финал (finish='stop').
     turn_ms: Option<u64>,
+    /// User-сообщения команд (created_ms, текст): канал вердиктов env-gc
+    /// (#1431) — POST /command с name task-env-gc кладёт вердикт-строку,
+    /// wait_user_message конвейера находит её в хвосте.
+    user_messages: Vec<(u64, String)>,
 }
 
 #[derive(Default)]
@@ -417,15 +421,35 @@ async fn main() {
         .route(
             "/api/session/{id}/command",
             post({
+                let store = store.clone();
                 let mode = mode.clone();
-                move |Path(id): Path<String>| {
+                move |Path(id): Path<String>, Json(body): Json<Value>| {
+                    let store = store.clone();
                     let mode = mode.clone();
                     async move {
                         if mode == "gate" {
                             return gate_post_reject();
                         }
-                        // bootstrap-команды детерминированы: принимаем, не эмулируя shell
-                        tracing::info!(event = "mock.command", id = %id, "POST /command");
+                        // bootstrap-команды детерминированы: task-env-gc —
+                        // канал вердиктов env-gc (#1431), мок эмулирует
+                        // shell-исход user-сообщением «ENV-GC <row> SWEPT»;
+                        // прочие принимаются без эмуляции shell
+                        let name = body["name"].as_str().unwrap_or_default();
+                        tracing::info!(event = "mock.command", id = %id, name, "POST /command");
+                        if name == "task-env-gc" {
+                            let row = body["text"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .split_whitespace()
+                                .next_back()
+                                .unwrap_or_default()
+                                .to_string();
+                            let mut sessions = store.sessions.lock().expect("store");
+                            if let Some(s) = sessions.get_mut(&id) {
+                                s.user_messages
+                                    .push((now_ms(), format!("ENV-GC {row} SWEPT")));
+                            }
+                        }
                         (StatusCode::OK, Json(json!({}))).into_response()
                     }
                 }
@@ -574,6 +598,7 @@ async fn create_session(
         dead: mode == "dead",
         reply: None,
         turn_ms: None,
+        user_messages: Vec::new(),
     };
     tracing::info!(event = "mock.session_created", id = %id,
         agent = %session.agent, title = %session.title, "POST /session");
@@ -1114,7 +1139,20 @@ async fn message_tail(store: Arc<Store>, id: String) -> Resp {
         Some(s) => {
             // Форма — живой опенкод 2.3.0 (проба #1150): тип в поле `type`,
             // у ассистента finish/content[].text/time.created; time.updated
-            // держим для last_activity_ms (wakeup-контур)
+            // держим для last_activity_ms (wakeup-контур). User-сообщения
+            // команд (вердикты env-gc, #1431) идут в хвост перед ассистентом
+            let mut tail: Vec<Value> = s
+                .user_messages
+                .iter()
+                .map(|(created_ms, text)| {
+                    json!({
+                        "type": "user",
+                        "role": "user",
+                        "time": { "created": created_ms, "updated": created_ms },
+                        "content": [{ "type": "text", "text": text }],
+                    })
+                })
+                .collect();
             let mut msg = json!({
                 "type": "assistant",
                 "role": "assistant",
@@ -1132,7 +1170,8 @@ async fn message_tail(store: Arc<Store>, id: String) -> Resp {
                     "cache": { "read": 0, "write": 0 }
                 });
             }
-            (StatusCode::OK, Json(json!([msg])))
+            tail.push(msg);
+            (StatusCode::OK, Json(json!(tail)))
         }
         None => (StatusCode::NOT_FOUND, Json(json!({ "status": "404" }))),
     }

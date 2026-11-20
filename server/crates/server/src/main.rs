@@ -663,6 +663,34 @@ async fn run(
         }
     }
 
+    // env-gc (#1431): снос env терминальных строк по доскам конфига.
+    // Отдельная tokio-задача, не Sidecar: rm мульти-ГБ каталогов идёт
+    // за 120-секундным капом сайдкар-тика. env_gc_days = 0 — kill-switch:
+    // задача вообще не заводится; observe-гейт — до live-флипа (срез 4).
+    if cfg.env_gc_days > 0 {
+        let gc_usecase = usecase.clone();
+        let gc_boards = plan.boards.clone();
+        let gc_clock = clock.clone();
+        let gc_days = cfg.env_gc_days;
+        let gc_observe = is_observe || cfg.env_gc_observe;
+        let gc_poll_sec = cfg.poll_sec;
+        tokio::spawn(env_gc_loop(
+            gc_usecase,
+            gc_boards,
+            gc_clock,
+            gc_days,
+            gc_observe,
+            gc_poll_sec,
+        ));
+        tracing::info!(
+            event = "env.gc.enabled",
+            days = cfg.env_gc_days,
+            observe = gc_observe,
+            boards = plan.boards.len(),
+            "env-gc: снос env терминальных строк включён"
+        );
+    }
+
     if let Some(backend) = semantic_backend.clone() {
         let clock2 = clock.clone();
 
@@ -757,6 +785,61 @@ async fn run(
     tick_task.abort();
     memory_task.abort();
     Ok(())
+}
+
+/// env-gc (#1431): периодический снос env терминальных строк по доскам
+/// конфига (пер-board механика клина холодного ящика: у каждой доски
+/// свой чекаут/исполнитель/env_root). Интервал — poll_sec; длинный
+/// проход не наслаивается — следующий начинается после сна.
+async fn env_gc_loop(
+    usecase: Arc<TickUseCase>,
+    boards: Vec<uwuwu_usecase::BoardPlan>,
+    clock: Arc<dyn uwuwu_usecase::Clock>,
+    days: u32,
+    observe: bool,
+    poll_sec: u64,
+) {
+    loop {
+        for b in &boards {
+            let tasks = match usecase.board.read_board(&b.board).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(
+                        event = "env.gc.board_failed",
+                        board = %b.board,
+                        error = %e,
+                        "Доска не прочитана — доска пропущена до следующего прохода"
+                    );
+                    continue;
+                }
+            };
+            let policy = uwuwu_usecase::env_gc::EnvGcPolicy {
+                now_ms: clock.now_ms(),
+                age_days: days,
+                observe,
+            };
+            let sessions = usecase.sessions.project(&b.project);
+            if let Err(e) = uwuwu_usecase::env_gc::sweep_envs(
+                &b.board,
+                &b.checkout,
+                &b.env_root,
+                &tasks,
+                sessions,
+                &usecase.models,
+                policy,
+            )
+            .await
+            {
+                tracing::warn!(
+                    event = "env.gc.failed",
+                    board = %b.board,
+                    error = %e,
+                    "Проход env-gc упал — переедет следующим интервалом"
+                );
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(poll_sec)).await;
+    }
 }
 
 /// Периодический снимок памяти (срез B' #1294): событие server.memory —
