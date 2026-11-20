@@ -8188,3 +8188,65 @@ async fn low_and_empty_priorities_defer_in_peak_same_gate() {
         "статусы нетронуты"
     );
 }
+
+/// Тест-раунд #1310 (допокрытие тестировщика): отложенный пиком будильник
+/// доставляется после окна — деферр не пишет seen-маркер, коммент не
+/// теряется и не дублируется (UC-05 «откладывается до конца окна»,
+/// семейство V4/V8 «не потерять отложенное»). Разрыв = молчаливая потеря
+/// коммента после окна при записи маркера на деферре — счётчиками
+/// (wakeups_deferred) этот класс не виден.
+#[tokio::test]
+async fn deferred_wakeup_delivered_after_window_without_loss_or_dup() {
+    let state = Arc::new(MemState(Mutex::default()));
+    let idle = row_with_session(390, "ses_dev_idle", Priority::Medium);
+    let (u, _, sessions, _, clock) = matrix_usecase(
+        vec![idle],
+        vec![CommentRef {
+            id: "c1".into(),
+            created_ms: 3000,
+            body: "свежий коммент владельца".into(),
+        }],
+        state.clone(),
+        true, // idle_reply: ход завершён до окна — коммент свежее ответа
+    );
+    let out = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.wakeups_deferred, 1, "в пике будильник отложен");
+    assert!(
+        sessions.prompts.lock().unwrap().is_empty(),
+        "доставки в окне нет"
+    );
+    assert!(
+        state.0.lock().unwrap().comments.is_empty(),
+        "seen-маркер на деферре не пишется — иначе коммент потеряется после окна"
+    );
+
+    // Окно кончилось: тот же коммент доставляется, маркер поглощает его
+    clock.in_peak.store(false, Ordering::SeqCst);
+    let out2 = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out2.wakeups, 1, "отложенный будильник доставлен после окна");
+    {
+        let prompts = sessions.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1, "ровно одна доставка: {prompts:?}");
+        assert!(
+            prompts[0].starts_with("ses_dev_idle|Wakeup"),
+            "промпт уходит в живую idle-сессию: {prompts:?}"
+        );
+    }
+    assert_eq!(
+        state.0.lock().unwrap().comments.as_slice(),
+        ["c1"],
+        "коммент поглощён маркером — ретрая не будет"
+    );
+
+    // Следующий тик не дублирует доставку (маркер уже стоит)
+    let out3 = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out3.wakeups, 0, "повторной доставки нет");
+    let wake_prompts = sessions
+        .prompts
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|p| p.contains("Wakeup:"))
+        .count();
+    assert_eq!(wake_prompts, 1, "дублей wake-доставки нет");
+}
