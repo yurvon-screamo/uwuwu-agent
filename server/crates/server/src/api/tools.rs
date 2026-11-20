@@ -813,9 +813,12 @@ fn ok_text(text: String) -> Result<Value, String> {
 }
 
 /// Метка коммента в выводе task_get (#1432): created_ms → ISO 8601 UTC
-/// (формат-контракт для тайминг-разборов агентов). Недостижимый ms
-/// (вне часов chrono) — «—» по конвенции пустых ячеек.
+/// (формат-контракт для тайминг-разборов агентов). ms вне часов chrono
+/// (в т.ч. > i64::MAX — до приведения типов) — «—» по конвенции пустых ячеек.
 fn iso_utc_stamp(ms: u64) -> String {
+    if ms > i64::MAX as u64 {
+        return "—".into();
+    }
     chrono::DateTime::from_timestamp_millis(ms as i64)
         .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
         .unwrap_or_else(|| "—".into())

@@ -235,7 +235,7 @@ write-path в MCP `task_body`.
 несут свой текст: «The server restarted while you were working» (рестарт serve),
 «The previous response was interrupted» (убитый ход), «[sticky-retry] provider outage»
 (аутеджи провайдера). Timeline дампа обрезан лимитом — полный подсчёт по пакету
-сессий задачи снимай SQL по БД из промпта (ids — из промпта/дампов):
+сессий задачи снимай SQL по БД узла (путь — конвенция шага 1; ids — из промпта/дампов):
 
 ```
 sqlite3 <db> "select s.id, count(*) n from session_message m join session_v2 s on s.id=m.session_id where s.id in (<ids>) and m.type='synthetic' and m.data like '%server restarted%' group by s.id"
