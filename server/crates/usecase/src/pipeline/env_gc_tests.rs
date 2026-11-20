@@ -2,7 +2,7 @@
 //! observe. Фейки изолированы на тест (rules-test-rule); вердикт-канал
 //! отвечает мгновенно — темп ожидания инфра-забота адаптера.
 
-use super::env_gc::{sweep_envs, EnvGcOutcome, EnvGcPolicy, ENV_GC_BATCH_CAP};
+use super::env_gc::{sweep_envs, EnvGcCtx, EnvGcOutcome, EnvGcPolicy, ENV_GC_BATCH_CAP};
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::ports::{AgentSessionGateway, AssistantReply, Liveness, SessionInfo, SessionSpec};
 use crate::router::SessionRouter;
@@ -132,17 +132,17 @@ fn policy(now: u64, observe: bool) -> EnvGcPolicy {
 async fn run(tasks: &[Task], gw: &Arc<FakeGcSessions>, now: u64, observe: bool) -> EnvGcOutcome {
     let router = SessionRouter::uniform(gw.clone());
     let sessions = router.project("p");
-    sweep_envs(
-        "Задачи uwuwu",
-        "/checkout",
-        ENV_ROOT,
+    let ctx = EnvGcCtx {
+        board_name: "Задачи uwuwu",
+        checkout: "/checkout",
+        env_root: ENV_ROOT,
         tasks,
         sessions,
-        &SpawnModels::canonical(),
-        policy(now, observe),
-    )
-    .await
-    .expect("проход не падает")
+        models: &SpawnModels::canonical(),
+    };
+    sweep_envs(&ctx, policy(now, observe))
+        .await
+        .expect("проход не падает")
 }
 
 const NOW: u64 = 1_800_000_000_000;
