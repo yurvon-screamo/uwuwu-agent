@@ -590,7 +590,12 @@ impl GitHubHub {
         expected: Status,
         confirmed: Option<String>,
     ) -> VerifyOutcome {
-        if confirmed.as_deref() == Some(uwuwu_usecase::status_name(expected)) {
+        // сравнение доменное, не строковое: в окне merge→rename (#1383)
+        // носитель отвечает легаси-русским именем опции при английском каноне
+        if confirmed
+            .as_deref()
+            .is_some_and(|raw| uwuwu_usecase::parse_status(raw) == expected)
+        {
             return VerifyOutcome::Ok;
         }
         for attempt in 0..3 {
@@ -637,8 +642,8 @@ impl GitHubHub {
                 // значение не доживает TTL-окно (ревью 1 Common-3)
                 self.pv2.invalidate_status(board, number);
                 return Err(UsecaseError::Board(format!(
-                    "статус #{number}: запись «{}» не подтвердилась чтением — \
-                     GitHub отдаёт лаг или мутация не применилась; не ретраить слепо",
+                    "status #{number}: write «{}» not confirmed by read — \
+                     GitHub lag or mutation not applied; do not retry blindly",
                     uwuwu_usecase::status_name(status)
                 )));
             }
@@ -759,7 +764,9 @@ fn item_values(item: &Value) -> ItemValues {
                 .unwrap_or_default();
             match field {
                 "Status" => out.status = value.to_string(),
-                crate::github::fields::F_PRIORITY | "Priority" => out.priority = value.to_string(),
+                crate::github::fields::F_PRIORITY | "Приоритет" => {
+                    out.priority = value.to_string()
+                }
                 // автомерж (#1232): новое имя, legacy «Autodone» — back-compat
                 "Automerge" | "Autodone" => out.automerge = value == "on" || value == "true",
                 uwuwu_usecase::F_DIRECT => out.direct = value == "on",
@@ -805,11 +812,14 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
     }
     // Приоритет с носителя: один парсер со snapshot-путём (naming::
     // parse_priority — trim/регистр/русские варианты); неизвестное — Empty.
+    // Ключ канона + легаси «Приоритет» (контракт окна merge→rename #1383:
+    // физическое issue-поле может нести старый лейбл до rename владельцем).
     // Без мапинга гейт пика морозил бы ВСЕ спавны, включая high
     // (инцидент #1170: high-таска deferred_peak'илась, ревьювер не
     // поднимался в окно GLM).
     let priority = raw
         .get(crate::github::fields::F_PRIORITY)
+        .or_else(|| raw.get("Приоритет"))
         .map(|v| uwuwu_usecase::parse_priority(v))
         .unwrap_or(uwuwu_domain::Priority::Empty);
     // VCS-жизненный цикл явный; пара (Branch, PR) — кодовый цикл с веткой.
@@ -1667,7 +1677,7 @@ mod tests {
             .settle_write_through("B", 7, VerifyOutcome::Mismatch, Status::InProgress)
             .expect_err("mismatch — громкая ошибка");
         assert!(
-            err.to_string().contains("не подтвердилась"),
+            err.to_string().contains("not confirmed by read"),
             "текст отказа: {err}"
         );
         assert!(

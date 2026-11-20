@@ -34,6 +34,11 @@ fn resolve_field(catalog: &HashMap<String, u64>, name: &str) -> Option<u64> {
     if name == uwuwu_usecase::F_AUTOMERGE {
         return catalog.get("Autodone").copied();
     }
+    // легаси-лейбл приоритета (#1383): физическое поле «Приоритет» живёт
+    // в каталогах до rename — канон "Priority" резолвится в него
+    if name == uwuwu_usecase::F_PRIORITY {
+        return catalog.get("Приоритет").copied();
+    }
     None
 }
 
@@ -295,6 +300,12 @@ pub fn parse_field_values(issue: &Value) -> Fields {
             if name == "Autodone" {
                 name = uwuwu_usecase::F_AUTOMERGE;
             }
+            // та же нормализация для приоритета (#1383): физический лейбл
+            // «Приоритет» читается каноном "Priority" — потребители load
+            // алиас не помнят (док F_PRIORITY: наружу всегда новое)
+            if name == "Приоритет" {
+                name = uwuwu_usecase::F_PRIORITY;
+            }
             let value = f["single_select_option"]["name"]
                 .as_str()
                 .or(f["value"].as_str())
@@ -415,7 +426,12 @@ mod tests {
         let f = parse_field_values(&issue);
         assert_eq!(f.get("Branch").map(String::as_str), Some("work/task-9"));
         assert_eq!(f.get("Сессия dev").map(String::as_str), Some("ses_a"));
-        assert_eq!(f.get("Приоритет").map(String::as_str), Some("high"));
+        assert_eq!(
+            f.get("Priority").map(String::as_str),
+            Some("high"),
+            "легаси-лейбл «Приоритет» нормализован на границе (#1383)"
+        );
+        assert!(!f.contains_key("Приоритет"), "legacy-ключ в карте");
         assert!(!f.contains_key("PR"), "пустые значения не в карте");
     }
 
@@ -468,9 +484,31 @@ mod tests {
     }
 
     #[test]
+    fn resolve_field_priority_prefers_canon() {
+        let mut catalog = HashMap::new();
+        catalog.insert("Priority".to_string(), 1);
+        catalog.insert("Приоритет".to_string(), 2);
+        assert_eq!(
+            resolve_field(&catalog, "Priority"),
+            Some(1),
+            "канон бьёт legacy-лейбл"
+        );
+    }
+
+    #[test]
+    fn resolve_field_priority_falls_back_to_legacy_label() {
+        // живой каталог: физическое поле «Приоритет» до rename (#1383) —
+        // запись каноном "Priority" резолвится в легаси-лейбл
+        let mut catalog = HashMap::new();
+        catalog.insert("Приоритет".to_string(), 49841008);
+        assert_eq!(resolve_field(&catalog, "Priority"), Some(49841008));
+    }
+
+    #[test]
     fn resolve_field_misses_yield_none() {
         let empty: HashMap<String, u64> = HashMap::new();
         assert_eq!(resolve_field(&empty, "Automerge"), None, "ensure_field");
+        assert_eq!(resolve_field(&empty, "Priority"), None);
         assert_eq!(resolve_field(&empty, "Приоритет"), None);
         let mut no_legacy = HashMap::new();
         no_legacy.insert("Приоритет".to_string(), 49841008);

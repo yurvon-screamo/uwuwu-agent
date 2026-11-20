@@ -421,7 +421,7 @@ impl Task {
     pub fn transition(&mut self, to: Status) -> Result<(), String> {
         if !Status::can_transition_with(self.status, to, self.direct) {
             return Err(format!(
-                "переход {:?} → {:?} вне канона конвейера (см. Status::can_transition)",
+                "transition {:?} → {:?} outside the pipeline canon (see Status::can_transition)",
                 self.status, to
             ));
         }

@@ -10,7 +10,8 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use uwuwu_usecase::{UsecaseError, UsecaseResult};
+use uwuwu_domain::Status;
+use uwuwu_usecase::{status_names, UsecaseError, UsecaseResult};
 
 use super::hub::TtlCache;
 use super::pv2_parse::{next_after, parse_field_catalog, parse_item_entry, parse_status_value};
@@ -21,6 +22,23 @@ pub(crate) struct Pv2Meta {
     pub(crate) project_number: u64,
     pub(crate) status_field_id: u64,
     pub(crate) options: HashMap<String, String>,
+}
+
+/// Резолв option-id Status по имени: канон или легаси (контракт окна
+/// merge→rename #1383 — доска может нести русские опции при английском
+/// каноне; lookup идёт по обоим, канон первым). Опция никогда не
+/// создаётся: авто-создание дало бы дубль-опцию и расщепление строк.
+pub(crate) fn resolve_status_option<'a>(
+    options: &'a HashMap<String, String>,
+    status_name: &str,
+) -> Option<&'a String> {
+    let status = uwuwu_usecase::parse_status(status_name);
+    if status != Status::Empty {
+        if let Some(id) = status_names(status).iter().find_map(|n| options.get(*n)) {
+            return Some(id);
+        }
+    }
+    options.get(status_name)
 }
 
 /// Строка индекса: numeric item id + последнее прочитанное Status-значение
@@ -321,9 +339,11 @@ impl Pv2Rest {
         status_name: &str,
     ) -> UsecaseResult<Option<String>> {
         let meta = self.meta(board).await?;
-        let option = meta.options.get(status_name).cloned().ok_or_else(|| {
-            UsecaseError::Board(format!("Status-опция «{status_name}» не найдена"))
-        })?;
+        let option = resolve_status_option(&meta.options, status_name)
+            .cloned()
+            .ok_or_else(|| {
+                UsecaseError::Board(format!("Status option not found on board: {status_name}"))
+            })?;
         let owner = self.owner()?;
         let Some(item) = self.item_id(board, number).await? else {
             return Err(UsecaseError::Board(format!(

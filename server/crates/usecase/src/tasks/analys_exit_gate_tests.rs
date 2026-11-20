@@ -152,8 +152,9 @@ impl TaskBoardRepo for GateBoard {
 }
 
 /// Поля issue на носителе живого вида: физическое имя автомержа —
-/// legacy «Autodone» (живой каталог «Automerge» не содержит, #1280 ревью);
-/// load нормализует ключ на границе — контракт fields.rs после фикса.
+/// legacy «Autodone», лейбл приоритета — legacy «Приоритет» (#1383;
+/// живой каталог канонов не содержит), load нормализует ключи на
+/// границе — контракт fields.rs после фикса.
 #[derive(Default)]
 struct GateFields {
     stored: Mutex<HashMap<String, String>>,
@@ -171,12 +172,13 @@ impl GateFields {
         }
     }
 
-    /// Нормализация ключа на границе носителя: «Autodone» → «Automerge».
+    /// Нормализация ключа на границе носителя: «Autodone» → «Automerge»,
+    /// «Приоритет» → «Priority».
     fn normalize(key: String) -> String {
-        if key == "Autodone" {
-            crate::naming::F_AUTOMERGE.to_string()
-        } else {
-            key
+        match key.as_str() {
+            "Autodone" => crate::naming::F_AUTOMERGE.to_string(),
+            "Приоритет" => crate::naming::F_PRIORITY.to_string(),
+            _ => key,
         }
     }
 }
@@ -244,10 +246,7 @@ async fn analys_exit_requires_priority() {
         .await
         .expect_err("пустой Приоритет должен отказать");
     let text = err.to_string();
-    assert!(
-        text.contains("Приоритет"),
-        "перечень без Приоритета: {text}"
-    );
+    assert!(text.contains("Priority"), "перечень без Приоритета: {text}");
     assert!(
         !text.contains("Automerge"),
         "перечень зовёт заполненное поле: {text}"
@@ -265,7 +264,7 @@ async fn analys_exit_requires_automerge() {
     let text = err.to_string();
     assert!(text.contains("Automerge"), "перечень без Automerge: {text}");
     assert!(
-        !text.contains("Приоритет"),
+        !text.contains("Priority"),
         "заполненное поле в перечне: {text}"
     );
 }
@@ -280,7 +279,7 @@ async fn analys_exit_lists_both_empty_fields() {
         .expect_err("оба пусты — должен отказать");
     let text = err.to_string();
     assert!(
-        text.contains("Приоритет") && text.contains("Automerge"),
+        text.contains("Priority") && text.contains("Automerge"),
         "перечень неполный: {text}"
     );
 }
@@ -344,7 +343,7 @@ async fn patch_garbage_priority_is_rejected() {
         .await
         .expect_err("мусорный патч-приоритет — не явное решение");
     assert!(
-        err.to_string().contains("Приоритет"),
+        err.to_string().contains("Priority"),
         "перечень без Приоритета: {err}"
     );
     assert!(
@@ -367,7 +366,7 @@ async fn patch_garbage_priority_without_automerge_is_rejected() {
         .await
         .expect_err("мусорный патч-приоритет без automerge — тоже отказ");
     assert!(
-        err.to_string().contains("Приоритет"),
+        err.to_string().contains("Priority"),
         "перечень без Приоритета: {err}"
     );
     assert!(
@@ -420,7 +419,7 @@ async fn garbage_priority_is_rejected() {
         .await
         .expect_err("мусорный приоритет — не явное решение");
     assert!(
-        err.to_string().contains("Приоритет"),
+        err.to_string().contains("Priority"),
         "мусор должен попасть в перечень: {err}"
     );
 }

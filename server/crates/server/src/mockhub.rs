@@ -915,7 +915,7 @@ mod tests {
             .await
             .expect_err("фантомный переход в закрытую строку отклонён гардом");
         assert!(
-            format!("{err}").contains("вне канона"),
+            format!("{err}").contains("outside the pipeline canon"),
             "громкая канон-ошибка про терминальность, получили: {err}"
         );
     }
