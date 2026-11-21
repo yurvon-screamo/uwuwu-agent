@@ -15,6 +15,10 @@ pub enum Status {
     InProgress,
     ReviewResult,
     Testing,
+    /// Ревью тестового кода (#1413): после pass тестировщика с
+    /// тестовыми коммитами — независимый взгляд на тест-дельту,
+    /// которую код-ревью не видело (компромисс ADR-066).
+    ReviewTesting,
     UserReview,
     Done,
     NeedsAttention,
@@ -28,7 +32,12 @@ impl Status {
     pub fn is_active(self) -> bool {
         matches!(
             self,
-            Self::Design | Self::ReviewPlan | Self::InProgress | Self::ReviewResult | Self::Testing
+            Self::Design
+                | Self::ReviewPlan
+                | Self::InProgress
+                | Self::ReviewResult
+                | Self::Testing
+                | Self::ReviewTesting
         )
     }
 
@@ -62,6 +71,7 @@ impl Status {
                     | S::InProgress
                     | S::ReviewResult
                     | S::Testing
+                    | S::ReviewTesting
                     | S::UserReview
                     | S::NeedsAttention
             );
@@ -90,7 +100,15 @@ impl Status {
                 )
                 | (
                     S::Testing,
-                    S::UserReview | S::InProgress | S::NeedsAttention
+                    S::UserReview | S::ReviewTesting | S::InProgress | S::NeedsAttention
+                )
+                | (
+                    // Ревью тестирования (#1413): вердикт тест-ревьювера —
+                    // чисто в Review, находки назад тестировщику (пара
+                    // счёта капа #1311), вопрос владельцу. Прод-код в
+                    // In Progress не возвращается — fail-цикл тестировщика.
+                    S::ReviewTesting,
+                    S::UserReview | S::Testing | S::NeedsAttention
                 )
                 | (S::UserReview, S::InProgress | S::NeedsAttention)
                 | (S::NeedsAttention, S::InProgress | S::Analys)
@@ -138,6 +156,7 @@ pub enum Slot {
     PlanReview,
     ResultReview,
     Test,
+    TestReview,
 }
 
 impl Slot {
@@ -150,6 +169,7 @@ impl Slot {
             Self::PlanReview => "🔍",
             Self::ResultReview => "🔬",
             Self::Test => "🧪",
+            Self::TestReview => "🧫",
         }
     }
 }
@@ -521,6 +541,7 @@ impl Task {
             Status::InProgress => Some(Slot::Dev),
             Status::ReviewResult => Some(Slot::ResultReview),
             Status::Testing => Some(Slot::Test),
+            Status::ReviewTesting => Some(Slot::TestReview),
             _ => None,
         }
     }
@@ -572,12 +593,13 @@ mod tests {
     /// (критерий различимости #1212).
     #[test]
     fn slot_emojis_distinct_and_linked_to_agents() {
-        let emojis: [&str; 5] = [
+        let emojis: [&str; 6] = [
             Slot::Design.emoji(),
             Slot::Dev.emoji(),
             Slot::PlanReview.emoji(),
             Slot::ResultReview.emoji(),
             Slot::Test.emoji(),
+            Slot::TestReview.emoji(),
         ];
         for i in 0..emojis.len() {
             for j in i + 1..emojis.len() {
@@ -592,6 +614,23 @@ mod tests {
         assert_eq!(emojis[2], Agent::PlanReviewer.emoji());
         assert_eq!(emojis[3], Agent::CodeQualityReviewer.emoji());
         assert_eq!(emojis[4], Agent::Tester.emoji());
+        assert_eq!(emojis[5], Agent::TestReviewer.emoji());
+    }
+
+    #[test]
+    fn review_testing_stage_is_wired() {
+        // #1413: статус → слот → спавн; is_active — CUP/пик
+        let t = task(Status::ReviewTesting);
+        assert_eq!(t.stage_slot(), Some(Slot::TestReview));
+        assert_eq!(t.stage_needs_spawn(), Some(Slot::TestReview));
+        assert!(
+            Status::ReviewTesting.is_active(),
+            "стадия LLM-тратящая — слот CUP и пик-гейт"
+        );
+        assert!(
+            !Status::ReviewTesting.is_terminal(),
+            "рабочая стадия, не терминал"
+        );
     }
 
     #[test]
@@ -760,6 +799,11 @@ mod tests {
             (S::ReviewResult, S::InProgress),
             (S::Testing, S::UserReview),
             (S::Testing, S::InProgress),
+            // ревью тестирования (#1413): pass с тест-коммитами и вердикты
+            (S::Testing, S::ReviewTesting),
+            (S::ReviewTesting, S::UserReview),
+            (S::ReviewTesting, S::Testing),
+            (S::ReviewTesting, S::NeedsAttention),
             (S::UserReview, S::InProgress),
             (S::NeedsAttention, S::InProgress),
             // аналитика (#1135): вход потока и цикл с ревью
@@ -789,6 +833,14 @@ mod tests {
             "Done — только close владельца"
         );
         assert!(!S::can_transition(S::InProgress, S::Todo));
+        assert!(
+            !S::can_transition(S::ReviewTesting, S::InProgress),
+            "тест-ревьювер прод-код не правит — fail-цикл тестировщика"
+        );
+        assert!(
+            !S::can_transition(S::ReviewTesting, S::ReviewResult),
+            "назад в код-ревью тест-дельта не ходит"
+        );
         assert!(
             !S::can_transition(S::Empty, S::Todo),
             "легаси — владельцу в UI"

@@ -121,6 +121,7 @@ impl TaskBoardRepo for FakeBoard {
                     Slot::PlanReview,
                     Slot::ResultReview,
                     Slot::Test,
+                    Slot::TestReview,
                 ] {
                     if let Some(s) = t.session_of(slot) {
                         f.set_session(slot, uwuwu_domain::SessionRef::parse(s).unwrap());
@@ -2308,6 +2309,82 @@ async fn escalation_digest_without_session_is_honest_dash() {
 }
 
 #[tokio::test]
+async fn test_review_cycle_counts_and_escalates_with_test_review_digest() {
+    // #1413: пара тест-ревью цикла (ReviewTesting → Testing) считается
+    // тем же капом; дайджест эскалации называет сессию TestReview-слота
+    let state = Arc::new(MemState(Mutex::default()));
+    // счёт 1: первый возврат тест-ревьювера (ReviewTesting → Testing)
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((52, Status::ReviewTesting));
+    let (u, _, _, _) = usecase_with_state(
+        vec![task(52, Status::Testing)],
+        PrState::Missing,
+        state.clone(),
+    );
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        state.review_rounds("B", 52),
+        1,
+        "возврат тест-ревьювера — счёт 1"
+    );
+    // баланс 3 + ещё один возврат — кап: эскалация с TestReview-дайджестом
+    state.0.lock().unwrap().review_rounds.push((53, 3));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((53, Status::ReviewTesting));
+    let mut t = task(53, Status::Testing);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::TestReview,
+        uwuwu_domain::SessionRef::parse("ses_test_rev_live").unwrap(),
+    );
+    t.apply_fields(f);
+    let (u2, board, _, _) = usecase_with_state(vec![t], PrState::Missing, state.clone());
+    u2.run(&plan(Mode::Live, 7)).await.unwrap();
+    let log = board.log.lock().unwrap();
+    let digest = log
+        .iter()
+        .find(|l| l.starts_with("comment#53=⚠︎ Кап ревью-раундов"))
+        .expect("дайджест эскалации тест-цикла");
+    assert!(
+        digest.contains("последняя ревью-сессия: ses_test_rev_live"),
+        "id тест-ревью-сессии в дайджесте: {digest}"
+    );
+    assert_eq!(state.review_rounds("B", 53), 0, "эскалация — свежий бюджет");
+}
+
+#[tokio::test]
+async fn test_review_cycle_approve_resets_counter() {
+    // #1413: approve тест-ревьювера (ReviewTesting → UserReview) — цикл
+    // сошёлся, счётчик с нуля
+    let state = Arc::new(MemState(Mutex::default()));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((54, Status::ReviewTesting));
+    let (u, _, _, _) = usecase_with_state(
+        vec![task(54, Status::UserReview)],
+        PrState::Missing,
+        state.clone(),
+    );
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        state.review_rounds("B", 54),
+        0,
+        "approve — цикл сошёлся, счётчик с нуля"
+    );
+}
+
+#[tokio::test]
 async fn review_rounds_retry_spawn_does_not_count() {
     // ретрай спавна ревьювера в том же статусе (мёртвая сессия того же
     // раунда) — не request_changes: счётчик не инкрементится
@@ -4166,6 +4243,52 @@ async fn spawn_prompt_demands_finish_transaction() {
     assert!(
         prompt.contains("Needs attention"),
         "вопрос владельцу — легальный финал"
+    );
+}
+
+#[tokio::test]
+async fn spawn_prompt_test_stage_marker_contract() {
+    // #1413: дизамбигуация классификации стадий (ревью 2, coupling) —
+    // тест-ревьювер классифицируется по уникальному stage-маркеру
+    // «тестовая дельта ветки» (mock_opencode::stage_action_of_prompt),
+    // tester-промпт маркера НЕ несёт: имя статуса «Ревью тестирования»
+    // живёт в его finish-инструкции (чекпойнт pass) и не должно
+    // перехватываться. Контракт двух поверхностей пинится на реальном
+    // выводе spawn_prompt — дрейф текста краснеет на юните, а не на
+    // дорогом прогоне стенда.
+    let board = BoardPlan {
+        board: "B".into(),
+        project: "p".into(),
+        repo: "a/c".into(),
+        checkout: "/tmp/checkout".into(),
+        env_root: "/tmp/env".into(),
+    };
+    let tester_prompt = crate::pipeline::actions::spawn_prompt(
+        &board,
+        &Task::new(8, "t".into(), Status::Testing),
+        Slot::Test,
+    );
+    assert!(
+        !tester_prompt.contains("тестовая дельта ветки"),
+        "tester-промпт без stage-маркера тест-ревьювера"
+    );
+    // чекпойнт pass тестировщика: развилка по (tester)-коммитам названа
+    assert!(
+        tester_prompt.contains("Ревью тестирования") && tester_prompt.contains("(tester)-коммиты"),
+        "finish-инструкция тестировщика несёт чекпойнт pass: {tester_prompt}"
+    );
+    let test_review_prompt = crate::pipeline::actions::spawn_prompt(
+        &board,
+        &Task::new(9, "t".into(), Status::ReviewTesting),
+        Slot::TestReview,
+    );
+    assert!(
+        test_review_prompt.contains("тестовая дельта ветки"),
+        "stage-маркер тест-ревьювера в промпте: {test_review_prompt}"
+    );
+    assert!(
+        test_review_prompt.contains("«Review»") && test_review_prompt.contains("«Тестирование»"),
+        "finish-инструкция тест-ревьювера называет оба вердикт-статуса: {test_review_prompt}"
     );
 }
 

@@ -997,6 +997,10 @@ impl TickUseCase {
         // слот последней ревью-сессии — по паре цикла счёт-перехода
         let round_slot = if prev == Some(Status::ReviewPlan) {
             Slot::PlanReview
+        } else if prev == Some(Status::ReviewTesting) {
+            // #1413: пара тест-ревью цикла — дайджест называет
+            // последнюю сессию правильного слота
+            Slot::TestReview
         } else {
             Slot::ResultReview
         };
