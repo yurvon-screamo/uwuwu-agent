@@ -185,6 +185,7 @@ say "V4: busy-флаг старше 30 мин (#1295) — слот свобод�
 stop_pid "$SRV_PID"; SRV_PID=""
 rm -f "$STATE"
 Z=$(mk_busy "$PORT_A" 2100000)   # 35 мин назад — протухший busy
+[ -n "$Z" ] || fail "V4: зомби-филлер не создан — сценарий недействителен"
 UWUWU_SERVER_CONFIG=$CONFIG UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
   UWUWU_SERVER_MODE=live UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=x \
   UWUWU_MOCK_SEED="Задачи uwuwu:3300:Design:Medium" \
