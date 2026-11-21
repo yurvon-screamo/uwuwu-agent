@@ -54,7 +54,7 @@ pub(crate) fn tool_hub(
         goals: Arc::new(uwuwu_usecase::GoalsView::new(
             memory.clone(),
             vec!["uwuwu".to_string()],
-            "https://github.com/acme/hub/issues?q=label%3Aproj%3A{project}".into(),
+            "https://github.com/acme/hub/milestones".into(),
         )),
         docs: Arc::new(uwuwu_usecase::DocsView::new(wiki.clone())),
         person: Arc::new(uwuwu_usecase::PersonView::new(wiki.clone())),

@@ -641,7 +641,7 @@ async fn fast_track_from_draft_and_todo() {
         goals: Arc::new(uwuwu_usecase::GoalsView::new(
             memory.clone(),
             vec!["uwuwu".to_string()],
-            "https://github.com/acme/hub/issues?q=label%3Aproj%3A{project}".into(),
+            "https://github.com/acme/hub/milestones".into(),
         )),
         docs: Arc::new(DocsView::new(wiki.clone())),
         person: Arc::new(PersonView::new(wiki.clone())),
@@ -1455,8 +1455,8 @@ async fn task_clean_garbage_ids_is_loud() {
 
 // ——— goal_list (#1216): MCP-поверхность — склейка диспетчера с вьюхой ———
 // Носитель в фикстуре — MemoryHub (целей нет): проверяется маршрутизация
-// тула и подсказка носителя с подставленным проектом; живые данные —
-// hub.rs::goals_live_tests (UWUWU_E2E=1).
+// тула и подсказка носителя; живые данные — hub.rs::goals_live_tests
+// (UWUWU_E2E=1).
 #[tokio::test]
 async fn goal_list_on_mcp_surface_carrier_hint_on_empty() {
     let (tools, _) = hub();
@@ -1464,10 +1464,10 @@ async fn goal_list_on_mcp_surface_carrier_hint_on_empty() {
         .await
         .expect("дефолт-проект uwuwu читается без arguments");
     assert!(out.contains("цели проекта не заведены"), "{out}");
-    assert!(out.contains("proj:uwuwu"), "{out}");
+    assert!(out.contains("milestones hub-репо"), "{out}");
     assert!(
-        out.contains("https://github.com/acme/hub"),
-        "URL фильтра из фикс.туры потерян: {out}"
+        out.contains("https://github.com/acme/hub/milestones"),
+        "URL реестра из фикс.туры потерян: {out}"
     );
 }
 

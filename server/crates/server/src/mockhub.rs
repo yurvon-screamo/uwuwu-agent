@@ -787,7 +787,7 @@ impl IssueFieldStore for MemoryHub {
 #[async_trait]
 impl uwuwu_usecase::GoalsRepo for MemoryHub {
     /// E2E-стенд: целей нет — goal_list честно отвечает «не заведены».
-    async fn open_goals(&self, _project: &str) -> UsecaseResult<Vec<uwuwu_usecase::GoalIssue>> {
+    async fn open_goals(&self, _project: &str) -> UsecaseResult<Vec<uwuwu_usecase::Goal>> {
         Ok(Vec::new())
     }
 }
