@@ -8721,14 +8721,13 @@ async fn judge_cap_verdict_continues_row_without_park() {
     state.0.lock().unwrap().review_rounds.push((47, 3));
     let (u, board, sessions, _) = judge_usecase(
         vec![judge_row(47, Status::InProgress, "ses_dev", Slot::Dev)],
-        Some(1000),
+        Some(100_000_000), // активность свежая — сталл-контур молчит, тестируем кап
         true,
         state,
         (Some(judge.clone() as Arc<dyn DecisionJudge>), cfg),
     );
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.judge_calls, 1, "судья вызван на кап-точке");
-    assert_eq!(out.judge_wakeups, 1, "пробуждение без переноса");
     assert_eq!(out.judge_forced, 0);
     assert!(
         !board
@@ -8740,12 +8739,7 @@ async fn judge_cap_verdict_continues_row_without_park() {
         "паркинга нет — судья сказал «ещё раунд»"
     );
     assert!(
-        sessions
-            .prompts
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|p| p.contains("Судья конвейера")),
-        "агент разбужен"
+        sessions.prompts.lock().unwrap().is_empty(),
+        "кап-продолжение без промптов: review-слот очищен до вызова, будить нечего (ревью C3)"
     );
 }

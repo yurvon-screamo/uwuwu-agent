@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """mock_decisions.py — эмулятор Google Decisions API для e2e-фазы судьи (#1364).
 
-  POST /decisions — canned answers: choice из последнего /set (дефолт hold-подобный)
-  POST /set       — {"status": "In Progress"} — вердикт следующих вызовов
+  POST /decisions — canned answers: choice из последнего PUT /set (дефолт Design —
+                    вердикт = текущий статус фазы, wake без переноса)
+  PUT  /set       — {"status": "NeedsAttention"} — вердикт следующих вызовов
   GET  /calls     — {"calls": N} — сколько вызовов судьи принял
-  POST /reset     — обнулить счётчик
+  PUT  /reset     — обнулить счётчик
 
 Запуск: MOCK_JUDGE_PORT=8097 python3 ops/stand/mock_decisions.py
 """
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
 
 LOCK = threading.Lock()
 CALLS = 0
@@ -32,7 +34,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # шум мока не нужен
         pass
 
-    def _json(self, code, obj):
+    def _json(self, code: int, obj: dict) -> None:
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -40,7 +42,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_POST(self):
+    def do_POST(self) -> None:
         global CALLS, STATUS
         if self.path != "/decisions":
             self._json(404, NO_ROUTE)
@@ -66,18 +68,18 @@ class Handler(BaseHTTPRequestHandler):
             "usage": {"total_input_tokens": 500, "total_output_tokens": 0},
         })
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         if self.path == "/calls":
             with LOCK:
                 self._json(200, {"calls": CALLS})
             return
         self._json(404, NO_ROUTE)
 
-    def _read(self):
+    def _read(self) -> dict:
         length = int(self.headers.get("Content-Length", "0"))
         return json.loads(self.rfile.read(length) or b"{}")
 
-    def do_PUT(self):
+    def do_PUT(self) -> None:
         global STATUS, CALLS
         if self.path == "/set":
             STATUS = self._read().get("status", "InProgress")

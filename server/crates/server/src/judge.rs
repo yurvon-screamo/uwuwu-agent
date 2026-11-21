@@ -123,9 +123,9 @@ impl GeminiJudge {
             let _ = writeln!(s, "\nТЕЛО ЗАДАЧИ (усечено):\n{}", ctx.body);
         }
         if !ctx.comments.is_empty() {
-            s.push_str("\nКОММЕНТЫ (от новых к старым, усечены):\n");
+            s.push_str("\nКОММЕНТЫ (от новых к старым, усечены, возраст — человеческий):\n");
             for (ms, body) in &ctx.comments {
-                let _ = writeln!(s, "- [{ms}] {body}");
+                let _ = writeln!(s, "- [{}] {body}", human_age(*ms, ctx.now_ms));
             }
         }
         if !ctx.sessions.is_empty() {
@@ -176,6 +176,17 @@ impl GeminiJudge {
                 }
             }
         })
+    }
+}
+
+/// Возраст метки человеческим языком (модель читает «3 ч назад», не epoch).
+fn human_age(then_ms: u64, now_ms: u64) -> String {
+    let mins = now_ms.saturating_sub(then_ms) / 60_000;
+    match mins {
+        0 => "только что".into(),
+        1..=59 => format!("{mins} мин назад"),
+        m @ 60..=1439 => format!("{} ч назад", m / 60),
+        m => format!("{} д назад", m / 1440),
     }
 }
 
@@ -318,6 +329,7 @@ mod tests {
             restart_recent_min: Some(6),
             body: "тело".into(),
             comments: vec![(1u64, "коммент".into())],
+            now_ms: 10_000_000,
             sessions: vec![JudgeSessionTail {
                 slot: uwuwu_domain::Slot::Dev,
                 text: "ответ".into(),

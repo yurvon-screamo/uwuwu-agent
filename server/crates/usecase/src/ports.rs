@@ -417,6 +417,8 @@ pub struct JudgeContext {
     pub comments: Vec<(u64, String)>,
     /// Хвосты сессий слотов с назначениями.
     pub sessions: Vec<JudgeSessionTail>,
+    /// Эпоха сборки контекста: возраст ленты в промпте (ревью L2).
+    pub now_ms: u64,
 }
 
 /// Судья — decision-модель статусных решений (#1364). Err — отказ вызова
