@@ -50,7 +50,7 @@ const QUERY: &str = r#"
             pageInfo{ hasNextPage endCursor }
             nodes{
               id
-              content{ __typename ...on Issue{ number title state closedAt } }
+              content{ __typename ...on Issue{ number title state closedAt issueType{ name } } }
               fieldValues(first:30){
                 nodes{ __typename
                   ...on ProjectV2ItemFieldSingleSelectValue{
@@ -725,6 +725,11 @@ fn parse_page(items: &[Value], meta: &mut BoardMeta) -> Vec<Task> {
             task.set_priority(uwuwu_usecase::parse_priority(&v.priority));
             task.set_automerge(v.automerge);
             task.set_direct(v.direct);
+            // тип — нативный issue Type на issue-узле (не ячейка доски;
+            // #1271): null/Task/неизвестное имя → None
+            task.set_kind(uwuwu_usecase::parse_task_type(
+                issue["issueType"]["name"].as_str().unwrap_or_default(),
+            ));
             meta.items
                 .insert(number, item["id"].as_str().unwrap_or_default().to_string());
             Some(task)
@@ -1062,6 +1067,11 @@ impl TaskBoardRepo for GitHubHub {
             .map(|v| v == "on")
             .unwrap_or(false);
         task.set_direct(direct);
+        // тип — нативный issue Type (верхний уровень GET issue, не
+        // issue_field_values; #1271) — REST-путь MCP честен, как тик-путь
+        task.set_kind(uwuwu_usecase::parse_task_type(
+            issue["type"]["name"].as_str().unwrap_or_default(),
+        ));
         let comments = self.all_comments(number).await?;
         Ok(IssueView {
             task,
@@ -1566,6 +1576,7 @@ impl uwuwu_usecase::IssueIndexSource for GitHubHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uwuwu_domain::TaskType;
     use uwuwu_domain::{gate, Gate, PeakWindow, Priority, SpawnPolicy, UtcMinute};
 
     #[test]
@@ -2357,6 +2368,44 @@ mod tests {
             guard_status(Status::ReviewResult, None),
             Status::ReviewResult
         );
+    }
+
+    #[test]
+    fn parse_page_carries_native_issue_type() {
+        // #1271: issueType с issue-узла снапшота доезжает до агрегата;
+        // null (native-null хвост) и нативный дефолт Task — None без ошибки
+        let mut meta = BoardMeta::default();
+        let items = vec![
+            json!({
+                "id": "IT_k1",
+                "content": { "__typename": "Issue", "number": 1, "title": "a",
+                             "state": "open", "issueType": { "name": "Bug" } },
+                "fieldValues": { "nodes": [] }
+            }),
+            json!({
+                "id": "IT_k2",
+                "content": { "__typename": "Issue", "number": 2, "title": "b",
+                             "state": "open", "issueType": { "name": "Refactoring" } },
+                "fieldValues": { "nodes": [] }
+            }),
+            json!({
+                "id": "IT_k3",
+                "content": { "__typename": "Issue", "number": 3, "title": "c",
+                             "state": "open", "issueType": null },
+                "fieldValues": { "nodes": [] }
+            }),
+            json!({
+                "id": "IT_k4",
+                "content": { "__typename": "Issue", "number": 4, "title": "d",
+                             "state": "open", "issueType": { "name": "Task" } },
+                "fieldValues": { "nodes": [] }
+            }),
+        ];
+        let rows = parse_page(&items, &mut meta);
+        assert_eq!(rows[0].kind(), Some(TaskType::Bug));
+        assert_eq!(rows[1].kind(), Some(TaskType::Refactoring));
+        assert_eq!(rows[2].kind(), None, "native-null хвост — пустой тип");
+        assert_eq!(rows[3].kind(), None, "нативный дефолт Task — пустой тип");
     }
 
     #[test]
