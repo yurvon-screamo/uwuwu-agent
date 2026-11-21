@@ -197,7 +197,7 @@ impl Pv2Rest {
                     .and_then(|project| project["number"].as_u64())
             })
             .ok_or_else(|| {
-                UsecaseError::Board(format!("проект «{board}» в projectsV2 {owner} не найден"))
+                UsecaseError::Board(format!("project «{board}» not found in projectsV2 {owner}"))
             })?;
         let fields = self
             .rest(
@@ -461,7 +461,7 @@ impl Pv2Rest {
             .as_object()
             .and_then(|item| item.get("id"))
             .and_then(Value::as_u64)
-            .ok_or_else(|| UsecaseError::Board(format!("add #{number}: нет item id")))?;
+            .ok_or_else(|| UsecaseError::Board(format!("add #{number}: no item id")))?;
         let now = std::time::Instant::now();
         // всегда кладём id в индекс (и при пустом кеше): list items не
         // видит свежедобавленную строку в read-лаг (живая проба

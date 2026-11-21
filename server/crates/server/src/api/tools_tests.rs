@@ -1533,8 +1533,8 @@ async fn goal_list_on_mcp_surface_carrier_hint_on_empty() {
     let out = call(&tools, "goal_list", json!({}))
         .await
         .expect("дефолт-проект uwuwu читается без arguments");
-    assert!(out.contains("цели проекта не заведены"), "{out}");
-    assert!(out.contains("milestones hub-репо"), "{out}");
+    assert!(out.contains("no goals set for the project"), "{out}");
+    assert!(out.contains("hub-repo milestones"), "{out}");
     assert!(
         out.contains("https://github.com/acme/hub/milestones"),
         "URL реестра из фикс.туры потерян: {out}"

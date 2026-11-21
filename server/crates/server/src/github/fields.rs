@@ -109,7 +109,7 @@ impl IssueFields {
             .rest(reqwest::Method::GET, "/user/issue-fields", None)
             .await?;
         if !status.is_success() {
-            return Err(UsecaseError::Board(format!("каталог полей: HTTP {status}")));
+            return Err(UsecaseError::Board(format!("field catalog: HTTP {status}")));
         }
         let mut map = HashMap::new();
         if let Some(list) = body.as_array() {
@@ -153,7 +153,7 @@ impl IssueFields {
                     self.ensure_field(name).await?;
                     catalog = self.catalog().await?;
                     resolve_field(&catalog, name).ok_or_else(|| {
-                        UsecaseError::Board(format!("глобальное поле «{name}» не найдено"))
+                        UsecaseError::Board(format!("the global field «{name}» was not found"))
                     })?
                 }
             };
@@ -214,12 +214,12 @@ impl IssueFields {
             // 422 (баг-репорт #1357 круг 1, п.2) — громкий отказ с телом
             if !field_422_already_exists(&resp) {
                 return Err(UsecaseError::Board(format!(
-                    "создание поля «{name}»: HTTP 422 — {resp}"
+                    "field creation «{name}»: HTTP 422 — {resp}"
                 )));
             }
         } else if !status.is_success() {
             return Err(UsecaseError::Board(format!(
-                "создание поля «{name}»: HTTP {status}"
+                "field creation «{name}»: HTTP {status}"
             )));
         }
         *self.catalog.lock().expect("catalog lock") = None;

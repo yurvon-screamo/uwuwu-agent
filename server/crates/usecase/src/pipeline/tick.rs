@@ -574,9 +574,9 @@ impl TickUseCase {
                                 .post_comment(
                                     task.number(),
                                     &format!(
-                                        "⚠︎ Спавн-петля: слот `{}` спавнился >2 раз без \
-                                         прогресса статуса ({:?}). Строка переведена в \
-                                         Needs attention — разбор владельца.",
+                                        "⚠︎ Spawn loop: the `{}` slot spawned >2 times without \
+                                         status progress ({:?}). The row moved to \
+                                         Needs attention — owner's triage.",
                                         naming::slot_key(slot),
                                         task.status()
                                     ),
@@ -1021,10 +1021,10 @@ impl TickUseCase {
                     return false;
                 }
                 let digest = format!(
-                    "⚠︎ Кап ревью-раундов: {next}-й подряд request_changes без approve \
-                     (порог {REVIEW_ROUND_CAP}) — раунд {} не назначается, строка в \
-                     Needs attention, разбор владельца. Находки и вердикты — в треде \
-                     выше; последняя ревью-сессия: {last}.",
+                    "⚠︎ Review-round cap: the {next}th request_changes in a row without an approve \
+                     (the {REVIEW_ROUND_CAP} threshold) — round {} is not assigned, the row is in \
+                     Needs attention, owner's triage. The findings and verdicts — in the thread \
+                     above; the last review session: {last}.",
                     next + 1
                 );
                 if let Err(e) = self.board.post_comment(task.number(), &digest).await {

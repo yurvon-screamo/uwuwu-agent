@@ -279,8 +279,8 @@ impl TaskCleanUseCase {
             .collect();
         if !unacked.is_empty() {
             return Err(UsecaseError::Board(format!(
-                "не-Draft строки требуют подтверждения владельца (ack): {} — \
-                 dry-run выше, подтверждённые номера передай в ack",
+                "non-Draft rows require the owner's confirmation (ack): {} — \
+                 the dry-run above; pass the confirmed numbers into ack",
                 unacked.join("; ")
             )));
         }
@@ -390,7 +390,7 @@ impl TaskCleanUseCase {
                     row.number,
                     row.title.clone(),
                     UndoOutcome::Failed(format!(
-                        "{e} (статус «{}» доставь task_edit)",
+                        "{e} (status «{}» — deliver it via task_edit)",
                         row.status_raw.as_deref().unwrap_or("—")
                     )),
                 )),
@@ -814,7 +814,10 @@ mod tests {
             .execute("uwuwu", &[2], &[])
             .await
             .expect_err("Dead (не-Draft) без ack — отказ");
-        assert!(err.to_string().contains("подтверждения"), "текст: {err}");
+        assert!(
+            err.to_string().contains("require the owner's confirmation"),
+            "текст: {err}"
+        );
     }
 
     #[tokio::test]
