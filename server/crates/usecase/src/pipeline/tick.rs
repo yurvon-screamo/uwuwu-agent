@@ -122,6 +122,22 @@ pub struct TickOutcome {
     pub executors_failed: Vec<String>,
 }
 
+/// Гейт CUP на доставке мягкого пинга (#1313): пинг — запуск хода,
+/// слот выделяется как будильнику/спавну. Бандл «политика + занятость» —
+/// один смысловой вход вердикт-прохода сталл-детекта.
+#[derive(Debug, Clone, Copy)]
+struct CupGate {
+    policy: SpawnPolicy,
+    active_now: usize,
+}
+
+impl CupGate {
+    /// Кап полон — новый ход не выдаётся.
+    fn full(&self) -> bool {
+        self.active_now >= self.policy.cup
+    }
+}
+
 /// Результат прохода сталл-детекта по строке.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StallAct {
@@ -896,7 +912,16 @@ impl TickUseCase {
             Ok(WakeAct::Deferred) => out.wakeups_deferred += 1,
             Ok(WakeAct::Guarded) => out.held_live += 1,
             Ok(WakeAct::GuardedBlind) => out.held_blind += 1,
-            Ok(WakeAct::None) => match self.stall_pass(board, task, plan.policy, *active_now).await
+            Ok(WakeAct::None) => match self
+                .stall_pass(
+                    board,
+                    task,
+                    CupGate {
+                        policy: plan.policy,
+                        active_now: *active_now,
+                    },
+                )
+                .await
             {
                 Ok(StallAct::None) => {}
                 Ok(StallAct::Pinged) => out.stall_pings += 1,
@@ -1125,14 +1150,13 @@ impl TickUseCase {
     /// ход завершён без статусного перевода (паттерн #1151/#1135/#384).
     /// Пинг агенту → повтор → Needs attention. Будит через механизм
     /// wakeup (пинг = коммент, следующий тик доставит его сессии).
-    /// Политика и занятость капа нужны доставке пинга: мягкий пинг —
-    /// запуск хода, гейтуется как будильник (#1313).
+    /// Гейт капа нужен доставке пинга: мягкий пинг — запуск хода,
+    /// гейтуется как будильник (#1313).
     async fn stall_pass(
         &self,
         board: &BoardPlan,
         task: &Task,
-        policy: SpawnPolicy,
-        active_now: usize,
+        cup: CupGate,
     ) -> UsecaseResult<StallAct> {
         let Some(slot) = task.stage_slot() else {
             return Ok(StallAct::None);
@@ -1206,10 +1230,8 @@ impl TickUseCase {
         if count > 0 && now.saturating_sub(last_ping) < every {
             return Ok(StallAct::None);
         }
-        self.stall_action(
-            board, task, slot, &session, soft, silence, count, now, policy, active_now,
-        )
-        .await
+        self.stall_action(board, task, slot, &session, soft, silence, count, now, cup)
+            .await
     }
 
     /// Действие сталл-раунда: эскалация владельцу (пинги исчерпаны),
@@ -1226,14 +1248,11 @@ impl TickUseCase {
         silence: u64,
         count: u32,
         now: u64,
-        policy: SpawnPolicy,
-        active_now: usize,
+        cup: CupGate,
     ) -> UsecaseResult<StallAct> {
         if count < STALL_MAX_PINGS {
             return self
-                .stall_ping_round(
-                    board, task, slot, session, soft, silence, now, policy, active_now,
-                )
+                .stall_ping_round(board, task, slot, session, soft, silence, now, cup)
                 .await;
         }
         // Проба живости В МОМЕНТ эскалации (#1281, различение причин):
@@ -1310,16 +1329,15 @@ impl TickUseCase {
         soft: bool,
         silence: u64,
         now: u64,
-        policy: SpawnPolicy,
-        active_now: usize,
+        cup: CupGate,
     ) -> UsecaseResult<StallAct> {
         if soft {
-            if active_now >= policy.cup {
+            if cup.full() {
                 tracing::info!(
                     event = "stall.soft_ping_held_cup",
                     number = task.number(),
-                    active = active_now,
-                    cap = policy.cup,
+                    active = cup.active_now,
+                    cap = cup.policy.cup,
                     "Мягкий пинг отложен: CUP cap — запуск хода ждёт слот"
                 );
                 return Ok(StallAct::Deferred);
