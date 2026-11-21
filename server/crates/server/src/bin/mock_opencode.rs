@@ -1264,4 +1264,39 @@ mod tests {
         let (next, _) = action_for_status("Ревью тестирования");
         assert_eq!(next, "Review");
     }
+
+    #[test]
+    fn every_mock_status_assignment_is_canonical_key() {
+        // Регресс-пин тест-круга #1413: RC-ветка test-review слала "Testing" —
+        // строка не является ключом parse_status (канон «Тестирование»):
+        // серверный гард резал правку («переход ReviewTesting → Empty вне
+        // канона конвейера»), строка зависала в «Ревью тестирования»,
+        // сценарный ключ "test-review:request_changes" не работал вживую
+        // (дефолтный стенд ветку не гоняет — только approve-путь). Каждый
+        // литерал присваивания статуса в драйвере обязан быть канон-ключом
+        // носителя; скан по исходнику ловит класс целиком (прецедент —
+        // mock_route_coverage: скан литералов вместо ручной таблицы).
+        let src = include_str!("mock_opencode.rs");
+        let needle = "status = \"";
+        let mut scanned: Vec<&str> = Vec::new();
+        let mut i = 0;
+        while let Some(pos) = src[i..].find(needle) {
+            let start = i + pos + needle.len();
+            let Some(end) = src[start..].find('"') else {
+                panic!("литерал статуса оборван (offset {start})");
+            };
+            scanned.push(&src[start..start + end]);
+            i = start + end;
+        }
+        assert!(
+            scanned.len() >= 5,
+            "скан должен находить все сайты присваивания: {scanned:?}"
+        );
+        for s in &scanned {
+            assert!(
+                !matches!(uwuwu_usecase::parse_status(s), uwuwu_domain::Status::Empty),
+                "мок шлёт невалидный статус-ключ «{s}» — гард режет правку"
+            );
+        }
+    }
 }

@@ -4247,6 +4247,52 @@ async fn spawn_prompt_demands_finish_transaction() {
 }
 
 #[tokio::test]
+async fn spawn_prompt_test_stage_marker_contract() {
+    // #1413: дизамбигуация классификации стадий (ревью 2, coupling) —
+    // тест-ревьювер классифицируется по уникальному stage-маркеру
+    // «тестовая дельта ветки» (mock_opencode::stage_action_of_prompt),
+    // tester-промпт маркера НЕ несёт: имя статуса «Ревью тестирования»
+    // живёт в его finish-инструкции (чекпойнт pass) и не должно
+    // перехватываться. Контракт двух поверхностей пинится на реальном
+    // выводе spawn_prompt — дрейф текста краснеет на юните, а не на
+    // дорогом прогоне стенда.
+    let board = BoardPlan {
+        board: "B".into(),
+        project: "p".into(),
+        repo: "a/c".into(),
+        checkout: "/tmp/checkout".into(),
+        env_root: "/tmp/env".into(),
+    };
+    let tester_prompt = crate::pipeline::actions::spawn_prompt(
+        &board,
+        &Task::new(8, "t".into(), Status::Testing),
+        Slot::Test,
+    );
+    assert!(
+        !tester_prompt.contains("тестовая дельта ветки"),
+        "tester-промпт без stage-маркера тест-ревьювера"
+    );
+    // чекпойнт pass тестировщика: развилка по (tester)-коммитам названа
+    assert!(
+        tester_prompt.contains("Ревью тестирования") && tester_prompt.contains("(tester)-коммиты"),
+        "finish-инструкция тестировщика несёт чекпойнт pass: {tester_prompt}"
+    );
+    let test_review_prompt = crate::pipeline::actions::spawn_prompt(
+        &board,
+        &Task::new(9, "t".into(), Status::ReviewTesting),
+        Slot::TestReview,
+    );
+    assert!(
+        test_review_prompt.contains("тестовая дельта ветки"),
+        "stage-маркер тест-ревьювера в промпте: {test_review_prompt}"
+    );
+    assert!(
+        test_review_prompt.contains("«Review»") && test_review_prompt.contains("«Тестирование»"),
+        "finish-инструкция тест-ревьювера называет оба вердикт-статуса: {test_review_prompt}"
+    );
+}
+
+#[tokio::test]
 async fn idle_sessions_do_not_hold_cup() {
     // Регресс 17.11 (#1206-семья): «живая» в API конвейерная сессия,
     // спящая между ходами (никогда не финализируется), считалась

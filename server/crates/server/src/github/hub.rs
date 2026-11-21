@@ -2381,6 +2381,46 @@ mod slot_mapping_tests {
             "Design-слот видит сессию"
         );
     }
+
+    #[test]
+    fn review_session_field_fills_test_review_slot() {
+        // #1413: fm-ячейка «Сессия ревью» — общая для трёх ревью-слотов
+        // (вектора assignments — не-экзаустивная поверхность вне
+        // компилятора): строка в «Ревью тестирования» с живой ячейкой
+        // видит сессию — тик не спавнит дубли (класс инцидента 15/16.11)
+        let mut raw = Fields::new();
+        raw.insert("Сессия ревью".into(), "ses_testrev".into());
+        let f = map_task_fields(&raw);
+        let mut task = uwuwu_domain::Task::new(2, "t".into(), uwuwu_domain::Status::ReviewTesting);
+        task.apply_fields(f);
+        assert_eq!(
+            task.session_of(uwuwu_domain::Slot::TestReview),
+            Some("ses_testrev")
+        );
+        assert_eq!(
+            task.session_of(uwuwu_domain::Slot::ResultReview),
+            Some("ses_testrev")
+        );
+        assert_eq!(
+            task.session_of(uwuwu_domain::Slot::PlanReview),
+            Some("ses_testrev")
+        );
+        assert_eq!(
+            task.session_of(uwuwu_domain::Slot::Dev),
+            None,
+            "ревью-ячейка не течёт в дев-слот"
+        );
+        assert_eq!(
+            task.session_of(uwuwu_domain::Slot::Test),
+            None,
+            "ревью-ячейка не течёт в тест-слот"
+        );
+        assert!(
+            task.stage_needs_spawn().is_none(),
+            "TestReview-слот видит сессию — спавн-дубля нет"
+        );
+    }
+
     #[test]
     fn priority_field_absent_maps_empty() {
         // отсутствующее поле — самый частый кейс доски: не High и не паника
