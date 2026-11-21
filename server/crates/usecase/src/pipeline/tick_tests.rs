@@ -4499,6 +4499,43 @@ async fn analyst_wave_held_when_cup_full() {
 }
 
 #[tokio::test]
+async fn analyst_wave_degrades_on_partial_outage() {
+    // Смешанное здоровье (ревью #1450): один исполнитель отказной, живой
+    // отвечает — волна идёт (busy/alive-гвард по живому union). Бывший
+    // strict-скан падал Err на любом отказе и ставил волну.
+    let state = Arc::new(MemState(Mutex::default()));
+    let live = Arc::new(FakeSessions::new());
+    let mut failing = FakeSessions::new();
+    failing.list_fails = true;
+    let failing = Arc::new(failing);
+    let (mut u, _) = analyst_uc_with_cup(
+        vec![titled(302, "заявка на разбор", Status::Analys)],
+        state,
+        live.clone(),
+        7,
+    );
+    u.sessions = Arc::new(SessionRouter::new(
+        "kisa",
+        live.clone(),
+        vec![("redmi".into(), failing)],
+        std::collections::HashMap::new(),
+    ));
+    let spawned = u
+        .tick()
+        .await
+        .expect("частичный отказ — не Err, деградация по исполнителю");
+    assert_eq!(
+        spawned, 1,
+        "волна идёт при частичном отказе — busy по живому union"
+    );
+    assert_eq!(
+        live.specs.lock().unwrap().len(),
+        1,
+        "спавн ушёл живому исполнителю"
+    );
+}
+
+#[tokio::test]
 async fn analyst_alive_guard_sees_second_turn() {
     // Регресс #1231: outcome — атрибут последнего финала, при новом ходе
     // не очищается. Аналитик на 2+ ходе (wakeup, busy=true, финал уже

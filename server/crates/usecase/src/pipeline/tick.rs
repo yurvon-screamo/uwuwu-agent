@@ -313,18 +313,9 @@ impl TickUseCase {
         // #1263): живая сирота отказного исполнителя спрятана от дубль-
         // спавна слепотой его проектов, а не глобальным параличом.
         let per_exec = self.sessions.list_sessions_per_executor().await;
-        let mut executors_failed = Vec::new();
-        let mut scan: Vec<crate::ports::SessionInfo> = Vec::new();
-        for (name, r) in &per_exec {
-            match r.as_ref() {
-                Ok(list) => scan.extend(list.iter().cloned()),
-                Err(e) => {
-                    executors_failed.push(name.clone());
-                    tracing::warn!(event = "cup.list_sessions_failed", executor = %name,
-                        error = %e, "list_sessions исполнителя недоступен — кап по живому union, его строки держит слепой hold");
-                }
-            }
-        }
+        // Контракт слияния — одна точка с роутером (router::merge_reachable,
+        // ревью #1450): extend живых + имена отказных с warn по каждому.
+        let (scan, executors_failed) = crate::router::merge_reachable(&per_exec);
         out.executors_failed = executors_failed;
         // Пер-проектное зрение: слепки по исполнителям, доска получает свой
         let mut sight_by_executor: HashMap<String, Option<Vec<SessionSighting>>> = HashMap::new();

@@ -14,6 +14,32 @@ pub fn busy_count(list: &[SessionInfo]) -> usize {
     list.iter().filter(|s| s.busy).count()
 }
 
+/// Слияние per-executor результатов в reachable-union (#1450): живые
+/// списки в union, отказные — имена в failed с warn по каждому. Одна
+/// точка знания контракта слияния — роутер и тик используют один код
+/// (ревью #1450: инлайн-мердж в тике дублировал семантику роутера).
+pub fn merge_reachable(
+    per_exec: &[(String, UsecaseResult<Vec<SessionInfo>>)],
+) -> (Vec<SessionInfo>, Vec<String>) {
+    let mut out = Vec::new();
+    let mut failed = Vec::new();
+    for (name, r) in per_exec {
+        match r.as_ref() {
+            Ok(list) => out.extend(list.iter().cloned()),
+            Err(e) => {
+                tracing::warn!(
+                    event = "sessions.list_reachable_failed",
+                    executor = %name,
+                    error = %e,
+                    "list_sessions исполнителя недоступен — деградация по исполнителю"
+                );
+                failed.push(name.clone());
+            }
+        }
+    }
+    (out, failed)
+}
+
 /// Есть ли среди busy-сессий агент данной роли: alive-гвард «≤1 живого»
 /// (#1231). «Живой» = ход в полёте: outcome — атрибут последнего финала
 /// и при новом ходе не очищается.
@@ -105,23 +131,8 @@ impl SessionRouter {
     /// а занятые слоты мертвы вместе с ним. Полный отказ — пустой список,
     /// все имена в failed.
     pub async fn list_sessions_reachable(&self) -> (Vec<SessionInfo>, Vec<String>) {
-        let mut out = Vec::new();
-        let mut failed = Vec::new();
-        for (name, gateway) in &self.all {
-            match gateway.list_sessions().await {
-                Ok(list) => out.extend(list),
-                Err(e) => {
-                    tracing::warn!(
-                        event = "sessions.list_reachable_failed",
-                        executor = %name,
-                        error = %e,
-                        "list_sessions исполнителя недоступен — деградация по исполнителю"
-                    );
-                    failed.push(name.clone());
-                }
-            }
-        }
-        (out, failed)
+        let per_exec = self.list_sessions_per_executor().await;
+        merge_reachable(&per_exec)
     }
 
     /// Число известных исполнителей — гард «все отказали» у потребителей
