@@ -69,12 +69,10 @@ pub struct SectionEditReport {
 #[async_trait]
 pub trait TaskWriter: Send + Sync {
     /// Создание: Analys (create-дефолт #1135), лейбл proj:<project>,
-    /// fm-скелет; дубль тайтла — ошибка. Тип — нативный issue Type в теле
-    /// POST (дефолт Feature; #1271).
+    /// fm-скелет; дубль тайтла — ошибка.
     async fn create(&self, project: &str, spec: NewTask) -> UsecaseResult<u64>;
-    /// Правка: статус/ветка/PR/приоритет/тайтл/тип (статус — поле доски,
-    /// ветка/PR/приоритет — нативные поля issue, тип — нативный issue
-    /// Type #1271, тайтл — rename).
+    /// Правка: статус/ветка/PR/приоритет/тайтл (статус — поле доски,
+    /// ветка/PR/приоритет — нативные поля issue, тайтл — rename).
     async fn edit(&self, project: &str, number: u64, patch: TaskPatch) -> UsecaseResult<()>;
     /// Заявка сессии в слот (dev — по умолчанию).
     async fn claim(&self, number: u64, session: &str, slot: Option<Slot>) -> UsecaseResult<()>;
@@ -119,9 +117,6 @@ pub struct TaskPatch {
     pub title: Option<String>,
     /// Автомерж on/off (#1232): до-пометка старых строк, выключение.
     pub automerge: Option<bool>,
-    /// Тип задачи (#1271): нативный issue Type, PATCH {"type": имя}.
-    /// None — не трогать (снос значения патчем не предусмотрен).
-    pub kind: Option<TaskType>,
 }
 
 impl TaskPatch {
@@ -136,7 +131,6 @@ impl TaskPatch {
                 priority: None,
                 title: None,
                 automerge: None,
-                kind: None,
             }
         )
     }
@@ -168,7 +162,7 @@ impl TaskWriteUseCase {
     fn dup_check(&self, rows: &[Task], title: &str) -> UsecaseResult<()> {
         if rows.iter().any(|t| t.title() == title) {
             return Err(UsecaseError::Board(format!(
-                "тайтл «{title}» уже есть на доске — дубль запрещён"
+                "title «{title}» already exists on the board — duplicates forbidden"
             )));
         }
         Ok(())
@@ -229,12 +223,12 @@ impl TaskWriteUseCase {
 impl TaskWriter for TaskWriteUseCase {
     async fn create(&self, project: &str, spec: NewTask) -> UsecaseResult<u64> {
         if spec.title.trim().is_empty() {
-            return Err(UsecaseError::Board("тайтл пуст".into()));
+            return Err(UsecaseError::Board("title is empty".into()));
         }
         let board = self.board_of(project);
         if board.is_empty() {
             return Err(UsecaseError::Board(format!(
-                "проект «{project}» вне конфига"
+                "project «{project}» is not in the config"
             )));
         }
         let rows = self.board.read_board(&board).await?;
@@ -252,14 +246,14 @@ impl TaskWriter for TaskWriteUseCase {
                     event = "dup_check.search_failed",
                     title = %spec.title.trim(),
                     error = %e,
-                    "REST-поиск тайтлов недоступен — холодный гард пропущен (первичный снапшот-гард отработал)"
+                    "the REST title search is unavailable — the cold guard is skipped (the primary snapshot guard already ran)"
                 );
                 Vec::new()
             }
         };
         if !cold.is_empty() {
             return Err(UsecaseError::Board(format!(
-                "тайтл «{}» уже занят issue #{} — дубль запрещён (строка вне снапшота: холодный ящик)",
+                "title «{}» is already taken by issue #{} — duplicates forbidden (the row is outside the snapshot: cold box)",
                 spec.title.trim(),
                 cold[0]
             )));
@@ -271,14 +265,16 @@ impl TaskWriter for TaskWriteUseCase {
                 project,
                 spec.title.trim(),
                 &render_create_body(&spec),
-                Some(naming::task_type_native_name(
-                    spec.kind.unwrap_or(uwuwu_domain::TaskType::Feature),
-                )),
             )
             .await?;
-        // тип уехал в теле POST create (нативный issue Type, #1271):
-        // атомарно, дрейф между issue и полем невозможен; тихий дроп
-        // без push-доступа ловит сверка эха на границе носителя
+        // тип — нативное поле issue (fm снесён); Тип в снапшоте не живёт
+        let kind = spec.kind.unwrap_or(uwuwu_domain::TaskType::Feature);
+        self.fields
+            .store(
+                number,
+                &[("Тип", Some(naming::task_type_name(kind).to_string()))],
+            )
+            .await?;
         // Приоритет/Automerge/Direct — ячейки снапшота доски: единая точка
         // записи board-адаптера с кеш-гигиеной (#1258; add_to_board
         // инвалидирует ДО записи полей — окно кеша без полей закрывается
@@ -322,7 +318,7 @@ impl TaskWriter for TaskWriteUseCase {
         let board = self.board_of(project);
         if board.is_empty() {
             return Err(UsecaseError::Board(format!(
-                "проект «{project}» вне конфига"
+                "project «{project}» is not in the config"
             )));
         }
         let need_rows = patch.title.is_some();
@@ -346,15 +342,15 @@ impl TaskWriter for TaskWriteUseCase {
             let current = match self.board.row_status(&board, number).await? {
                 None => {
                     return Err(UsecaseError::Board(format!(
-                        "строка #{number} не на доске «{board}» \
-                         (статус на носителе отсутствует)"
+                        "row #{number} is not on board «{board}» \
+                         (no status on the carrier)"
                     )))
                 }
                 Some(Status::Empty) => {
                     return Err(UsecaseError::Board(format!(
-                        "статус носителя #{number} не читается — запись без \
-                         верифицированного current запрещена (класс разбираемого \
-                         бага #1235), разбор владельца"
+                        "the carrier status of #{number} is unreadable — writing without \
+                         a verified current is forbidden (the class of the triaged \
+                         bug #1235), owner's triage"
                     )))
                 }
                 Some(current) => current,
@@ -401,7 +397,7 @@ impl TaskWriter for TaskWriteUseCase {
                 .any(|t| t.number() != number && t.title() == title)
             {
                 return Err(UsecaseError::Board(format!(
-                    "тайтл «{title}» уже занят другой строкой"
+                    "title «{title}» is already taken by another row"
                 )));
             }
             // холодный ящик (#1293, Low дельта-раунда 2): rename-гард
@@ -415,14 +411,14 @@ impl TaskWriter for TaskWriteUseCase {
                         event = "dup_check.search_failed",
                         title = %title,
                         error = %e,
-                        "REST-поиск тайтлов недоступен при rename — холодный гард пропущен"
+                        "the REST title search is unavailable during rename — the cold guard is skipped"
                     );
                     Vec::new()
                 }
             };
             if let Some(other) = cold.iter().find(|n| **n != number) {
                 return Err(UsecaseError::Board(format!(
-                    "тайтл «{title}» уже занят issue #{other} — дубль запрещён (строка вне снапшота: холодный ящик)"
+                    "title «{title}» is already taken by issue #{other} — duplicates forbidden (the row is outside the snapshot: cold box)"
                 )));
             }
             self.board.rename_issue(number, title).await?;
@@ -432,14 +428,14 @@ impl TaskWriter for TaskWriteUseCase {
         let mut field_patch: Vec<(&str, Option<String>)> = Vec::new();
         if let Some(b) = &patch.branch {
             let name = uwuwu_domain::BranchName::parse(b).ok_or_else(|| {
-                UsecaseError::Board(format!("ветка «{b}» не валидна (пробелы/глоб-символы)"))
+                UsecaseError::Board(format!("branch «{b}» is invalid (spaces/glob characters)"))
             })?;
             field_patch.push(("Branch", Some(name.as_str().to_string())));
             want_branch = Some(name.as_str().to_string());
         }
         if let Some(p) = &patch.pr {
             let url = uwuwu_domain::PrUrl::parse(p)
-                .ok_or_else(|| UsecaseError::Board(format!("PR «{p}» не http(s)-URL")))?;
+                .ok_or_else(|| UsecaseError::Board(format!("PR «{p}» is not an http(s) URL")))?;
             field_patch.push(("PR", Some(url.as_str().to_string())));
             want_pr = Some(url.as_str().to_string());
         }
@@ -462,15 +458,6 @@ impl TaskWriter for TaskWriteUseCase {
             want_priority = patch.priority.clone();
             want_automerge = patch.automerge;
         }
-        // тип — нативный issue Type (#1271): PATCH {"type": имя}, мимо
-        // снапшота доски; контрольное чтение ниже сверяет парс носителя
-        let mut want_kind: Option<uwuwu_domain::TaskType> = None;
-        if let Some(kind) = patch.kind {
-            self.board
-                .set_issue_type(number, naming::task_type_native_name(kind))
-                .await?;
-            want_kind = Some(kind);
-        }
         self.verify_edit_delivery(
             &board,
             number,
@@ -480,7 +467,6 @@ impl TaskWriter for TaskWriteUseCase {
                 pr: want_pr,
                 priority: want_priority,
                 automerge: want_automerge,
-                kind: want_kind,
             },
         )
         .await
@@ -493,7 +479,7 @@ impl TaskWriter for TaskWriteUseCase {
 
     async fn comment(&self, number: u64, text: &str, reply_to: Option<&str>) -> UsecaseResult<()> {
         if text.trim().is_empty() {
-            return Err(UsecaseError::Board("коммент пуст".into()));
+            return Err(UsecaseError::Board("the comment is empty".into()));
         }
         let body = match reply_to {
             Some(anchor) => format!("> {anchor}\n\n{text}"),
@@ -537,8 +523,8 @@ impl TaskWriter for TaskWriteUseCase {
                     "Пост коммента не подтвердился чтением ленты носителя"
                 );
                 Err(UsecaseError::Board(format!(
-                    "коммент #{number}: пост не подтвердился чтением ленты носителя — \
-                     не ретраить слепо (риск дубля), сверь task_get"
+                    "comment #{number}: the post was not confirmed by reading the carrier feed — \
+                     do not retry blindly (duplicate risk), verify via task_get"
                 )))
             }
             Delivery::Blind => {
@@ -569,7 +555,7 @@ impl TaskWriter for TaskWriteUseCase {
             }
         }
         Err(UsecaseError::Board(format!(
-            "строка #{number} не на досках конфига"
+            "row #{number} is not on the configured boards"
         )))
     }
 
@@ -588,7 +574,7 @@ impl TaskWriter for TaskWriteUseCase {
         // мусорный project не пишет «мимо доски» молча (ревью #1331 Low)
         if board.is_empty() {
             return Err(UsecaseError::Board(format!(
-                "проект «{project}» вне конфига"
+                "project «{project}» is not in the config"
             )));
         }
         self.board.replace_body(number, clean).await?;
@@ -622,8 +608,8 @@ impl TaskWriter for TaskWriteUseCase {
                     "Запись тела не подтвердилась контрольным чтением носителя"
                 );
                 Err(UsecaseError::Board(format!(
-                    "тело #{number}: запись не подтвердилась чтением носителя — \
-                     GitHub отдаёт не записанное; не ретраить слепо, сверь task_get"
+                    "body #{number}: the write was not confirmed by reading the carrier — \
+                     GitHub returns something other than what was written; do not retry blindly, verify via task_get"
                 )))
             }
             Delivery::Blind => {
@@ -651,17 +637,19 @@ impl TaskWriter for TaskWriteUseCase {
         base_hash: &str,
     ) -> UsecaseResult<SectionEditReport> {
         if section.trim().is_empty() {
-            return Err(UsecaseError::Board("секция пуста — укажи заголовок".into()));
+            return Err(UsecaseError::Board(
+                "the section is empty — provide the heading".into(),
+            ));
         }
         if base_hash.trim().is_empty() {
             return Err(UsecaseError::Board(
-                "base_hash обязателен (body_hash из fm task_get)".into(),
+                "base_hash is required (body_hash from the fm of task_get)".into(),
             ));
         }
         let board = self.board_of(project);
         if board.is_empty() {
             return Err(UsecaseError::Board(format!(
-                "проект «{project}» вне конфига"
+                "project «{project}» is not in the config"
             )));
         }
         let current = self.board.read_issue(&board, number).await?;
@@ -748,42 +736,24 @@ where
 /// назад в task_body, и шапка наслаивалась в теле (fm-стек инцидента
 /// #1331). Срезается на границе записи: инвариант ADR-105 «тело — чистый
 /// markdown» держит сервер, не дисциплина агента (прецедент #1151).
-/// Консервативно: строго набор/порядок ключей рендера (текущий и легаси
-/// до #1271 — тела с ним ресабмятся агентами), любой посторонний контент
-/// («--- fm ---» внутри текста) не трогается.
+/// Консервативно: строго набор/порядок ключей рендера, любой посторонний
+/// контент («--- fm ---» внутри текста) не трогается.
 fn strip_task_get_header(md: &str) -> &str {
-    const KEYS: [&str; 6] = [
-        "branch: ",
-        "pr: ",
-        "automerge: ",
-        "direct: ",
-        "type: ",
-        "body_hash: ",
-    ];
-    const LEGACY_KEYS: [&str; 5] = ["branch: ", "pr: ", "automerge: ", "direct: ", "body_hash: "];
+    const KEYS: [&str; 5] = ["branch: ", "pr: ", "automerge: ", "direct: ", "body_hash: "];
     let Some(rest) = md.strip_prefix("--- fm ---\n") else {
         return md;
     };
-    for keys in [&KEYS[..], &LEGACY_KEYS[..]] {
-        if let Some(stripped) = strip_header_keys(rest, keys) {
-            return stripped;
-        }
-    }
-    md
-}
-
-/// Строгое совпадение набора/порядка ключей одного рендера; частичные
-/// шапки и посторонний контент — None.
-fn strip_header_keys<'a>(rest: &'a str, keys: &[&str]) -> Option<&'a str> {
     let mut pos = rest;
-    for key in keys {
-        let line_end = pos.find('\n')?;
+    for key in KEYS {
+        let Some(line_end) = pos.find('\n') else {
+            return md;
+        };
         if !pos[..line_end].starts_with(key) {
-            return None;
+            return md;
         }
         pos = &pos[line_end + 1..];
     }
-    Some(pos.trim_start_matches('\n'))
+    pos.trim_start_matches('\n')
 }
 
 /// Ожидания контрольного чтения edit: Some — значение менялось и должно
@@ -795,7 +765,6 @@ struct EditExpectations {
     pr: Option<String>,
     priority: Option<String>,
     automerge: Option<bool>,
-    kind: Option<TaskType>,
 }
 
 impl EditExpectations {
@@ -806,49 +775,39 @@ impl EditExpectations {
                 &self.branch,
                 &self.pr,
                 &self.priority,
-                self.automerge,
-                self.kind,
+                self.automerge
             ),
-            (None, None, None, None, None, None)
+            (None, None, None, None, None)
         )
     }
 
     /// Несошедшие ключи последнего чтения — в текст громкой ошибки.
     fn mismatches(&self, view: &crate::ports::IssueView) -> Vec<&'static str> {
         let mut out = Vec::new();
-        if self
-            .title
-            .as_deref()
-            .is_some_and(|t| view.task.title() != t)
-        {
-            out.push("тайтл");
+        if let Some(t) = &self.title {
+            if view.task.title() != t {
+                out.push("title");
+            }
         }
-        if self
-            .branch
-            .as_deref()
-            .is_some_and(|b| view.task.branch().map(|x| x.as_str()) != Some(b))
-        {
-            out.push("ветка");
+        if let Some(b) = &self.branch {
+            if view.task.branch().map(|x| x.as_str()) != Some(b.as_str()) {
+                out.push("branch");
+            }
         }
-        if self
-            .pr
-            .as_deref()
-            .is_some_and(|u| view.task.pr().map(|x| x.as_str()) != Some(u))
-        {
-            out.push("PR");
+        if let Some(u) = &self.pr {
+            if view.task.pr().map(|x| x.as_str()) != Some(u.as_str()) {
+                out.push("PR");
+            }
         }
-        if self
-            .priority
-            .as_deref()
-            .is_some_and(|p| view.task.priority() != crate::naming::parse_priority(p))
-        {
-            out.push("приоритет");
+        if let Some(p) = &self.priority {
+            if view.task.priority() != crate::naming::parse_priority(p) {
+                out.push("priority");
+            }
         }
-        if self.automerge.is_some_and(|a| view.task.automerge() != a) {
-            out.push("automerge");
-        }
-        if self.kind.is_some_and(|k| view.task.kind() != Some(k)) {
-            out.push("тип");
+        if let Some(a) = self.automerge {
+            if view.task.automerge() != a {
+                out.push("automerge");
+            }
         }
         out
     }
@@ -920,7 +879,7 @@ impl TaskWriteUseCase {
                         if m.is_empty() {
                             String::new()
                         } else {
-                            format!("не сошлись: {} — ", m.join(", "))
+                            format!("mismatched: {} — ", m.join(", "))
                         }
                     }
                     Err(_) => String::new(),
@@ -932,8 +891,8 @@ impl TaskWriteUseCase {
                     "Запись edit не подтвердилась контрольным чтением носителя"
                 );
                 Err(UsecaseError::Board(format!(
-                    "edit #{number}: запись не подтвердилась чтением носителя ({detail}\
-                     тайтл/ветка/PR/приоритет/automerge/тип) — не ретраить слепо, сверь task_get"
+                    "edit #{number}: the write was not confirmed by reading the carrier ({detail}\
+                     title/branch/PR/priority/automerge) — do not retry blindly, verify via task_get"
                 )))
             }
             Delivery::Blind => {
@@ -949,8 +908,7 @@ impl TaskWriteUseCase {
     }
 }
 
-/// Тело новой задачи: чистый markdown (fm снесён; приоритет — нативное
-/// глобальное поле, тип — нативный issue Type #1271).
+/// Тело новой задачи: чистый markdown (fm снесён; приоритет/тип — нативные поля).
 /// Инвариант держит граница: fm-шапку (агенты копируют старый канон)
 /// вырезаем из любого входа — тело не несёт fm независимо от дисциплины
 /// вызывающего (инцидент #1151: дример завёл задачу с fm в теле).
@@ -1024,7 +982,6 @@ mod tests {
         priority: Option<String>,
         automerge: bool,
         direct: bool,
-        kind: Option<TaskType>,
         status: Status,
     }
 
@@ -1039,7 +996,6 @@ mod tests {
                 priority: None,
                 automerge: false,
                 direct: false,
-                kind: None,
                 status: Status::Empty,
             }
         }
@@ -1073,7 +1029,6 @@ mod tests {
             ));
             task.set_automerge(self.automerge);
             task.set_direct(self.direct);
-            task.set_kind(self.kind);
             IssueView {
                 task,
                 body: self.body.clone(),
@@ -1181,22 +1136,8 @@ mod tests {
             _project: &str,
             _title: &str,
             _body: &str,
-            kind_name: Option<&str>,
         ) -> UsecaseResult<u64> {
-            // POST с type (#1271): имя «принято» носителем — Carrier видит
-            // парс (как живой GitHub: эхо ответа = состояние носителя)
-            if !self.phantom {
-                self.carrier.lock().expect("fake carrier").kind =
-                    kind_name.and_then(crate::naming::parse_task_type);
-            }
             Ok(1)
-        }
-        async fn set_issue_type(&self, _n: u64, kind_name: &str) -> UsecaseResult<()> {
-            if !self.phantom {
-                self.carrier.lock().expect("fake carrier").kind =
-                    crate::naming::parse_task_type(kind_name);
-            }
-            Ok(())
         }
         async fn rename_issue(&self, _n: u64, t: &str) -> UsecaseResult<()> {
             if !self.phantom {
@@ -1419,8 +1360,7 @@ mod tests {
             "create потерял automerge (мимо board-порта)"
         );
         // fields.store больше не несёт ячейку снапшота (Приоритет/Automerge —
-        // единая точка записи board-адаптера); тип уехал в POST create
-        // (нативный issue Type, #1271) — в полях его тоже нет
+        // единая точка записи board-адаптера); Тип остаётся нативным полем
         assert!(!fields
             .stored
             .lock()
@@ -1497,77 +1437,6 @@ mod tests {
             board.carrier.lock().expect("fake carrier").status,
             Status::Empty,
             "set_status для обычной строки не вызывается"
-        );
-    }
-
-    /// Тип уезжает в POST create нативным именем (#1271): маппинг канона
-    /// в словарь issue Type и дефолт Feature (канон create) — на носителе.
-    #[tokio::test]
-    async fn create_carries_native_issue_type() {
-        let fields = Arc::new(FakeFields::default());
-        let (u, board) = writecase(fields.clone());
-        let mut s = spec("тело");
-        s.kind = Some(TaskType::Bug);
-        u.create("uwuwu", s).await.unwrap();
-        assert_eq!(
-            board.carrier.lock().expect("fake carrier").kind,
-            Some(TaskType::Bug),
-            "Bug → нативный «Bug» в POST, носитель читает парс"
-        );
-
-        let (u, board) = writecase(fields.clone());
-        u.create("uwuwu", spec("без типа")).await.unwrap();
-        assert_eq!(
-            board.carrier.lock().expect("fake carrier").kind,
-            Some(TaskType::Feature),
-            "None → дефолт feature канона create"
-        );
-    }
-
-    /// edit(type): нативный issue Type записан и подтверждён контрольным
-    /// чтением (#1271, честная квитанция #1331).
-    #[tokio::test]
-    async fn edit_kind_is_verified_by_carrier_read() {
-        let fields = Arc::new(FakeFields::default());
-        let (u, board) = writecase(fields);
-        u.edit(
-            "uwuwu",
-            1,
-            TaskPatch {
-                kind: Some(TaskType::Refactoring),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("edit type доставлен");
-        assert_eq!(
-            board.carrier.lock().expect("fake carrier").kind,
-            Some(TaskType::Refactoring),
-        );
-    }
-
-    /// Фантомный edit(type): PATCH «принят», носитель типа не видит —
-    /// громкий отказ с вычисленным перечнем («не сошлись: тип»).
-    #[tokio::test]
-    async fn phantom_edit_kind_is_loud() {
-        let fields = Arc::new(FakeFields::default());
-        let u = writecase_carrier(fields, true, false);
-        let err = u
-            .edit(
-                "uwuwu",
-                1,
-                TaskPatch {
-                    kind: Some(TaskType::Docs),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect_err("фантомный edit type — громкий отказ");
-        let text = err.to_string();
-        assert!(text.contains("не подтвердилась"), "текст отказа: {text}");
-        assert!(
-            text.contains("не сошлись: тип"),
-            "перечень несошедших ключей вычислен: {text}"
         );
     }
 
@@ -1692,17 +1561,16 @@ mod tests {
 
     /// Дисплей-шапка task_get срезается на границе записи (fm-стек
     /// инцидента #1331: агент копирует вывод task_get назад в task_body).
-    /// Набор ключей = рендер MCP (#1271: +type, порядок = порядок KEYS).
     #[test]
     fn task_get_display_header_is_stripped() {
-        let md = "--- fm ---\nbranch: work/task-1331\npr: —\nautomerge: true\ndirect: false\ntype: refactoring\nbody_hash: 9de430c691c92328\n\n## Постановка\nтекст";
+        let md = "--- fm ---\nbranch: work/task-1331\npr: —\nautomerge: true\ndirect: false\nbody_hash: 9de430c691c92328\n\n## Постановка\nтекст";
         assert_eq!(strip_task_get_header(md), "## Постановка\nтекст");
     }
 
     #[test]
     fn task_get_header_in_middle_is_kept() {
         let md =
-            "## Секция\n\n--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\ntype: bug\nbody_hash: h\n\nтекст";
+            "## Секция\n\n--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\nbody_hash: h\n\nтекст";
         assert_eq!(
             strip_task_get_header(md),
             md,
@@ -1715,11 +1583,6 @@ mod tests {
         // неполный набор ключей — не рендер task_get
         let md = "--- fm ---\nbranch: x\npr: y\n\n## Тело";
         assert_eq!(strip_task_get_header(md), md);
-        // легаси-рендер без type (#1271) — срезается тоже: тела с ним
-        // ресабмятся агентами (старый вывод task_get копируется в task_body)
-        let md_legacy =
-            "--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\nbody_hash: h\n\n## Т";
-        assert_eq!(strip_task_get_header(md_legacy), "## Т");
         // посторонняя строка в «шапке» — не трогаем
         let md2 = "--- fm ---\nbranch: x\nслучайная строка\nautomerge: true\nbody_hash: h\n\n## Т";
         assert_eq!(strip_task_get_header(md2), md2);
@@ -1741,7 +1604,7 @@ mod tests {
             .await
             .expect_err("фантомная запись тела — громкий отказ");
         assert!(
-            err.to_string().contains("не подтвердилась"),
+            err.to_string().contains("was not confirmed"),
             "текст отказа: {err}"
         );
     }
@@ -1755,7 +1618,7 @@ mod tests {
             .await
             .expect_err("фантомный коммент — громкий отказ");
         assert!(
-            err.to_string().contains("не подтвердился"),
+            err.to_string().contains("was not confirmed"),
             "текст отказа: {err}"
         );
     }
@@ -1779,9 +1642,9 @@ mod tests {
             .await
             .expect_err("фантомный edit — громкий отказ");
         let text = err.to_string();
-        assert!(text.contains("не подтвердилась"), "текст отказа: {text}");
+        assert!(text.contains("was not confirmed"), "текст отказа: {text}");
         assert!(
-            text.contains("не сошлись: ветка"),
+            text.contains("mismatched: branch"),
             "перечень несошедших ключей вычислен, не статичен: {text}"
         );
     }
@@ -1803,7 +1666,7 @@ mod tests {
             .await
             .expect_err("фантомный rename — громкий отказ");
         assert!(
-            err.to_string().contains("не подтвердилась"),
+            err.to_string().contains("was not confirmed"),
             "текст отказа: {err}"
         );
     }

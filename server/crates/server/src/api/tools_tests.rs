@@ -1393,7 +1393,7 @@ async fn blob_put_over_limit_is_loud_through_dispatcher() {
     .await
     .expect_err("громкий отказ по лимиту");
     assert!(err.contains("blob too big"), "{err}");
-    assert!(err.contains("прецедент UC-06"), "{err}");
+    assert!(err.contains("the UC-06 precedent"), "{err}");
 }
 
 // ===== Батч-снос #1158: поверхность MCP (dry-run/confirm/ack/undo) =====
@@ -1547,7 +1547,7 @@ async fn goal_list_on_mcp_surface_unknown_project_is_honest() {
     let err = call(&tools, "goal_list", json!({ "project": "origa" }))
         .await
         .expect_err("проект вне конфига фикстуры — честный NotFound");
-    assert!(err.contains("вне конфига"), "{err}");
+    assert!(err.contains("is not in the pipeline config"), "{err}");
 }
 
 // ——— Носитель типа — нативный issue Type (#1271): главный сценарий ———

@@ -51,7 +51,7 @@ pub fn tool_descriptors() -> Value {
         ),
         tool(
             "docs_ls",
-            "List wiki .md docs under prefix (slugs without docs/ and .md); on file/dir collision the row reads «X (неоднозначно: файл … + папка …)» — slug for docs_read up to « (неоднозначно»",
+            "List wiki .md docs under prefix (slugs without docs/ and .md); on file/dir collision the row reads «X (ambiguous: file … + folder …)» — slug for docs_read up to « (ambiguous»",
             object(json!({ "path": string("prefix: project/folder; empty — whole wiki") }))
         ),
         tool(
@@ -332,7 +332,7 @@ impl ToolHub {
         );
         out.push_str(&view.body);
         if !view.comments.is_empty() {
-            out.push_str("\n\n--- комменты (последние) ---\n");
+            out.push_str("\n\n--- comments (latest) ---\n");
             for c in &view.comments {
                 out.push_str(&format!(
                     "---\n{}\n{}\n",

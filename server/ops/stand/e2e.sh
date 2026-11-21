@@ -853,17 +853,17 @@ print(t.split('#')[1].split(' ')[0])") || fail "create на фантом-сте�
 BODY_RESP=$(mcp task_body "{\"number\":$PH_N,\"body\":\"## Постановка\n\nфантомное тело\n\"}")
 printf '%s' "$BODY_RESP" | grep -q '"isError":true' \
   || fail "task_body на фантоме не отказал: $BODY_RESP"
-printf '%s' "$BODY_RESP" | grep -q 'не подтвердилась' \
+printf '%s' "$BODY_RESP" | grep -q 'was not confirmed' \
   || fail "текст отказа body без вердикта контрольного чтения: $BODY_RESP"
 COMMENT_RESP=$(mcp task_comment "{\"number\":$PH_N,\"text\":\"probe-1331\"}")
 printf '%s' "$COMMENT_RESP" | grep -q '"isError":true' \
   || fail "task_comment на фантоме не отказал: $COMMENT_RESP"
-printf '%s' "$COMMENT_RESP" | grep -q 'не подтвердился' \
+printf '%s' "$COMMENT_RESP" | grep -q 'was not confirmed' \
   || fail "текст отказа comment без вердикта контрольного чтения: $COMMENT_RESP"
 EDIT_RESP=$(mcp task_edit "{\"number\":$PH_N,\"branch\":\"work/task-1331\"}")
 printf '%s' "$EDIT_RESP" | grep -q '"isError":true' \
   || fail "task_edit(branch) на фантоме не отказал: $EDIT_RESP"
-printf '%s' "$EDIT_RESP" | grep -q 'не подтвердилась' \
+printf '%s' "$EDIT_RESP" | grep -q 'was not confirmed' \
   || fail "текст отказа edit без вердикта контрольного чтения: $EDIT_RESP"
 CARRIER=$(mcp task_get "{\"number\":$PH_N}")
 printf '%s' "$CARRIER" | grep -q 'фантомное тело' \
@@ -886,8 +886,8 @@ import json,sys
 t = json.load(sys.stdin)['result']['content'][0]['text']
 print(t.split('#')[1].split(' ')[0])") || fail "create на честном стенде не отдал номер: $CREATED"
 HONEST=$(mcp task_body "{\"number\":$H_N,\"body\":\"## Постановка\n\nчестное тело\n\"}")
-printf '%s' "$HONEST" | grep -q 'заменено' || fail "task_body на честном носителе отказал: $HONEST"
-printf '%s' "$HONEST" | grep -q 'не подтверждена' \
+printf '%s' "$HONEST" | grep -q 'replaced' || fail "task_body на честном носителе отказал: $HONEST"
+printf '%s' "$HONEST" | grep -q 'delivery not confirmed' \
   && fail "честная запись получила маркер непроверенности: $HONEST"
 HONEST_C=$(mcp task_comment "{\"number\":$H_N,\"text\":\"probe-ok\"}")
 printf '%s' "$HONEST_C" | grep -q 'коммент отправлен' \

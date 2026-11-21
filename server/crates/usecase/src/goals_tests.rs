@@ -54,7 +54,10 @@ async fn unknown_project_is_honest_not_found() {
     let err = view(vec![]).list("ckii").await.unwrap_err();
     match err {
         ViewError::NotFound(msg) => {
-            assert!(msg.contains("вне конфига"), "actual: {msg}")
+            assert!(
+                msg.contains("is not in the pipeline config"),
+                "actual: {msg}"
+            )
         }
         other => panic!("expected NotFound, got {other:?}"),
     }
