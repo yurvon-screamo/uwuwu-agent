@@ -78,6 +78,22 @@ pub fn judge_step(calls_no_progress: u32, escalate_after: u32) -> JudgeStep {
     }
 }
 
+/// Стадия в полномочиях судьи (#1364): сталл- и кап-точки строк на стадиях
+/// вне матрицы [`verdict_target`] идут по старой механике — любой вердикт
+/// там отклоняется, вызовы API горят без легального ответа. ReviewTesting
+/// (#1413) — вердикты тест-ревьювера, не судьи: до отдельного решения
+/// стадия остаётся на пингах/капе старой механики.
+pub fn judge_stage(current: Status) -> bool {
+    matches!(
+        current,
+        Status::Design
+            | Status::InProgress
+            | Status::ReviewPlan
+            | Status::ReviewResult
+            | Status::Testing
+    )
+}
+
 /// Каноничность перехода (решение ревью плана #1364, C1): `Some(цель)` —
 /// переход легален; цель == текущий статус — пробуждение агента без
 /// переноса (наследник мягкого пинга, счётчик гварда растёт — статуса
@@ -248,5 +264,23 @@ mod tests {
             None
         );
         assert_eq!(verdict_target(Status::Todo, JudgeStatus::InProgress), None);
+    }
+
+    #[test]
+    fn judge_stage_covers_exactly_the_verdict_matrix() {
+        // полномочия судьи = активные стадии матрицы; ReviewTesting (#1413)
+        // и неактивные стадии — старая механика
+        for status in [
+            Status::Design,
+            Status::InProgress,
+            Status::ReviewPlan,
+            Status::ReviewResult,
+            Status::Testing,
+        ] {
+            assert!(judge_stage(status), "{status:?} — стадия судьи");
+        }
+        for status in [Status::ReviewTesting, Status::Todo, Status::Done] {
+            assert!(!judge_stage(status), "{status:?} — вне судьи");
+        }
     }
 }

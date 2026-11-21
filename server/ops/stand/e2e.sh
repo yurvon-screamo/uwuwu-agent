@@ -274,18 +274,22 @@ case "$S2047" in
   *) fail "2047 не эскалировал в Needs attention, статус: [$S2047]" ;;
 esac
 
-# kill мок-2 (транспортная смерть): strict-union CUP → фолбэк на статусный
-# подсчёт; дример/аналитика на strict — sidecar.tick_failed (решения по
-# агрегату честно останавливаются), тик конвейера продолжает жить
+# kill мок-2 (транспортная смерть): семантика #1450 — отказ одного
+# исполнителя деградирует зрение по нему (warn + слепота его проектов),
+# конвейер не морозит; бывший strict-фолбэк убит (инцидент 21.11:
+# 37 активных строк при капе 7 = сутки spawns=0). Дример на живом
+# union — решения по агрегату честно деградируют, тик продолжает жить
 BEFORE_TICKS=$(grep -c '"event":"tick.completed"' "$LOG_SRV_MULTI" || true)
 kill "$MOCK2_PID" 2>/dev/null || true
 sleep 25   # 2+ тика на отказе
 AFTER_TICKS=$(grep -c '"event":"tick.completed"' "$LOG_SRV_MULTI" || true)
 [ "$AFTER_TICKS" -gt "$BEFORE_TICKS" ] || fail "тик умер после отказа исполнителя (тик-луп встал)"
-grep -q 'cup.list_sessions_failed' "$LOG_SRV_MULTI" || fail "нет CUP-фолбэка (strict union не отработал)"
-grep -q '"sidecar":"dreamer"' "$LOG_SRV_MULTI" || fail "нет sidecar.tick_failed дримера (strict union не отработал)"
+grep -q 'sessions.list_reachable_failed' "$LOG_SRV_MULTI" \
+  || fail "нет деградации отказного исполнителя (warn #1450 не прозвучал)"
+grep -q 'dreamer.list_degraded' "$LOG_SRV_MULTI" \
+  || fail "нет честной деградации дримера по отказному исполнителю"
 curl -s --max-time 5 "http://127.0.0.1:$PORT_MOCK/api/session" >/dev/null || fail "мок-1 недоступен после отказа мок-2"
-say "отказ исполнителя: CUP-фолбэк + strict-остановка дримера, тик живёт ($BEFORE_TICKS → $AFTER_TICKS тиков)"
+say "отказ исполнителя: деградация по нему (#1450), тик живёт ($BEFORE_TICKS → $AFTER_TICKS тиков)"
 kill "$SRV_PID" "$MOCK_PID" "$MOCK2_PID" 2>/dev/null || true
 wait "$SRV_PID" "$MOCK_PID" "$MOCK2_PID" 2>/dev/null || true
 SRV_PID=""; MOCK_PID=""; MOCK2_PID=""
@@ -1156,5 +1160,4 @@ sleep 1
 say "фаза 14 ок: judge wake без переноса + паркинг вердиктом + fallback при отказе API"
 
 
-say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + мульти-экзекьютор + гард #1163 + self-эхо + слепой hold #1263 + преемпшен CUP #1259 + давка-волна #1412 + клин #1293 + дример #1306 + phantom-квитанции #1331 + lost-сессия #1288: десинк-парковка + lost-resurrection + судья #1364); логи: $RUN_DIR"
 say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри и семейство-непрерывностью сессий #1237 + мульти-экзекьютор + гард #1163 + self-эхо в прод-геометрии #1237 + слепой hold #1263 + преемпшен CUP #1259 + давка-волна #1412 + клин #1293 + дример #1306 + phantom-квитанции #1331 + lost-сессия #1288: десинк-парковка + lost-resurrection + судья #1364); логи: $RUN_DIR"

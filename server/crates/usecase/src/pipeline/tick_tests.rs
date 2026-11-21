@@ -8873,6 +8873,123 @@ async fn judge_cap_verdict_parks_row_on_needs_attention() {
 }
 
 #[tokio::test]
+async fn judge_stage_guard_stall_on_review_testing_uses_legacy_pings() {
+    // Гард стадии, сталл-точка (#1413, раунд 3): ReviewTesting — вердикты
+    // тест-ревьювера, не судьи; любой вердикт там гард отклоняет, вызов
+    // сжёг бы API без легального ответа. Сталл тест-ревью-сессии при
+    // включённом судье идёт по пингам старой механики.
+    const NOW: u64 = 100_000_000;
+    let judge = FakeJudge::says(uwuwu_domain::JudgeStatus::NeedsAttention);
+    let cfg = JudgeCfg {
+        enabled: true,
+        ..JudgeCfg::default()
+    };
+    let state = Arc::new(MemState(Mutex::default()));
+    // статус уже виден тику (смены нет): иначе первое видение = вход в
+    // стадию — «свежие глаза» чистят тест-ревью-слот до сталл-контура
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((52, Status::ReviewTesting));
+    let (u, board, _, _) = judge_usecase(
+        vec![judge_row(
+            52,
+            Status::ReviewTesting,
+            "ses_tr",
+            Slot::TestReview,
+        )],
+        Some(NOW - 90 * 60_000), // тишина 90 мин, ход идёт (idle=false)
+        false,
+        state,
+        (Some(judge.clone() as Arc<dyn DecisionJudge>), cfg),
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert!(
+        judge.calls.lock().unwrap().is_empty(),
+        "модель не вызывается на стадии вне полномочий судьи"
+    );
+    assert_eq!(out.judge_calls, 0, "счётчик вызовов судьи пуст");
+    assert!(
+        board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("comment#52=")),
+        "пинг старой механики доставлен комментом"
+    );
+    assert!(
+        !board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("status#52=")),
+        "статус не менялся (пинг, не паркинг)"
+    );
+}
+
+#[tokio::test]
+async fn judge_stage_guard_test_cap_uses_legacy_force_park() {
+    // Гард стадии, кап-точка (#1413, раунд 3): цикл капа — стадия prev.
+    // Пара ReviewTesting→Testing — fail-возвраты тест-ревьювера, не
+    // request_changes; строка к тику уже в Testing (в матрице судьи),
+    // поэтому гард — по prev: кап тест-цикла паркует старая механика
+    // без вызова модели.
+    const NOW: u64 = 100_000_000;
+    let judge = FakeJudge::says(uwuwu_domain::JudgeStatus::NeedsAttention);
+    let cfg = JudgeCfg {
+        enabled: true,
+        ..JudgeCfg::default()
+    };
+    let state = Arc::new(MemState(Mutex::default()));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((53, Status::ReviewTesting));
+    state.0.lock().unwrap().review_rounds.push((53, 4));
+    let (u, board, _, _) = judge_usecase(
+        vec![judge_row(53, Status::Testing, "ses_test", Slot::Test)],
+        Some(NOW), // активность свежая — сталл-контур молчит
+        true,
+        state,
+        (Some(judge.clone() as Arc<dyn DecisionJudge>), cfg),
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert!(
+        judge.calls.lock().unwrap().is_empty(),
+        "модель не вызывается на тест-капе"
+    );
+    assert_eq!(out.judge_calls, 0, "счётчик вызовов судьи пуст");
+    assert!(
+        board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l == "status#53=NeedsAttention"),
+        "кап тест-цикла паркует старая механика"
+    );
+    assert!(
+        board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("comment#53=⚠︎ Кап ревью-раундов")),
+        "дайджест старой механики (не «⚖︎ Судья»)"
+    );
+    assert_eq!(
+        out.review_flagged, 1,
+        "эскалация посчитана после состоявшегося паркинга (Low раунда 3)"
+    );
+}
+
+#[tokio::test]
 async fn judge_cap_guard_forces_park_without_model_call() {
     // Гвард кап-точки: раунды CAP + escalate_after → паркинг БЕЗ вызова
     // модели (set_status + дайджест, счётчик сброс). Тик-уровень форс-ветки

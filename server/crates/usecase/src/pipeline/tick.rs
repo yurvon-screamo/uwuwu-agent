@@ -1043,8 +1043,11 @@ impl TickUseCase {
                 // decision-модели (она видит ленту — «цикл не сходится»).
                 // Форс-паркинг без вызова: раунды CAP+escalate_after — гвард
                 // сверху судьи, бесконечных «ещё раунд» нет. Err — fallback
-                // на автопаркинг ниже.
-                if self.judge_enabled() {
+                // на автопаркинг ниже. Цикл капа — стадия prev: тест-кап
+                // (#1413, ReviewTesting→Testing) — fail-возвраты тест-
+                // ревьювера, не request_changes; строка к этому тику уже в
+                // Testing (в матрице судьи), поэтому гард — по prev.
+                if self.judge_enabled() && prev.is_some_and(uwuwu_domain::judge_stage) {
                     return self
                         .judge_round_action(board, task, out, round_slot, next)
                         .await;
@@ -1223,7 +1226,10 @@ impl TickUseCase {
         // интервал повторов, рестарт-инвариант #1281), решение — вердикт
         // decision-модели вместо пингов/автопаркинга. Err вызова — fallback
         // на старую механику ниже: судья — улучшение, не зависимость.
-        if self.judge_enabled() {
+        // Стадии вне матрицы (ReviewTesting #1413 — вердикт тест-ревьювера)
+        // остаются на пингах старой механики: вызов судьи там сжёг бы API —
+        // любой вердикт гард отклоняет (judge_stage).
+        if self.judge_enabled() && uwuwu_domain::judge_stage(task.status()) {
             let call = JudgeCall {
                 board,
                 task,
@@ -1462,8 +1468,6 @@ impl TickUseCase {
                     return false;
                 }
                 // паркинг вердиктом: дайджест с факторами вердикта
-                out.review_flagged += 1;
-                out.judge_transitions += 1;
                 let last = task
                     .session_of(round_slot)
                     .map(str::to_string)
@@ -1475,7 +1479,15 @@ impl TickUseCase {
                      разбор владельца. Последняя ревью-сессия: {last}.",
                     verdict.owner_needed, verdict.confidence
                 );
-                self.judge_round_park(board, task, &digest, out).await
+                // инкременты после set_status (Low раунда 3): счётчики тика —
+                // аудит судьи, отказ set_status не насчитывает паркинг,
+                // которого не было
+                let parked = self.judge_round_park(board, task, &digest, out).await;
+                if parked {
+                    out.review_flagged += 1;
+                    out.judge_transitions += 1;
+                }
+                parked
             }
             Err(e) => {
                 tracing::warn!(
@@ -1528,7 +1540,6 @@ impl TickUseCase {
         round_slot: Slot,
         next: u32,
     ) -> bool {
-        out.review_flagged += 1;
         tracing::warn!(
             event = "review.rounds_escalated",
             number = task.number(),
@@ -1550,7 +1561,13 @@ impl TickUseCase {
              выше; последняя ревью-сессия: {last}.",
             next + 1
         );
-        self.judge_round_park(board, task, &digest, out).await
+        let parked = self.judge_round_park(board, task, &digest, out).await;
+        // инкремент после set_status (Low раунда 3, класс verdict-ветки):
+        // отказ паркинга не насчитывает эскалацию, которой не было
+        if parked {
+            out.review_flagged += 1;
+        }
+        parked
     }
 
     /// Применение вердикта (сталл- и кап-точки; ревизия ADR-106 по санкции
