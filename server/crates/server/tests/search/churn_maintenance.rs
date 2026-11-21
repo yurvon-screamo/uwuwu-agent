@@ -232,7 +232,9 @@ async fn churn_accumulates_versions_without_bounds() {
     churn(&backend, &wiki).await;
 
     let versions = versions_of(&dir, "chunks").await;
-    let expected_floor = (CHURN_ROUNDS * DOCS * 2) / 2;
+    // floor = половина теоретических коммитов (2 на док каждого раунда:
+    // delete+add) — гард от слияния парных коммитов лансом
+    let expected_floor = CHURN_ROUNDS * DOCS;
     assert!(
         versions >= expected_floor,
         "чурн копит версии (механика #1436): {versions} < {expected_floor}"

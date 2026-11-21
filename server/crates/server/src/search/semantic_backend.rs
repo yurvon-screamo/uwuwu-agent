@@ -163,19 +163,11 @@ impl LanceSemanticBackend {
     }
 
     async fn chunks(&self) -> UsecaseResult<Table> {
-        self.db
-            .open_table(CHUNKS)
-            .execute()
-            .await
-            .map_err(|e| err(format!("open chunks: {e}")))
+        self.table_named(CHUNKS).await
     }
 
     async fn docs(&self) -> UsecaseResult<Table> {
-        self.db
-            .open_table(DOCS)
-            .execute()
-            .await
-            .map_err(|e| err(format!("open docs: {e}")))
+        self.table_named(DOCS).await
     }
 
     /// Обслуживание таблиц после чурна (#1436): компакция мелких фрагментов
