@@ -44,6 +44,10 @@ fn board_row_key(board: &str, number: u64) -> String {
     format!("{board}:{number}")
 }
 
+/// Дословный маркер волны в промпте — контракт мок-стенда
+/// (mock_opencode::stage_action_of_prompt); правка промпта через него.
+pub const ANALYST_WAVE_MARKER: &str = "Analytics wave (project {project})";
+
 impl AnalystUseCase {
     /// Один проход: по каждой доске — не больше одного спавна за тик,
     /// очередь доски летит в одну сессию пачкой (мультиборд: чекаут и
@@ -273,12 +277,13 @@ impl AnalystUseCase {
 }
 
 fn analyst_prompt(project: &str, rows: &[&Task]) -> String {
+    let marker = ANALYST_WAVE_MARKER.replace("{project}", project);
     let mut list = String::new();
     for t in rows {
         list.push_str(&format!("- #{} «{}»\n", t.number(), t.title()));
     }
     format!(
-        "Analytics wave (project {project}) — rows in Analys, the whole batch:\n\n{list}\n\
+        "{marker} — rows in Analys, the whole batch:\n\n{list}\n\
          Act per the repo methodology agents/analyst. Via uwuwu MCP, for each row:\n\
          1. uwuwu_task_get {{number}} — the full request; sources: the project Design Spec,\n\
             README/Domains, ADRs, verbatim owner quotes in the request/thread.\n\

@@ -27,6 +27,10 @@ pub struct AnalystReviewUseCase {
     pub cup: usize,
 }
 
+/// Дословный маркер волны ревью аналитики — контракт мок-стенда
+/// (mock_opencode::stage_action_of_prompt); правка промпта через него.
+pub const ANALYST_REVIEW_WAVE_MARKER: &str = "Analytics review (project {project})";
+
 impl AnalystReviewUseCase {
     /// Один проход: по каждой доске — не больше одного спавна за тик.
     /// Цикл-гвард ревью-контура (R2-C2): спавны ревьювера при неизменном
@@ -205,12 +209,13 @@ impl AnalystReviewUseCase {
 }
 
 fn analyst_review_prompt(project: &str, rows: &[&Task]) -> String {
+    let marker = ANALYST_REVIEW_WAVE_MARKER.replace("{project}", project);
     let mut list = String::new();
     for t in rows {
         list.push_str(&format!("- #{} «{}»\n", t.number(), t.title()));
     }
     format!(
-        "Analytics review (project {project}) — rows in Review Analys, the whole wave:\n\n{list}\n\
+        "{marker} — rows in Review Analys, the whole wave:\n\n{list}\n\
          Act per the repo methodology agents/analyst-reviewer. For each row:\n\
          1. uwuwu_task_get {{number}} — the reworked body; verify against the request sources\n\
             (Design Spec/README/ADRs/owner quotes): every requirement has a source;\n\

@@ -31,7 +31,7 @@ export default Plugin.define({
       editor.add({
         name: "review",
         description:
-          "Machine qlty review of a diff or a commit: qlty check/smells --upstream — findings only in changed lines (a file's pre-existing baseline debt is not shown; the uncommitted tail and untracked files are part of the delta). Attribution format [plugin:rule] path:line (level) — message; a whole-file finding without region.startLine — path (строка неизвестна) (level). Returns a markdown report. The default level low cuts the note noise.",
+          "Machine qlty review of a diff or a commit: qlty check/smells --upstream — findings only in changed lines (a file's pre-existing baseline debt is not shown; the uncommitted tail and untracked files are part of the delta). Attribution format [plugin:rule] path:line (level) — message; a whole-file finding without region.startLine — path (line unknown) (level). Returns a markdown report. The default level low cuts the note noise.",
         input: {
           type: "object",
           properties: {
