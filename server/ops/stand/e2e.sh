@@ -26,6 +26,8 @@
 #   фаза 10 (дример #1306): revival отдрименной сессии → wakeup ТОЙ ЖЕ
 #     дример-сессии (ADR-005 1:1), без revival — тишина; watermark+линк
 #     в state.json.
+#   фаза 14 (судья #1364): wake без переноса на шуме, паркинг вердиктом,
+#     fallback на старую механику при отказе decision-API.
 #
 # Запуск: server/ops/stand/e2e.sh   (из каталога server; cargo build сам)
 # Выход: 0 — ок; 1 — провал с диагнозом. Логи/state/config — mktemp-рандир
@@ -51,13 +53,13 @@ STATE="$RUN_DIR/state.json"
 CONFIG="$RUN_DIR/config.memory.toml"
 sed "s|http://127.0.0.1:8099|http://127.0.0.1:$PORT_MOCK|" \
   ops/config.memory.toml > "$CONFIG"
-MOCK_PID=""; SRV_PID=""; MOCK2_PID=""
+MOCK_PID=""; SRV_PID=""; MOCK2_PID=""; MOCK_JUDGE_PID=""
 
 say()  { printf '\033[1;34m[e2e]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[e2e FAIL]\033[0m %s\n' "$*"; KEEP=1; exit 1; }
 
 cleanup() { # только СВОИ процессы (pid-scoped): параллельные стенды не трогаем
-  for pid in "$SRV_PID" "$MOCK_PID" "$MOCK2_PID"; do
+  for pid in "$SRV_PID" "$MOCK_PID" "$MOCK2_PID" "$MOCK_JUDGE_PID"; do
     [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
   done
   # пер-ран бинари тяжёлые (~2.2 ГБ debug-сборка) — снимаются ВСЕГДА:
@@ -272,18 +274,22 @@ case "$S2047" in
   *) fail "2047 не эскалировал в Needs attention, статус: [$S2047]" ;;
 esac
 
-# kill мок-2 (транспортная смерть): strict-union CUP → фолбэк на статусный
-# подсчёт; дример/аналитика на strict — sidecar.tick_failed (решения по
-# агрегату честно останавливаются), тик конвейера продолжает жить
+# kill мок-2 (транспортная смерть): семантика #1450 — отказ одного
+# исполнителя деградирует зрение по нему (warn + слепота его проектов),
+# конвейер не морозит; бывший strict-фолбэк убит (инцидент 21.11:
+# 37 активных строк при капе 7 = сутки spawns=0). Дример на живом
+# union — решения по агрегату честно деградируют, тик продолжает жить
 BEFORE_TICKS=$(grep -c '"event":"tick.completed"' "$LOG_SRV_MULTI" || true)
 kill "$MOCK2_PID" 2>/dev/null || true
 sleep 25   # 2+ тика на отказе
 AFTER_TICKS=$(grep -c '"event":"tick.completed"' "$LOG_SRV_MULTI" || true)
 [ "$AFTER_TICKS" -gt "$BEFORE_TICKS" ] || fail "тик умер после отказа исполнителя (тик-луп встал)"
-grep -q 'cup.list_sessions_failed' "$LOG_SRV_MULTI" || fail "нет CUP-фолбэка (strict union не отработал)"
-grep -q '"sidecar":"dreamer"' "$LOG_SRV_MULTI" || fail "нет sidecar.tick_failed дримера (strict union не отработал)"
+grep -q 'sessions.list_reachable_failed' "$LOG_SRV_MULTI" \
+  || fail "нет деградации отказного исполнителя (warn #1450 не прозвучал)"
+grep -q 'dreamer.list_degraded' "$LOG_SRV_MULTI" \
+  || fail "нет честной деградации дримера по отказному исполнителю"
 curl -s --max-time 5 "http://127.0.0.1:$PORT_MOCK/api/session" >/dev/null || fail "мок-1 недоступен после отказа мок-2"
-say "отказ исполнителя: CUP-фолбэк + strict-остановка дримера, тик живёт ($BEFORE_TICKS → $AFTER_TICKS тиков)"
+say "отказ исполнителя: деградация по нему (#1450), тик живёт ($BEFORE_TICKS → $AFTER_TICKS тиков)"
 kill "$SRV_PID" "$MOCK_PID" "$MOCK2_PID" 2>/dev/null || true
 wait "$SRV_PID" "$MOCK_PID" "$MOCK2_PID" 2>/dev/null || true
 SRV_PID=""; MOCK_PID=""; MOCK2_PID=""
@@ -1021,4 +1027,137 @@ sleep 1
 say "фаза 13 ок: lost-resurrection через lost-руку, луп-гвард парковал, сироты чисты, попытка одна за тик"
 
 
-say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри и семейство-непрерывностью сессий #1237 + мульти-экзекьютор + гард #1163 + self-эхо в прод-геометрии #1237 + слепой hold #1263 + преемпшен CUP #1259 + давка-волна #1412 + клин #1293 + дример #1306 + phantom-квитанции #1331 + lost-сессия #1288: десинк-парковка + lost-resurrection); логи: $RUN_DIR"
+
+say "фаза 14: судья #1364 — wake без переноса на шуме, паркинг вердиктом, fallback при отказе"
+PORT_JUDGE="${PORT_JUDGE:-$((PORT_MOCK + 4))}"
+JUDGE_SEED=2070
+export MOCK_JUDGE_PORT=$PORT_JUDGE
+MOCK_JUDGE_PORT=$PORT_JUDGE python3 ops/stand/mock_decisions.py >"$RUN_DIR/mock-judge.log" 2>&1 &
+MOCK_JUDGE_PID=$!
+sleep 1
+CONFIG_JUDGE="$RUN_DIR/config.judge.toml"
+cat > "$CONFIG_JUDGE" <<EOF
+mode = "live"
+poll_sec = 10
+port = $PORT_SRV
+
+[hub]
+repo = "yurvon-screamo/uwuwu-hub"
+driver = "memory"
+
+[executor]
+name = "local-mock"
+url = "http://127.0.0.1:$PORT_MOCK"
+
+[policy]
+cup = 1
+peak = { enabled = false, start_min = 0, end_min = 0 }
+
+[[project]]
+name = "uwuwu"
+board = "Задачи uwuwu"
+repo = "yurvon-screamo/uwuwu-agent"
+checkout = "/home/yurvon/uwuwu-agent"
+env_root = "/home/yurvon/agents-env"
+
+[judge]
+enabled = true
+every_ms = 15000
+escalate_after = 3
+rpm_limit = 30
+EOF
+rm -f "$STATE"
+LOG_SRV_JUDGE="$RUN_DIR/server-judge.log"
+task_status_n() { # статус строки по номеру через task_get
+  mcp task_get "{\"number\":$1}" | python3 -c "
+import json,sys
+t = json.load(sys.stdin)['result']['content'][0]['text']
+print(t.split(chr(10))[0].split('— ')[-1])" 2>/dev/null
+}
+# мок-исполнитель: idle-реплаи, активность насильно 90 мин старая — тишина
+# глубока с первого тика, судья срабатывает без ожидания часов
+MOCK_MODE=idle MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=100 MOCK_ACTIVITY_AGE_MS=5400000 \
+  "$BIN_MOCK" >"$LOG_MOCK" 2>&1 &
+MOCK_PID=$!
+sleep 1
+UWUWU_SERVER_CONFIG=$CONFIG_JUDGE UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
+  UWUWU_SERVER_MODE=live \
+  UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
+  UWUWU_MOCK_SEED="$JUDGE_SEED:Design" \
+  GEMINI_API_KEY=stand-test-key UWUWU_JUDGE_URL="http://127.0.0.1:$PORT_JUDGE/decisions" \
+  RUST_LOG=info "$BIN_SRV" >"$LOG_SRV_JUDGE" 2>&1 &
+SRV_PID=$!
+SEEN=0
+while [ $SEEN -lt 15 ]; do
+  SEEN=$((SEEN + 1))
+  sleep 4
+  grep -q '"event":"judge.wake"' "$LOG_SRV_JUDGE" && break
+done
+grep -q '"event":"judge.wake"' "$LOG_SRV_JUDGE" \
+  || fail "нет judge.wake за 60с (судья не сработала на сталл-точке)"
+CALLS=$(curl -s "http://127.0.0.1:$PORT_JUDGE/calls" | python3 -c "import json,sys; print(json.load(sys.stdin)['calls'])")
+[ "$CALLS" -ge 1 ] || fail "мок-decisions не принял вызов: $CALLS"
+S=$(task_status_n $JUDGE_SEED)
+case "$S" in
+  *Design*) say "14a ок: вердикт «текущий статус» — wake без переноса ($S), вызовов: $CALLS" ;;
+  *) fail "вердикт Design должен оставить строку в Design: $S" ;;
+esac
+# 14b: вердикт Needs attention → паркинг с дайджестом
+curl -s -X PUT "http://127.0.0.1:$PORT_JUDGE/set" \
+  -H 'Content-Type: application/json' -d '{"status":"NeedsAttention"}' >/dev/null
+SEEN=0
+while [ $SEEN -lt 15 ]; do
+  SEEN=$((SEEN + 1))
+  sleep 4
+  grep -q '"event":"judge.moved"' "$LOG_SRV_JUDGE" && break
+done
+grep -q '"event":"judge.moved"' "$LOG_SRV_JUDGE" \
+  || fail "нет judge.moved (паркинг вердиктом не состоялся)"
+S=$(task_status_n $JUDGE_SEED)
+case "$S" in
+  *attention*|*Needs*) say "14b ок: вердикт Needs attention — строка запаркована ($S)" ;;
+  *) fail "строка не в Needs attention после вердикта: $S" ;;
+esac
+mcp task_get "{\"number\":$JUDGE_SEED}" | grep -q '⚖︎ Судья' \
+  || fail "нет дайджеста вердикта в ленте строки"
+# 14c: судья недоступна — fallback на старую механику (свежая строка)
+JUDGE_SEED2=2071
+kill "$SRV_PID" 2>/dev/null || true
+wait "$SRV_PID" 2>/dev/null || true
+kill "$MOCK_JUDGE_PID" 2>/dev/null || true
+wait "$MOCK_JUDGE_PID" 2>/dev/null || true
+MOCK_JUDGE_PID=""
+rm -f "$STATE"
+UWUWU_SERVER_CONFIG=$CONFIG_JUDGE UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
+  UWUWU_SERVER_MODE=live \
+  UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
+  UWUWU_MOCK_SEED="$JUDGE_SEED2:Design" \
+  GEMINI_API_KEY=stand-test-key UWUWU_JUDGE_URL="http://127.0.0.1:$((PORT_JUDGE + 1))" \
+  RUST_LOG=info "$BIN_SRV" >"$LOG_SRV_JUDGE" 2>&1 &
+SRV_PID=$!
+SEEN=0
+while [ $SEEN -lt 15 ]; do
+  SEEN=$((SEEN + 1))
+  sleep 4
+  grep -q '"event":"judge.err"' "$LOG_SRV_JUDGE" && break
+done
+grep -q '"event":"judge.err"' "$LOG_SRV_JUDGE" \
+  || fail "нет judge.err при мёртвой decision-API"
+SEEN=0
+while [ $SEEN -lt 15 ]; do
+  SEEN=$((SEEN + 1))
+  sleep 4
+  grep -q '"event":"stall.soft_pinged"' "$LOG_SRV_JUDGE" && break
+done
+grep -q '"event":"stall.soft_pinged"' "$LOG_SRV_JUDGE" \
+  || fail "нет мягкого пинга после fallback (старая механика не сработала)"
+say "14c ок: судья недоступна — fallback на мягкий пинг старой механики"
+kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+SRV_PID=""; MOCK_PID=""
+if [ -n "$MOCK_JUDGE_PID" ]; then kill "$MOCK_JUDGE_PID" 2>/dev/null || true; fi
+sleep 1
+say "фаза 14 ок: judge wake без переноса + паркинг вердиктом + fallback при отказе API"
+
+
+say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри и семейство-непрерывностью сессий #1237 + мульти-экзекьютор + гард #1163 + self-эхо в прод-геометрии #1237 + слепой hold #1263 + преемпшен CUP #1259 + давка-волна #1412 + клин #1293 + дример #1306 + phantom-квитанции #1331 + lost-сессия #1288: десинк-парковка + lost-resurrection + судья #1364); логи: $RUN_DIR"

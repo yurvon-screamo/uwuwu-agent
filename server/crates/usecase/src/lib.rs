@@ -45,9 +45,10 @@ pub use pipeline::{
     DreamerUseCase, Mode, TickOutcome, TickPlan, TickUseCase,
 };
 pub use ports::{
-    AgentSessionGateway, AppendDocOutcome, AssistantReply, Clock, CommentRef, DreamerMark,
-    FmMutator, IssueDigest, IssueFieldStore, IssueIndexSource, IssueView, Liveness, PrGateway,
-    PrState, SessionInfo, SessionSpec, TaskBoardRepo, TickStateStore, WikiRepo,
+    AgentSessionGateway, AppendDocOutcome, AssistantReply, Clock, CommentRef, DecisionJudge,
+    DreamerMark, FmMutator, IssueDigest, IssueFieldStore, IssueIndexSource, IssueView, JudgeCfg,
+    JudgeContext, JudgeSessionTail, Liveness, PrGateway, PrState, SessionInfo, SessionSpec,
+    TaskBoardRepo, TickStateStore, WikiRepo,
 };
 pub use router::SessionRouter;
 pub use search::{sync_allowed, SearchHit, SearchUseCase, SemanticBackend};
