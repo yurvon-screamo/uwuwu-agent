@@ -712,6 +712,30 @@ env_root = "/tmp/env"
         std::env::remove_var(KEY);
     }
 
+    /// #1273: TOML-ключ `port` задаёт порт HTTP-сервера. PORT — глобал
+    /// процесса, cargo test гоняет тесты параллельно в одном процессе,
+    /// поэтому все env-чувствительные фазы port() живут в одном тесте —
+    /// единственном читателе/писателе PORT в наборе (изоляция структурная).
+    #[test]
+    fn config_toml_port_key_reaches_port() {
+        // фаза 1 (красная на master): TOML-ключ port доходит до port()
+        std::env::remove_var("PORT");
+        let raw = format!("port = 18090\n{}", minimal());
+        let cfg = toml::from_str::<Config>(&raw).expect("toml парсится");
+        assert_eq!(cfg.port(), 18090, "TOML port проигран дефолту — ключ съеден");
+
+        // фаза 2 (регресс-охрана): env PORT старше TOML
+        std::env::set_var("PORT", "5555");
+        assert_eq!(cfg.port(), 5555);
+        std::env::remove_var("PORT"); // до фазы 3: гварду нужен чистый env
+
+        // фаза 3 (гвард примера): ключ port из канон-примера читается
+        let ex_cfg = toml::from_str::<Config>(example()).expect("example валиден");
+        let ex_table: toml::Table = toml::from_str(example()).expect("example — toml");
+        let ex_port = ex_table["port"].as_integer().expect("ключ port в примере");
+        assert_eq!(ex_cfg.port() as i64, ex_port, "example врёт про порт");
+    }
+
     #[test]
     fn rejects_unknown_executor_reference() {
         let raw = format!(
