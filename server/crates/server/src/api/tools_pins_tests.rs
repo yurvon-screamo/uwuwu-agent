@@ -162,7 +162,7 @@ async fn task_get_comment_carries_iso_utc_stamp() {
     .await
     .expect("create");
     let number: u64 = created
-        .trim_start_matches("создана задача #")
+        .trim_start_matches("task #")
         .split(' ')
         .next()
         .unwrap()
@@ -179,7 +179,7 @@ async fn task_get_comment_carries_iso_utc_stamp() {
         .await
         .expect("get");
     let block = text
-        .split("--- комменты (последние) ---\n")
+        .split("--- comments (latest) ---\n")
         .nth(1)
         .expect("хвост комментов");
     let stamp = block

@@ -756,13 +756,13 @@ pub const STAGE_PROMPTS: &[(Slot, &str)] = &[
         Slot::Test,
         "testing: feature quality, pass/fail verdict with steps",
     ),
+    (
+        Slot::TestReview,
+        "testing review: the branch's test delta, verdict in a comment",
+    ),
 ];
 
 pub(crate) fn spawn_prompt(board: &BoardPlan, task: &Task, slot: Slot) -> String {
-<<<<<<< HEAD
-    let stage = match slot {
-=======
->>>>>>> 6b6e577 (🐛(#1383): review round 3 — marker constants bind mock stand to prompt source)
     let stage = STAGE_PROMPTS
         .iter()
         .find(|(s, _)| *s == slot)
@@ -783,7 +783,6 @@ pub(crate) fn spawn_prompt(board: &BoardPlan, task: &Task, slot: Slot) -> String
         Slot::TestReview => {
             "verdict in a comment → «Review» (clean) or «Testing» (findings) per the verdict"
         }
-    };
     };
     format!(
         "Task #{number} «{title}» (board «{board}», project {project}).\n\

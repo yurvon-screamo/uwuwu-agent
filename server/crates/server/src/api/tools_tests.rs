@@ -1191,7 +1191,7 @@ async fn mcp_task_edit_schema_lists_canonical_statuses() {
         .unwrap()
         .to_string();
     let list = schema_status
-        .split_once("статус канона:")
+        .split_once("canon status:")
         .map(|(_, rest)| rest)
         .unwrap_or(&schema_status);
     for canonical in [
@@ -1200,14 +1200,14 @@ async fn mcp_task_edit_schema_lists_canonical_statuses() {
         "Review Analys",
         "Todo",
         "Design",
-        "Ревью плана",
+        "Plan review",
         "In Progress",
-        "Ревью результата",
-        "Тестирование",
-        "Ревью тестирования",
+        "Result review",
+        "Testing",
+        "Testing review",
         "Review",
         "Needs attention",
-        "Вейт",
+        "Wait",
     ] {
         assert!(
             list.split('/').any(|s| s.trim() == canonical),
