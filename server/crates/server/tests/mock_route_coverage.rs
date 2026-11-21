@@ -14,6 +14,9 @@
 #[path = "../src/mock_routes.rs"]
 mod mock_routes;
 
+mod common;
+
+use common::{probe_session, spawn_mock, wait_ready};
 use mock_routes::{canonical, MOCK_ROUTES};
 
 // ---------- пин 1: скан клиента ----------
@@ -198,65 +201,9 @@ fn leading_slash_literals_finds_literals_inside_comments_too() {
 
 // ---------- пин 2: проб роутера ----------
 
-/// Спавн бинаря мока на свободном порту; Drop-гард убивает процесс.
-struct MockProc(std::process::Child);
-
-impl Drop for MockProc {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn spawn_mock() -> (String, MockProc) {
-    use std::process::{Command, Stdio};
-
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("free port");
-    let port = listener.local_addr().expect("addr").port();
-    drop(listener);
-
-    let child = Command::new(env!("CARGO_BIN_EXE_mock_opencode"))
-        .env("MOCK_MODE", "plain")
-        .env("MOCK_PORT", port.to_string())
-        .env("MOCK_STEP_MS", "50")
-        .env("MOCK_MCP_URL", "http://127.0.0.1:1")
-        .env("MOCK_MCP_TOKEN", "")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn mock_opencode (cargo строит бин для integration-тестов)");
-    (format!("http://127.0.0.1:{port}"), MockProc(child))
-}
-
-async fn wait_ready(base: &str) {
-    let http = reqwest::Client::new();
-    for _ in 0..100 {
-        if let Ok(resp) = http.get(format!("{base}/api/session")).send().await {
-            if resp.status().is_success() {
-                return;
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    panic!("мок не поднялся за 5с: {base}");
-}
-
-/// Свежая probe-сессия: маршруты с {id} ходят каждый по своей — DELETE
-/// не ломает соседей.
-async fn probe_session(base: &str, http: &reqwest::Client) -> String {
-    let resp = http
-        .post(format!("{base}/api/session"))
-        .json(&serde_json::json!({ "title": "route probe" }))
-        .send()
-        .await
-        .expect("create probe session");
-    let body: serde_json::Value = resp.json().await.expect("create json");
-    body["data"]["id"].as_str().expect("probe id").to_string()
-}
-
 #[tokio::test]
 async fn mock_router_serves_every_manifest_route() {
-    let (base, _mock) = spawn_mock();
+    let (base, _mock) = spawn_mock(&[]);
     wait_ready(&base).await;
     let http = reqwest::Client::new();
 

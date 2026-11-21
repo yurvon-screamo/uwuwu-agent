@@ -745,7 +745,7 @@ grep -q '"event":"dreamer.spawned"' "$LOG_SRV_DREAM" \
   || fail "дример не спавнил носителя по уснувшей сессии (кандидат не найден?)"
 DREAM_ID=$(curl -s --max-time 5 "http://127.0.0.1:$PORT_MOCK/api/session" | python3 -c "
 import json,sys
-dreams = [s['id'] for s in json.load(sys.stdin) if s.get('agent') == 'dreamer']
+dreams = [s['id'] for s in json.load(sys.stdin).get('data', []) if s.get('agent') == 'dreamer']
 print(dreams[0] if dreams else '')")
 [ -n "$DREAM_ID" ] || fail "спавна нет на исполнителе (сессии agent=dreamer нет)"
 # сайдкар-мутации (метка/линк) сбрасываются save'ом СЛЕДУЮЩЕГО main-тика
@@ -789,7 +789,7 @@ SPAWNS=$(grep -c '"event":"dreamer.spawned"' "$LOG_SRV_DREAM" || true)
 [ "$SPAWNS" -eq 1 ] || fail "revival породил новый спавн (инвариант 1:1 сломан): $SPAWNS"
 SESSIONS=$(curl -s --max-time 5 "http://127.0.0.1:$PORT_MOCK/api/session" | python3 -c "
 import json,sys
-print(len(json.load(sys.stdin)))")
+print(len(json.load(sys.stdin).get('data', [])))")
 [ "$SESSIONS" -eq 2 ] || fail "на исполнителе лишние сессии (новый носитель?): $SESSIONS"
 STATE_OK=0
 for _ in $(seq 1 6); do
