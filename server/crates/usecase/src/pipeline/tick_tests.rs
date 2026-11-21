@@ -4233,6 +4233,28 @@ async fn probe_degradation_strip_reaches_threshold_signal() {
     );
 }
 
+#[test]
+fn stage_prompts_spawned_per_slot() {
+    // связка мок-стенда с источником (#1383 круг 3): spawn_prompt обязан
+    // нести дословный маркер стадии из STAGE_PROMPTS — на нём
+    // классифицирует спавн mock_opencode::stage_action_of_prompt
+    let board = BoardPlan {
+        board: "B".into(),
+        project: "p".into(),
+        repo: "a/c".into(),
+        checkout: "/tmp/checkout".into(),
+        env_root: "/tmp/env".into(),
+    };
+    let task = Task::new(7, "t".into(), Status::Design);
+    for (slot, marker) in crate::pipeline::actions::STAGE_PROMPTS {
+        let prompt = crate::pipeline::actions::spawn_prompt(&board, &task, *slot);
+        assert!(
+                prompt.contains(marker),
+                "spawn_prompt слота {slot:?} потерял маркер «{marker}» — мок-стенд перестанет классифицировать стадию"
+            );
+    }
+}
+
 #[tokio::test]
 async fn spawn_prompt_demands_finish_transaction() {
     // Дыра промптинга (владелец 16.11): контракт хода обязан быть в промпте

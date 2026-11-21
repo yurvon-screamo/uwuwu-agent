@@ -730,8 +730,39 @@ fn session_title(task: &Task, slot: Slot) -> String {
     format!("#{} {} {}", task.number(), slot.emoji(), task.title())
 }
 
+/// Дословные строки стадий в spawn_prompt — контракт мок-стенда:
+/// `mock_opencode::stage_action_of_prompt` классифицирует спавн по этим
+/// фрагментам (импортирует константу — правка стадии через этот массив,
+/// расхождение источника и мока ловится тестом
+/// `stage_prompts_spawned_per_slot`).
+pub const STAGE_PROMPTS: &[(Slot, &str)] = &[
+    (
+        Slot::Design,
+        "design stage: study the statement, clarify with the owner, build the plan",
+    ),
+    (
+        Slot::Dev,
+        "implementation per the approved plan; run the task per the AGENTS.md canon",
+    ),
+    (
+        Slot::PlanReview,
+        "plan review: paraphrase/zoom-out/readiness, verdict in a comment",
+    ),
+    (
+        Slot::ResultReview,
+        "result review: code/CI/report, verdict in a comment",
+    ),
+    (
+        Slot::Test,
+        "testing: feature quality, pass/fail verdict with steps",
+    ),
+];
+
 pub(crate) fn spawn_prompt(board: &BoardPlan, task: &Task, slot: Slot) -> String {
+<<<<<<< HEAD
     let stage = match slot {
+=======
+>>>>>>> 6b6e577 (🐛(#1383): review round 3 — marker constants bind mock stand to prompt source)
     let stage = STAGE_PROMPTS
         .iter()
         .find(|(s, _)| *s == slot)
