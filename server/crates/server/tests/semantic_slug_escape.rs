@@ -75,7 +75,10 @@ struct FixedEmbedder;
 #[async_trait]
 impl Embedder for FixedEmbedder {
     async fn embed_docs(&self, docs: &[(String, String)]) -> UsecaseResult<Vec<Vec<f32>>> {
-        Ok(docs.iter().map(|_| vec![0.0f32; EMBED_MODEL_DIMS]).collect())
+        Ok(docs
+            .iter()
+            .map(|_| vec![0.0f32; EMBED_MODEL_DIMS])
+            .collect())
     }
 
     async fn embed_query(&self, _query: &str) -> UsecaseResult<Vec<f32>> {

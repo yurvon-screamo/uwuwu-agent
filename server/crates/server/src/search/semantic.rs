@@ -112,7 +112,10 @@ impl GeminiEmbeddings {
             .collect();
         let resp = self
             .http
-            .post(format!("{API_BASE}/models/{}:batchEmbedContents", self.model))
+            .post(format!(
+                "{API_BASE}/models/{}:batchEmbedContents",
+                self.model
+            ))
             .header("x-goog-api-key", &self.api_key)
             .json(&serde_json::json!({ "requests": requests }))
             .send()
