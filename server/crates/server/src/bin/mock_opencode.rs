@@ -1166,9 +1166,12 @@ async fn message_tail(store: Arc<Store>, id: String) -> Resp {
             // у ассистента finish/content[].text/time.created; time.updated
             // держим для last_activity_ms (wakeup-контур). User-сообщения
             // команд (вердикты env-gc, #1431) идут в хвост перед ассистентом
+            // Свежайший user первым (order=desc живого API, #1431
+            // ревью L3): адаптер берёт первого user в массиве
             let mut tail: Vec<Value> = s
                 .user_messages
                 .iter()
+                .rev()
                 .map(|(created_ms, text)| {
                     json!({
                         "type": "user",

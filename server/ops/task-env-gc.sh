@@ -16,7 +16,7 @@
 #             env_root общий у нескольких проектов, чужое не трогаем;
 #   DIRTY   — git status --porcelain непуст (незакоммиченная работа);
 #   SWEPT   — env снесён; FAIL — мутация не доведена до конца.
-set -uo pipefail
+set -euo pipefail
 
 cmd="${1:-}"
 row="${2:-}"
@@ -63,8 +63,8 @@ if ! git -C "$src" worktree remove "$repo"; then
   echo "ENV-GC $safe FAIL (worktree remove)"
   exit 0
 fi
-rm -rf "$env_dir"
-git -C "$src" worktree prune
+rm -rf "$env_dir" || { echo "ENV-GC $safe FAIL (rm -rf)"; exit 0; }
+git -C "$src" worktree prune || true
 # Строчный -d отказывается на несмерженной ветке: ветка переживает снос
 # (refs не диск), отказ — заметка серверу, вердикт не портит.
 if ! git -C "$src" branch -d "$branch" >/dev/null 2>&1; then
