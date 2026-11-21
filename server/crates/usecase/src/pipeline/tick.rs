@@ -87,6 +87,9 @@ pub struct TickOutcome {
     pub stall_pings: usize,
     /// Мягких пингов (idle-сессия, прямой промпт — санкция владельца 16.11).
     pub soft_pings: usize,
+    /// Мягких пингов, отложенных CUP-капом (#1313): пинг — запуск хода,
+    /// слот не выдан, mark не пишется — ретрай следующим тиком.
+    pub soft_pings_deferred: usize,
     /// Строк, переведённых в Needs attention сталл-детектом.
     pub stall_flagged: usize,
     /// Строк, снятых с раунда капом ревью-раундов (#1311).
@@ -126,6 +129,9 @@ enum StallAct {
     Pinged,
     /// Мягкий пинг: ход завершён (idle), прямой промпт в сессию.
     SoftPinged,
+    /// Мягкий пинг отложен CUP-капом (#1313): пинг — запуск хода, слот
+    /// не выдан, mark не пишется — доставка ретраится следующим тиком.
+    Deferred,
     Flagged,
     /// Недостоверная проба исполнителя: сталл-проход строки отложен —
     /// вердикт о тишине не может быть получен (#1281, срез честности
@@ -447,6 +453,7 @@ impl TickUseCase {
             held_live = out.held_live,
             stall_pings = out.stall_pings,
             soft_pings = out.soft_pings,
+            soft_pings_deferred = out.soft_pings_deferred,
             stall_flagged = out.stall_flagged,
             review_flagged = out.review_flagged,
             session_lost_flagged = out.session_lost_flagged,
@@ -889,7 +896,8 @@ impl TickUseCase {
             Ok(WakeAct::Deferred) => out.wakeups_deferred += 1,
             Ok(WakeAct::Guarded) => out.held_live += 1,
             Ok(WakeAct::GuardedBlind) => out.held_blind += 1,
-            Ok(WakeAct::None) => match self.stall_pass(board, task).await {
+            Ok(WakeAct::None) => match self.stall_pass(board, task, plan.policy, *active_now).await
+            {
                 Ok(StallAct::None) => {}
                 Ok(StallAct::Pinged) => out.stall_pings += 1,
                 Ok(StallAct::SoftPinged) => {
@@ -897,6 +905,7 @@ impl TickUseCase {
                     // мягкий пинг доставлен — доставка в сессию работает (#1288)
                     self.state.clear_lost_session(&board.board, task.number());
                 }
+                Ok(StallAct::Deferred) => out.soft_pings_deferred += 1,
                 Ok(StallAct::Flagged) => out.stall_flagged += 1,
                 Ok(StallAct::ProbeFailed) => out.probe_failed += 1,
                 // обе Err-ветки — путь доставки: классифицированная потеря
@@ -1116,7 +1125,15 @@ impl TickUseCase {
     /// ход завершён без статусного перевода (паттерн #1151/#1135/#384).
     /// Пинг агенту → повтор → Needs attention. Будит через механизм
     /// wakeup (пинг = коммент, следующий тик доставит его сессии).
-    async fn stall_pass(&self, board: &BoardPlan, task: &Task) -> UsecaseResult<StallAct> {
+    /// Политика и занятость капа нужны доставке пинга: мягкий пинг —
+    /// запуск хода, гейтуется как будильник (#1313).
+    async fn stall_pass(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        policy: SpawnPolicy,
+        active_now: usize,
+    ) -> UsecaseResult<StallAct> {
         let Some(slot) = task.stage_slot() else {
             return Ok(StallAct::None);
         };
@@ -1189,8 +1206,10 @@ impl TickUseCase {
         if count > 0 && now.saturating_sub(last_ping) < every {
             return Ok(StallAct::None);
         }
-        self.stall_action(board, task, slot, &session, soft, silence, count, now)
-            .await
+        self.stall_action(
+            board, task, slot, &session, soft, silence, count, now, policy, active_now,
+        )
+        .await
     }
 
     /// Действие сталл-раунда: эскалация владельцу (пинги исчерпаны),
@@ -1207,10 +1226,14 @@ impl TickUseCase {
         silence: u64,
         count: u32,
         now: u64,
+        policy: SpawnPolicy,
+        active_now: usize,
     ) -> UsecaseResult<StallAct> {
         if count < STALL_MAX_PINGS {
             return self
-                .stall_ping_round(board, task, slot, session, soft, silence, now)
+                .stall_ping_round(
+                    board, task, slot, session, soft, silence, now, policy, active_now,
+                )
                 .await;
         }
         // Проба живости В МОМЕНТ эскалации (#1281, различение причин):
@@ -1274,6 +1297,9 @@ impl TickUseCase {
 
     /// Один раунд пинга: мягкий — прямым промптом в сессию (мгновенное
     /// пробуждение, без обхода через коммент), классический — комментом.
+    /// Мягкий пинг — запуск хода: при полном капе держится без mark
+    /// (доставка ретраится следующим тиком), классический — коммент без
+    /// гейта (ход стартует только гейтованным будильником) (#1313).
     #[allow(clippy::too_many_arguments)]
     async fn stall_ping_round(
         &self,
@@ -1284,8 +1310,20 @@ impl TickUseCase {
         soft: bool,
         silence: u64,
         now: u64,
+        policy: SpawnPolicy,
+        active_now: usize,
     ) -> UsecaseResult<StallAct> {
         if soft {
+            if active_now >= policy.cup {
+                tracing::info!(
+                    event = "stall.soft_ping_held_cup",
+                    number = task.number(),
+                    active = active_now,
+                    cap = policy.cup,
+                    "Мягкий пинг отложен: CUP cap — запуск хода ждёт слот"
+                );
+                return Ok(StallAct::Deferred);
+            }
             let gw = self.sessions.project(&board.project);
             // пин агента слота перед ходом (#1300) — как на будильнике
             if let Some(agent) = Agent::of_slot(slot) {

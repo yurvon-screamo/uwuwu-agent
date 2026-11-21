@@ -3793,6 +3793,93 @@ async fn soft_ping_wakes_idle_session_without_transaction() {
         .any(|p| p.contains("Мягкий пинг")));
 }
 
+#[tokio::test]
+async fn soft_ping_held_when_cup_full_then_delivered_on_free_slot() {
+    // #1313: мягкий пинг — запуск хода, тот же LLM-слот, что будильник и
+    // спавн (UC-05 «все новые запуски ходов откладываются»). Кап полон —
+    // доставка держится без mark_stall_ping (ретрай следующим тиком),
+    // на освободившемся слоте уходит.
+    struct BigClock;
+    impl Clock for BigClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            100_000_000
+        }
+    }
+    let mut t = task(64, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dev_64").unwrap(),
+    );
+    t.apply_fields(f);
+    let board = Arc::new(FakeBoard {
+        rows: std::sync::Mutex::new(vec![t]),
+        log: Mutex::default(),
+        comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
+        status_fails: AtomicBool::new(false),
+    });
+    let sess = Arc::new(FakeSessions {
+        // молчание 16 мин, ход завершён (idle)
+        activity_ms: Some(100_000_000 - 16 * 60_000),
+        idle_reply: true,
+        ..FakeSessions::new()
+    });
+    // кап полон: чужая busy-сессия занимает единственный слот
+    sess.extra.lock().unwrap().push(crate::ports::SessionInfo {
+        id: "ses_cap_filler".into(),
+        agent: String::new(),
+        directory: String::new(),
+        updated_ms: 0,
+        outcome: String::new(),
+        total_tokens: 100,
+        busy: true,
+    });
+    let state = Arc::new(MemState(Mutex::default()));
+    let u = TickUseCase {
+        board,
+        sessions: Arc::new(SessionRouter::uniform(sess.clone())),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+            probes: Mutex::default(),
+        }),
+        clock: Arc::new(BigClock),
+        state: state.clone(),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        boot_ms: 0,
+    };
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(out.soft_pings, 0, "кап полон — мягкий пинг не доставляется");
+    assert_eq!(out.soft_pings_deferred, 1, "холд пинга наблюдаем");
+    assert!(
+        !sess
+            .prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.contains("Мягкий пинг")),
+        "промпта нет"
+    );
+    assert!(
+        state.0.lock().unwrap().stalls.is_empty(),
+        "mark_stall_ping при холде не пишется — доставка ретраится"
+    );
+    // слот освободился — пинг уходит следующим тиком
+    sess.extra.lock().unwrap().clear();
+    let out2 = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(out2.soft_pings, 1, "свободный слот — пинг доставлен");
+    assert_eq!(out2.soft_pings_deferred, 0);
+}
+
 /// Инцидент 18.11 (#1281): рестарт uwuwu-server не должен парковать живые
 /// stage-сессии сталл-детектом. Геометрия прод: persisted count=2 (два
 /// автопинга ДО рестарта, volume /data переживает пересоздание контейнера),
