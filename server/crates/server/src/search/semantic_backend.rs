@@ -18,6 +18,7 @@ use lancedb::Connection;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use uwuwu_usecase::SemanticBackend;
 use uwuwu_usecase::WikiRepo;
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
@@ -25,7 +26,7 @@ use uwuwu_usecase::{UsecaseError, UsecaseResult};
 const CHUNKS: &str = "chunks";
 const DOCS: &str = "doc_meta";
 
-fn err(msg: String) -> UsecaseError {
+pub(super) fn err(msg: String) -> UsecaseError {
     UsecaseError::State(format!("lance: {msg}"))
 }
 
@@ -162,19 +163,31 @@ impl LanceSemanticBackend {
     }
 
     async fn chunks(&self) -> UsecaseResult<Table> {
-        self.db
-            .open_table(CHUNKS)
-            .execute()
-            .await
-            .map_err(|e| err(format!("open chunks: {e}")))
+        self.table_named(CHUNKS).await
     }
 
     async fn docs(&self) -> UsecaseResult<Table> {
+        self.table_named(DOCS).await
+    }
+
+    /// Обслуживание таблиц после чурна (#1436): компакция мелких фрагментов
+    /// и prune версий/файлов по ретеншену. Ретеншен — параметр: прод-вызов
+    /// из sync_index — константа `PROD_RETENTION`, интеграционный пин —
+    /// ноль (чурн-петля теста живёт секунды).
+    pub async fn maintain(&self, older_than: Duration) -> UsecaseResult<()> {
+        for (name, label) in [(CHUNKS, "chunks"), (DOCS, "meta")] {
+            let table = self.table_named(name).await?;
+            crate::search::maintenance::maintain_table(table, label, older_than).await?;
+        }
+        Ok(())
+    }
+
+    async fn table_named(&self, name: &str) -> UsecaseResult<Table> {
         self.db
-            .open_table(DOCS)
+            .open_table(name)
             .execute()
             .await
-            .map_err(|e| err(format!("open docs: {e}")))
+            .map_err(|e| err(format!("open {name}: {e}")))
     }
 
     /// slug → git blob-sha последнего проиндексированного док-слага
@@ -446,6 +459,20 @@ impl SemanticBackend for LanceSemanticBackend {
                 docs = changed,
                 "Lance index synced"
             );
+            // Чурн этого синка плодит версии/фрагменты/deletion-файлы —
+            // обслуживание сразу (#1436). Отказ гигиены не роняет синк:
+            // индекс корректен, обслуживание догонит следующим чурном
+            // (громкий warn вместо тишины и вместо часового бэкоффа синка).
+            if let Err(e) = self
+                .maintain(crate::search::maintenance::PROD_RETENTION)
+                .await
+            {
+                tracing::warn!(
+                    event = "semantic.maintain_failed",
+                    error = %e,
+                    "Lance maintenance failed — sync result intact"
+                );
+            }
         }
         Ok(changed)
     }
