@@ -402,7 +402,7 @@ impl GitHubHub {
                 .find(|p| p["title"].as_str() == Some(board))
                 .ok_or_else(|| {
                     UsecaseError::Board(format!(
-                        "доска «{board}» не найдена среди {} шт",
+                        "board «{board}» not found among {} boards",
                         nodes.len()
                     ))
                 })?;
@@ -421,7 +421,7 @@ impl GitHubHub {
                 }
                 if meta.project_id.is_empty() {
                     return Err(UsecaseError::Board(format!(
-                        "доска «{board}»: нет project id"
+                        "board «{board}»: no project id"
                     )));
                 }
             }
@@ -435,7 +435,7 @@ impl GitHubHub {
             cursor = items["pageInfo"]["endCursor"].as_str().map(String::from);
         }
         Err(UsecaseError::Board(format!(
-            "доска «{board}» превысила {MAX_PAGES} страниц — гард"
+            "board «{board}» exceeded the {MAX_PAGES} pages — the guard"
         )))
     }
 
