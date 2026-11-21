@@ -4,6 +4,9 @@ pub mod actions;
 pub mod analyst;
 pub mod analyst_review;
 pub mod dreamer;
+pub mod env_gc;
+#[cfg(test)]
+mod env_gc_tests;
 pub mod executor;
 pub mod incident;
 pub mod sweeper;

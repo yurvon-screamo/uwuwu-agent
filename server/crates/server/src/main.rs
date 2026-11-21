@@ -663,6 +663,29 @@ async fn run(
         }
     }
 
+    // env-gc (#1431): снос env терминальных строк по доскам конфига.
+    // Отдельная tokio-задача, не Sidecar: rm мульти-ГБ каталогов идёт
+    // за 120-секундным капом сайдкар-тика. env_gc_days = 0 — kill-switch:
+    // задача вообще не заводится; observe-гейт — до live-флипа (срез 4).
+    if cfg.env_gc_days > 0 {
+        let gc_observe = is_observe || cfg.env_gc_observe;
+        tokio::spawn(env_gc_loop(EnvGcLoopArgs {
+            usecase: usecase.clone(),
+            boards: plan.boards.clone(),
+            clock: clock.clone(),
+            days: cfg.env_gc_days,
+            observe: gc_observe,
+            poll_sec: cfg.poll_sec,
+        }));
+        tracing::info!(
+            event = "env.gc.enabled",
+            days = cfg.env_gc_days,
+            observe = gc_observe,
+            boards = plan.boards.len(),
+            "env-gc: снос env терминальных строк включён"
+        );
+    }
+
     if let Some(backend) = semantic_backend.clone() {
         let clock2 = clock.clone();
 
@@ -693,17 +716,19 @@ async fn run(
                     match b.sync_index(search::SEMANTIC_SYNC_BUDGET).await {
                         Ok(_) => Ok(()),
                         Err(uwuwu_usecase::UsecaseError::RateLimited {
-                            retry_after_secs,
-                            ..
+                            retry_after_secs, ..
                         }) => {
                             let secs = retry_after_secs
                                 .unwrap_or(search::RATE_LIMIT_DEFAULT_SECS)
                                 .min(search::RATE_LIMIT_CAP_SECS);
                             let until = now + secs * 1000;
                             *backoff.lock().expect("backoff lock") = until;
-                            tracing::warn!(event = "semantic.backoff_rate_limited",
-                                until_ms = until, retry_after_secs = secs,
-                                "Semantic sync: 429, пауза в минутах");
+                            tracing::warn!(
+                                event = "semantic.backoff_rate_limited",
+                                until_ms = until,
+                                retry_after_secs = secs,
+                                "Semantic sync: 429, пауза в минутах"
+                            );
                             Ok(())
                         }
                         Err(e) => {
@@ -757,6 +782,72 @@ async fn run(
     tick_task.abort();
     memory_task.abort();
     Ok(())
+}
+
+/// Аргументы env-gc лупа (#1431) — не россыпь параметров
+/// (qlty function-parameters).
+struct EnvGcLoopArgs {
+    usecase: Arc<TickUseCase>,
+    boards: Vec<uwuwu_usecase::BoardPlan>,
+    clock: Arc<dyn uwuwu_usecase::Clock>,
+    days: u32,
+    observe: bool,
+    poll_sec: u64,
+}
+
+/// env-gc (#1431): периодический снос env терминальных строк по доскам
+/// конфига (пер-board механика клина холодного ящика: у каждой доски
+/// свой чекаут/исполнитель/env_root). Интервал — poll_sec; длинный
+/// проход не наслаивается — следующий начинается после сна.
+async fn env_gc_loop(args: EnvGcLoopArgs) {
+    let EnvGcLoopArgs {
+        usecase,
+        boards,
+        clock,
+        days,
+        observe,
+        poll_sec,
+    } = args;
+    loop {
+        for b in &boards {
+            let tasks = match usecase.board.read_board(&b.board).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(
+                        event = "env.gc.board_failed",
+                        board = %b.board,
+                        error = %e,
+                        "Доска не прочитана — доска пропущена до следующего прохода"
+                    );
+                    continue;
+                }
+            };
+            let policy = uwuwu_usecase::env_gc::EnvGcPolicy {
+                now_ms: clock.now_ms(),
+                age_days: days,
+                observe,
+            };
+            let sessions = usecase.sessions.project(&b.project);
+            let ctx = uwuwu_usecase::env_gc::EnvGcCtx {
+                board_name: &b.board,
+                checkout: &b.checkout,
+                env_root: &b.env_root,
+                tasks: &tasks,
+                sessions,
+                models: &usecase.models,
+                board: usecase.board.as_ref(),
+            };
+            if let Err(e) = uwuwu_usecase::env_gc::sweep_envs(&ctx, policy).await {
+                tracing::warn!(
+                    event = "env.gc.failed",
+                    board = %b.board,
+                    error = %e,
+                    "Проход env-gc упал — переедет следующим интервалом"
+                );
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(poll_sec)).await;
+    }
 }
 
 /// Периодический снимок памяти (срез B' #1294): событие server.memory —
