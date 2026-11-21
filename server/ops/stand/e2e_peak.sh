@@ -49,6 +49,8 @@ MOCK_PID=""; SRV_PID=""
 say()  { printf '\033[1;34m[e2e-peak]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[e2e-peak FAIL]\033[0m %s\n' "$*"; KEEP=1; exit 1; }
 
+say "порты: сервер $PORT_SRV, мок $PORT_MOCK"
+
 cleanup() {
   for pid in "$SRV_PID" "$MOCK_PID"; do
     [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
