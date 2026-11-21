@@ -786,10 +786,13 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
     use uwuwu_domain::{Slot, TaskFields, Vcs};
     let s = |v: Option<&String>| v.and_then(|s| uwuwu_domain::SessionRef::parse(s));
     // слоты: dev/review/test; review-поле покрывает оба ревью-слота,
-    // dev-поле — оба слота дев-семьи (Design/Dev единая сессия, канон
-    // сессий #328): иначе Design-строка читается без сессии и тик
-    // бесконечно пытается спавнить дубль (инцидент 15.11/16.11 —
-    // budget-отказы маскировали, budget-50 вскрыл бы спавном дублей)
+    // dev-поле — оба слота дев-семьи (Design/Dev — единая сессия, канон
+    // дев-семьи — usecase/pipeline/tick.rs «едина между этапами и
+    // откатами (требование владельца)», носитель — семейные поля
+    // fields.rs + set_session): иначе Design-строка читается без
+    // сессии и тик бесконечно пытается спавнить дубль (инцидент
+    // 15.11/16.11 — budget-отказы маскировали, budget-50 вскрыл бы
+    // спавном дублей)
     let mut assignments = std::collections::BTreeMap::new();
     for (name, slots) in [
         (
