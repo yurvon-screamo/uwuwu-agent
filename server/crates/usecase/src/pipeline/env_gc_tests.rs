@@ -216,7 +216,11 @@ impl TaskBoardRepo for FakeBoard {
         _project: &str,
         _title: &str,
         _body: &str,
+        _kind_name: Option<&str>,
     ) -> UsecaseResult<u64> {
+        todo!("не используется проходом env-gc")
+    }
+    async fn set_issue_type(&self, _number: u64, _kind_name: &str) -> UsecaseResult<()> {
         todo!("не используется проходом env-gc")
     }
     async fn rename_issue(&self, _number: u64, _title: &str) -> UsecaseResult<()> {
