@@ -832,6 +832,7 @@ async fn env_gc_loop(args: EnvGcLoopArgs) {
                 tasks: &tasks,
                 sessions,
                 models: &usecase.models,
+                board: usecase.board.as_ref(),
             };
             if let Err(e) = uwuwu_usecase::env_gc::sweep_envs(&ctx, policy).await {
                 tracing::warn!(
