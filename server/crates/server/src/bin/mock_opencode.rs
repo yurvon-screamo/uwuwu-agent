@@ -101,6 +101,12 @@ struct Store {
     /// Адмиссии нативного компакта (#1221): id сессий по порядку —
     /// наблюдаемость e2e-фазы компакта.
     compacts: Mutex<Vec<String>>,
+    /// Окна фаз turn-хвоста (мс): MOCK_TURN_STREAM_MS / MOCK_TURN_TRAP_MS.
+    /// Дефолты — под поллинг раннера 2с (reply_poll_ms); контракт-тест
+    /// формы (#1254) растягивает окно стрима — проба детерминированно
+    /// попадает в фазу. Форма фаз от окон не зависит (пин #1254).
+    turn_stream_ms: u64,
+    turn_trap_ms: u64,
 }
 
 fn now_ms() -> u64 {
@@ -256,6 +262,8 @@ async fn main() {
     let mcp_token = cfg("MOCK_MCP_TOKEN", "");
     let port: u16 = cfg("MOCK_PORT", "8099").parse().unwrap_or(8099);
     let prompt_404_after: u64 = cfg("MOCK_PROMPT_404_AFTER", "0").parse().unwrap_or(0);
+    let turn_stream_ms: u64 = cfg("MOCK_TURN_STREAM_MS", "1200").parse().unwrap_or(1200);
+    let turn_trap_ms: u64 = cfg("MOCK_TURN_TRAP_MS", "3500").parse().unwrap_or(3500);
 
     let store = Arc::new(Store {
         verdicts: Mutex::new(
@@ -268,6 +276,8 @@ async fn main() {
         lost_directory: Mutex::new(String::new()),
         prompt_404_after,
         prompt_ok: AtomicU64::new(0),
+        turn_stream_ms,
+        turn_trap_ms,
         ..Store::default()
     });
     let verdicts_left = store.verdicts.lock().expect("verdicts").len();
@@ -633,7 +643,11 @@ async fn list_sessions(store: Arc<Store>, q: Query<ListQuery>) -> Resp {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n > 0);
     let Some(page_size) = page else {
-        return (StatusCode::OK, Json(Value::Array(list)));
+        // живая форма 2.3 (пин #1254): список всегда обёрнут {data, cursor}
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "data": list, "cursor": { "next": "" } })),
+        );
     };
     // пагинация newest-first не моделируем — стабильный порядок по id:
     // контракт для сервера тот же (страница + cursor.next), iteration
@@ -662,9 +676,10 @@ async fn list_sessions(store: Arc<Store>, q: Query<ListQuery>) -> Resp {
 }
 
 fn session_json(s: &MockSession) -> Value {
-    json!({
+    // живая форма 2.3 (пин #1254): agent-ключ только у role-сессий,
+    // у default отсутствует (не null); outcome null у живых
+    let mut v = json!({
         "id": s.id,
-        "agent": if s.agent.is_empty() { Value::Null } else { json!(s.agent) },
         "title": s.title,
         "location": { "directory": s.directory },
         "time": {
@@ -675,7 +690,11 @@ fn session_json(s: &MockSession) -> Value {
         },
         "outcome": if s.outcome.is_empty() { Value::Null } else { json!(s.outcome) },
         "tokens": { "input": s.tokens_in, "output": s.tokens_out },
-    })
+    });
+    if !s.agent.is_empty() {
+        v["agent"] = json!(s.agent);
+    }
+    v
 }
 
 async fn get_session(store: Arc<Store>, id: String) -> Resp {
@@ -759,15 +778,24 @@ async fn model_catalog(store: Arc<Store>) -> Resp {
     (StatusCode::OK, Json(Value::Array(items)))
 }
 
-/// Стендовая ручка времени: updated_ms -= ms (сатаурирующий вычет).
-/// Дример-сценарии стенда: сессия «уснула» 31+ минут назад без реального
-/// ожидания; revival = свежий prompt + повторный age.
+/// Стендовая ручка времени: все отметки сессии -= ms (сатаурирующий
+/// вычет). Дример-сценарии стенда: сессия «уснула» 31+ минут назад без
+/// реального ожидания; revival = свежий prompt + повторный age.
+/// Форма 2.3 (пин #1254): time.updated в сообщениях нет — активность
+/// хвоста читается по цепочке created-полей, поэтому reply/turn сдвигаются
+/// наравне с updated_ms (контракт ручки «сессия замерла N минут назад»).
 async fn age_session(store: Arc<Store>, id: String, body: Value) -> Resp {
     let ms = body["ms"].as_u64().unwrap_or(0);
     let mut sessions = store.sessions.lock().expect("store");
     match sessions.get_mut(&id) {
         Some(s) => {
             s.updated_ms = s.updated_ms.saturating_sub(ms);
+            if let Some((created, _)) = &mut s.reply {
+                *created = created.saturating_sub(ms);
+            }
+            if let Some(turn) = &mut s.turn_ms {
+                *turn = turn.saturating_sub(ms);
+            }
             let updated = s.updated_ms;
             tracing::info!(event = "mock.session_aged", %id, by_ms = ms, updated,
                 "POST /session/{id}/age");
@@ -1085,17 +1113,24 @@ async fn work_like_agent(
 /// Фазы многосообщного хода (#1209, наблюдённая модель пробы): стрим
 /// (finish=None) → ловушка для старого условия (шаг finish='tool-calls',
 /// is_latest=true — зазор после тула) → финал finish='stop'. Окна —
-/// константы под поллинг раннера 2с (reply_poll_ms).
-fn turn_tail(turn_ms: u64) -> Value {
-    const STREAM_MS: u64 = 1_200;
-    const TRAP_MS: u64 = 3_500;
+/// ручки MOCK_TURN_STREAM_MS / MOCK_TURN_TRAP_MS (дефолты под поллинг
+/// раннера 2с, reply_poll_ms); контракт-тест формы (#1254) растягивает
+/// стрим-окно — проба детерминированно попадает в фазу.
+/// Форма — живой опенкод 2.3 (пин #1254): обёртка {data:[...]}, у
+/// assistant created/firstToken/streamed (финал + completed),
+/// time.updated нет ни у одного события (в т.ч. у user).
+fn turn_tail(turn_ms: u64, stream_ms: u64, trap_ms: u64) -> Value {
     const STEP_TEXT: &str = "промежуточный шаг хода";
     const FINAL_TEXT: &str = "turn final ok";
     let now = now_ms();
     let step1 = json!({
         "type": "assistant",
         "role": "assistant",
-        "time": { "created": turn_ms, "updated": now },
+        "time": {
+            "created": turn_ms,
+            "firstToken": turn_ms + 10,
+            "streamed": turn_ms + 20,
+        },
         "content": [
             { "type": "text", "text": STEP_TEXT },
             { "type": "tool", "state": { "status": "completed" } },
@@ -1103,61 +1138,78 @@ fn turn_tail(turn_ms: u64) -> Value {
     });
     let user = json!({
         "type": "user",
-        "time": { "created": turn_ms - 100, "updated": turn_ms - 100 },
+        "time": { "created": turn_ms - 100 },
     });
-    if now < turn_ms + STREAM_MS {
+    if now < turn_ms + stream_ms {
         // стримится: без finish — не ответ
         let mut msg = step1.clone();
         msg["finish"] = Value::Null;
-        return json!([msg, user]);
+        return json!({ "data": [msg, user] });
     }
-    if now < turn_ms + TRAP_MS {
+    if now < turn_ms + trap_ms {
         // шаг завершён, ход продолжается — ловушка finished+is_latest
         let mut msg = step1.clone();
         msg["finish"] = json!("tool-calls");
-        return json!([msg, user]);
+        return json!({ "data": [msg, user] });
     }
     let final_msg = json!({
         "type": "assistant",
         "role": "assistant",
-        "time": { "created": turn_ms + TRAP_MS, "updated": now },
+        "time": {
+            "created": turn_ms + trap_ms,
+            "firstToken": turn_ms + trap_ms + 10,
+            "streamed": turn_ms + trap_ms + 20,
+            "completed": now,
+        },
         "finish": "stop",
         "tokens": { "input": 1234, "output": 50, "reasoning": 0,
                     "cache": { "read": 0, "write": 0 } },
         "content": [{ "type": "text", "text": FINAL_TEXT }],
     });
-    json!([final_msg, step1, user])
+    json!({ "data": [final_msg, step1, user] })
 }
 
 async fn message_tail(store: Arc<Store>, id: String) -> Resp {
     let sessions = store.sessions.lock().expect("store");
     match sessions.get(&id) {
         Some(s) if s.turn_ms.is_some() => {
-            let tail = turn_tail(s.turn_ms.expect("turn_ms checked"));
+            let tail = turn_tail(
+                s.turn_ms.expect("turn_ms checked"),
+                store.turn_stream_ms,
+                store.turn_trap_ms,
+            );
             (StatusCode::OK, Json(tail))
         }
         Some(s) => {
-            // Форма — живой опенкод 2.3.0 (проба #1150): тип в поле `type`,
-            // у ассистента finish/content[].text/time.created; time.updated
-            // держим для last_activity_ms (wakeup-контур)
-            let mut msg = json!({
-                "type": "assistant",
-                "role": "assistant",
-                "time": { "updated": s.updated_ms },
-            });
-            if let Some((created_ms, text)) = &s.reply {
-                msg["finish"] = json!("stop");
-                msg["time"]["created"] = json!(created_ms);
-                msg["time"]["completed"] = json!(created_ms);
-                msg["content"] = json!([{ "type": "text", "text": text }]);
-                // токены поворота (#1221): компакт-проба читает хвост как
-                // занятость окна контекста
-                msg["tokens"] = json!({
-                    "input": s.tokens_in, "output": s.tokens_out, "reasoning": 0,
-                    "cache": { "read": 0, "write": 0 }
-                });
-            }
-            (StatusCode::OK, Json(json!([msg])))
+            // Форма — живой опенкод 2.3 (пин #1254): хвост обёрнут
+            // {data:[...]}, time.updated нет ни у одного события; ответ
+            // ассистента несёт created/firstToken/streamed/completed,
+            // сессия без ответа открывается idle-событием (только
+            // created — активность хвоста по нему же)
+            let msg = if let Some((created_ms, text)) = &s.reply {
+                json!({
+                    "type": "assistant",
+                    "role": "assistant",
+                    "time": {
+                        "created": created_ms,
+                        "firstToken": created_ms + 10,
+                        "streamed": created_ms + 20,
+                        "completed": created_ms + 30,
+                    },
+                    "finish": "stop",
+                    "tokens": {
+                        "input": s.tokens_in, "output": s.tokens_out, "reasoning": 0,
+                        "cache": { "read": 0, "write": 0 }
+                    },
+                    "content": [{ "type": "text", "text": text }],
+                })
+            } else {
+                json!({
+                    "type": "idle",
+                    "time": { "created": s.updated_ms },
+                })
+            };
+            (StatusCode::OK, Json(json!({ "data": [msg] })))
         }
         None => (StatusCode::NOT_FOUND, Json(json!({ "status": "404" }))),
     }
