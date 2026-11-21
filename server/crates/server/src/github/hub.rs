@@ -1127,13 +1127,22 @@ impl TaskBoardRepo for GitHubHub {
     }
 
     async fn set_issue_type(&self, number: u64, kind_name: &str) -> UsecaseResult<()> {
-        let (_, resp) = self
+        let (status, resp) = self
             .rest(
                 reqwest::Method::PATCH,
                 &format!("/repos/{}/issues/{number}", self.repo),
                 Some(json!({ "type": kind_name })),
             )
             .await?;
+        // громкий отказ с телом носителя до сверки эха (#1271): gherr ловит
+        // только 403/429 — 422/5xx дошли бы до эхо-ветки с неверным
+        // диагнозом вместо точной причины GitHub
+        if !status.is_success() {
+            return Err(UsecaseError::Board(format!(
+                "edit #{number}: HTTP {status}: {}",
+                resp.to_string().chars().take(140).collect::<String>()
+            )));
+        }
         // сверка эха — симметрично create (#1271): тихий дроп без
         // push-доступа не проходит как успех
         if resp["type"]["name"].as_str() != Some(kind_name) {

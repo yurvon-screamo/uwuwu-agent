@@ -194,7 +194,8 @@ pub fn schedule_label(s: &Schedule) -> String {
     }
 }
 
-/// Все типы канона (порядок = порядок опций поля «Тип»).
+/// Все типы канона: порядок кормит `type_enum_list()` — перечни enum в
+/// дескрипторах task_create/task_edit и тексты громких отказов (#1271).
 pub const TASK_TYPES: [TaskType; 9] = [
     TaskType::Bug,
     TaskType::Spike,

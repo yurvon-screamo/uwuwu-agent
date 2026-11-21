@@ -748,8 +748,9 @@ where
 /// назад в task_body, и шапка наслаивалась в теле (fm-стек инцидента
 /// #1331). Срезается на границе записи: инвариант ADR-105 «тело — чистый
 /// markdown» держит сервер, не дисциплина агента (прецедент #1151).
-/// Консервативно: строго набор/порядок ключей рендера, любой посторонний
-/// контент («--- fm ---» внутри текста) не трогается.
+/// Консервативно: строго набор/порядок ключей рендера (текущий и легаси
+/// до #1271 — тела с ним ресабмятся агентами), любой посторонний контент
+/// («--- fm ---» внутри текста) не трогается.
 fn strip_task_get_header(md: &str) -> &str {
     const KEYS: [&str; 6] = [
         "branch: ",
@@ -759,20 +760,30 @@ fn strip_task_get_header(md: &str) -> &str {
         "type: ",
         "body_hash: ",
     ];
+    const LEGACY_KEYS: [&str; 5] = ["branch: ", "pr: ", "automerge: ", "direct: ", "body_hash: "];
     let Some(rest) = md.strip_prefix("--- fm ---\n") else {
         return md;
     };
+    for keys in [&KEYS[..], &LEGACY_KEYS[..]] {
+        if let Some(stripped) = strip_header_keys(rest, keys) {
+            return stripped;
+        }
+    }
+    md
+}
+
+/// Строгое совпадение набора/порядка ключей одного рендера; частичные
+/// шапки и посторонний контент — None.
+fn strip_header_keys<'a>(rest: &'a str, keys: &[&str]) -> Option<&'a str> {
     let mut pos = rest;
-    for key in KEYS {
-        let Some(line_end) = pos.find('\n') else {
-            return md;
-        };
+    for key in keys {
+        let line_end = pos.find('\n')?;
         if !pos[..line_end].starts_with(key) {
-            return md;
+            return None;
         }
         pos = &pos[line_end + 1..];
     }
-    pos.trim_start_matches('\n')
+    Some(pos.trim_start_matches('\n'))
 }
 
 /// Ожидания контрольного чтения edit: Some — значение менялось и должно
@@ -1704,11 +1715,11 @@ mod tests {
         // неполный набор ключей — не рендер task_get
         let md = "--- fm ---\nbranch: x\npr: y\n\n## Тело";
         assert_eq!(strip_task_get_header(md), md);
-        // легаси-рендер без type (#1271) — не текущая шапка: консервативно
-        // не трогается (срезает строго набор ключей актуального рендера)
+        // легаси-рендер без type (#1271) — срезается тоже: тела с ним
+        // ресабмятся агентами (старый вывод task_get копируется в task_body)
         let md_legacy =
             "--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\nbody_hash: h\n\n## Т";
-        assert_eq!(strip_task_get_header(md_legacy), md_legacy);
+        assert_eq!(strip_task_get_header(md_legacy), "## Т");
         // посторонняя строка в «шапке» — не трогаем
         let md2 = "--- fm ---\nbranch: x\nслучайная строка\nautomerge: true\nbody_hash: h\n\n## Т";
         assert_eq!(strip_task_get_header(md2), md2);
