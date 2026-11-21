@@ -619,7 +619,12 @@ async fn create_session(
         tokens_in: 0,
         tokens_out: 0,
         busy: false,
-        busy_ms: 0,
+        // дев-ручка стенда (#1313 V4): busy_ms в прошлом — зомби-флаг
+        // (busy > idle старше 30 мин не держит CUP-кап)
+        busy_ms: body["busy_ms_ago"]
+            .as_u64()
+            .map(|ago| now_ms().saturating_sub(ago))
+            .unwrap_or(0),
         idle_ms: 0,
         dead: mode == "dead",
         reply: None,
@@ -894,6 +899,10 @@ async fn prompt(
                 .find(|l| !l.trim().is_empty())
                 .unwrap_or_default();
             s.reply = Some((now_ms(), format!("мок-ответ на: {tail}")));
+            // ход мгновенно завершён — idle ≥ busy (контракт бинаря 2.3.0,
+            // сверено #1231): завершённый plain-ход не держит CUP-кап
+            // (#1313 V5 — иначе dev-сессии висят busy 30 мин до зомби-гарда)
+            s.idle_ms = now_ms();
         }
     }
     drop(sessions);
@@ -1184,7 +1193,9 @@ fn turn_tail(turn_ms: u64, stream_ms: u64, trap_ms: u64) -> Value {
             "created": turn_ms + trap_ms,
             "firstToken": turn_ms + trap_ms + 10,
             "streamed": turn_ms + trap_ms + 20,
-            "completed": now,
+            // completed — момент завершения хода, не момент запроса: старение
+            // turn_ms (#1313 V5) уводит активность в прошлое, сталл-тишина копится
+            "completed": (turn_ms + trap_ms).min(now),
         },
         "finish": "stop",
         "tokens": { "input": 1234, "output": 50, "reasoning": 0,

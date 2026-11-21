@@ -2535,3 +2535,46 @@ async fn compact_gone_session_skips_bot_and_neighbors_continue() {
         "здоровый сосед ужался"
     );
 }
+
+/// Пин исключения ботов из CUP-капа (#1313, решение владельца
+/// 20.11: «Ботов не гейти - там копеечкные запросы - пусть свободно
+/// отвечают»): ход бота доставляется при занятой сессии — раннер не
+/// гейтится капом конвейера. Если кто-то добавит CUP-гейт в раннер,
+/// тест красный — решение владельца менять только владельцем.
+#[tokio::test]
+async fn bot_turn_delivered_while_session_busy_cap_ignored() {
+    let tg = FakeTg::new(vec![private_update(11, "yurvon", "вопрос при полном капе")]);
+    let sessions = FakeSessions::new();
+    sessions.auto_reply.store(false, Ordering::SeqCst);
+    sessions
+        .script
+        .lock()
+        .expect("lock")
+        .push(step_reply(1_000, "ответ бота despite кап", "stop"));
+    let state = Arc::new(FakeState::default());
+    // вечная сессия бота занята («кап полон») — раннер это не читает
+    state.set_bot_session(SLUG, Some("ses_bot_forever"));
+    sessions.set_busy("ses_bot_forever", true);
+    let task = spawn_bot_task(deps(
+        tg.clone(),
+        sessions.clone(),
+        state.clone(),
+        1_000,
+        10,
+        BotLive::new(Some("yurvon".into()), None, "м".into()),
+    ));
+    let ok = wait_until(
+        || {
+            tg.sent_snapshot()
+                .iter()
+                .any(|(_, t)| t.contains("ответ бота"))
+        },
+        2000,
+    )
+    .await;
+    task.abort();
+    assert!(
+        ok,
+        "ход бота доставлен при занятой сессии — исключение живо"
+    );
+}
