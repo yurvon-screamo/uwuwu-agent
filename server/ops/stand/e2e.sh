@@ -42,7 +42,10 @@ cd "$(dirname "$0")/../.."   # server/
 # shellcheck disable=SC1091
 source "$(dirname "$0")/stand_ports.sh"
 # Порты: оверрайд задан — как есть; не задан — свободные из пробы-бинда
-read -r PORT_SRV_D PORT_MOCK_D MOCK2_PORT_D <<<"$(stand_pick_ports 3)"
+# (подбор в переменную: отказ stand_pick_ports роняет прогон здесь —
+# set -e на присваивании; пустые порты дальше не едут)
+ports="$(stand_pick_ports 3)"
+read -r PORT_SRV_D PORT_MOCK_D MOCK2_PORT_D <<<"$ports"
 PORT_MOCK="${PORT_MOCK:-$PORT_MOCK_D}"; PORT_SRV="${PORT_SRV:-$PORT_SRV_D}"
 MOCK2_PORT="${MOCK2_PORT:-$MOCK2_PORT_D}"
 BEARER="${UWUWU_SERVER_BEARER:-stand-e2e-bearer}"

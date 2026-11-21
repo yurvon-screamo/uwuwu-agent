@@ -10,7 +10,10 @@
 #
 # Использование:
 #   source "$(dirname "$0")/stand_ports.sh"
-#   read -r A B C <<<"$(stand_pick_ports 3)"
+#   ports="$(stand_pick_ports 3)"   # отказ подбора роняет скрипт: set -e
+#                                   # ловит статус присваивания (read в
+#                                   # подстановке — нет)
+#   read -r A B C <<<"$ports"
 #   PORT_X="${PORT_X:-$A}"
 
 # stand_pick_ports N — N различных свободных портов одной строкой (stdout)

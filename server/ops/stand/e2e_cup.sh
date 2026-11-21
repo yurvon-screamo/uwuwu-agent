@@ -25,7 +25,8 @@ cd "$(dirname "$0")/../.."   # server/
 # не следует; сам файл валиден отдельно (SC1091 off на этой строке, #1304)
 # shellcheck disable=SC1091
 source "$(dirname "$0")/stand_ports.sh"
-read -r PORT_A_D PORT_B_D PORT_SRV_D <<<"$(stand_pick_ports 3)"
+ports="$(stand_pick_ports 3)"
+read -r PORT_A_D PORT_B_D PORT_SRV_D <<<"$ports"
 PORT_A="${PORT_MOCK_A:-$PORT_A_D}"; PORT_B="${PORT_MOCK_B:-$PORT_B_D}"; PORT_SRV="${PORT_SRV:-$PORT_SRV_D}"
 BEARER="${UWUWU_SERVER_BEARER:-stand-e2e-bearer}"
 export GH_TOKEN="${GH_TOKEN:-stand-e2e-dummy}"

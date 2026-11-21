@@ -29,7 +29,8 @@ cd "$(dirname "$0")/../.."   # server/
 # не следует; сам файл валиден отдельно (SC1091 off на этой строке, #1304)
 # shellcheck disable=SC1091
 source "$(dirname "$0")/stand_ports.sh"
-read -r PORT_SRV_D PORT_MOCK_D <<<"$(stand_pick_ports 2)"
+ports="$(stand_pick_ports 2)"
+read -r PORT_SRV_D PORT_MOCK_D <<<"$ports"
 PORT_MOCK="${PORT_MOCK:-$PORT_MOCK_D}"; PORT_SRV="${PORT_SRV:-$PORT_SRV_D}"
 BEARER="${UWUWU_SERVER_BEARER:-stand-e2e-bearer}"
 # config.secrets() валидирует GH_TOKEN безусловно (non_empty_env), хотя
