@@ -272,18 +272,21 @@ case "$S2047" in
   *) fail "2047 не эскалировал в Needs attention, статус: [$S2047]" ;;
 esac
 
-# kill мок-2 (транспортная смерть): strict-union CUP → фолбэк на статусный
-# подсчёт; дример/аналитика на strict — sidecar.tick_failed (решения по
-# агрегату честно останавливаются), тик конвейера продолжает жить
+# kill мок-2 (транспортная смерть): деградация union-скана по исполнителю
+# (#1450 — отказ одного не морозит конвейер, событие
+# sessions.list_reachable_failed вместо бывшего cup.list_sessions_failed);
+# тик конвейера продолжает жить
 BEFORE_TICKS=$(grep -c '"event":"tick.completed"' "$LOG_SRV_MULTI" || true)
 kill "$MOCK2_PID" 2>/dev/null || true
 sleep 25   # 2+ тика на отказе
 AFTER_TICKS=$(grep -c '"event":"tick.completed"' "$LOG_SRV_MULTI" || true)
 [ "$AFTER_TICKS" -gt "$BEFORE_TICKS" ] || fail "тик умер после отказа исполнителя (тик-луп встал)"
-grep -q 'cup.list_sessions_failed' "$LOG_SRV_MULTI" || fail "нет CUP-фолбэка (strict union не отработал)"
-grep -q '"sidecar":"dreamer"' "$LOG_SRV_MULTI" || fail "нет sidecar.tick_failed дримера (strict union не отработал)"
+grep -q 'sessions.list_reachable_failed' "$LOG_SRV_MULTI" \
+  || fail "нет деградации union-скана (sessions.list_reachable_failed не увиден)"
+grep -q '"event":"dreamer.list_degraded"' "$LOG_SRV_MULTI" \
+  || fail "нет dreamer.list_degraded (дример не отразил деградацию union-скана)"
 curl -s --max-time 5 "http://127.0.0.1:$PORT_MOCK/api/session" >/dev/null || fail "мок-1 недоступен после отказа мок-2"
-say "отказ исполнителя: CUP-фолбэк + strict-остановка дримера, тик живёт ($BEFORE_TICKS → $AFTER_TICKS тиков)"
+say "отказ исполнителя: деградация по исполнителю (#1450), дример по живому union, тик живёт ($BEFORE_TICKS → $AFTER_TICKS тиков)"
 kill "$SRV_PID" "$MOCK_PID" "$MOCK2_PID" 2>/dev/null || true
 wait "$SRV_PID" "$MOCK_PID" "$MOCK2_PID" 2>/dev/null || true
 SRV_PID=""; MOCK_PID=""; MOCK2_PID=""
@@ -1020,5 +1023,135 @@ SRV_PID=""; MOCK_PID=""
 sleep 1
 say "фаза 13 ок: lost-resurrection через lost-руку, луп-гвард парковал, сироты чисты, попытка одна за тик"
 
+say "фаза 14: env-gc #1431 — observe логирует кандидатов, live сносит по вердикту мока"
 
-say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри и семейство-непрерывностью сессий #1237 + мульти-экзекьютор + гард #1163 + self-эхо в прод-геометрии #1237 + слепой hold #1263 + преемпшен CUP #1259 + давка-волна #1412 + клин #1293 + дример #1306 + phantom-квитанции #1331 + lost-сессия #1288: десинк-парковка + lost-resurrection); логи: $RUN_DIR"
+# env-gc: candidates из снапшота доски (терминальная + закрытие > 48 ч),
+# снос — bootstrap в чекауте + slash-команда task-env-gc, вердикт —
+# user-сообщение мока (командный канал эмулирует shell-исход).
+# 2060 закрыта 3 суток назад (кандидат), 2061 — сегодня (свежая);
+# done-сиды CUP не занимают, тик терминальные строки не спавнит
+CONFIG_EGC="$RUN_DIR/config.egc.toml"
+cat > "$CONFIG_EGC" <<EOF
+mode = "live"
+poll_sec = 10
+sweep_days = 7
+env_gc_days = 1
+env_gc_observe = false
+port = $PORT_SRV
+
+[hub]
+repo = "yurvon-screamo/uwuwu-hub"
+driver = "memory"
+
+[executor]
+name = "local-mock"
+url = "http://127.0.0.1:$PORT_MOCK"
+
+[policy]
+cup = 1
+peak = { enabled = false, start_min = 0, end_min = 0 }
+
+[[project]]
+name = "uwuwu"
+board = "Задачи uwuwu"
+repo = "yurvon-screamo/uwuwu-agent"
+checkout = "/home/yurvon/uwuwu-agent"
+env_root = "/home/yurvon/agents-env"
+EOF
+EGC_SEED="Задачи uwuwu:2060:Done:low:3;Задачи uwuwu:2061:Done:low:0"
+
+# 14a: observe-гейт (env_gc_observe = true): кандидаты в логе, команд нет
+sed 's/env_gc_observe = false/env_gc_observe = true/' "$CONFIG_EGC" > "$CONFIG_EGC.obs"
+rm -f "$STATE"
+LOG_SRV_EGC="$RUN_DIR/server-egc.log"
+MOCK_MODE=idle MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=100 \
+  "$BIN_MOCK" >"$LOG_MOCK" 2>&1 &
+MOCK_PID=$!
+sleep 1
+UWUWU_SERVER_CONFIG="$CONFIG_EGC.obs" UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
+  UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
+  UWUWU_MOCK_SEED="$EGC_SEED" RUST_LOG=info "$BIN_SRV" >"$LOG_SRV_EGC" 2>&1 &
+SRV_PID=$!
+SEEN=0
+while [ $SEEN -lt 10 ]; do
+  SEEN=$((SEEN + 1)); sleep 4
+  grep -q '"event":"env.gc.observe"' "$LOG_SRV_EGC" && break
+done
+grep -q '"event":"env.gc.observe"' "$LOG_SRV_EGC" \
+  || fail "observe-env-gc не показал кандидатов (env.gc.observe нет за 40с)"
+grep -q 'task-env-gc' "$LOG_MOCK" \
+  && fail "observe-env-gc диспатчит команды (мутация в observe)"
+say "14a ок: observe показал кандидата, команд нет"
+
+# 14b: live — диспатч сноса, вердикт SWEPT через мок, свежая строка не тронута
+kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+SRV_PID=""; MOCK_PID=""
+rm -f "$STATE"
+MOCK_MODE=idle MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=100 \
+  "$BIN_MOCK" >"$LOG_MOCK" 2>&1 &
+MOCK_PID=$!
+sleep 1
+UWUWU_SERVER_CONFIG="$CONFIG_EGC" UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
+  UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
+  UWUWU_MOCK_SEED="$EGC_SEED" RUST_LOG=info "$BIN_SRV" >"$LOG_SRV_EGC" 2>&1 &
+SRV_PID=$!
+SEEN=0
+while [ $SEEN -lt 15 ]; do
+  SEEN=$((SEEN + 1)); sleep 4
+  grep -q '"event":"env.swept"' "$LOG_SRV_EGC" && break
+done
+grep -q '"event":"env.swept"' "$LOG_SRV_EGC" \
+  || fail "live-env-gc не получил вердикт SWEPT (env.swept нет за 60с)"
+grep -q '"event":"mock.command"' "$LOG_MOCK" && grep -q 'task-env-gc' "$LOG_MOCK" \
+  || fail "мок не принял команду task-env-gc"
+grep -q '"event":"env.gc.completed"' "$LOG_SRV_EGC" \
+  || fail "нет итогового env.gc.completed"
+# свежая строка (2061) не кандидат: счётчики completed сходятся
+COMPLETED=$(grep '"event":"env.gc.completed"' "$LOG_SRV_EGC" | tail -1)
+echo "$COMPLETED" | grep -q '"swept":1' || fail "completed без swept=1: $COMPLETED"
+echo "$COMPLETED" | grep -q '"candidates":1' \
+  || fail "completed насчитал не одного кандидата: $COMPLETED"
+grep -q '"event":"mock.session_deleted"' "$LOG_MOCK" \
+  || fail "bootstrap env-gc не погашен после прохода"
+kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+SRV_PID=""; MOCK_PID=""
+sleep 1
+say "фаза 14 ок: observe без мутаций, live снёс кандидата по вердикту мока, свежая не тронута, bootstrap погашен"
+
+# 14c: реальный скрипт сноса на фикстуре — shell-граница под автотестом
+# (мок 14b эмулирует исход команды; гарды и грамматика самого
+# task-env-gc.sh до этого проверялись только ручными смоуками)
+say "фаза 14c: реальный task-env-gc.sh — SWEPT/DIRTY/FOREIGN/NOREPO/ABSENT, идемпотентность"
+GC_FIX="$RUN_DIR/envgc-fixture"
+GC_SCRIPT="$PWD/ops/task-env-gc.sh"
+mkdir -p "$GC_FIX/checkout"
+git -C "$GC_FIX/checkout" init -q
+git -C "$GC_FIX/checkout" -c user.email=e2e@stand -c user.name=e2e commit --allow-empty -q -m init
+gc_sweep() { ( cd "$GC_FIX/checkout" && UWUWU_ENV_ROOT="$GC_FIX/envs" bash "$GC_SCRIPT" sweep "$1" ); }
+# clean: ворктри зарегистрирован в чекауте-фикстуре, porcelain пуст → SWEPT
+git -C "$GC_FIX/checkout" worktree add -q -b work/task-990001 "$GC_FIX/envs/990001/repo"
+V=$(gc_sweep 990001); [ "$V" = "ENV-GC 990001 SWEPT" ] || fail "clean-фикстура не SWEPT: $V"
+[ -d "$GC_FIX/envs/990001" ] && fail "clean-фикстура пережила снос"
+git -C "$GC_FIX/checkout" worktree list --porcelain | grep -q 990001 && fail "worktree чистой фикстуры не снят"
+git -C "$GC_FIX/checkout" branch --list work/task-990001 | grep -q . && fail "ветка чистой фикстуры не удалена"
+V=$(gc_sweep 990001); [ "$V" = "ENV-GC 990001 ABSENT" ] || fail "повторный снос не ABSENT: $V"
+# dirty: незакоммиченная правка → DIRTY, env жив
+git -C "$GC_FIX/checkout" worktree add -q -b work/task-990002 "$GC_FIX/envs/990002/repo"
+echo dirt > "$GC_FIX/envs/990002/repo/dirty.txt"
+V=$(gc_sweep 990002); [ "$V" = "ENV-GC 990002 DIRTY" ] || fail "грязная фикстура не DIRTY: $V"
+[ -d "$GC_FIX/envs/990002" ] || fail "грязный env снесён молча"
+# foreign: repo/.git без регистрации в чекауте → FOREIGN, env жив
+mkdir -p "$GC_FIX/envs/990003/repo"; git -C "$GC_FIX/envs/990003/repo" init -q
+V=$(gc_sweep 990003); [ "$V" = "ENV-GC 990003 FOREIGN" ] || fail "чужой env не FOREIGN: $V"
+[ -d "$GC_FIX/envs/990003" ] || fail "чужой env снесён"
+# norepo: env без repo/.git → NOREPO, env жив
+mkdir -p "$GC_FIX/envs/990004/repo"; echo '{"x":1}' > "$GC_FIX/envs/990004/repo/data.json"
+V=$(gc_sweep 990004); [ "$V" = "ENV-GC 990004 NOREPO" ] || fail "env без repo не NOREPO: $V"
+[ -d "$GC_FIX/envs/990004" ] || fail "norepo-env снесён"
+# absent: каталога нет → ABSENT
+V=$(gc_sweep 990005); [ "$V" = "ENV-GC 990005 ABSENT" ] || fail "отсутствующий env не ABSENT: $V"
+say "14c ок: реальный скрипт вернул все вердикты, грязный/чужой/без-repo выжили, повтор ABSENT"
+
+say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри и семейство-непрерывностью сессий #1237 + мульти-экзекьютор + гард #1163 + self-эхо в прод-геометрии #1237 + слепой hold #1263 + преемпшен CUP #1259 + давка-волна #1412 + клин #1293 + дример #1306 + phantom-квитанции #1331 + lost-сессия #1288: десинк-парковка + lost-resurrection + env-gc #1431); логи: $RUN_DIR"
