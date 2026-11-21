@@ -968,7 +968,7 @@ async fn work_like_agent(
                     verdict = "ревью request_changes (мок) — на доработку";
                 }
                 "test-review" => {
-                    status = "Testing";
+                    status = "Тестирование";
                     verdict = "тест-ревью request_changes (мок) — находки тестировщику";
                 }
                 "analys-review" => {
