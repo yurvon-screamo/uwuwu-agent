@@ -78,7 +78,9 @@ pub fn parse_agent(raw: &str) -> Option<Agent> {
     })
 }
 
-/// Каноническое имя типа задачи (поле issue).
+/// Каноническое имя типа задачи (MCP-поверхность: дескрипторы/валидация
+/// create-edit). Носитель — нативный issue Type (#1271), его словарь
+/// резолвит task_type_native_name.
 pub fn task_type_name(t: TaskType) -> &'static str {
     match t {
         TaskType::Bug => "bug",
@@ -90,6 +92,19 @@ pub fn task_type_name(t: TaskType) -> &'static str {
         TaskType::Legacy => "legacy",
         TaskType::Qa => "qa",
         TaskType::Infrastructure => "infrastructure",
+    }
+}
+
+/// Имя типа в нативном словаре issue Type репо-хаба (заведён владельцем
+/// 12.11: дефолты Task/Bug/Feature + остальные канонные 1:1) — запись
+/// create/edit и чтение носителя одним знанием (#1271). Обратный маппинг
+/// — parse_task_type (case-insensitive): «Task» (нативный дефолт),
+/// null и неизвестное имя → None без громкой ошибки.
+pub fn task_type_native_name(t: TaskType) -> &'static str {
+    match t {
+        TaskType::Bug => "Bug",
+        TaskType::Feature => "Feature",
+        t => task_type_name(t),
     }
 }
 
@@ -261,7 +276,17 @@ mod tests {
             TaskType::Infrastructure,
         ] {
             assert_eq!(parse_task_type(task_type_name(t)), Some(t));
+            // круг через нативный словарь issue Type (#1271): записанное
+            // имя читается обратно тем же parse
+            assert_eq!(parse_task_type(task_type_native_name(t)), Some(t));
         }
+        // нативный дефолт Task и нативная капс канона читаются честно:
+        // «Task» — не канонный тип (None), капс гасится lowercase-парсом
+        assert_eq!(parse_task_type("Task"), None);
+        assert_eq!(parse_task_type("Bug"), Some(TaskType::Bug));
+        assert_eq!(task_type_native_name(TaskType::Bug), "Bug");
+        assert_eq!(task_type_native_name(TaskType::Feature), "Feature");
+        assert_eq!(task_type_native_name(TaskType::Spike), "spike");
         // idea/analys выведены: старые значения — неизвестный тип
         assert_eq!(parse_task_type("idea"), None);
         assert_eq!(parse_task_type("analys"), None);
