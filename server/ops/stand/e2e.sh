@@ -890,7 +890,7 @@ printf '%s' "$HONEST" | grep -q 'replaced' || fail "task_body на честно�
 printf '%s' "$HONEST" | grep -q 'delivery not confirmed' \
   && fail "честная запись получила маркер непроверенности: $HONEST"
 HONEST_C=$(mcp task_comment "{\"number\":$H_N,\"text\":\"probe-ok\"}")
-printf '%s' "$HONEST_C" | grep -q 'коммент отправлен' \
+printf '%s' "$HONEST_C" | grep -q 'comment posted to' \
   || fail "task_comment на честном носителе отказал: $HONEST_C"
 kill "$SRV_PID" 2>/dev/null || true; wait "$SRV_PID" 2>/dev/null || true; SRV_PID=""
 sleep 1
@@ -944,7 +944,7 @@ case "$S" in
   *attention*|*Needs*) say "строка запаркована: $S" ;;
   *) fail "строка не в Needs attention после lost.escalated: $S" ;;
 esac
-mcp task_get "{\"number\":$SEED_N}" | grep -q 'Сессия потеряна' \
+mcp task_get "{\"number\":$SEED_N}" | grep -q 'Session lost' \
   || fail "нет коммента с причиной парковки на строке"
 # анти-дубль: respawn при живом списке запрещён — спавн ровно один
 SPAWNS=$(grep -c '"event":"spawn.done"' "$LOG_SRV_LOST" || true)
@@ -966,7 +966,7 @@ say "фаза 13: lost-resurrection #1288 — сессия скрыта из lis
 # скрыта из list, GET 200 (probe Alive), prompt/switch_agent → 404.
 # lost-рука видит «сессии нет в списке» → resurrection гвардами
 # Dead-ветки; 404 свежих спавнов — сирота-делит (анти-ре-энтри),
-# луп-гвард >4 паркует («Респавн-петля», юнит-класс T2 живьём).
+# луп-гвард >4 паркует («Respawn loop», юнит-класс T2 живьём).
 rm -f "$STATE"
 LOG_SRV_LRES="$RUN_DIR/server-lres.log"
 MOCK_MODE=plain MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=1500 \
@@ -1006,8 +1006,8 @@ case "$S" in
   *attention*|*Needs*) say "луп-гвард запарковал: $S" ;;
   *) fail "строка не в Needs attention после respawn-петли: $S" ;;
 esac
-mcp task_get "{\"number\":$SEED_N}" | grep -q 'Респавн-петля' \
-  || fail "нет коммента «Респавн-петля» на строке"
+mcp task_get "{\"number\":$SEED_N}" | grep -q 'Respawn loop' \
+  || fail "нет коммента «Respawn loop» на строке"
 # анти-ре-энтри: одна respawn-попытка за тик — create/delete пары чисты
 # (bootstrap+work пары + сироты; deleted = created - живые work-сессии)
 CREATED=$(grep -c '"event":"mock.session_created"' "$LOG_MOCK" || true)
