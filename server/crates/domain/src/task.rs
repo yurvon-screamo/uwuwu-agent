@@ -292,7 +292,9 @@ impl TaskFields {
     /// Мутатор: открытие PR (требуется ветка — канон: PR из ветки задачи).
     pub fn open_pr(&mut self, url: PrUrl) -> Result<(), &'static str> {
         match self.vcs.clone() {
-            Vcs::Local | Vcs::Artifact { .. } => Err("PR без ветки: сначала Branch-ячейка"),
+            Vcs::Local | Vcs::Artifact { .. } => {
+                Err("a PR without a branch: the Branch cell first")
+            }
             Vcs::Branch(branch) => {
                 self.vcs = Vcs::PullRequest { branch, url };
                 Ok(())
@@ -421,7 +423,7 @@ impl Task {
     pub fn transition(&mut self, to: Status) -> Result<(), String> {
         if !Status::can_transition_with(self.status, to, self.direct) {
             return Err(format!(
-                "переход {:?} → {:?} вне канона конвейера (см. Status::can_transition)",
+                "transition {:?} → {:?} outside the pipeline canon (see Status::can_transition)",
                 self.status, to
             ));
         }
@@ -520,7 +522,7 @@ impl Task {
     pub fn claim(&mut self, slot: Slot, session: SessionRef) -> Result<(), String> {
         if self.status.is_terminal() {
             return Err(format!(
-                "claim на терминальной строке ({:?}) запрещён",
+                "claim on a terminal row ({:?}) is forbidden",
                 self.status
             ));
         }

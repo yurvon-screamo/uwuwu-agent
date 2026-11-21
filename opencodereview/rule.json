@@ -13,47 +13,47 @@
   "rules": [
     {
       "path": "**/*.{ts,tsx,js,jsx,mjs,cjs}",
-      "rule": "Язык: TypeScript / JavaScript / TSX / JSX.\n\nФокус:\n- Типобезопасность: отсутствие `any` без обоснования, корректные типы возвращаемых значений, строгие union-типы вместо enum там, где уместно.\n- Обработка ошибок и асинхронность: await внутри try/catch, отсутствие плавающих promise (unhandled rejection), корректное использование Promise.all/allSettled.\n- Реакт-специфика: хуки без неиспользуемых deps в useEffect/useMemo/useCallback, отсутствие side-effect'ов в render, корректные key в списках, иммутабельное обновление state.\n- DRY как знание, а не код: одинаковый код может моделировать разные домены — не объединяй через абстракцию, пока не появится 3 случая и общая причина менять вместе.\n- Чистые функции где уместно, иммутабельность, отсутствие магических чисел/строк."
+      "rule": "Language: TypeScript / JavaScript / TSX / JSX.\n\nFocus:\n- Type safety: no `any` without justification, correct return types, strict union types instead of enums where appropriate.\n- Error handling and async: await inside try/catch, no floating promises (unhandled rejections), correct use of Promise.all/allSettled.\n- React specifics: hooks without unused deps in useEffect/useMemo/useCallback, no side effects in render, correct keys in lists, immutable state updates.\n- DRY as knowledge, not code: identical code may model different domains — do not merge via an abstraction until there are 3 cases and a shared reason to change together.\n- Pure functions where appropriate, immutability, no magic numbers/strings."
     },
     {
       "path": "**/*.rs",
-      "rule": "Язык: Rust.\n\nФокус:\n- Ownership/borrowing: корректные lifetimes, отсутствие лишних clone(), предпочтение заимствованных ссылок.\n- Обработка ошибок: Result/Option вместо unwrap()/expect() в не-тестовом коде, контекст ошибок через thiserror/anyhow.\n- Async: отсутствие .unwrap() на tokio::spawn, корректное использование Send bounds, отсутствие блокирующих вызовов в async-контексте.\n- Idiomatic Rust: паттерн newtype для доменных типов, derive макросы где уместно, отсутствие C-style кода.\n- Безопасность: unsafe только с обоснованием."
+      "rule": "Language: Rust.\n\nFocus:\n- Ownership/borrowing: correct lifetimes, no redundant clone(), preferring borrowed references.\n- Error handling: Result/Option instead of unwrap()/expect() in non-test code, error context via thiserror/anyhow.\n- Async: no .unwrap() on tokio::spawn, correct Send bounds, no blocking calls in async context.\n- Idiomatic Rust: the newtype pattern for domain types, derive macros where appropriate, no C-style code.\n- Safety: unsafe only with justification."
     },
     {
       "path": "**/*.py",
-      "rule": "Язык: Python.\n\nФокус:\n- Типизация: type hints на всех публичных функциях, Pydantic/dataclasses для моделей, отсутствие dynamic typing в API границах.\n- Асинхронность: async/await без блокирующих вызовов, корректное использование asyncio.gather/create_task.\n- Обработка ошибок: конкретные исключения вместо bare except, logging с структурным контекстом, отсутствие swallowing ошибок.\n- Идиомы: pathlib вместо os.path, f-strings, list/dict comprehensions где читаемо."
+      "rule": "Language: Python.\n\nFocus:\n- Typing: type hints on all public functions, Pydantic/dataclasses for models, no dynamic typing at API boundaries.\n- Async: async/await without blocking calls, correct use of asyncio.gather/create_task.\n- Error handling: specific exceptions instead of bare except, logging with structured context, no error swallowing.\n- Idioms: pathlib instead of os.path, f-strings, list/dict comprehensions where readable."
     },
     {
       "path": "**/*.cs",
-      "rule": "Язык: C#.\n\nФокус:\n- Async/await: отсутствие .Result/.Wait() на Task, ConfigureAwait или отсутствие, CancellationToken пробрасывается.\n- LINQ: читаемость over преждевременная оптимизация, отсутствие side-effect'ов в Select/Where.\n- IDisposable: using/using declarations для ресурсов, корректный паттерн dispose.\n- Безопасность: nullability context, NullReferenceException prevention."
+      "rule": "Language: C#.\n\nFocus:\n- Async/await: no .Result/.Wait() on Tasks, ConfigureAwait presence or absence, CancellationToken propagated.\n- LINQ: readability over premature optimization, no side effects in Select/Where.\n- IDisposable: using/using declarations for resources, the correct dispose pattern.\n- Safety: nullable context, NullReferenceException prevention."
     },
     {
       "path": "**/*mapper*.xml",
-      "rule": "MyBatis mapper XML.\n\nФокус:\n- SQL-инъекции: только #{} (prepared statements), ${} только для идентификаторов таблиц/колонок и только после whitelist-валидации.\n- Параметры: отсутствие пропущенных jdbcType для nullable полей, корректный typeHandler.\n- Структура: закрытые теги, валидный resultMap, отсутствие дублирования SQL."
+      "rule": "MyBatis mapper XML.\n\nFocus:\n- SQL injection: only #{} (prepared statements); ${} only for table/column identifiers and only after whitelist validation.\n- Parameters: no missing jdbcType for nullable fields, a correct typeHandler.\n- Structure: closed tags, a valid resultMap, no SQL duplication."
     },
     {
       "path": "**/{package.json,Cargo.toml,pom.xml,build.gradle}",
-      "rule": "Манифесты зависимостей.\n\nФокус:\n- Версии: явные constraints, отсутствие *. Использование caret/tilde по конвенции экосистемы.\n- Новые зависимости: обоснование в commit message или рядом, проверка лицензии.\n- Скрипты/задачи: отсутствие секретов в скриптах, корректные pre/post hooks."
+      "rule": "Dependency manifests.\n\nFocus:\n- Versions: explicit constraints, no *. Caret/tilde per the ecosystem's convention.\n- New dependencies: justification in the commit message or nearby, a license check.\n- Scripts/tasks: no secrets in scripts, correct pre/post hooks."
     },
     {
       "path": "**/*.{json,json5,jsonc}",
-      "rule": "JSON-конфигурация.\n\nФокус:\n- Валидность схемы, отсутствие trailing comma, корректные типы значений.\n- Секреты: отсутствие захардкоженных токенов/паролей.\n- Консистентность ключей (camelCase/snake_case по конвенции проекта)."
+      "rule": "JSON configuration.\n\nFocus:\n- Schema validity, no trailing commas, correct value types.\n- Secrets: no hardcoded tokens/passwords.\n- Key consistency (camelCase/snake_case per the project's convention)."
     },
     {
       "path": ".github/workflows/**/*.{yaml,yml}",
-      "rule": "GitHub Actions workflow.\n\nФокус:\n- Безопасность: permissions минимальные (readonly по умолчанию), отсутствие pull_request_target в небезопасных шагах, фильтрация secrets по веткам.\n- Версии action: pin по SHA, а не по тегу (например @<sha> вместо @v4).\n- Корректные триггеры, отсутствие бесконечных циклов (workflow_run → commit → workflow_run).\n- Секреты через secrets., отсутствие инъекций через ${{ }} в run-блоках без санитизации."
+      "rule": "GitHub Actions workflow.\n\nFocus:\n- Security: minimal permissions (readonly by default), no pull_request_target in unsafe steps, secrets filtered by branches.\n- Action versions: pinned by SHA, not by tag (e.g. @<sha> instead of @v4).\n- Correct triggers, no infinite loops (workflow_run → commit → workflow_run).\n- Secrets via secrets., no injections via ${{ }} in run blocks without sanitization."
     },
     {
       "path": "**/*.{yaml,yml}",
-      "rule": "YAML-конфигурация.\n\nФокус:\n- Безопасность: отсутствие автовключения якорей и псевдонимов там, где парсер может их разворачивать небезопасно.\n- Читаемость: явные кавычки для строк, похожих на числа/булевы.\n- Секреты: отсутствие захардкоженных значений."
+      "rule": "YAML configuration.\n\nFocus:\n- Security: no auto-inclusion of anchors and aliases where the parser may unfold them unsafely.\n- Readability: explicit quotes for strings that look like numbers/booleans.\n- Secrets: no hardcoded values."
     },
     {
       "path": "**/*.{md,mdx}",
-      "rule": "Markdown-документация.\n\nФокус:\n- Актуальность относительно кода (если документирует API/поведение — проверить соответствие).\n- Структура: заголовки без пропусков уровней, корректные ссылки (не 404 на внутренние файлы).\n- Примеры кода: компилируемые/исполняемые, отсутствие устаревших API."
+      "rule": "Markdown documentation.\n\nFocus:\n- Freshness relative to the code (if it documents an API/behavior — check conformance).\n- Structure: headings without skipped levels, correct links (no 404s to internal files).\n- Code examples: compilable/executable, no outdated APIs."
     },
     {
       "path": "**/*.{sh,bash}",
-      "rule": "Shell-скрипты.\n\nФокус:\n- Безопасность: set -euo pipefail, quoting переменных \"$VAR\", отсутствие eval без необходимости.\n- Переносимость: #!/usr/bin/env bash вместо #!/bin/bash, отсутствие bashism'ов если скрипт sh.\n- Обработка ошибок: проверка exit code критических команд, cleanup через trap."
+      "rule": "Shell scripts.\n\nFocus:\n- Safety: set -euo pipefail, quoting variables \"$VAR\", no eval unless necessary.\n- Portability: #!/usr/bin/env bash instead of #!/bin/bash, no bashisms if the script is sh.\n- Error handling: checking exit codes of critical commands, cleanup via trap."
     }
   ]
 }

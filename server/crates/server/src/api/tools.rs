@@ -40,114 +40,114 @@ pub fn tool_descriptors() -> Value {
     json!([
         tool(
             "task_list",
-            "Строки доски проекта: number, статус, приоритет, тайтл",
-            object(json!({ "project": string("имя проекта; дефолт uwuwu") }))
+            "Project board rows: number, status, priority, title",
+            object(json!({ "project": string("project name; default uwuwu") }))
         ),
         tool(
             "task_get",
-            "Карточка задачи целиком: fm-поля, тело issue, последние комменты",
-            object(json!({ "number": integer("номер задачи (row-id)"),
-                         "project": string("проект; дефолт uwuwu") }))
+            "Full task card: fm fields, issue body, latest comments",
+            object(json!({ "number": integer("task number (row-id)"),
+                         "project": string("project; default uwuwu") }))
         ),
         tool(
             "docs_ls",
-            "Список .md-доков вики под префиксом (слаги без docs/ и .md); при file/dir-коллизии строка = «X (неоднозначно: файл … + папка …)» — слаг для docs_read до « (неоднозначно»",
-            object(json!({ "path": string("префикс: проект/папка; пусто — вся вики") }))
+            "List wiki .md docs under prefix (slugs without docs/ and .md); on file/dir collision the row reads «X (ambiguous: file … + folder …)» — slug for docs_read up to « (ambiguous»",
+            object(json!({ "path": string("prefix: project/folder; empty — whole wiki") }))
         ),
         tool(
             "docs_read",
-            "Markdown дока по слагу (без docs/ и .md)",
-            object(json!({ "slug": string("слаг: Projects/uwuwu/README, Experience/...") }))
+            "Doc markdown by slug (without docs/ and .md)",
+            object(json!({ "slug": string("slug: Projects/uwuwu/README, Experience/...") }))
         ),
         tool(
             "person_show",
-            "Персона владельца (язык/стиль/граны) — читают агенты в начале работы",
+            "Owner persona (language/style/grains) — agents read it at the start of work",
             object(json!({}))
         ),
         tool(
             "goal_list",
-            "Реестр долгосрочных целей проекта: open milestones hub-репо (тайтл с префиксом [проект]) — читай перед работой над задачей; работа вразрез с открытой целью — флаг владельцу",
-            object(json!({ "project": string("имя проекта; дефолт uwuwu") }))
+            "Project long-term goal registry: open hub-repo milestones (the title prefixed with [project]) — read before working on a task; work against an open goal is flagged to the owner",
+            object(json!({ "project": string("project name; default uwuwu") }))
         ),
         tool(
             "projects",
-            "Проекты конвейера (доски в конфиге сервера)",
+            "Pipeline projects (boards in the server config)",
             object(json!({}))
         ),
         tool(
             "task_create",
-            "Создать задачу на доске проекта (Analys; тайтл уникален; direct — сразу In Progress)",
+            "Create a task on the project board (Analys; title unique; direct — straight to In Progress)",
             object(json!({
-                "title": string("тайтл (уникален на доске)"),
-                "project": string("проект; дефолт uwuwu"),
-                "body": string("markdown-тело (Постановка…)"),
+                "title": string("title (unique on the board)"),
+                "project": string("project; default uwuwu"),
+                "body": string("markdown body (problem statement…)"),
                 "type": string("bug|spike|docs|other|feature|refactoring|legacy|qa|infrastructure"),
-                "priority": string("high|medium|low; дефолт medium"),
-                "automerge": json!({"type":"boolean","description":"автомерж: мерж PR при входе в Review, строка остаётся в Review; дефолт true (у direct — false)"}),
-                "direct": json!({"type":"boolean","description":"direct-задача (#1357): строка сразу In Progress, агент сам финализирует в Review мимо фабричных стадий. Только по прямому поручению владельца — дословная цитата поручения в теле; дефолт false"})
+                "priority": string("high|medium|low; default medium"),
+                "automerge": json!({"type":"boolean","description":"automerge: merge the PR on entering Review, the row stays in Review; default true (direct — false)"}),
+                "direct": json!({"type":"boolean","description":"direct task (#1357): row goes straight to In Progress, the agent finalizes to Review itself bypassing factory stages. Only on the owner's direct order — verbatim quote of the order in the body; default false"})
             }))
         ),
         tool(
             "task_edit",
-            "Правка ячеек задачи: статус/ветка/PR/приоритет/тайтл",
+            "Edit task cells: status/branch/PR/priority/title",
             object(json!({
-                "number": integer("номер задачи"),
-                "project": string("проект; дефолт uwuwu"),
-                "status": string("статус канона: Draft/Analys/Review Analys/Todo/Design/Ревью плана/In Progress/Ревью результата/Тестирование/Ревью тестирования/Review/Needs attention/Вейт"),
-                "branch": string("имя ветки"),
-                "pr": string("URL PR"),
+                "number": integer("task number"),
+                "project": string("project; default uwuwu"),
+                "status": string("canon status: Draft/Analys/Review Analys/Todo/Design/Plan review/In Progress/Result review/Testing/Testing review/Review/Needs attention/Wait"),
+                "branch": string("branch name"),
+                "pr": string("PR URL"),
                 "priority": string("high|medium|low"),
-                "title": string("новый тайтл"),
-                "automerge": json!({"type":"boolean","description":"автомерж on/off (до-пометка старых строк)"})
+                "title": string("new title"),
+                "automerge": json!({"type":"boolean","description":"automerge on/off (back-tagging old rows)"})
             }))
         ),
         tool(
             "task_claim",
-            "Заявить свою сессию в слот dev (фабрика не спавнит дубля)",
+            "Claim your session into the dev slot (the factory will not spawn a duplicate)",
             object(json!({
-                "number": integer("номер задачи"),
-                "project": string("проект; дефолт uwuwu"),
-                "session": string("свой session id (ses_…)")
+                "number": integer("task number"),
+                "project": string("project; default uwuwu"),
+                "session": string("your session id (ses_…)")
             }))
         ),
         tool(
             "task_comment",
-            "Коммент в задачу (вопрос/доклад владельцу; будит агентов)",
+            "Comment on a task (question/report to the owner; wakes agents)",
             object(json!({
-                "number": integer("номер задачи"),
-                "text": string("текст коммента"),
-                "reply_to": string("цитата-якорь для ответа в тред (опционально)")
+                "number": integer("task number"),
+                "text": string("comment text"),
+                "reply_to": string("quote anchor for thread reply (optional)")
             }))
         ),
         tool(
             "task_close",
-            "Закрыть задачу (Done; reason not_planned для отказов)",
+            "Close the task (Done; reason not_planned for rejections)",
             object(json!({
-                "number": integer("номер задачи"),
-                "project": string("проект; дефолт uwuwu"),
-                "not_planned": json!({"type":"boolean","description":"true — отказ/дубль, false — выполнено"})
+                "number": integer("task number"),
+                "project": string("project; default uwuwu"),
+                "not_planned": json!({"type":"boolean","description":"true — rejected/duplicate, false — done"})
             }))
         ),
         tool(
             "task_clean",
-            "Батч-снос строк доски с guard'ом (#1158): dry-run с вердиктами \
-             (Live/Dead/DraftSkeleton/NoRow/Divergent) — дефолт, ноль мутаций; \
-             confirm=true исполняет. Не-Draft строки (Live/Dead) требуют ack \
-             владельца — без него весь батч отклоняется; write-ahead журнал \
-             даёт undo (task_undo)",
+            "Batch board-row cleanup with a guard (#1158): dry-run with verdicts \
+             (Live/Dead/DraftSkeleton/NoRow/Divergent) — default, zero mutations; \
+             confirm=true executes. Non-Draft rows (Live/Dead) require the owner's ack \
+             — without it the whole batch is rejected; a write-ahead journal \
+             provides undo (task_undo)",
             object(json!({
                 "ids": json!({
-                    "description": "номера строк: csv «1,2,3» или массив integers",
+                    "description": "row numbers: csv «1,2,3» or an array of integers",
                     "oneOf": [
                         { "type": "string" },
                         { "type": "array", "items": { "type": "integer" } }
                     ]
                 }),
-                "project": string("проект; дефолт uwuwu"),
-                "confirm": json!({"type":"boolean","description":"false/нет — dry-run (вердикты), true — снос"}),
+                "project": string("project; default uwuwu"),
+                "confirm": json!({"type":"boolean","description":"false/absent — dry-run (verdicts), true — delete"}),
                 "ack": json!({
-                    "description": "номера не-Draft строк (Live/Dead), подтверждённые \
-                                    владельцем: csv или массив integers",
+                    "description": "non-Draft row numbers (Live/Dead) confirmed \
+                                    by the owner: csv or array of integers",
                     "oneOf": [
                         { "type": "string" },
                         { "type": "array", "items": { "type": "integer" } }
@@ -157,100 +157,100 @@ pub fn tool_descriptors() -> Value {
         ),
         tool(
             "task_undo",
-            "Откат сноса строк по undo-журналу (идемпотентно): recreate item + \
-             возврат статуса; без journal — свежий журнал проекта",
+            "Undo row deletion from the undo journal (idempotent): recreate item + \
+             restore status; without journal — the project's latest one",
             object(json!({
-                "project": string("проект; дефолт uwuwu"),
-                "journal": string("id журнала из task_clean; опционально — свежий")
+                "project": string("project; default uwuwu"),
+                "journal": string("journal id from task_clean; optional — latest")
             }))
         ),
         tool(
             "docs_append",
-            "Дописать строку в конец дока вики (журналы кронов, классы опыта; commit ff-only)",
+            "Append a line to the end of a wiki doc (cron journals, experience classes; ff-only commit)",
             object(json!({
-                "slug": string("слаг дока (без docs/ и .md)"),
-                "line": string("строка целиком (markdown)"),
-                "message": string("сообщение коммита; дефолт append")
+                "slug": string("doc slug (without docs/ and .md)"),
+                "line": string("the whole line (markdown)"),
+                "message": string("commit message; default append")
             }))
         ),
         tool(
             "docs_write",
-            "Перезаписать док вики целиком (commit ff-only; для новых статей опыта)",
+            "Overwrite a wiki doc entirely (ff-only commit; for new experience articles)",
             object(json!({
-                "slug": string("слаг дока (без docs/ и .md)"),
-                "content": string("markdown целиком"),
-                "message": string("сообщение коммита; дефолт write")
+                "slug": string("doc slug (without docs/ and .md)"),
+                "content": string("full markdown"),
+                "message": string("commit message; default write")
             }))
         ),
         tool(
             "cron_list",
-            "Инвентарь кронов (мастера /cron/<имя>/README.md: расписание + журнал-хвост)",
+            "Cron inventory (masters /cron/<name>/README.md: schedule + journal tail)",
             object(json!({
-                "project": string("фильтр по проекту (fm project мастера); без него — все кроны")
+                "project": string("filter by project (master fm project); without it — all crons")
             }))
         ),
         tool(
             "search",
-            "Гибридный поиск по вики: полнотекст + семантика (если индекс жив)",
+            "Hybrid wiki search: full-text + semantic (if the index is alive)",
             object(json!({
-                "query": string("поисковый запрос (токены AND + вектор)"),
-                "top": json!({"type":"integer","description":"сколько попаданий на секцию; дефолт 5"})
+                "query": string("search query (AND tokens + vector)"),
+                "top": json!({"type":"integer","description":"hits per section; default 5"})
             }))
         ),
         tool(
             "session_export",
-            "Экспорт сессии опенкода (контент для дримера/аудита)",
+            "Export an opencode session (content for the dreamer/audit)",
             object(json!({
-                "session": string("id сессии (ses_…)")
+                "session": string("session id (ses_…)")
             }))
         ),
         tool(
             "task_body",
-            "Полная замена тела задачи целиком (fm в тело не пишется — поля \
-             нативные; большое тело правь секционно через task_body_section)",
+            "Full replacement of the task body (fm is not written into the body — fields are \
+             native; edit large bodies sectionally via task_body_section)",
             object(json!({
-                "number": integer("номер задачи"),
-                "project": string("проект; дефолт uwuwu"),
-                "body": string("markdown-тело целиком (без fm)")
+                "number": integer("task number"),
+                "project": string("project; default uwuwu"),
+                "body": string("full markdown body (no fm)")
             }))
         ),
         tool(
             "task_body_section",
-            "Секционная правка тела задачи: дельта секции вместо полного body \
-             (большие тела — только этот путь); свежесть — base_hash",
+            "Sectional edit of the task body: a section delta instead of the full body \
+             (large bodies — this path only); freshness — base_hash",
             object(json!({
-                "number": integer("номер задачи"),
-                "project": string("проект; дефолт uwuwu"),
-                "section": string("заголовок секции; ATX-префикс пинит уровень \
-                                  («### X» — h3), bare/«## X» — дефолт h2"),
-                "content": string("новый контент секции без заголовка; пустая \
-                                  строка — очистка секции"),
-                "base_hash": string("body_hash тела на момент чтения (fm-блок \
-                                    task_get или прошлая квитанция); обязателен")
+                "number": integer("task number"),
+                "project": string("project; default uwuwu"),
+                "section": string("section heading; ATX prefix pins the level \
+                                  («### X» — h3), bare/«## X» — default h2"),
+                "content": string("new section content without the heading; empty \
+                                  string — clear the section"),
+                "base_hash": string("body_hash of the body at read time (fm block of \
+                                    task_get or a prior receipt); required")
             }))
         ),
         tool(
             "blob_put",
-            "Положить файл в приватный blob-бакет (Tigris) — вложение к \
-             задаче/доку: ключ + presigned-ссылка (TTL 7 суток; истёкшая \
-             переподписывается blob_get по ключу)",
+            "Put a file into the private blob bucket (Tigris) — an attachment to a \
+             task/doc: key + presigned URL (TTL 7 days; an expired one is \
+             re-signed via blob_get by key)",
             object(json!({
-                "filename": string("имя файла с расширением — content-type \
-                                   берётся из него"),
-                "data_base64": string("содержимое файла base64; лимит 20 MiB"),
-                "number": integer("номер задачи: ключ blobs/<project>/<number>/…; \
-                                  без него — сегмент misc"),
-                "project": string("проект; дефолт uwuwu")
+                "filename": string("file name with extension — content-type \
+                                   is derived from it"),
+                "data_base64": string("file content base64; limit 20 MiB"),
+                "number": integer("task number: key blobs/<project>/<number>/…; \
+                                  without it — misc segment"),
+                "project": string("project; default uwuwu")
             }))
         ),
         tool(
             "blob_get",
-            "Свежая presigned-ссылка на blob по ключу — переподпись истёкшей; \
-             существование объекта не проверяется. Ключи: канон из blob_put \
-             (blobs/…) или legacy assets/… — вложения, перенесённые из репо \
-             hub в бакет (#1365)",
-            object(json!({ "key": string("ключ из blob_put (blobs/…) или \
-                             legacy-ключ перенесённого вложения (assets/<путь>)") }))
+            "Fresh presigned URL for a blob by key — re-signs an expired one; \
+             object existence is not checked. Keys: the blob_put canon \
+             (blobs/…) or a legacy assets/… key — attachments migrated from the \
+             hub repo into the bucket (#1365)",
+            object(json!({ "key": string("key from blob_put (blobs/…) or \
+                             a legacy key of a migrated attachment (assets/<path>)") }))
         ),
     ])
 }
@@ -332,7 +332,7 @@ impl ToolHub {
         );
         out.push_str(&view.body);
         if !view.comments.is_empty() {
-            out.push_str("\n\n--- комменты (последние) ---\n");
+            out.push_str("\n\n--- comments (latest) ---\n");
             for c in &view.comments {
                 out.push_str(&format!(
                     "---\n{}\n{}\n",
@@ -387,10 +387,10 @@ impl ToolHub {
         // честность ответа (#1353): append к существующему vs создание —
         // разрушительный класс бага видно по ответу, а не только коммит-статом
         let fact = if outcome.created {
-            format!("создан «{slug}»: файла не было, записана строка")
+            format!("created «{slug}»: the file did not exist, one line written")
         } else {
             format!(
-                "дописано в «{slug}» — append к существующему, строк в доке: {}",
+                "appended to «{slug}» — append to an existing doc, lines in the doc: {}",
                 outcome.lines
             )
         };
@@ -405,7 +405,7 @@ impl ToolHub {
             .write_doc(&slug, &arg_str(args, "content"), &message)
             .await
             .map_err(|e| e.to_string())?;
-        ok_text(format!("док «{slug}» записан"))
+        ok_text(format!("doc «{slug}» written"))
     }
 
     async fn cron_list(&self, args: &Value) -> Result<Value, String> {
@@ -431,8 +431,8 @@ impl ToolHub {
             .collect::<String>();
         ok_text(if out.is_empty() {
             match filter {
-                Some(p) => format!("кроны проекта {p} не найдены"),
-                None => "кроны не найдены".to_string(),
+                Some(p) => format!("no crons for project {p}"),
+                None => "no crons found".to_string(),
             }
         } else {
             out
@@ -442,7 +442,7 @@ impl ToolHub {
     async fn search(&self, args: &Value) -> Result<Value, String> {
         let query = arg_str(args, "query");
         if query.is_empty() {
-            return Err("query обязателен".into());
+            return Err("query is required".into());
         }
         let top = args.get("top").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
         let hits = self
@@ -461,7 +461,7 @@ impl ToolHub {
     async fn session_export(&self, args: &Value) -> Result<Value, String> {
         let session = arg_str(args, "session");
         if !session.starts_with("ses_") {
-            return Err("session обязан быть ses_…".into());
+            return Err("session must be ses_…".into());
         }
         let export = self
             .sessions
@@ -475,7 +475,7 @@ impl ToolHub {
         let raw_kind = arg_str(args, "type");
         if !raw_kind.is_empty() && uwuwu_usecase::parse_task_type(&raw_kind).is_none() {
             return Err(format!(
-                "неизвестный тип «{raw_kind}»: bug|spike|docs|feature|refactoring|legacy|qa|infrastructure|other"
+                "unknown type «{raw_kind}»: bug|spike|docs|feature|refactoring|legacy|qa|infrastructure|other"
             ));
         }
         let direct = args
@@ -493,7 +493,7 @@ impl ToolHub {
             Some(v) if v.is_boolean() => v.as_bool().unwrap_or(true),
             Some(v) if !v.is_null() => {
                 return Err(format!(
-                    "automerge: жду boolean, пришло {v} — on-мандат не интерпретируется молча"
+                    "automerge: expecting boolean, got {v} — an on-mandate is never interpreted silently"
                 ));
             }
             _ => !direct,
@@ -512,9 +512,9 @@ impl ToolHub {
             .await
             .map_err(|e| e.to_string())?;
         ok_text(if direct {
-            format!("создана direct-задача #{n} (In Progress) на доске проекта {project}")
+            format!("direct task #{n} created (In Progress) on the {project} board")
         } else {
-            format!("создана задача #{n} (Analys) на доске проекта {project}")
+            format!("task #{n} created (Analys) on the {project} board")
         })
     }
 
@@ -529,13 +529,13 @@ impl ToolHub {
             automerge: args.get("automerge").and_then(|v| v.as_bool()),
         };
         if patch.is_empty() {
-            return Err("пустой патч: укажи хотя бы одно поле".into());
+            return Err("empty patch: set at least one field".into());
         }
         self.writer
             .edit(project, number, patch)
             .await
             .map_err(|e| e.to_string())?;
-        ok_text(format!("задача #{number} обновлена"))
+        ok_text(format!("task #{number} updated"))
     }
 
     async fn task_claim(&self, args: &Value) -> Result<Value, String> {
@@ -543,13 +543,13 @@ impl ToolHub {
         let session = arg_str(args, "session");
         // валидация — в домене (SessionRef): мусорный id не заявка
         if uwuwu_domain::SessionRef::parse(&session).is_none() {
-            return Err("session обязан быть ses_… (валидный id опенкода)".into());
+            return Err("session must be ses_… (a valid opencode id)".into());
         }
         self.writer
             .claim(number, &session, None)
             .await
             .map_err(|e| e.to_string())?;
-        ok_text(format!("задача #{number}: дев-слот заявлен за {session}"))
+        ok_text(format!("task #{number}: dev slot claimed by {session}"))
     }
 
     async fn task_comment(&self, args: &Value) -> Result<Value, String> {
@@ -560,7 +560,7 @@ impl ToolHub {
             .comment(number, &text, reply.as_deref())
             .await
             .map_err(|e| e.to_string())?;
-        ok_text(format!("коммент отправлен в #{number}"))
+        ok_text(format!("comment posted to #{number}"))
     }
 
     async fn task_close(&self, args: &Value) -> Result<Value, String> {
@@ -573,7 +573,7 @@ impl ToolHub {
             .close(number, np)
             .await
             .map_err(|e| e.to_string())?;
-        ok_text(format!("задача #{number} закрыта"))
+        ok_text(format!("task #{number} closed"))
     }
 
     async fn task_clean(&self, project: &str, args: &Value) -> Result<Value, String> {
@@ -617,7 +617,7 @@ impl ToolHub {
         let number = need_number(args)?;
         let body = arg_str(args, "body");
         if body.trim().is_empty() {
-            return Err("пустое тело".into());
+            return Err("empty body".into());
         }
         let receipt = self
             .writer
@@ -625,7 +625,7 @@ impl ToolHub {
             .await
             .map_err(|e| e.to_string())?;
         let mut msg = format!(
-            "тело #{number} заменено; {} байт; body_hash: {}",
+            "body of #{number} replaced; {} bytes; body_hash: {}",
             receipt.body_size, receipt.body_hash
         );
         if !receipt.verified {
@@ -640,10 +640,10 @@ impl ToolHub {
         let content = arg_str(args, "content");
         let base_hash = arg_str(args, "base_hash");
         if section.trim().is_empty() {
-            return Err("section обязателен (заголовок секции)".into());
+            return Err("section is required (the section heading)".into());
         }
         if base_hash.trim().is_empty() {
-            return Err("base_hash обязателен (body_hash из fm task_get)".into());
+            return Err("base_hash is required (body_hash from the fm of task_get)".into());
         }
         let report = self
             .writer
@@ -659,7 +659,7 @@ impl ToolHub {
         let data_base64 = arg_str(args, "data_base64");
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(data_base64.trim())
-            .map_err(|e| format!("data_base64 не декодируется: {e}"))?;
+            .map_err(|e| format!("data_base64 does not decode: {e}"))?;
         let number = optional_number(args)?;
         let target = BlobPlace {
             project: project.to_string(),
@@ -672,7 +672,7 @@ impl ToolHub {
             .await
             .map_err(|e| e.to_string())?;
         ok_text(format!(
-            "ключ: {}\nссылка (TTL 7 суток): {}\n{}; {} байт",
+            "key: {}\nURL (TTL 7 days): {}\n{}; {} bytes",
             receipt.key, receipt.url, receipt.content_type, receipt.size
         ))
     }
@@ -680,16 +680,16 @@ impl ToolHub {
     async fn blob_get(&self, args: &Value) -> Result<Value, String> {
         let raw = arg_str(args, "key");
         if raw.trim().is_empty() {
-            return Err("key обязателен".into());
+            return Err("key is required".into());
         }
         let key = uwuwu_domain::BlobKey::parse_read(raw.trim()).ok_or(
-            "ключ должен иметь форму blobs/<project>/<task|misc>/<sha8>-<имя> \
-             или assets/<путь перенесённого вложения>",
+            "key must look like blobs/<project>/<task|misc>/<sha8>-<name> \
+             or assets/<path of a migrated attachment>",
         )?;
         let url = self.blobs.fresh_url(&key).map_err(|e| e.to_string())?;
         ok_text(format!(
-            "ссылка (TTL 7 суток): {url}\n(существование объекта не проверяется — \
-             подпись локальна; замену ссылки в носителе делай текстовыми тулами)"
+            "URL (TTL 7 days): {url}\n(object existence is not checked — \
+             the signature is local; replace the URL in the carrier with text tools)"
         ))
     }
 }
@@ -712,7 +712,7 @@ fn require_args(args: &Value, keys: &[&str]) -> Result<(), String> {
     if all_filled {
         return Ok(());
     }
-    Err(format!("{} обязательны", keys.join(" и ")))
+    Err(format!("{} are required", keys.join(" and ")))
 }
 
 /// message из аргументов или дефолт (например, «append: слаг»).
@@ -738,7 +738,7 @@ fn need_number(args: &Value) -> Result<u64, String> {
             v.as_u64()
                 .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
         })
-        .ok_or("number обязателен (число)".to_string())
+        .ok_or("number is required (an integer)".to_string())
 }
 
 /// Опциональный number: отсутствует/null → None, мусор — громкий отказ.
@@ -749,7 +749,7 @@ fn optional_number(args: &Value) -> Result<Option<u64>, String> {
             .as_u64()
             .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
             .map(Some)
-            .ok_or("number обязан быть числом".to_string()),
+            .ok_or("number must be an integer".to_string()),
     }
 }
 
@@ -759,7 +759,7 @@ fn optional_number(args: &Value) -> Result<Option<u64>, String> {
 /// пропуск: батч не сужается молча, ревью #1158 Low-1).
 fn arg_numbers(args: &Value, key: &str) -> Result<Vec<u64>, String> {
     let raw: Vec<Value> = match args.get(key) {
-        None | Some(Value::Null) => return Err(format!("{key} обязателен (номера строк)")),
+        None | Some(Value::Null) => return Err(format!("{key} is required (row numbers)")),
         Some(Value::Array(items)) => items.clone(),
         Some(Value::String(csv)) => csv
             .split(',')
@@ -767,7 +767,7 @@ fn arg_numbers(args: &Value, key: &str) -> Result<Vec<u64>, String> {
             .collect(),
         Some(other) => {
             return Err(format!(
-                "{key}: массив integers или csv-строка «1,2,3», получено: {other}"
+                "{key}: an array of integers or a csv string «1,2,3», got: {other}"
             ))
         }
     };
@@ -775,7 +775,9 @@ fn arg_numbers(args: &Value, key: &str) -> Result<Vec<u64>, String> {
         .map(|v| {
             v.as_u64()
                 .or_else(|| v.as_str().map(str::trim).and_then(|s| s.parse().ok()))
-                .ok_or(format!("{key}: мусорный токен «{v}» — жду номер строки"))
+                .ok_or(format!(
+                    "{key}: garbage token «{v}» — expecting a row number"
+                ))
         })
         .collect()
 }
@@ -786,15 +788,18 @@ fn arg_numbers(args: &Value, key: &str) -> Result<Vec<u64>, String> {
 fn render_section_report(section: &str, report: &uwuwu_usecase::SectionEditReport) -> String {
     use uwuwu_usecase::SectionAction;
     let mut verdict = match (report.action, report.cleared) {
-        (SectionAction::Replaced, true) => format!("секция «{section}» очищена"),
-        (SectionAction::Replaced, false) => format!("секция «{section}» заменена"),
-        (SectionAction::Appended, _) => format!("секция «{section}» добавлена в конец"),
+        (SectionAction::Replaced, true) => format!("section «{section}» cleared"),
+        (SectionAction::Replaced, false) => format!("section «{section}» replaced"),
+        (SectionAction::Appended, _) => format!("section «{section}» appended at the end"),
     };
     if report.duplicates_removed > 0 {
-        verdict.push_str(&format!(" (дублей снят ×{})", report.duplicates_removed));
+        verdict.push_str(&format!(
+            " (×{} duplicates removed)",
+            report.duplicates_removed
+        ));
     }
     format!(
-        "{verdict}; тело {} байт; body_hash: {}{}",
+        "{verdict}; body {} bytes; body_hash: {}{}",
         report.body_size,
         report.body_hash,
         if report.verified {
@@ -809,8 +814,8 @@ fn render_section_report(section: &str, report: &uwuwu_usecase::SectionEditRepor
 /// не состоялось — hash/размер от отправленного, ретрай мутации запрещён.
 /// Единая точка текста для task_body и секционного отчёта.
 fn delivery_unverified_marker() -> &'static str {
-    "; ⚠ доставка не подтверждена контрольным чтением (носитель не прочитан) — \
-     ретрай мутации запрещён, сверь task_get"
+    "; ⚠ delivery not confirmed by a control read (carrier not read) — \
+     retrying the mutation is forbidden, verify via task_get"
 }
 
 fn ok_text(text: String) -> Result<Value, String> {
@@ -832,28 +837,28 @@ fn iso_utc_stamp(ms: u64) -> String {
 /// Dry-run чистки: вердикты и подсказки, ноль мутаций.
 fn render_clean_plan(reports: &[uwuwu_usecase::CleanRowReport]) -> String {
     use uwuwu_usecase::CleanVerdict;
-    let mut out = String::from("dry-run чистки (мутаций нет):\n");
+    let mut out = String::from("cleanup dry-run (no mutations):\n");
     for r in reports {
         match r.verdict {
             CleanVerdict::NoRow => out.push_str(&format!(
-                "  #{:>6}  NoRow          — строки нет\n",
+                "  #{:>6}  NoRow          — no such row\n",
                 r.number
             )),
             CleanVerdict::Divergent => out.push_str(&format!(
-                "  #{:>6}  Divergent      — {}; батч не исполняется\n",
+                "  #{:>6}  Divergent      — {}; batch not executed\n",
                 r.number,
-                r.note.as_deref().unwrap_or("проба не состоялась")
+                r.note.as_deref().unwrap_or("probe did not complete")
             )),
             CleanVerdict::Live => out.push_str(&format!(
-                "  #{:>6}  Live           «{}» — защищена (не-Draft: нужен ack владельца)\n",
+                "  #{:>6}  Live           «{}» — protected (non-Draft: owner's ack required)\n",
                 r.number, r.title
             )),
             CleanVerdict::Dead => out.push_str(&format!(
-                "  #{:>6}  Dead           «{}» — терминальная (снос с ack владельца)\n",
+                "  #{:>6}  Dead           «{}» — terminal (delete with owner's ack)\n",
                 r.number, r.title
             )),
             CleanVerdict::DraftSkeleton => out.push_str(&format!(
-                "  #{:>6}  DraftSkeleton  «{}» — пустышка, снос с confirm\n",
+                "  #{:>6}  DraftSkeleton  «{}» — empty stub, delete with confirm\n",
                 r.number, r.title
             )),
         }
@@ -865,7 +870,7 @@ fn render_clean_plan(reports: &[uwuwu_usecase::CleanRowReport]) -> String {
         .collect();
     if !live_or_dead.is_empty() {
         out.push_str(&format!(
-            "\nне-Draft строки ({}): подтверждение владельца — номерами в ack (confirm=true исполняет снос)\n",
+            "\nnon-Draft rows ({}): owner's confirmation — numbers into ack (confirm=true executes the deletion)\n",
             live_or_dead.join(", ")
         ));
     } else if reports
@@ -873,7 +878,7 @@ fn render_clean_plan(reports: &[uwuwu_usecase::CleanRowReport]) -> String {
         .any(|r| r.verdict == CleanVerdict::DraftSkeleton)
     {
         out.push_str(
-            "\nDraft-пустышки: confirm=true снесёт их (журнал undo пишется автоматически)\n",
+            "\nDraft stubs: confirm=true will delete them (the undo journal is written automatically)\n",
         );
     }
     out
@@ -883,10 +888,10 @@ fn render_clean_plan(reports: &[uwuwu_usecase::CleanRowReport]) -> String {
 fn render_clean_exec(project: &str, report: &uwuwu_usecase::CleanExecReport) -> String {
     let mut out = String::new();
     if report.deleted.is_empty() {
-        out.push_str("сносить нечего (журнал не пишется):\n");
+        out.push_str("nothing to delete (no journal written):\n");
     } else {
         out.push_str(&format!(
-            "снесено {} строк; журнал undo: {} (откат — task_undo {{project: \"{project}\", journal: \"{}\"}})\n",
+            "deleted {} rows; undo journal: {} (rollback — task_undo {{project: \"{project}\", journal: \"{}\"}})\n",
             report.deleted.len(),
             report.journal_id,
             report.journal_id
@@ -894,7 +899,7 @@ fn render_clean_exec(project: &str, report: &uwuwu_usecase::CleanExecReport) -> 
     }
     for r in &report.deleted {
         out.push_str(&format!(
-            "  #{:>6}  {}  «{}» — снесена (item {})\n",
+            "  #{:>6}  {}  «{}» — deleted (item {})\n",
             r.number,
             r.verdict.label(),
             r.title,
@@ -903,7 +908,7 @@ fn render_clean_exec(project: &str, report: &uwuwu_usecase::CleanExecReport) -> 
     }
     for r in &report.skipped {
         out.push_str(&format!(
-            "  #{:>6}  {}  — пропущена (строки нет)\n",
+            "  #{:>6}  {}  — skipped (no such row)\n",
             r.number,
             r.verdict.label()
         ));
@@ -914,18 +919,18 @@ fn render_clean_exec(project: &str, report: &uwuwu_usecase::CleanExecReport) -> 
 /// Отчёт undo: карта «строка → исход», идемпотентные skip'и видны.
 fn render_undo(report: &uwuwu_usecase::UndoReport) -> String {
     use uwuwu_usecase::UndoOutcome;
-    let mut out = format!("undo журнала {}:\n", report.journal_id);
+    let mut out = format!("undo of journal {}:\n", report.journal_id);
     for (number, title, outcome) in &report.rows {
         match outcome {
             UndoOutcome::Restored(item_id) => out.push_str(&format!(
-                "  #{number:>6}  «{title}» — восстановлена (item {item_id})\n"
+                "  #{number:>6}  «{title}» — restored (item {item_id})\n"
             )),
             UndoOutcome::AlreadyOnBoard => out.push_str(&format!(
-                "  #{number:>6}  «{title}» — уже на доске (skip)\n"
+                "  #{number:>6}  «{title}» — already on the board (skip)\n"
             )),
-            UndoOutcome::Failed(reason) => out.push_str(&format!(
-                "  #{number:>6}  «{title}» — НЕ удалось: {reason}\n"
-            )),
+            UndoOutcome::Failed(reason) => {
+                out.push_str(&format!("  #{number:>6}  «{title}» — FAILED: {reason}\n"))
+            }
         }
     }
     out

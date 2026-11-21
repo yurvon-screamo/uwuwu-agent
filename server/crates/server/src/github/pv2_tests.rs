@@ -6,6 +6,7 @@ use crate::github::pv2_parse::{
     next_after, parse_field_catalog, parse_item_entry, parse_status_value,
 };
 use serde_json::json;
+use std::collections::HashMap;
 
 /// Живой каталог GET /projectsV2/{n}/fields (проба 18.11): Status —
 /// numeric id, опции — hex-строки, имя опции в name.raw.
@@ -36,6 +37,45 @@ fn field_catalog_matches_live_probe_shape() {
 fn field_catalog_without_status_is_loud() {
     let fields = json!([{ "id": 1, "name": "Title", "data_type": "title" }]);
     assert!(parse_field_catalog(5, &fields, "Задачи uwuwu").is_err());
+}
+
+/// Контракт окна merge→rename (#1383): опции доски легаси-русские,
+/// запись каноном «Plan review» резолвится в существующую опцию — без
+/// создания дублей; канон-опции резолвятся напрямую.
+#[test]
+fn resolve_status_option_accepts_canon_and_legacy() {
+    use crate::github::pv2::resolve_status_option;
+    let legacy_board: HashMap<String, String> = HashMap::from([
+        ("Ревью плана".to_string(), "aaa111".to_string()),
+        ("Ревью результата".to_string(), "bbb222".to_string()),
+        ("Тестирование".to_string(), "ccc333".to_string()),
+        ("Вейт".to_string(), "ddd444".to_string()),
+    ]);
+    assert_eq!(
+        resolve_status_option(&legacy_board, "Plan review").map(String::as_str),
+        Some("aaa111"),
+        "канон в легаси-опцию, дубль не создаётся"
+    );
+    assert_eq!(
+        resolve_status_option(&legacy_board, "Result review").map(String::as_str),
+        Some("bbb222")
+    );
+    assert_eq!(
+        resolve_status_option(&legacy_board, "Тестирование").map(String::as_str),
+        Some("ccc333"),
+        "легаси-имя тоже валидно на входе"
+    );
+    let renamed_board: HashMap<String, String> =
+        HashMap::from([("Plan review".to_string(), "eee555".to_string())]);
+    assert_eq!(
+        resolve_status_option(&renamed_board, "Plan review").map(String::as_str),
+        Some("eee555")
+    );
+    assert_eq!(
+        resolve_status_option(&renamed_board, "Мусор"),
+        None,
+        "неизвестному имени — None, опция не создаётся"
+    );
 }
 
 /// Живой PATCH-ответ (проба): Status single-select — значение в

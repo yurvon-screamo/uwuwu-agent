@@ -33,8 +33,8 @@ pub use error::{UsecaseError, UsecaseResult, ViewError};
 pub use goals::{gist_of, Goal, GoalsRepo, GoalsView};
 pub use naming::{
     agent_name, parse_agent, parse_priority, parse_status, parse_task_type, priority_name,
-    schedule_label, slot_key, status_name, task_type_name, F_AUTOMERGE, F_DIRECT, F_PRIORITY,
-    TASK_TYPES,
+    schedule_label, slot_key, status_name, status_names, task_type_name, F_AUTOMERGE, F_DIRECT,
+    F_PRIORITY, TASK_TYPES,
 };
 pub use pipeline::sweeper;
 pub use pipeline::{
@@ -42,7 +42,8 @@ pub use pipeline::{
     executor::EXECUTOR_UNAVAILABLE_THRESHOLD, executor::EXECUTOR_UNAVAILABLE_WINDOW_MS,
     incident::IncidentLoudness, incident::INCIDENT_COOLDOWN_MS, incident::INCIDENT_THRESHOLD,
     incident::INCIDENT_WINDOW_MS, AnalystBoard, AnalystReviewUseCase, AnalystUseCase, BoardPlan,
-    DreamerUseCase, Mode, TickOutcome, TickPlan, TickUseCase,
+    DreamerUseCase, Mode, TickOutcome, TickPlan, TickUseCase, ANALYST_REVIEW_WAVE_MARKER,
+    ANALYST_WAVE_MARKER, STAGE_PROMPTS,
 };
 pub use ports::{
     AgentSessionGateway, AppendDocOutcome, AssistantReply, Clock, CommentRef, DreamerMark,

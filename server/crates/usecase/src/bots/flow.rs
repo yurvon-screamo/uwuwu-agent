@@ -46,8 +46,8 @@ pub fn classify_message(msg: &TgMessage, owner: Option<&str>) -> Option<Incoming
 /// инструкции в истории сессии).
 pub fn build_prompt(manual: &str, text: &str) -> String {
     format!(
-        "Методичка бота — единственная действующая версия, прежние инструкции \
-         в истории устарели.\n\n## Методичка\n\n{manual}\n\n## Сообщение пользователя\n\n{text}"
+        "The bot manual is the only valid version; earlier instructions \
+         in the session history are stale.\n\n## Manual\n\n{manual}\n\n## User message\n\n{text}"
     )
 }
 
@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn prompt_carries_manual_prefix() {
         let p = build_prompt("создавай Draft", "заявка");
-        assert!(p.starts_with("Методичка бота"));
+        assert!(p.starts_with("The bot manual is the only valid version"));
         assert!(p.contains("создавай Draft"));
         assert!(p.ends_with("заявка"));
     }

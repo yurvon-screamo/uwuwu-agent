@@ -5,7 +5,7 @@ description: Apply these rules when writing Playwright tests in TypeScript - E2E
 
 # Playwright Testing Standards
 
-> TypeScript-базу (strict mode, async, ESLint) — в `engineer-typescript`. Общие правила (размеры, комментарии) — в `rules-clean-code`. Здесь только Playwright-специфика.
+> The TypeScript base (strict mode, async, ESLint) — in `engineer-typescript`. General rules (sizes, comments) — in `rules-clean-code`. Only Playwright specifics here.
 
 ## Test Structure and Performance
 

@@ -574,9 +574,9 @@ impl TickUseCase {
                                 .post_comment(
                                     task.number(),
                                     &format!(
-                                        "⚠︎ Спавн-петля: слот `{}` спавнился >2 раз без \
-                                         прогресса статуса ({:?}). Строка переведена в \
-                                         Needs attention — разбор владельца.",
+                                        "⚠︎ Spawn loop: the `{}` slot spawned >2 times without \
+                                         status progress ({:?}). The row moved to \
+                                         Needs attention — owner's triage.",
                                         naming::slot_key(slot),
                                         task.status()
                                     ),
@@ -1021,10 +1021,10 @@ impl TickUseCase {
                     return false;
                 }
                 let digest = format!(
-                    "⚠︎ Кап ревью-раундов: {next}-й подряд request_changes без approve \
-                     (порог {REVIEW_ROUND_CAP}) — раунд {} не назначается, строка в \
-                     Needs attention, разбор владельца. Находки и вердикты — в треде \
-                     выше; последняя ревью-сессия: {last}.",
+                    "⚠︎ Review-round cap: the {next}th request_changes in a row without an approve \
+                     (the {REVIEW_ROUND_CAP} threshold) — round {} is not assigned, the row is in \
+                     Needs attention, owner's triage. The findings and verdicts — in the thread \
+                     above; the last review session: {last}.",
                     next + 1
                 );
                 if let Err(e) = self.board.post_comment(task.number(), &digest).await {
@@ -1258,10 +1258,10 @@ impl TickUseCase {
             .post_comment(
                 task.number(),
                 &format!(
-                    "⚠︎ Сталл-детект: stage-сессия `{}` молчит {} мин при живой \
-                     сессии — агент не завершает статусную транзакцию (проба \
-                     исполнителя: жива; автопингов в раунде: {count}). Строка в \
-                     Needs attention, разбор владельца.",
+                    "⚠︎ Stall detect: the `{}` stage session has been silent for {} min \
+                     with the session alive — the agent is not completing the status \
+                     transaction (executor probe: alive; auto-pings in the round: {count}). \
+                     The row is in Needs attention, owner's triage.",
                     naming::slot_key(slot),
                     silence / 60_000
                 ),
@@ -1294,10 +1294,10 @@ impl TickUseCase {
             gw.prompt(
                 session,
                 &format!(
-                    "⏰ Мягкий пинг: ход завершён, статусный перевод не выполнен — \
-                     строка #{} стоит. Заверши транзакцию по контракту хода: \
-                     uwuwu_task_edit {{number: {}, status: <следующая стадия>}} \
-                     или вопрос владельцу комментом + Needs attention.",
+                    "⏰ Soft ping: the turn has finished without the status transition — \
+                     row #{} is stalled. Close the transaction per the turn contract: \
+                     uwuwu_task_edit {{number: {}, status: <next stage>}} \
+                     or ask the owner in a comment + Needs attention.",
                     task.number(),
                     task.number()
                 ),
@@ -1324,10 +1324,10 @@ impl TickUseCase {
             .post_comment(
                 task.number(),
                 &format!(
-                    "⏰ Автопинг сталл-детекта: сессия стадии `{}` молчит {} мин при статусе \
-                     {:?} — ход, похоже, завершён без перевода статуса. Заверши транзакцию: \
-                     переведи статус по канону пайпа (или продолжай работу и доведи её до \
-                     статусного перевода).",
+                    "⏰ Stall auto-ping: the `{}` stage session has been silent for {} min at status \
+                     {:?} — the turn seems to have finished without the status transition. Close \
+                     the transaction: set the status per the pipeline canon (or keep working \
+                     until the status transition is done).",
                     naming::slot_key(slot),
                     silence / 60_000,
                     task.status()

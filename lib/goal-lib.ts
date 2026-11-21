@@ -62,17 +62,17 @@ export function renderTranscript(
 /** Промпт судьи: цель + транскрипт + требование доказательств. */
 export function judgePrompt(goal: string, transcript: string): string {
   return [
-    "Ты — строгий судья достижения цели. Проверь цель по ФАКТАМ: файлы, коммиты, выводы команд (используй инструменты чтения). Пересказу агента не верь — проверяй. Слабые или косвенные улики считай недостаточными. Пользователь ушёл — агент действует автономно. Если цель включает код — убедись, что проведён код-ревью плана и изменений.",
+    "You are a strict judge of goal achievement. Verify the goal against FACTS: files, commits, command outputs (use reading tools). Do not trust the agent's retelling — check. Weak or circumstantial evidence counts as insufficient. The user has left — the agent acts autonomously. If the goal includes code — make sure the code review of the plan and the changes has been done.",
     "",
-    `ЦЕЛЬ: ${goal}`,
+    `GOAL: ${goal}`,
     "",
-    "ПЕРЕПИСКА С МОМЕНТА ПОСТАНОВКИ ЦЕЛИ (USER — пользователь, AGENT — агент):",
-    transcript || "(пусто)",
+    "THE TRANSCRIPT FROM THE MOMENT THE GOAL WAS SET (USER — the user, AGENT — the agent):",
+    transcript || "(empty)",
     "",
-    "Ответь СТРОГО одной строкой, первый токен — вердикт:",
-    "GOAL_DONE: <чем подтверждается достижение>",
-    "GOAL_NOT_DONE: <конкретно что не сделано>",
-    "GOAL_IMPOSSIBLE: <почему цель недостижима>",
+    "Reply STRICTLY in one line, the first token — the verdict:",
+    "GOAL_DONE: <what confirms the achievement>",
+    "GOAL_NOT_DONE: <specifically what is not done>",
+    "GOAL_IMPOSSIBLE: <why the goal is unachievable>",
   ].join("\n")
 }
 

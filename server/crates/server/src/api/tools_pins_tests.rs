@@ -35,7 +35,7 @@ async fn call(tools: &ToolHub, name: &str, args: Value) -> Result<String, String
 async fn search_without_query_keeps_master_error_text() {
     let tools = hub();
     let err = call(&tools, "search", json!({})).await.expect_err("отказ");
-    assert_eq!(err, "query обязателен");
+    assert_eq!(err, "query is required");
 }
 
 #[tokio::test]
@@ -44,7 +44,7 @@ async fn docs_append_requires_slug_and_line() {
     let err = call(&tools, "docs_append", json!({}))
         .await
         .expect_err("отказ");
-    assert_eq!(err, "slug и line обязательны");
+    assert_eq!(err, "slug and line are required");
 }
 
 /// Гард append-семантики docs_append (#1353): дописывание сохраняет
@@ -69,7 +69,7 @@ async fn docs_append_keeps_body_of_existing_doc() {
     .await
     .expect("append");
     assert!(
-        answer.contains("дописано") && answer.contains("строк в доке: 2"),
+        answer.contains("appended to") && answer.contains("lines in the doc: 2"),
         "ответ append без факта операции: {answer}"
     );
     let stored = call(&tools, "docs_read", json!({ "slug": slug }))
@@ -90,7 +90,7 @@ async fn docs_append_reports_creation_of_missing_doc() {
     .await
     .expect("append");
     assert!(
-        answer.contains("создан"),
+        answer.contains("created"),
         "создание не названо созданием: {answer}"
     );
 }
@@ -101,7 +101,7 @@ async fn docs_write_requires_slug_and_content() {
     let err = call(&tools, "docs_write", json!({ "slug": "x/y" }))
         .await
         .expect_err("отказ");
-    assert_eq!(err, "slug и content обязательны");
+    assert_eq!(err, "slug and content are required");
 }
 
 /// Гвард пустого патча через диспетчер: TaskPatch::is_empty в домене.
@@ -111,7 +111,7 @@ async fn task_edit_empty_patch_is_loudly_rejected() {
     let err = call(&tools, "task_edit", json!({ "number": 1 }))
         .await
         .expect_err("отказ");
-    assert_eq!(err, "пустой патч: укажи хотя бы одно поле");
+    assert_eq!(err, "empty patch: set at least one field");
 }
 
 #[tokio::test]
@@ -120,7 +120,7 @@ async fn task_get_requires_number() {
     let err = call(&tools, "task_get", json!({}))
         .await
         .expect_err("отказ");
-    assert_eq!(err, "number обязателен (число)");
+    assert_eq!(err, "number is required (an integer)");
 }
 
 /// need_number принимает и число, и строку-число — наблюдаемое удобство.
@@ -135,7 +135,7 @@ async fn task_get_accepts_number_as_string() {
     .await
     .expect("create");
     let number: u64 = created
-        .trim_start_matches("создана задача #")
+        .trim_start_matches("task #")
         .split(' ')
         .next()
         .unwrap()
@@ -162,7 +162,7 @@ async fn task_get_comment_carries_iso_utc_stamp() {
     .await
     .expect("create");
     let number: u64 = created
-        .trim_start_matches("создана задача #")
+        .trim_start_matches("task #")
         .split(' ')
         .next()
         .unwrap()
@@ -179,7 +179,7 @@ async fn task_get_comment_carries_iso_utc_stamp() {
         .await
         .expect("get");
     let block = text
-        .split("--- комменты (последние) ---\n")
+        .split("--- comments (latest) ---\n")
         .nth(1)
         .expect("хвост комментов");
     let stamp = block
@@ -222,7 +222,7 @@ async fn task_create_rejects_unknown_type_with_canonical_list() {
     .expect_err("отказ");
     assert_eq!(
         err,
-        "неизвестный тип «супер»: bug|spike|docs|feature|refactoring|legacy|qa|infrastructure|other"
+        "unknown type «супер»: bug|spike|docs|feature|refactoring|legacy|qa|infrastructure|other"
     );
 }
 
@@ -232,7 +232,7 @@ async fn session_export_requires_ses_prefix() {
     let err = call(&tools, "session_export", json!({ "session": "мусор" }))
         .await
         .expect_err("отказ");
-    assert_eq!(err, "session обязан быть ses_…");
+    assert_eq!(err, "session must be ses_…");
 }
 
 #[tokio::test]
@@ -245,7 +245,10 @@ async fn task_body_section_requires_base_hash() {
     )
     .await
     .expect_err("отказ");
-    assert_eq!(err, "base_hash обязателен (body_hash из fm task_get)");
+    assert_eq!(
+        err,
+        "base_hash is required (body_hash from the fm of task_get)"
+    );
 }
 
 /// Ветка `_` match-таблицы диспетчера: неизвестное имя — громкий отказ.
@@ -270,7 +273,7 @@ async fn create_get_list_roundtrip_reports_analys_receipt() {
     )
     .await
     .expect("create");
-    assert_eq!(created, "создана задача #1 (Analys) на доске проекта uwuwu");
+    assert_eq!(created, "task #1 created (Analys) on the uwuwu board");
     let get = call(&tools, "task_get", json!({ "number": 1 }))
         .await
         .expect("get");

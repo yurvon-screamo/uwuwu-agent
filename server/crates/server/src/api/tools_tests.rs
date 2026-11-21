@@ -67,7 +67,7 @@ async fn create_task(tools: &ToolHub, title: &str, body: &str) -> (u64, String) 
     .await
     .expect("create");
     let number: u64 = text
-        .trim_start_matches("создана задача #")
+        .trim_start_matches("task #")
         .split(' ')
         .next()
         .unwrap()
@@ -96,7 +96,7 @@ async fn section_edit_replaces_h2_and_receipt_carries_fresh_hash() {
     )
     .await
     .expect("section edit");
-    assert!(text.contains("заменена"), "квитанция: {text}");
+    assert!(text.contains("replaced"), "квитанция: {text}");
     assert!(text.contains("body_hash: "), "хэш в квитанции: {text}");
 
     let stored = memory
@@ -119,7 +119,7 @@ async fn section_edit_replaces_h2_and_receipt_carries_fresh_hash() {
         "хэш квитанции = хэш записанного тела: {text}"
     );
     assert!(
-        text.contains(&format!("{} байт", stored.len())),
+        text.contains(&format!("{} bytes", stored.len())),
         "размер: {text}"
     );
 }
@@ -149,9 +149,9 @@ async fn section_edit_rejects_stale_base_hash_without_write() {
     )
     .await
     .expect_err("freshness-отказ");
-    assert!(err.contains("base_hash мимо"), "отказ по свежести: {err}");
+    assert!(err.contains("stale base_hash"), "отказ по свежести: {err}");
     assert!(
-        err.contains("актуальный body_hash: "),
+        err.contains("current body_hash: "),
         "актуальный хэш в отказе: {err}"
     );
     let stored = memory
@@ -183,7 +183,7 @@ async fn section_edit_appends_missing_h2() {
     .await
     .expect("append");
     assert!(
-        text.contains("добавлена в конец"),
+        text.contains("appended at the end"),
         "квитанция append: {text}"
     );
     let stored = memory
@@ -214,9 +214,9 @@ async fn section_edit_guards_twin_of_other_level() {
     )
     .await
     .expect_err("твин-гард");
-    assert!(err.contains("тёзка на уровне h3"), "гард: {err}");
+    assert!(err.contains("namesake exists at h3"), "гард: {err}");
     assert!(
-        err.contains("пином `### Суть изменений`"),
+        err.contains("pinned `### Суть изменений`"),
         "подсказка пина: {err}"
     );
     let stored = memory
@@ -244,7 +244,7 @@ async fn pinned_h3_edits_report_inner_section_case_1046() {
     )
     .await
     .expect("pin-h3");
-    assert!(text.contains("заменена"), "квитанция: {text}");
+    assert!(text.contains("replaced"), "квитанция: {text}");
     let stored = memory
         .read_issue("Задачи uwuwu", number)
         .await
@@ -282,7 +282,7 @@ async fn clear_of_absent_section_refuses_at_surface() {
     )
     .await
     .expect_err("очищать нечего");
-    assert!(err.contains("очищать нечего"), "{err}");
+    assert!(err.contains("nothing to clear"), "{err}");
     let stored = memory
         .read_issue("Задачи uwuwu", number)
         .await
@@ -310,7 +310,7 @@ async fn task_body_receipt_keeps_leading_hashes() {
     .await
     .expect("full body");
     assert!(text.contains("body_hash: "), "квитанция с хэшем: {text}");
-    assert!(text.contains("байт"), "размер в квитанции: {text}");
+    assert!(text.contains("bytes"), "размер в квитанции: {text}");
     let stored = memory
         .read_issue("Задачи uwuwu", number)
         .await
@@ -446,7 +446,7 @@ async fn section_edit_requires_section_and_base_hash() {
     )
     .await
     .expect_err("base_hash обязателен");
-    assert!(err.contains("base_hash обязателен"), "{err}");
+    assert!(err.contains("base_hash is required"), "{err}");
     let err = call(
         &tools,
         "task_body_section",
@@ -454,7 +454,7 @@ async fn section_edit_requires_section_and_base_hash() {
     )
     .await
     .expect_err("section обязателен");
-    assert!(err.contains("section обязателен"), "{err}");
+    assert!(err.contains("section is required"), "{err}");
 }
 
 #[test]
@@ -503,7 +503,7 @@ async fn task_create_defaults_to_analys() {
     )
     .await
     .expect_err("idea выведен");
-    assert!(err.contains("неизвестный тип"), "{err}");
+    assert!(err.contains("unknown type"), "{err}");
 }
 
 #[tokio::test]
@@ -572,7 +572,7 @@ async fn analysis_pipeline_edges_on_mcp_surface() {
     )
     .await
     .expect_err("In Progress → Todo вне канона");
-    assert!(err.contains("вне канона"), "{err}");
+    assert!(err.contains("outside the pipeline canon"), "{err}");
 }
 
 /// Гейт полноты полей на MCP-поверхности (#1280): выход из Analys с пустым
@@ -603,7 +603,7 @@ async fn analys_exit_gate_on_mcp_surface() {
     )
     .await
     .expect_err("пустой Приоритет не выпускает строку из Analys");
-    assert!(err.contains("Приоритет"), "перечень без Приоритета: {err}");
+    assert!(err.contains("Priority"), "перечень без Приоритета: {err}");
     assert!(
         !err.contains("Automerge"),
         "заполненное поле в перечне: {err}"
@@ -1136,7 +1136,7 @@ async fn mcp_tools_list_serves_canonical_task_types_only() {
     let text = json["result"]["content"][0]["text"]
         .as_str()
         .unwrap_or_default();
-    assert!(text.contains("неизвестный тип"), "{text}");
+    assert!(text.contains("unknown type"), "{text}");
     let list = call(&tools, "task_list", json!({ "project": "uwuwu" }))
         .await
         .expect("list");
@@ -1191,7 +1191,7 @@ async fn mcp_task_edit_schema_lists_canonical_statuses() {
         .unwrap()
         .to_string();
     let list = schema_status
-        .split_once("статус канона:")
+        .split_once("canon status:")
         .map(|(_, rest)| rest)
         .unwrap_or(&schema_status);
     for canonical in [
@@ -1200,14 +1200,14 @@ async fn mcp_task_edit_schema_lists_canonical_statuses() {
         "Review Analys",
         "Todo",
         "Design",
-        "Ревью плана",
+        "Plan review",
         "In Progress",
-        "Ревью результата",
-        "Тестирование",
-        "Ревью тестирования",
+        "Result review",
+        "Testing",
+        "Testing review",
         "Review",
         "Needs attention",
-        "Вейт",
+        "Wait",
     ] {
         assert!(
             list.split('/').any(|s| s.trim() == canonical),
@@ -1271,22 +1271,22 @@ async fn blob_put_returns_key_and_url_get_resigns_by_key() {
     .expect("put ok");
     let key = put
         .lines()
-        .find_map(|l| l.strip_prefix("ключ: "))
-        .expect("ключ в квитанции");
+        .find_map(|l| l.strip_prefix("key: "))
+        .expect("key in the receipt");
     assert!(key.starts_with("blobs/uwuwu/1292/"), "{put}");
     assert!(key.ends_with("скрин от МПНЧ.png"), "имя сохранено: {put}");
-    assert!(put.contains("ссылка (TTL 7 суток): memory://"), "{put}");
+    assert!(put.contains("URL (TTL 7 days): memory://"), "{put}");
     assert!(put.contains("image/png"), "{put}");
 
     let get = call(&tools, "blob_get", json!({ "key": key }))
         .await
         .expect("get ok");
     assert!(
-        get.contains(&format!("ссылка (TTL 7 суток): memory://{key}")),
+        get.contains(&format!("URL (TTL 7 days): memory://{key}")),
         "{get}"
     );
     assert!(
-        get.contains("существование объекта не проверяется"),
+        get.contains("object existence is not checked"),
         "семантика L-1 в ответе: {get}"
     );
 }
@@ -1301,7 +1301,7 @@ async fn blob_put_without_number_goes_to_misc_segment() {
     )
     .await
     .expect("put ok");
-    assert!(put.contains("ключ: blobs/uwuwu/misc/"), "{put}");
+    assert!(put.contains("key: blobs/uwuwu/misc/"), "{put}");
     assert!(put.contains("image/svg+xml"), "{put}");
 }
 
@@ -1366,7 +1366,7 @@ async fn blob_tools_fail_loud_without_env() {
     )
     .await
     .expect_err("громкий отказ");
-    assert!(err.contains("blob не сконфигурирован"), "{err}");
+    assert!(err.contains("blob is not configured"), "{err}");
     assert!(
         err.contains("UWUWU_S3_ENDPOINT") && err.contains("UWUWU_S3_BUCKET"),
         "{err}"
@@ -1393,7 +1393,7 @@ async fn blob_put_over_limit_is_loud_through_dispatcher() {
     .await
     .expect_err("громкий отказ по лимиту");
     assert!(err.contains("blob too big"), "{err}");
-    assert!(err.contains("прецедент UC-06"), "{err}");
+    assert!(err.contains("the UC-06 precedent"), "{err}");
 }
 
 // ===== Батч-снос #1158: поверхность MCP (dry-run/confirm/ack/undo) =====
@@ -1431,7 +1431,7 @@ async fn task_clean_dry_run_verdicts_without_mutations() {
     assert!(out.contains("DraftSkeleton"), "draft-вердикт: {out}");
     assert!(out.contains("Dead"), "dead-вердикт: {out}");
     assert!(out.contains("ack"), "подсказка про ack: {out}");
-    assert!(out.contains("мутаций нет"), "заголовок dry-run: {out}");
+    assert!(out.contains("no mutations"), "заголовок dry-run: {out}");
     let rows = memory.read_board("Задачи uwuwu").await.unwrap();
     assert_eq!(rows.len(), 2, "dry-run — ноль мутаций");
 }
@@ -1463,15 +1463,15 @@ async fn task_clean_execute_deletes_draft_and_undo_restores() {
     let out = call(&tools, "task_clean", json!({ "ids": "1", "confirm": true }))
         .await
         .expect("снос draft");
-    assert!(out.contains("снесено 1 строк"), "{out}");
-    assert!(out.contains("журнал undo: uwuwu-"), "id журнала: {out}");
+    assert!(out.contains("deleted 1 rows"), "{out}");
+    assert!(out.contains("undo journal: uwuwu-"), "journal id: {out}");
     assert!(
         memory.read_board("Задачи uwuwu").await.unwrap().is_empty(),
         "строка покинула доску"
     );
     // undo без journal — свежий журнал проекта
     let out = call(&tools, "task_undo", json!({})).await.expect("undo");
-    assert!(out.contains("восстановлена"), "{out}");
+    assert!(out.contains("restored"), "{out}");
     let rows = memory.read_board("Задачи uwuwu").await.unwrap();
     assert_eq!(rows.len(), 1, "строка вернулась");
     assert_eq!(rows[0].number(), 1, "номер тот же (item пересоздан)");
@@ -1498,7 +1498,7 @@ async fn task_clean_execute_with_ack_takes_live_row() {
     )
     .await
     .expect("ack владельца — снос");
-    assert!(out.contains("снесено 1 строк"), "{out}");
+    assert!(out.contains("deleted 1 rows"), "{out}");
     assert!(
         memory.read_board("Задачи uwuwu").await.unwrap().is_empty(),
         "live-строка снесена по ack"
@@ -1511,16 +1511,16 @@ async fn task_clean_garbage_ids_is_loud() {
     let err = call(&tools, "task_clean", json!({ "ids": "1,два,3" }))
         .await
         .expect_err("мусорный токен — громкий отказ");
-    assert!(err.contains("мусорный"), "{err}");
+    assert!(err.contains("garbage token"), "{err}");
     // null в массиве тоже громкий (ревью #1158 Low-1: батч не сужается молча)
     let err = call(&tools, "task_clean", json!({ "ids": [1, null, 3] }))
         .await
         .expect_err("null-токен — громкий отказ");
-    assert!(err.contains("мусорный"), "{err}");
+    assert!(err.contains("garbage token"), "{err}");
     let err = call(&tools, "task_clean", json!({}))
         .await
         .expect_err("ids отсутствует");
-    assert!(err.contains("ids обязателен"), "{err}");
+    assert!(err.contains("ids is required"), "{err}");
 }
 
 // ——— goal_list (#1216): MCP-поверхность — склейка диспетчера с вьюхой ———
@@ -1533,8 +1533,8 @@ async fn goal_list_on_mcp_surface_carrier_hint_on_empty() {
     let out = call(&tools, "goal_list", json!({}))
         .await
         .expect("дефолт-проект uwuwu читается без arguments");
-    assert!(out.contains("цели проекта не заведены"), "{out}");
-    assert!(out.contains("milestones hub-репо"), "{out}");
+    assert!(out.contains("no goals set for the project"), "{out}");
+    assert!(out.contains("hub-repo milestones"), "{out}");
     assert!(
         out.contains("https://github.com/acme/hub/milestones"),
         "URL реестра из фикс.туры потерян: {out}"
@@ -1547,5 +1547,5 @@ async fn goal_list_on_mcp_surface_unknown_project_is_honest() {
     let err = call(&tools, "goal_list", json!({ "project": "origa" }))
         .await
         .expect_err("проект вне конфига фикстуры — честный NotFound");
-    assert!(err.contains("вне конфига"), "{err}");
+    assert!(err.contains("is not in the pipeline config"), "{err}");
 }

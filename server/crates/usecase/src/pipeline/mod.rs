@@ -13,7 +13,8 @@ pub mod tick;
 #[cfg(test)]
 pub(crate) mod tick_tests;
 
-pub use analyst::{AnalystBoard, AnalystUseCase};
-pub use analyst_review::AnalystReviewUseCase;
+pub use actions::STAGE_PROMPTS;
+pub use analyst::{AnalystBoard, AnalystUseCase, ANALYST_WAVE_MARKER};
+pub use analyst_review::{AnalystReviewUseCase, ANALYST_REVIEW_WAVE_MARKER};
 pub use dreamer::DreamerUseCase;
 pub use tick::{BoardPlan, Mode, TickOutcome, TickPlan, TickUseCase};
