@@ -11,6 +11,8 @@ pub enum Agent {
     PlanReviewer,
     CodeQualityReviewer,
     Tester,
+    /// Ревьювер тестового кода (#1413): стадия «Ревью тестирования».
+    TestReviewer,
     /// Дример: ночная обработка сессий в опыт.
     Dreamer,
     /// Аналитик: волновая проработка строк Analys (замена триажа, #1135).
@@ -30,6 +32,7 @@ impl Agent {
             Slot::PlanReview => Some(Self::PlanReviewer),
             Slot::ResultReview => Some(Self::CodeQualityReviewer),
             Slot::Test => Some(Self::Tester),
+            Slot::TestReview => Some(Self::TestReviewer),
         }
     }
 
@@ -43,6 +46,7 @@ impl Agent {
             Self::PlanReviewer => "🔍",
             Self::CodeQualityReviewer => "🔬",
             Self::Tester => "🧪",
+            Self::TestReviewer => "🧫",
             Self::Dreamer => "🌙",
             Self::Analyst => "🧠",
             Self::AnalystReviewer => "⚖️",
@@ -131,6 +135,7 @@ mod tests {
             Some(Agent::CodeQualityReviewer)
         );
         assert_eq!(Agent::of_slot(Slot::Test), Some(Agent::Tester));
+        assert_eq!(Agent::of_slot(Slot::TestReview), Some(Agent::TestReviewer));
         // #1300: дев-семья пинится на явного developer — опора на
         // ambient-дефолт исполнителя подменяла агента дев-сессии
         // (инцидент #1044: рестарт будил ход под аналитиком)

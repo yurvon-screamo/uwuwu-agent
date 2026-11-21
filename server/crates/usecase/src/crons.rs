@@ -58,22 +58,23 @@ impl CronUseCase {
     pub async fn tick(&self) -> UsecaseResult<Vec<FireOutcome>> {
         let mut fired = Vec::new();
         // CUP-гвард (#1231): крон-ран — запуск хода, ему нужен свободный
-        // слот единого капа. Strict union (#1203): отказ скана — файр
-        // откладывается (ран не считается состоявшимся, журнал не пишется).
-        // busy — счётчик на весь тик: файр текущего тика занимает слот
-        // (инкремент после успешного запуска), иначе мульти-файр при
-        // неполном капе оверселлит до cap+N-1 (#1244-класс, ревью #1231).
-        let mut busy = match self.sessions.list_sessions_strict().await {
-            Ok(list) => crate::router::busy_count(&list),
-            Err(e) => {
-                tracing::warn!(
-                    event = "cron.list_sessions_failed",
-                    error = %e,
-                    "Кроны: union-скан недоступен — файр отложен"
-                );
-                return Ok(fired);
-            }
-        };
+        // слот единого капа. Деградация по исполнителю (#1450): busy —
+        // по живому union; полный отказ всех исполнителей — файр
+        // откладывается (ран не считается состоявшимся, журнал не
+        // пишется). busy — счётчик на весь тик: файр текущего тика
+        // занимает слот (инкремент после успешного запуска), иначе
+        // мульти-файр при неполном капе оверселлит до cap+N-1
+        // (#1244-класс, ревью #1231).
+        let (list, failed) = self.sessions.list_sessions_reachable().await;
+        if failed.len() == self.sessions.executors_total() {
+            tracing::warn!(
+                event = "cron.list_sessions_failed",
+                executors = ?failed,
+                "Кроны: ни один исполнитель недоступен — файр отложен"
+            );
+            return Ok(fired);
+        }
+        let mut busy = crate::router::busy_count(&list);
         let masters = self.scan_masters().await?;
         for master in masters {
             let name = cron_name(&master.slug).to_string();
@@ -384,6 +385,44 @@ mod tests {
 
     use std::sync::{Arc, Mutex};
 
+    /// Гейтвей отказного исполнителя: list_sessions всегда Err.
+    struct FailingSessions;
+    #[async_trait::async_trait]
+    impl crate::ports::AgentSessionGateway for FailingSessions {
+        async fn create_session(&self, _: &crate::ports::SessionSpec) -> UsecaseResult<String> {
+            Ok("ses_x".into())
+        }
+        async fn prompt(&self, _: &str, _: &str) -> UsecaseResult<()> {
+            Ok(())
+        }
+        async fn run_command(&self, _: &str, _: &str, _: &str) -> UsecaseResult<()> {
+            Ok(())
+        }
+        async fn liveness(&self, _: &str) -> crate::ports::Liveness {
+            crate::ports::Liveness::Unknown
+        }
+        async fn delete_session(&self, _: &str) -> UsecaseResult<()> {
+            Ok(())
+        }
+        async fn last_activity_ms(&self, _: &str) -> UsecaseResult<Option<u64>> {
+            Ok(None)
+        }
+        async fn last_assistant_reply(
+            &self,
+            _: &str,
+        ) -> UsecaseResult<Option<crate::ports::AssistantReply>> {
+            Ok(None)
+        }
+        async fn list_sessions(&self) -> UsecaseResult<Vec<crate::ports::SessionInfo>> {
+            Err(crate::error::UsecaseError::Session(
+                "исполнитель недоступен".into(),
+            ))
+        }
+        async fn export_session(&self, _: &str) -> UsecaseResult<String> {
+            Ok(String::new())
+        }
+    }
+
     #[test]
     fn master_requires_valid_schedule_and_project() {
         let md = "---\ntitle: Тест\nschedule: 5m\nproject: uwuwu\n---\n\nТело";
@@ -635,45 +674,10 @@ mod tests {
 
     #[tokio::test]
     async fn cron_fire_deferred_when_scan_fails() {
-        // Отказная ветка: union-скан strict-Err (исполнитель недоступен) —
-        // файр откладывается до свободного тика, ран не считается
-        // состоявшимся (консистентно с конвейером).
-        struct FailingSessions;
-        #[async_trait::async_trait]
-        impl crate::ports::AgentSessionGateway for FailingSessions {
-            async fn create_session(&self, _: &crate::ports::SessionSpec) -> UsecaseResult<String> {
-                Ok("ses_x".into())
-            }
-            async fn prompt(&self, _: &str, _: &str) -> UsecaseResult<()> {
-                Ok(())
-            }
-            async fn run_command(&self, _: &str, _: &str, _: &str) -> UsecaseResult<()> {
-                Ok(())
-            }
-            async fn liveness(&self, _: &str) -> crate::ports::Liveness {
-                crate::ports::Liveness::Unknown
-            }
-            async fn delete_session(&self, _: &str) -> UsecaseResult<()> {
-                Ok(())
-            }
-            async fn last_activity_ms(&self, _: &str) -> UsecaseResult<Option<u64>> {
-                Ok(None)
-            }
-            async fn last_assistant_reply(
-                &self,
-                _: &str,
-            ) -> UsecaseResult<Option<crate::ports::AssistantReply>> {
-                Ok(None)
-            }
-            async fn list_sessions(&self) -> UsecaseResult<Vec<crate::ports::SessionInfo>> {
-                Err(crate::error::UsecaseError::Session(
-                    "исполнитель недоступен".into(),
-                ))
-            }
-            async fn export_session(&self, _: &str) -> UsecaseResult<String> {
-                Ok(String::new())
-            }
-        }
+        // Отказная ветка (#1450): ВСЕ исполнители недоступны — файр
+        // откладывается до свободного тика, ран не считается
+        // состоявшимся (консистентно с конвейером). Частичный отказ
+        // файр не останавливает — busy по живому union (тест ниже).
         let wiki = master_wiki();
         let sessions = Arc::new(FailingSessions);
         let u = CronUseCase {
@@ -689,6 +693,48 @@ mod tests {
         };
         let fired = u.tick().await.unwrap();
         assert!(fired.is_empty(), "отказ скана — файр отложен");
+    }
+
+    #[tokio::test]
+    async fn cron_fire_partial_degradation_fires() {
+        // Смешанное здоровье (ревью #1450): один исполнитель отказной,
+        // живой отвечает — файр идёт, busy считается по живому union.
+        // Спавн уходит живому исполнителю (дефолт роутера).
+        let wiki = master_wiki();
+        let live_mem = Arc::new(MemSessions {
+            busy: 0.into(),
+            spawned: Mutex::default(),
+            fail_create: false.into(),
+        });
+        let live: crate::router::Gateway = live_mem.clone();
+        let failing: crate::router::Gateway = Arc::new(FailingSessions);
+        let u = CronUseCase {
+            wiki,
+            sessions: Arc::new(SessionRouter::new(
+                "kisa",
+                live.clone(),
+                vec![("redmi".into(), failing)],
+                std::collections::HashMap::new(),
+            )),
+            clock: Arc::new(TicksClock),
+            models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+            projects: std::collections::HashMap::from([(
+                "uwuwu".to_string(),
+                "/tmp/checkout".to_string(),
+            )]),
+            cup: 7,
+        };
+        let fired = u.tick().await.unwrap();
+        assert_eq!(
+            fired.len(),
+            1,
+            "частичный отказ файр не морозит — busy по живому union"
+        );
+        assert_eq!(
+            live_mem.spawned.lock().unwrap().len(),
+            1,
+            "спавн ушёл живому исполнителю"
+        );
     }
 
     #[tokio::test]

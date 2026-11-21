@@ -121,6 +121,7 @@ impl TaskBoardRepo for FakeBoard {
                     Slot::PlanReview,
                     Slot::ResultReview,
                     Slot::Test,
+                    Slot::TestReview,
                 ] {
                     if let Some(s) = t.session_of(slot) {
                         f.set_session(slot, uwuwu_domain::SessionRef::parse(s).unwrap());
@@ -2320,6 +2321,82 @@ async fn escalation_digest_without_session_is_honest_dash() {
 }
 
 #[tokio::test]
+async fn test_review_cycle_counts_and_escalates_with_test_review_digest() {
+    // #1413: пара тест-ревью цикла (ReviewTesting → Testing) считается
+    // тем же капом; дайджест эскалации называет сессию TestReview-слота
+    let state = Arc::new(MemState(Mutex::default()));
+    // счёт 1: первый возврат тест-ревьювера (ReviewTesting → Testing)
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((52, Status::ReviewTesting));
+    let (u, _, _, _) = usecase_with_state(
+        vec![task(52, Status::Testing)],
+        PrState::Missing,
+        state.clone(),
+    );
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        state.review_rounds("B", 52),
+        1,
+        "возврат тест-ревьювера — счёт 1"
+    );
+    // баланс 3 + ещё один возврат — кап: эскалация с TestReview-дайджестом
+    state.0.lock().unwrap().review_rounds.push((53, 3));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((53, Status::ReviewTesting));
+    let mut t = task(53, Status::Testing);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::TestReview,
+        uwuwu_domain::SessionRef::parse("ses_test_rev_live").unwrap(),
+    );
+    t.apply_fields(f);
+    let (u2, board, _, _) = usecase_with_state(vec![t], PrState::Missing, state.clone());
+    u2.run(&plan(Mode::Live, 7)).await.unwrap();
+    let log = board.log.lock().unwrap();
+    let digest = log
+        .iter()
+        .find(|l| l.starts_with("comment#53=⚠︎ Кап ревью-раундов"))
+        .expect("дайджест эскалации тест-цикла");
+    assert!(
+        digest.contains("последняя ревью-сессия: ses_test_rev_live"),
+        "id тест-ревью-сессии в дайджесте: {digest}"
+    );
+    assert_eq!(state.review_rounds("B", 53), 0, "эскалация — свежий бюджет");
+}
+
+#[tokio::test]
+async fn test_review_cycle_approve_resets_counter() {
+    // #1413: approve тест-ревьювера (ReviewTesting → UserReview) — цикл
+    // сошёлся, счётчик с нуля
+    let state = Arc::new(MemState(Mutex::default()));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((54, Status::ReviewTesting));
+    let (u, _, _, _) = usecase_with_state(
+        vec![task(54, Status::UserReview)],
+        PrState::Missing,
+        state.clone(),
+    );
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        state.review_rounds("B", 54),
+        0,
+        "approve — цикл сошёлся, счётчик с нуля"
+    );
+}
+
+#[tokio::test]
 async fn review_rounds_retry_spawn_does_not_count() {
     // ретрай спавна ревьювера в том же статусе (мёртвая сессия того же
     // раунда) — не request_changes: счётчик не инкрементится
@@ -2676,19 +2753,21 @@ async fn dead_stage_and_candidate_hold_blind_when_list_unavailable() {
 }
 
 #[tokio::test]
-async fn mixed_health_candidate_decided_by_status_fallback_at_cup_gate() {
-    // смешанное здоровье (ревью Common #1263): ЧУЖОЙ исполнитель отказной
-    // (дефолтный redmi), свой (kisa) жив — зрение проекта Some, кандидат
-    // без сестры доходит до CUP-гейта и решается СТАТУСНЫМ подсчётом
-    // fallback'а: строка с сессией + кандидат дают fallback_active=2 —
-    // кап 1 держит кандидата (held_cup), кап 7 пропускает спавн
-    // (консервативный кап против шторма при деградации, не паралич)
+async fn mixed_health_cup_counts_only_reachable_busy() {
+    // Отказной исполнитель не морозит живой (#1450): redmi (дефолт)
+    // недоступен, доска p на живом kisa. Бывший strict-фолбэк считал бы
+    // кап по статусам всех строк (2: мёртвая сессия + кандидат) — тот же
+    // механизм сутки держал прод при капе 7 и 37 активных строках
+    // (инцидент 21.11). Теперь кап = реальный busy живых списков (0):
+    // мёртвая сессия строки 66 респавнится, кандидат 67 спавнится.
+    // Строки самого отказного держит слепой hold (#1263), зрение проекта
+    // чужой отказ не гасит.
     let rows = || {
         let mut session_row = task(66, Status::InProgress);
         let mut f = TaskFields::default();
         f.set_session(
             Slot::Dev,
-            uwuwu_domain::SessionRef::parse("ses_live_66").unwrap(),
+            uwuwu_domain::SessionRef::parse("ses_dead_66").unwrap(),
         );
         session_row.apply_fields(f);
         vec![session_row, task(67, Status::InProgress)]
@@ -2697,6 +2776,12 @@ async fn mixed_health_candidate_decided_by_status_fallback_at_cup_gate() {
         let mut redmi = FakeSessions::new();
         redmi.list_fails = true;
         let kisa = FakeSessions::new();
+        // list и GET согласованы: сессии нет в list → она мёртва и в
+        // liveness (контракт second source #1163)
+        kisa.dead_sessions
+            .lock()
+            .unwrap()
+            .push("ses_dead_66".into());
         let mut by_project = std::collections::HashMap::new();
         by_project.insert(
             "p".to_string(),
@@ -2708,6 +2793,15 @@ async fn mixed_health_candidate_decided_by_status_fallback_at_cup_gate() {
             vec![("kisa".to_string(), by_project["p"].clone())],
             by_project,
         );
+        // prev = текущий статус: мёртвая сессия строки 66 идёт
+        // респавн-путём (не кик-разморозкой)
+        let state = Arc::new(MemState(Mutex::default()));
+        state
+            .0
+            .lock()
+            .unwrap()
+            .statuses
+            .push((66, Status::InProgress));
         let board = Arc::new(FakeBoard {
             rows: std::sync::Mutex::new(rows()),
             log: Mutex::default(),
@@ -2717,9 +2811,6 @@ async fn mixed_health_candidate_decided_by_status_fallback_at_cup_gate() {
             clear_session_fails: AtomicBool::new(false),
             status_fails: AtomicBool::new(false),
         });
-        // master-break #1155 x #1263: struct вырос probes, оба новых
-        // теста #1263 не догнали (тесты мастера не компилировались);
-        // починено попутно в #1259, факт — в отчёте задачи
         let prs = Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
@@ -2730,27 +2821,24 @@ async fn mixed_health_candidate_decided_by_status_fallback_at_cup_gate() {
             sessions: Arc::new(router),
             prs: prs.clone(),
             clock: Arc::new(FixedClock),
-            state: Arc::new(MemState(Mutex::default())),
+            state,
             models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
             boot_ms: 0,
             judge: None,
             judge_cfg: Default::default(),
         }
     };
-    let held = build().run(&plan(Mode::Live, 1)).await.unwrap();
+    let out = build().run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
-        held.held_cup, 1,
-        "кандидат решён статусным подсчётом fallback'а (не слепотой и не сестрой)"
+        out.sessions_busy, 0,
+        "кап = busy живых списков, не статусный счёт fallback'а"
     );
-    assert_eq!(held.spawns_done, 0);
-    assert_eq!(held.held_blind, 0, "чужой отказ не слепит зрение проекта");
-    assert_eq!(held.held_live, 0);
-    let under_cap = build().run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
-        under_cap.spawns_done, 1,
-        "под-каповый спавн идёт по статусному fallback'у — деградация не паралич"
+        out.spawns_done, 2,
+        "респавн мёртвой строки и кандидат проходят — деградация не паралич"
     );
-    assert_eq!(under_cap.held_blind, 0);
+    assert_eq!(out.held_cup, 0);
+    assert_eq!(out.held_blind, 0, "чужой отказ не слепит зрение проекта");
 }
 
 #[tokio::test]
@@ -4214,6 +4302,52 @@ async fn spawn_prompt_demands_finish_transaction() {
 }
 
 #[tokio::test]
+async fn spawn_prompt_test_stage_marker_contract() {
+    // #1413: дизамбигуация классификации стадий (ревью 2, coupling) —
+    // тест-ревьювер классифицируется по уникальному stage-маркеру
+    // «тестовая дельта ветки» (mock_opencode::stage_action_of_prompt),
+    // tester-промпт маркера НЕ несёт: имя статуса «Ревью тестирования»
+    // живёт в его finish-инструкции (чекпойнт pass) и не должно
+    // перехватываться. Контракт двух поверхностей пинится на реальном
+    // выводе spawn_prompt — дрейф текста краснеет на юните, а не на
+    // дорогом прогоне стенда.
+    let board = BoardPlan {
+        board: "B".into(),
+        project: "p".into(),
+        repo: "a/c".into(),
+        checkout: "/tmp/checkout".into(),
+        env_root: "/tmp/env".into(),
+    };
+    let tester_prompt = crate::pipeline::actions::spawn_prompt(
+        &board,
+        &Task::new(8, "t".into(), Status::Testing),
+        Slot::Test,
+    );
+    assert!(
+        !tester_prompt.contains("тестовая дельта ветки"),
+        "tester-промпт без stage-маркера тест-ревьювера"
+    );
+    // чекпойнт pass тестировщика: развилка по (tester)-коммитам названа
+    assert!(
+        tester_prompt.contains("Ревью тестирования") && tester_prompt.contains("(tester)-коммиты"),
+        "finish-инструкция тестировщика несёт чекпойнт pass: {tester_prompt}"
+    );
+    let test_review_prompt = crate::pipeline::actions::spawn_prompt(
+        &board,
+        &Task::new(9, "t".into(), Status::ReviewTesting),
+        Slot::TestReview,
+    );
+    assert!(
+        test_review_prompt.contains("тестовая дельта ветки"),
+        "stage-маркер тест-ревьювера в промпте: {test_review_prompt}"
+    );
+    assert!(
+        test_review_prompt.contains("«Review»") && test_review_prompt.contains("«Тестирование»"),
+        "finish-инструкция тест-ревьювера называет оба вердикт-статуса: {test_review_prompt}"
+    );
+}
+
+#[tokio::test]
 async fn idle_sessions_do_not_hold_cup() {
     // Регресс 17.11 (#1206-семья): «живая» в API конвейерная сессия,
     // спящая между ходами (никогда не финализируется), считалась
@@ -4531,6 +4665,43 @@ async fn analyst_wave_held_when_cup_full() {
         "цикл-гвард не заряжается отложкой"
     );
     assert!(board.log.lock().unwrap().is_empty(), "статусы не тронуты");
+}
+
+#[tokio::test]
+async fn analyst_wave_degrades_on_partial_outage() {
+    // Смешанное здоровье (ревью #1450): один исполнитель отказной, живой
+    // отвечает — волна идёт (busy/alive-гвард по живому union). Бывший
+    // strict-скан падал Err на любом отказе и ставил волну.
+    let state = Arc::new(MemState(Mutex::default()));
+    let live = Arc::new(FakeSessions::new());
+    let mut failing = FakeSessions::new();
+    failing.list_fails = true;
+    let failing = Arc::new(failing);
+    let (mut u, _) = analyst_uc_with_cup(
+        vec![titled(302, "заявка на разбор", Status::Analys)],
+        state,
+        live.clone(),
+        7,
+    );
+    u.sessions = Arc::new(SessionRouter::new(
+        "kisa",
+        live.clone(),
+        vec![("redmi".into(), failing)],
+        std::collections::HashMap::new(),
+    ));
+    let spawned = u
+        .tick()
+        .await
+        .expect("частичный отказ — не Err, деградация по исполнителю");
+    assert_eq!(
+        spawned, 1,
+        "волна идёт при частичном отказе — busy по живому union"
+    );
+    assert_eq!(
+        live.specs.lock().unwrap().len(),
+        1,
+        "спавн ушёл живому исполнителю"
+    );
 }
 
 #[tokio::test]

@@ -11,8 +11,14 @@ pub mod semantic;
 #[path = "../../src/search/semantic_backend.rs"]
 pub mod semantic_backend;
 
+#[path = "../../src/search/maintenance.rs"]
+pub mod maintenance;
+
 #[path = "dim_migration.rs"]
 pub mod dim_migration;
+
+#[path = "churn_maintenance.rs"]
+pub mod churn_maintenance;
 
 #[path = "gemini_live.rs"]
 pub mod gemini_live;

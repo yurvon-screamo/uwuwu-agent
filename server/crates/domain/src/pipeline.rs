@@ -75,7 +75,8 @@ pub fn awaits(status: Status) -> Awaits {
         | Status::ReviewPlan
         | Status::InProgress
         | Status::ReviewResult
-        | Status::Testing => Awaits::StageSession,
+        | Status::Testing
+        | Status::ReviewTesting => Awaits::StageSession,
         Status::UserReview | Status::NeedsAttention => Awaits::Owner,
         Status::Draft => Awaits::Owner,
         Status::Todo => Awaits::Owner,
@@ -168,12 +169,13 @@ pub enum ReviewRoundStep {
 
 /// Классификация статус-перехода для цикл-гварда ревью-контура (#1311).
 /// Считаются переходы «ревьювер вернул строку в работу»: ReviewResult →
-/// InProgress и ReviewPlan → Design — по статусам, тексты вердиктов не
-/// интерпретируются (ADR-106). Выход из пары цикла в любой другой статус
-/// (approve в Testing/InProgress, Needs attention, терминальные, возврат
-/// на доработку плана) — сброс; ре-вход в ревью-статус — не событие.
+/// InProgress, ReviewPlan → Design и ReviewTesting → Testing (#1413) —
+/// по статусам, тексты вердиктов не интерпретируются (ADR-106). Выход
+/// из пары цикла в любой другой статус (approve, Needs attention,
+/// терминальные, возврат на доработку плана) — сброс; ре-вход в
+/// ревью-статус — не событие.
 pub fn review_round_step(prev: Option<Status>, current: Status, rounds: u32) -> ReviewRoundStep {
-    use Status::{Design, InProgress, ReviewPlan, ReviewResult};
+    use Status::{Design, InProgress, ReviewPlan, ReviewResult, ReviewTesting, Testing};
     let Some(prev) = prev else {
         return ReviewRoundStep::None;
     };
@@ -181,12 +183,15 @@ pub fn review_round_step(prev: Option<Status>, current: Status, rounds: u32) -> 
         escalate: next >= REVIEW_ROUND_CAP,
     };
     match (prev, current) {
-        (ReviewResult, InProgress) | (ReviewPlan, Design) => count(rounds + 1),
+        (ReviewResult, InProgress) | (ReviewPlan, Design) | (ReviewTesting, Testing) => {
+            count(rounds + 1)
+        }
         (ReviewResult, cur) if cur != ReviewResult && cur != InProgress => ReviewRoundStep::Reset,
         (InProgress, cur) if cur != ReviewResult && cur != InProgress => ReviewRoundStep::Reset,
         (ReviewPlan, cur) if cur != ReviewPlan && cur != Design => ReviewRoundStep::Reset,
         (Design, cur) if cur != ReviewPlan && cur != Design => ReviewRoundStep::Reset,
-        // движение внутри пары (ре-вход в ревью) и прочие статусы
+        (ReviewTesting, cur) if cur != ReviewTesting && cur != Testing => ReviewRoundStep::Reset,
+        // движение внутри пар (ре-вход в ревью) и прочие статусы
         _ => ReviewRoundStep::None,
     }
 }
@@ -342,6 +347,41 @@ mod tests {
         assert_eq!(
             step(Some(Status::ReviewPlan), Status::Design, 0),
             ReviewRoundStep::Count { escalate: false }
+        );
+    }
+
+    #[test]
+    fn review_rounds_test_cycle_counts_resets_and_escalates() {
+        // #1413: пара тест-ревью цикла — тот же счёт, тот же кап
+        let step = |prev, cur, rounds| review_round_step(prev, cur, rounds);
+        assert_eq!(
+            step(Some(Status::ReviewTesting), Status::Testing, 0),
+            ReviewRoundStep::Count { escalate: false }
+        );
+        assert_eq!(
+            step(Some(Status::ReviewTesting), Status::Testing, 3),
+            ReviewRoundStep::Count { escalate: true },
+            "кап ревью-семейства общий: 4-й возврат тест-ревьювера — эскалация"
+        );
+        // approve: чисто → Review — цикл сошёлся
+        assert_eq!(
+            step(Some(Status::ReviewTesting), Status::UserReview, 2),
+            ReviewRoundStep::Reset
+        );
+        // вопрос владельцу — выход из цикла
+        assert_eq!(
+            step(Some(Status::ReviewTesting), Status::NeedsAttention, 1),
+            ReviewRoundStep::Reset
+        );
+        // ре-вход в ревью-статус (мимо вердикта) — не событие
+        assert_eq!(
+            step(Some(Status::Testing), Status::ReviewTesting, 1),
+            ReviewRoundStep::None
+        );
+        // переходы старых пар из тест-статуса не трогаются
+        assert_eq!(
+            step(Some(Status::Testing), Status::InProgress, 3),
+            ReviewRoundStep::None
         );
     }
 
@@ -550,6 +590,12 @@ mod tests {
         assert_eq!(awaits(Status::Todo), Awaits::Owner);
         assert_eq!(awaits(Status::Analys), Awaits::Entry);
         assert_eq!(awaits(Status::ReviewAnalys), Awaits::Entry);
+    }
+
+    #[test]
+    fn review_testing_is_stage_session() {
+        // #1413: стадия ждёт сессию слота, не мяч владельца
+        assert_eq!(awaits(Status::ReviewTesting), Awaits::StageSession);
     }
 
     #[test]

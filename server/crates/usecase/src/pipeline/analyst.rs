@@ -52,10 +52,16 @@ impl AnalystUseCase {
         // ≤1 живого аналитика: busy-признак («ход в полёте», #1231) —
         // outcome атрибут последнего финала и при новом ходе не
         // очищается, дубль-волна на 2+ ходе аналитика была незаметна.
-        // Strict union (#1203): живой аналитик на офлайн-исполнителе не
-        // должен порождать дубль-спавн волны на другом — как CUP, отказ
-        // любого исполнителя честно останавливает волну до следующего тика
-        let scan = self.sessions.list_sessions_strict().await?;
+        // Деградация по исполнителю (#1450): волна считается по живому
+        // union — отказ одного исполнителя не останавливает волну
+        let (scan, failed) = self.sessions.list_sessions_reachable().await;
+        if !failed.is_empty() {
+            tracing::warn!(
+                event = "analys.list_degraded",
+                executors = ?failed,
+                "Аналитика: часть исполнителей недоступна — волна по живому union"
+            );
+        }
         if crate::router::has_busy_agent(&scan, Agent::Analyst) {
             tracing::debug!(event = "analys.alive_skip", "Живой аналитик — волна ждёт");
             return Ok(0);

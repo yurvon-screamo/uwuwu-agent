@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use uwuwu_domain::{Status, Task};
-use uwuwu_usecase::{CommentRef, GoalIssue, GoalsRepo, IssueView, TaskBoardRepo};
+use uwuwu_usecase::{CommentRef, Goal, GoalsRepo, IssueView, TaskBoardRepo};
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 pub struct GitHubHub {
@@ -793,7 +793,7 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
         ),
         (
             crate::github::fields::F_REVIEW_SESSION,
-            vec![Slot::PlanReview, Slot::ResultReview],
+            vec![Slot::PlanReview, Slot::ResultReview, Slot::TestReview],
         ),
         (crate::github::fields::F_TEST_SESSION, vec![Slot::Test]),
     ] {
@@ -915,9 +915,9 @@ impl TaskBoardRepo for GitHubHub {
     ) -> UsecaseResult<()> {
         let name = match slot {
             uwuwu_domain::Slot::Dev => crate::github::fields::F_DEV_SESSION,
-            uwuwu_domain::Slot::PlanReview | uwuwu_domain::Slot::ResultReview => {
-                crate::github::fields::F_REVIEW_SESSION
-            }
+            uwuwu_domain::Slot::PlanReview
+            | uwuwu_domain::Slot::ResultReview
+            | uwuwu_domain::Slot::TestReview => crate::github::fields::F_REVIEW_SESSION,
             uwuwu_domain::Slot::Test => crate::github::fields::F_TEST_SESSION,
             uwuwu_domain::Slot::Design => crate::github::fields::F_DEV_SESSION,
         };
@@ -994,9 +994,9 @@ impl TaskBoardRepo for GitHubHub {
             uwuwu_domain::Slot::Dev | uwuwu_domain::Slot::Design => {
                 crate::github::fields::F_DEV_SESSION
             }
-            uwuwu_domain::Slot::PlanReview | uwuwu_domain::Slot::ResultReview => {
-                crate::github::fields::F_REVIEW_SESSION
-            }
+            uwuwu_domain::Slot::PlanReview
+            | uwuwu_domain::Slot::ResultReview
+            | uwuwu_domain::Slot::TestReview => crate::github::fields::F_REVIEW_SESSION,
             uwuwu_domain::Slot::Test => crate::github::fields::F_TEST_SESSION,
         };
         self.fields.store(number, &[(name, None)]).await?;
@@ -1249,42 +1249,61 @@ impl TaskBoardRepo for GitHubHub {
     }
 }
 
-/// Цели проекта из ответа GitHub issues API (#1216): скип PR-записей
-/// (поле pull_request), gist — первая содержательная строка body.
-/// Чистая функция — юнит-тесты без HTTP.
-pub(crate) fn goals_from_json(items: &[Value]) -> Vec<GoalIssue> {
+/// Проектный префикс тайтла milestone — `[проект] Название`: у
+/// milestones нет лейблов, ассоциация с проектом кодируется в тайтле
+/// (#1216). Возвращает (проект, тайтл без префикса); нет префикса —
+/// None (такой milestone невидим goal_list ни одного проекта).
+fn milestone_project_prefix(title: &str) -> Option<(String, String)> {
+    let rest = title.strip_prefix('[')?;
+    let close = rest.find(']')?;
+    let project = &rest[..close];
+    if project.is_empty() {
+        return None;
+    }
+    let name = rest[close + 1..].strip_prefix(' ')?;
+    Some((project.to_string(), name.to_string()))
+}
+
+/// Цели проекта из ответа GitHub milestones API (#1216): фильтр по
+/// проектному префиксу `[проект]` в тайтле, gist — первая
+/// содержательная строка description. Чистая функция — юнит-тесты
+/// без HTTP.
+pub(crate) fn goals_from_milestones(items: &[Value], project: &str) -> Vec<Goal> {
     items
         .iter()
-        .filter(|i| i["pull_request"].is_null())
-        .map(|i| GoalIssue {
-            number: i["number"].as_u64().unwrap_or(0),
-            title: i["title"].as_str().unwrap_or_default().to_string(),
-            gist: uwuwu_usecase::gist_of(i["body"].as_str().unwrap_or_default()),
+        .filter_map(|m| {
+            let (proj, name) = milestone_project_prefix(m["title"].as_str()?)?;
+            (proj == project).then(|| Goal {
+                number: m["number"].as_u64().unwrap_or(0),
+                title: name,
+                gist: uwuwu_usecase::gist_of(m["description"].as_str().unwrap_or_default()),
+            })
         })
         .collect()
 }
 
 #[async_trait]
 impl GoalsRepo for GitHubHub {
-    /// Открытые цели проекта: issues hub-репо с лейблами `goal` +
-    /// `proj:<проект>` (#1216). REST — вне GraphQL-бюджета (#1243).
-    async fn open_goals(&self, project: &str) -> UsecaseResult<Vec<GoalIssue>> {
+    /// Открытые цели проекта: milestones hub-репо с префиксом
+    /// `[проект]` в тайтле (#1216). REST — вне GraphQL-бюджета (#1243).
+    async fn open_goals(&self, project: &str) -> UsecaseResult<Vec<Goal>> {
         let (status, body) = self
             .rest(
                 reqwest::Method::GET,
                 &format!(
-                    "/repos/{}/issues?labels=goal,proj:{}&state=open&per_page=100",
-                    self.repo,
-                    crate::wiki::encode_path(project)
+                    "/repos/{}/milestones?state=open&per_page=100",
+                    crate::wiki::encode_path(&self.repo)
                 ),
                 None,
             )
             .await?;
         if !status.is_success() {
-            return Err(UsecaseError::Board(format!("goal issues: HTTP {status}")));
+            return Err(UsecaseError::Board(format!(
+                "goal milestones: HTTP {status}"
+            )));
         }
         match body.as_array() {
-            Some(items) => Ok(goals_from_json(items)),
+            Some(items) => Ok(goals_from_milestones(items, project)),
             None => Ok(Vec::new()),
         }
     }
@@ -1292,54 +1311,64 @@ impl GoalsRepo for GitHubHub {
 
 #[cfg(test)]
 mod goals_json_tests {
-    use super::goals_from_json;
+    use super::{goals_from_milestones, milestone_project_prefix};
     use serde_json::json;
 
     #[test]
-    fn maps_number_title_and_first_body_line() {
+    fn prefix_parsing_strips_project_and_name() {
+        assert_eq!(
+            milestone_project_prefix("[origa] Стабилизация"),
+            Some(("origa".into(), "Стабилизация".into()))
+        );
+        assert_eq!(milestone_project_prefix("Без префикса"), None);
+        assert_eq!(milestone_project_prefix("[] имя"), None);
+        // без пробела после префикса — не по конвенции, невидим
+        assert_eq!(milestone_project_prefix("[origa]БезПробела"), None);
+    }
+
+    #[test]
+    fn maps_prefix_title_and_description_gist() {
         let items = [json!({
-            "number": 52,
-            "title": "Переход к единой ИС на Rust",
-            "body": "Суть: консолидировать контур.\n\nдетали",
+            "number": 7,
+            "title": "[uwuwu] Переход к единой ИС на Rust",
+            "description": "Суть: консолидировать контур.\n\nдетали",
         })];
-        let goals = goals_from_json(&items);
+        let goals = goals_from_milestones(&items, "uwuwu");
         assert_eq!(goals.len(), 1);
-        assert_eq!(goals[0].number, 52);
+        assert_eq!(goals[0].number, 7);
         assert_eq!(goals[0].title, "Переход к единой ИС на Rust");
         assert_eq!(goals[0].gist, "Суть: консолидировать контур.");
     }
 
     #[test]
-    fn skips_pull_request_records() {
+    fn filters_by_exact_project_prefix() {
         let items = [
-            json!({ "number": 52, "title": "цель", "body": "суть" }),
-            json!({
-                "number": 53,
-                "title": "PR: что-то",
-                "body": "diff",
-                "pull_request": { "url": "https://api.github.com/repos/x/y/pulls/53" }
-            }),
+            json!({ "number": 7, "title": "[origa] цель origa", "description": "" }),
+            // похожий префикс другого проекта не матчится
+            json!({ "number": 8, "title": "[origal] чужая цель", "description": "" }),
+            json!({ "number": 9, "title": "без префикса", "description": "" }),
         ];
-        let goals = goals_from_json(&items);
+        let goals = goals_from_milestones(&items, "origa");
         assert_eq!(goals.len(), 1);
-        assert_eq!(goals[0].number, 52);
+        assert_eq!(goals[0].number, 7);
+        assert_eq!(goals[0].title, "цель origa");
     }
 
     #[test]
-    fn empty_or_blank_body_yields_empty_gist() {
+    fn empty_or_blank_description_yields_empty_gist() {
         let items = [
-            json!({ "number": 60, "title": "без тела", "body": "" }),
-            json!({ "number": 61, "title": "null-тело", "body": null }),
-            json!({ "number": 62, "title": "пробельное", "body": "  \n\t " }),
+            json!({ "number": 60, "title": "[uwuwu] без тела", "description": "" }),
+            json!({ "number": 61, "title": "[uwuwu] null-тело", "description": null }),
+            json!({ "number": 62, "title": "[uwuwu] пробельное", "description": "  \n\t " }),
         ];
-        let goals = goals_from_json(&items);
+        let goals = goals_from_milestones(&items, "uwuwu");
         assert_eq!(goals.len(), 3);
         assert!(goals.iter().all(|g| g.gist.is_empty()));
     }
 
     #[test]
     fn empty_array_yields_empty_list() {
-        assert!(goals_from_json(&[]).is_empty());
+        assert!(goals_from_milestones(&[], "uwuwu").is_empty());
     }
 }
 
@@ -1350,13 +1379,12 @@ mod goals_live_tests {
 
     // Живой e2e REST-границы целей (#1216): реальный hub-репо, гвард
     // UWUWU_E2E=1 (культура репо — образец gitea_tests::live_probe_*).
-    // Ловит возврат «слепого» потребителя (мастер: goal_list отвечал
-    // «реестр пуст» на всё): поломку запроса (лейблы/state), маппинг
-    // ответа и проектный фильтр лейблов на живых данных. Фиксация на
-    // живой реестр uwuwu (цели #1393/#1394): если владелец закрыл все
-    // цели — тест правится на актуальный факт, не сносится.
+    // Ловит возврат «слепого» потребителя: поломку запроса (state),
+    // маппинг ответа и проектный фильтр префикса на живых данных.
+    // Фиксация на живой реестр uwuwu (milestones #1/#2): если владелец
+    // закрыл все цели — тест правится на актуальный факт, не сносится.
     #[tokio::test]
-    async fn live_goal_list_reads_open_issues_by_labels() {
+    async fn live_goal_list_reads_open_milestones_by_prefix() {
         if std::env::var("UWUWU_E2E").as_deref() != Ok("1") {
             return;
         }
@@ -1372,17 +1400,17 @@ mod goals_live_tests {
             "реестр uwuwu пуст на живом hub — сломан носитель или запрос"
         );
         for g in &goals {
-            assert!(g.number > 0, "номер issue не смапился: {g:?}");
+            assert!(g.number > 0, "номер milestone не смапился: {g:?}");
             assert!(!g.title.is_empty(), "тайтл не смапился: {g:?}");
         }
-        // проектный фильтр лейблов: несуществующий проект — пусто, не чужие цели
+        // проектный фильтр префикса: несуществующий проект — пусто, не чужие цели
         let none = hub
             .open_goals("no-such-proj-1216")
             .await
             .expect("живой REST open_goals по несуществующему проекту");
         assert!(
             none.is_empty(),
-            "лейбл-фильтр пропустил чужие цели: {none:?}"
+            "префикс-фильтр пропустил чужие цели: {none:?}"
         );
     }
 }
@@ -2381,6 +2409,46 @@ mod slot_mapping_tests {
             "Design-слот видит сессию"
         );
     }
+
+    #[test]
+    fn review_session_field_fills_test_review_slot() {
+        // #1413: fm-ячейка «Сессия ревью» — общая для трёх ревью-слотов
+        // (вектора assignments — не-экзаустивная поверхность вне
+        // компилятора): строка в «Ревью тестирования» с живой ячейкой
+        // видит сессию — тик не спавнит дубли (класс инцидента 15/16.11)
+        let mut raw = Fields::new();
+        raw.insert("Сессия ревью".into(), "ses_testrev".into());
+        let f = map_task_fields(&raw);
+        let mut task = uwuwu_domain::Task::new(2, "t".into(), uwuwu_domain::Status::ReviewTesting);
+        task.apply_fields(f);
+        assert_eq!(
+            task.session_of(uwuwu_domain::Slot::TestReview),
+            Some("ses_testrev")
+        );
+        assert_eq!(
+            task.session_of(uwuwu_domain::Slot::ResultReview),
+            Some("ses_testrev")
+        );
+        assert_eq!(
+            task.session_of(uwuwu_domain::Slot::PlanReview),
+            Some("ses_testrev")
+        );
+        assert_eq!(
+            task.session_of(uwuwu_domain::Slot::Dev),
+            None,
+            "ревью-ячейка не течёт в дев-слот"
+        );
+        assert_eq!(
+            task.session_of(uwuwu_domain::Slot::Test),
+            None,
+            "ревью-ячейка не течёт в тест-слот"
+        );
+        assert!(
+            task.stage_needs_spawn().is_none(),
+            "TestReview-слот видит сессию — спавн-дубля нет"
+        );
+    }
+
     #[test]
     fn priority_field_absent_maps_empty() {
         // отсутствующее поле — самый частый кейс доски: не High и не паника

@@ -125,29 +125,38 @@ async fn unknown_project_falls_back_to_default() {
 }
 
 #[tokio::test]
-async fn strict_union_merges_all_executors() {
+async fn reachable_union_merges_live_executors() {
     let router = SessionRouter::new(
         "kisa",
         gw(FakeGw::serving("kisa", &["ses-a"])),
         vec![("redmi".into(), gw(FakeGw::serving("redmi", &["ses-b"])))],
         HashMap::new(),
     );
-    let list = router.list_sessions_strict().await.expect("merge");
+    let (list, failed) = router.list_sessions_reachable().await;
+    assert!(failed.is_empty(), "все живы — отказных нет");
     let mut ids: Vec<&str> = list.iter().map(|s| s.id.as_str()).collect();
     ids.sort();
     assert_eq!(ids, vec!["ses-a", "ses-b"]);
 }
 
 #[tokio::test]
-async fn strict_union_fails_when_any_executor_down() {
+async fn reachable_union_degrades_when_executor_down() {
+    // Деградация по исполнителю (#1450): отказной не роняет скан — его
+    // имя честно репортится, живой сохраняет полное зрение своего списка
     let router = SessionRouter::new(
         "kisa",
         gw(FakeGw::serving("kisa", &["ses-a"])),
         vec![("redmi".into(), gw(FakeGw::failing("redmi")))],
         HashMap::new(),
     );
-    let err = router.list_sessions_strict().await.expect_err("all-or-Err");
-    assert!(err.to_string().contains("redmi"), "{err}");
+    let (list, failed) = router.list_sessions_reachable().await;
+    assert_eq!(failed, vec!["redmi".to_string()]);
+    assert_eq!(
+        list.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        vec!["ses-a"],
+        "живой исполнитель не теряет зрение при чужом отказе"
+    );
+    assert_eq!(router.executors_total(), 2);
 }
 
 #[tokio::test]

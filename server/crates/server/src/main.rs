@@ -338,8 +338,8 @@ async fn run(
         board.clone(),
         boards_cfg.clone(),
     ));
-    // Реестр целей (#1216): issues hub-репо, лейблы goal + proj:<проект>;
-    // memory-стенд отвечает «не заведены» (GoalsRepo мок-реализация).
+    // Реестр целей (#1216): milestones hub-репо, префикс [проект] в
+    // тайтле; memory-стенд отвечает «не заведены» (GoalsRepo мок-реализация).
     let goals_repo: Arc<dyn uwuwu_usecase::GoalsRepo> = match &memory_hub {
         Some(mem) => mem.clone(),
         None => github_hub
@@ -349,10 +349,7 @@ async fn run(
     let goals_view = Arc::new(uwuwu_usecase::GoalsView::new(
         goals_repo,
         boards_cfg.iter().map(|(p, _)| p.clone()).collect(),
-        format!(
-            "https://github.com/{}/issues?q=is%3Aissue+is%3Aopen+label%3Agoal+label%3Aproj%3A{{project}}",
-            cfg.hub.repo
-        ),
+        format!("https://github.com/{}/milestones", cfg.hub.repo),
     ));
     let wiki: Arc<dyn uwuwu_usecase::WikiRepo> = match &memory_hub {
         Some(mem) => mem.clone(),

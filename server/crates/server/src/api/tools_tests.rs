@@ -641,7 +641,7 @@ async fn fast_track_from_draft_and_todo() {
         goals: Arc::new(uwuwu_usecase::GoalsView::new(
             memory.clone(),
             vec!["uwuwu".to_string()],
-            "https://github.com/acme/hub/issues?q=label%3Aproj%3A{project}".into(),
+            "https://github.com/acme/hub/milestones".into(),
         )),
         docs: Arc::new(DocsView::new(wiki.clone())),
         person: Arc::new(PersonView::new(wiki.clone())),
@@ -1146,6 +1146,76 @@ async fn mcp_tools_list_serves_canonical_task_types_only() {
     );
 }
 
+/// Статусная строка схемы task_edit несёт весь канон статусов доски
+/// (#1413): агент конвейера ставит статусы по методичке — дрейф
+/// «статус есть в каноне, нет в схеме тула» ловится здесь, а не в
+/// рантайме (семейство пина типов #1298).
+#[tokio::test]
+async fn mcp_task_edit_schema_lists_canonical_statuses() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let (tools, _memory) = hub();
+    let state = Arc::new(super::McpState {
+        bearer: Arc::new("t-bearer".into()),
+        tools: tools.clone(),
+    });
+    let app = super::mcp_router(state);
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("authorization", "Bearer t-bearer")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    let schema_status = json["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "task_edit")
+        .expect("task_edit в tools/list")["inputSchema"]["properties"]["status"]["description"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let list = schema_status
+        .split_once("статус канона:")
+        .map(|(_, rest)| rest)
+        .unwrap_or(&schema_status);
+    for canonical in [
+        "Draft",
+        "Analys",
+        "Review Analys",
+        "Todo",
+        "Design",
+        "Ревью плана",
+        "In Progress",
+        "Ревью результата",
+        "Тестирование",
+        "Ревью тестирования",
+        "Review",
+        "Needs attention",
+        "Вейт",
+    ] {
+        assert!(
+            list.split('/').any(|s| s.trim() == canonical),
+            "«{canonical}» нет в схеме task_edit: {schema_status}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn automerge_cell_roundtrips_on_mock_carrier() {
     let (tools, _memory) = hub();
@@ -1455,8 +1525,8 @@ async fn task_clean_garbage_ids_is_loud() {
 
 // ——— goal_list (#1216): MCP-поверхность — склейка диспетчера с вьюхой ———
 // Носитель в фикстуре — MemoryHub (целей нет): проверяется маршрутизация
-// тула и подсказка носителя с подставленным проектом; живые данные —
-// hub.rs::goals_live_tests (UWUWU_E2E=1).
+// тула и подсказка носителя; живые данные — hub.rs::goals_live_tests
+// (UWUWU_E2E=1).
 #[tokio::test]
 async fn goal_list_on_mcp_surface_carrier_hint_on_empty() {
     let (tools, _) = hub();
@@ -1464,10 +1534,10 @@ async fn goal_list_on_mcp_surface_carrier_hint_on_empty() {
         .await
         .expect("дефолт-проект uwuwu читается без arguments");
     assert!(out.contains("цели проекта не заведены"), "{out}");
-    assert!(out.contains("proj:uwuwu"), "{out}");
+    assert!(out.contains("milestones hub-репо"), "{out}");
     assert!(
-        out.contains("https://github.com/acme/hub"),
-        "URL фильтра из фикс.туры потерян: {out}"
+        out.contains("https://github.com/acme/hub/milestones"),
+        "URL реестра из фикс.туры потерян: {out}"
     );
 }
 

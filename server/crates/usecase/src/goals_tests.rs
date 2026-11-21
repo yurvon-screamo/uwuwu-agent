@@ -4,25 +4,25 @@ use crate::error::ViewError;
 use async_trait::async_trait;
 use std::sync::Arc;
 
-struct FakeGoals(Vec<super::GoalIssue>);
+struct FakeGoals(Vec<super::Goal>);
 
 #[async_trait]
 impl crate::goals::GoalsRepo for FakeGoals {
-    async fn open_goals(&self, _project: &str) -> crate::UsecaseResult<Vec<super::GoalIssue>> {
+    async fn open_goals(&self, _project: &str) -> crate::UsecaseResult<Vec<super::Goal>> {
         Ok(self.0.clone())
     }
 }
 
-fn view(goals: Vec<super::GoalIssue>) -> GoalsView {
+fn view(goals: Vec<super::Goal>) -> GoalsView {
     GoalsView::new(
         Arc::new(FakeGoals(goals)),
         vec!["uwuwu".into(), "origa".into()],
-        "https://github.com/acme/hub/issues?q=is%3Aissue+is%3Aopen+label%3Agoal+label%3Aproj%3A{project}".into(),
+        "https://github.com/acme/hub/milestones".into(),
     )
 }
 
-fn goal(number: u64, title: &str, gist: &str) -> super::GoalIssue {
-    super::GoalIssue {
+fn goal(number: u64, title: &str, gist: &str) -> super::Goal {
+    super::Goal {
         number,
         title: title.into(),
         gist: gist.into(),
@@ -42,13 +42,11 @@ async fn list_renders_number_title_gist() {
 }
 
 #[tokio::test]
-async fn empty_goals_hint_carrier_and_filter_url() {
+async fn empty_goals_hint_carrier_and_url() {
     let md = view(vec![]).list("origa").await.unwrap();
     assert!(md.contains("цели проекта не заведены"));
-    assert!(md.contains("лейблы goal + proj:origa"));
-    assert!(md.contains(
-        "https://github.com/acme/hub/issues?q=is%3Aissue+is%3Aopen+label%3Agoal+label%3Aproj%3Aoriga"
-    ));
+    assert!(md.contains("milestones hub-репо"));
+    assert!(md.contains("https://github.com/acme/hub/milestones"));
 }
 
 #[tokio::test]
@@ -67,14 +65,14 @@ async fn repo_error_passes_through_as_source() {
     struct Broken;
     #[async_trait]
     impl crate::goals::GoalsRepo for Broken {
-        async fn open_goals(&self, _project: &str) -> crate::UsecaseResult<Vec<super::GoalIssue>> {
+        async fn open_goals(&self, _project: &str) -> crate::UsecaseResult<Vec<super::Goal>> {
             Err(UsecaseError::Board("gh api: 502".into()))
         }
     }
     let v = GoalsView::new(
         Arc::new(Broken),
         vec!["uwuwu".into()],
-        "u://{project}".into(),
+        "u://milestones".into(),
     );
     let err = v.list("uwuwu").await.unwrap_err();
     assert!(matches!(err, ViewError::Source(_)));

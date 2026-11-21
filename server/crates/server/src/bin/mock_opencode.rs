@@ -34,7 +34,9 @@
 //! Env: MOCK_MODE (деф. plain), MOCK_PORT (8099), MOCK_STEP_MS (1500),
 //!      MOCK_MCP_URL (http://127.0.0.1:8090), MOCK_MCP_TOKEN («»),
 //!      MOCK_VERDICTS («plan:request_changes;result:request_changes;...») —
-//!      сценарные вердикты ревью-стадий по порядку (ре-энтри-циклы).
+//!      сценарные вердикты ревью-стадий по порядку (ре-энтри-циклы);
+//!      ключ «test-review:request_changes» — находки тест-ревьювера
+//!      (#1413), ключ «test:review» — pass теста без тест-коммитов.
 //!
 //! Запуск рядом с локальным uwuwu-server (executor.url = http://127.0.0.1:8099).
 
@@ -128,8 +130,20 @@ fn stage_action_of_prompt(prompt: &str) -> Option<(&'static str, &'static str, &
         ("dev", "Ревью результата", "реализация завершена (мок)")
     } else if prompt.contains("ревью результата") {
         ("result", "Тестирование", "ревью approve (мок)")
+    } else if prompt.contains("тестовая дельта ветки") {
+        // #1413: уникальный stage-маркер тест-ревьювера, не подстрока
+        // имени статуса «Ревью тестирования» — она живёт и в
+        // finish-инструкции тестировщика (чекпойнт pass), матч по имени
+        // статуса классифицировал бы tester-промпт как test-review
+        ("test-review", "Review", "тест-ревью: чисто (мок)")
     } else if prompt.contains("тестирование") {
-        ("test", "Review", "тест pass (мок)")
+        // дефолт стенда — pass с тест-коммитами: полный цикл конвейера
+        // (#1413); «pass без тест-коммитов → Review» — сценар test:review
+        (
+            "test",
+            "Ревью тестирования",
+            "тест pass, есть тест-коммиты (мок)",
+        )
     } else if prompt.contains("Аналитика волны") {
         ("analys", "Review Analys", "аналитика: проработано (мок)")
     } else if prompt.contains("Ревью аналитики") {
@@ -160,7 +174,9 @@ fn action_for_status(status: &str) -> (&'static str, &'static str) {
         "Design" => ("Ревью плана", "план доработан (мок)"),
         "In Progress" => ("Ревью результата", "доработка завершена (мок)"),
         "Ревью результата" => ("Тестирование", "ревью approve (мок)"),
-        "Тестирование" => ("Review", "тест pass (мок)"),
+        // дефолт стенда: pass с тест-коммитами → ревью тестирования (#1413)
+        "Тестирование" => ("Ревью тестирования", "тест pass, есть тест-коммиты (мок)"),
+        "Ревью тестирования" => ("Review", "тест-ревью approve (мок)"),
         "Ревью плана" => ("In Progress", "план approve (мок)"),
         _ => ("", "сводка (мок)"),
     }
@@ -951,6 +967,10 @@ async fn work_like_agent(
                     status = "In Progress";
                     verdict = "ревью request_changes (мок) — на доработку";
                 }
+                "test-review" => {
+                    status = "Тестирование";
+                    verdict = "тест-ревью request_changes (мок) — находки тестировщику";
+                }
                 "analys-review" => {
                     status = "Analys";
                     verdict = "ревью аналитики: request_changes (мок) — возврат в Analys";
@@ -969,6 +989,11 @@ async fn work_like_agent(
                     "сценарий +die: сессии строки убиты (respawn-путь)"
                 );
             }
+        } else if stage == "test" && v == "test:review" {
+            // pass без тест-коммитов: тестировщик ведёт в Review мимо
+            // ревью тестирования (#1413 — гиркин «без тестовых коммитов»)
+            status = "Review";
+            verdict = "тест pass, без тест-коммитов (мок)";
         }
     }
     if wave_numbers(&prompt_text).is_empty() {
@@ -1207,7 +1232,9 @@ mod tests {
             ("ревью плана: парафриз", "In Progress"),
             ("реализация по утверждённому плану", "Ревью результата"),
             ("ревью результата: код/CI", "Тестирование"),
-            ("тестирование: качество фичи", "Review"),
+            // дефолт стенда: pass с тест-коммитами — полный цикл (#1413)
+            ("тестирование: качество фичи", "Ревью тестирования"),
+            ("ревью тестирования: тестовая дельта ветки", "Review"),
             (
                 "Аналитика волны (проект p) — строки в Analys",
                 "Review Analys",
@@ -1221,6 +1248,21 @@ mod tests {
             let (_, status, _) = stage_action_of_prompt(prompt).unwrap();
             assert_eq!(status, want, "промпт «{prompt}»");
         }
+        // тест-ревьювер классифицируется по уникальному stage-маркеру
+        let (test_review_stage, _, _) =
+            stage_action_of_prompt("ревью тестирования: тестовая дельта ветки").unwrap();
+        assert_eq!(test_review_stage, "test-review");
+        // дизамбигуация (#1413 ревью 2): tester-промпт с именем статуса
+        // «Ревью тестирования» в finish-инструкции — НЕ test-review
+        let tester_prompt = "Задача #42 «t» — тестирование: качество фичи, вердикт pass/fail \
+             с шагами. … вердикт pass/fail комментом → pass: есть (tester)-коммиты — статус \
+             «Ревью тестирования», нет — «Review»; fail — In Progress";
+        let (test_stage, test_status, _) = stage_action_of_prompt(tester_prompt).unwrap();
+        assert_eq!(
+            (test_stage, test_status),
+            ("test", "Ревью тестирования"),
+            "tester-промпт не перехватывается test-review-маркером"
+        );
         // триаж выведен (#1135): старого маркера нет
         assert_ne!(
             stage_action_of_prompt("Триаж черновика #5").unwrap().0,
@@ -1232,5 +1274,55 @@ mod tests {
             ""
         );
         assert_eq!(stage_action_of_prompt("Крон-ран «X»").unwrap().1, "");
+    }
+
+    #[test]
+    fn test_review_scripted_verdicts_follow_canon() {
+        // #1413: сценарные вердикты тест-контура — гиркин-ветки
+        let (stage, status, _) = stage_action_of_prompt("тестирование: качество фичи").unwrap();
+        assert_eq!((stage, status), ("test", "Ревью тестирования"));
+        let (stage, status, _) =
+            stage_action_of_prompt("ревью тестирования: тестовая дельта ветки").unwrap();
+        assert_eq!((stage, status), ("test-review", "Review"));
+        // action_for_status: wakeup-путь по текущему статусу строки
+        let (next, _) = action_for_status("Тестирование");
+        assert_eq!(next, "Ревью тестирования");
+        let (next, _) = action_for_status("Ревью тестирования");
+        assert_eq!(next, "Review");
+    }
+
+    #[test]
+    fn every_mock_status_assignment_is_canonical_key() {
+        // Регресс-пин тест-круга #1413: RC-ветка test-review слала "Testing" —
+        // строка не является ключом parse_status (канон «Тестирование»):
+        // серверный гард резал правку («переход ReviewTesting → Empty вне
+        // канона конвейера»), строка зависала в «Ревью тестирования»,
+        // сценарный ключ "test-review:request_changes" не работал вживую
+        // (дефолтный стенд ветку не гоняет — только approve-путь). Каждый
+        // литерал присваивания статуса в драйвере обязан быть канон-ключом
+        // носителя; скан по исходнику ловит класс целиком (прецедент —
+        // mock_route_coverage: скан литералов вместо ручной таблицы).
+        let src = include_str!("mock_opencode.rs");
+        let needle = "status = \"";
+        let mut scanned: Vec<&str> = Vec::new();
+        let mut i = 0;
+        while let Some(pos) = src[i..].find(needle) {
+            let start = i + pos + needle.len();
+            let Some(end) = src[start..].find('"') else {
+                panic!("литерал статуса оборван (offset {start})");
+            };
+            scanned.push(&src[start..start + end]);
+            i = start + end;
+        }
+        assert!(
+            scanned.len() >= 5,
+            "скан должен находить все сайты присваивания: {scanned:?}"
+        );
+        for s in &scanned {
+            assert!(
+                !matches!(uwuwu_usecase::parse_status(s), uwuwu_domain::Status::Empty),
+                "мок шлёт невалидный статус-ключ «{s}» — гард режет правку"
+            );
+        }
     }
 }

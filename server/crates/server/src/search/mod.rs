@@ -2,6 +2,7 @@
 //! (таблица чанков + FTS BM25; dim-guard — прозрачная переиндексация
 //! при смене размерности, ADR-108 маршрута туннеля не обслуживает).
 
+mod maintenance;
 mod semantic;
 mod semantic_backend;
 

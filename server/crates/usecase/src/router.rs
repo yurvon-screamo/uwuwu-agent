@@ -1,6 +1,7 @@
 //! Маршрутизатор сессий «проект → executor» (#1203): per-project гейтвеи,
-//! дефолт — [executor]. Union-скан strict: all-or-Err — частичный список
-//! искажает busy-подсчёт CUP и alive-гварды (#1231).
+//! дефолт — [executor]. Union-скан reachable (#1450): сессии живых
+//! исполнителей + имена отказных — отказ одного не обнуляет зрение
+//! конвейера, его строки держит пер-проектное зрение/слепой hold (#1263).
 
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::ports::{AgentSessionGateway, SessionInfo};
@@ -11,6 +12,32 @@ use uwuwu_domain::Agent;
 /// Число busy-сессий union-скана — занятые слоты единого капа (#1231).
 pub fn busy_count(list: &[SessionInfo]) -> usize {
     list.iter().filter(|s| s.busy).count()
+}
+
+/// Слияние per-executor результатов в reachable-union (#1450): живые
+/// списки в union, отказные — имена в failed с warn по каждому. Одна
+/// точка знания контракта слияния — роутер и тик используют один код
+/// (ревью #1450: инлайн-мердж в тике дублировал семантику роутера).
+pub fn merge_reachable(
+    per_exec: &[(String, UsecaseResult<Vec<SessionInfo>>)],
+) -> (Vec<SessionInfo>, Vec<String>) {
+    let mut out = Vec::new();
+    let mut failed = Vec::new();
+    for (name, r) in per_exec {
+        match r.as_ref() {
+            Ok(list) => out.extend(list.iter().cloned()),
+            Err(e) => {
+                tracing::warn!(
+                    event = "sessions.list_reachable_failed",
+                    executor = %name,
+                    error = %e,
+                    "list_sessions исполнителя недоступен — деградация по исполнителю"
+                );
+                failed.push(name.clone());
+            }
+        }
+    }
+    (out, failed)
 }
 
 /// Есть ли среди busy-сессий агент данной роли: alive-гвард «≤1 живого»
@@ -97,22 +124,21 @@ impl SessionRouter {
         &self.default
     }
 
-    /// Список сессий со ВСЕХ исполнителей, all-or-Err: потребители,
-    /// принимающие решения по агрегату (CUP), частичный список не получают —
-    /// он представил бы сессии офлайн-исполнителя мёртвыми → овер-спавн.
-    pub async fn list_sessions_strict(&self) -> UsecaseResult<Vec<SessionInfo>> {
-        let mut out = Vec::new();
-        for (name, gateway) in &self.all {
-            match gateway.list_sessions().await {
-                Ok(list) => out.extend(list),
-                Err(e) => {
-                    return Err(UsecaseError::Session(format!(
-                        "list_sessions: исполнитель «{name}» недоступен: {e}"
-                    )))
-                }
-            }
-        }
-        Ok(out)
+    /// Union-скан живых исполнителей (#1450): сессии всех ДОСТУПНЫХ
+    /// исполнителей + имена отказных. Решения по агрегату (CUP,
+    /// alive-гварды) считают по тому, что видно; строки отказного
+    /// исполнителя держит слепой hold (#1263) — спавн к нему невозможен,
+    /// а занятые слоты мертвы вместе с ним. Полный отказ — пустой список,
+    /// все имена в failed.
+    pub async fn list_sessions_reachable(&self) -> (Vec<SessionInfo>, Vec<String>) {
+        let per_exec = self.list_sessions_per_executor().await;
+        merge_reachable(&per_exec)
+    }
+
+    /// Число известных исполнителей — гард «все отказали» у потребителей
+    /// reachable-скана (кроны: файр откладывается, когда файрить некому).
+    pub fn executors_total(&self) -> usize {
+        self.all.len()
     }
 
     /// Экспорт сессии с веером по исполнителям: дефолт → остальные,
