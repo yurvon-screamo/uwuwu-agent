@@ -58,22 +58,23 @@ impl CronUseCase {
     pub async fn tick(&self) -> UsecaseResult<Vec<FireOutcome>> {
         let mut fired = Vec::new();
         // CUP-гвард (#1231): крон-ран — запуск хода, ему нужен свободный
-        // слот единого капа. Strict union (#1203): отказ скана — файр
-        // откладывается (ран не считается состоявшимся, журнал не пишется).
-        // busy — счётчик на весь тик: файр текущего тика занимает слот
-        // (инкремент после успешного запуска), иначе мульти-файр при
-        // неполном капе оверселлит до cap+N-1 (#1244-класс, ревью #1231).
-        let mut busy = match self.sessions.list_sessions_strict().await {
-            Ok(list) => crate::router::busy_count(&list),
-            Err(e) => {
-                tracing::warn!(
-                    event = "cron.list_sessions_failed",
-                    error = %e,
-                    "Кроны: union-скан недоступен — файр отложен"
-                );
-                return Ok(fired);
-            }
-        };
+        // слот единого капа. Деградация по исполнителю (#1450): busy —
+        // по живому union; полный отказ всех исполнителей — файр
+        // откладывается (ран не считается состоявшимся, журнал не
+        // пишется). busy — счётчик на весь тик: файр текущего тика
+        // занимает слот (инкремент после успешного запуска), иначе
+        // мульти-файр при неполном капе оверселлит до cap+N-1
+        // (#1244-класс, ревью #1231).
+        let (list, failed) = self.sessions.list_sessions_reachable().await;
+        if failed.len() == self.sessions.executors_total() {
+            tracing::warn!(
+                event = "cron.list_sessions_failed",
+                executors = ?failed,
+                "Кроны: ни один исполнитель недоступен — файр отложен"
+            );
+            return Ok(fired);
+        }
+        let mut busy = crate::router::busy_count(&list);
         let masters = self.scan_masters().await?;
         for master in masters {
             let name = cron_name(&master.slug).to_string();
@@ -635,9 +636,10 @@ mod tests {
 
     #[tokio::test]
     async fn cron_fire_deferred_when_scan_fails() {
-        // Отказная ветка: union-скан strict-Err (исполнитель недоступен) —
-        // файр откладывается до свободного тика, ран не считается
-        // состоявшимся (консистентно с конвейером).
+        // Отказная ветка (#1450): ВСЕ исполнители недоступны — файр
+        // откладывается до свободного тика, ран не считается
+        // состоявшимся (консистентно с конвейером). Частичный отказ
+        // файр не останавливает — busy по живому union.
         struct FailingSessions;
         #[async_trait::async_trait]
         impl crate::ports::AgentSessionGateway for FailingSessions {

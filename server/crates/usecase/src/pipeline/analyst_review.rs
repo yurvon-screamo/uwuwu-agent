@@ -36,10 +36,17 @@ impl AnalystReviewUseCase {
     pub async fn tick(&self) -> UsecaseResult<usize> {
         // парность: ≤1 живого ревьювера аналитики — busy-признак (ход в
         // полёте, #1231): outcome при новом ходе не очищается, дубль-волна
-        // на 2+ ходе ревьювера была незаметна. Strict union (#1203): как у
-        // аналитика — живой ревьювер волны на офлайн-исполнителе не
-        // порождает дубль-спавн на другом
-        let scan = self.sessions.list_sessions_strict().await?;
+        // на 2+ ходе ревьювера была незаметна. Деградация по исполнителю
+        // (#1450): как у аналитика — волна по живому union, отказ одного
+        // исполнителя волну не останавливает
+        let (scan, failed) = self.sessions.list_sessions_reachable().await;
+        if !failed.is_empty() {
+            tracing::warn!(
+                event = "analys_review.list_degraded",
+                executors = ?failed,
+                "Ревью аналитики: часть исполнителей недоступна — волна по живому union"
+            );
+        }
         if crate::router::has_busy_agent(&scan, Agent::AnalystReviewer) {
             tracing::debug!(
                 event = "analys_review.alive_skip",

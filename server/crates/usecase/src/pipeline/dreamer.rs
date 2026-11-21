@@ -39,16 +39,26 @@ impl DreamerUseCase {
     /// сессии с финалом И реальной работой (токены > 0, не пустышки).
     pub async fn tick(&self) -> UsecaseResult<usize> {
         let now = self.clock.now_ms();
-        // Strict union (#1203/#1231): busy-учёт капа и alive-гвард —
-        // решения по агрегату, частичный список искажает подсчёт.
-        // Офлайн-исполнитель останавливает тик дримера до возврата
-        // (пост-обработка догоняет на следующем тике).
-        let list = self.sessions.list_sessions_strict().await?;
+        // Деградация по исполнителю (#1450): busy-учёт капа и alive-гвард
+        // по живому union — отказ одного исполнителя дримера не
+        // останавливает (пост-обработка догоняет на следующем тике).
+        let (list, failed) = self.sessions.list_sessions_reachable().await;
+        if !failed.is_empty() {
+            tracing::warn!(
+                event = "dreamer.list_degraded",
+                executors = ?failed,
+                "Дример: часть исполнителей недоступна — по живому union, prune отложен"
+            );
+        }
         // Гигиена state сразу после живого скана и ДО гвардов (#1306):
         // день с исчерпанным капом гигиену не пропускает — записи
-        // умерших сессий не копятся.
+        // умерших сессий не копятся. Полное зрение — условие prune
+        // (#1450): частичный список снёс бы записи сессий, живых на
+        // офлайн-исполнителе.
         let live: std::collections::HashSet<String> = list.iter().map(|s| s.id.clone()).collect();
-        self.state.prune_dreamer(&live);
+        if failed.is_empty() {
+            self.state.prune_dreamer(&live);
+        }
         // ≤1 живого дримера — busy-признак (ход в полёте, #1231): outcome
         // при новом ходе не очищается, дубль-дример на 2+ ходе был незаметен
         if crate::router::has_busy_agent(&list, Agent::Dreamer) {

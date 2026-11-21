@@ -1,6 +1,7 @@
 //! Маршрутизатор сессий «проект → executor» (#1203): per-project гейтвеи,
-//! дефолт — [executor]. Union-скан strict: all-or-Err — частичный список
-//! искажает busy-подсчёт CUP и alive-гварды (#1231).
+//! дефолт — [executor]. Union-скан reachable (#1450): сессии живых
+//! исполнителей + имена отказных — отказ одного не обнуляет зрение
+//! конвейера, его строки держит пер-проектное зрение/слепой hold (#1263).
 
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::ports::{AgentSessionGateway, SessionInfo};
@@ -97,22 +98,36 @@ impl SessionRouter {
         &self.default
     }
 
-    /// Список сессий со ВСЕХ исполнителей, all-or-Err: потребители,
-    /// принимающие решения по агрегату (CUP), частичный список не получают —
-    /// он представил бы сессии офлайн-исполнителя мёртвыми → овер-спавн.
-    pub async fn list_sessions_strict(&self) -> UsecaseResult<Vec<SessionInfo>> {
+    /// Union-скан живых исполнителей (#1450): сессии всех ДОСТУПНЫХ
+    /// исполнителей + имена отказных. Решения по агрегату (CUP,
+    /// alive-гварды) считают по тому, что видно; строки отказного
+    /// исполнителя держит слепой hold (#1263) — спавн к нему невозможен,
+    /// а занятые слоты мертвы вместе с ним. Полный отказ — пустой список,
+    /// все имена в failed.
+    pub async fn list_sessions_reachable(&self) -> (Vec<SessionInfo>, Vec<String>) {
         let mut out = Vec::new();
+        let mut failed = Vec::new();
         for (name, gateway) in &self.all {
             match gateway.list_sessions().await {
                 Ok(list) => out.extend(list),
                 Err(e) => {
-                    return Err(UsecaseError::Session(format!(
-                        "list_sessions: исполнитель «{name}» недоступен: {e}"
-                    )))
+                    tracing::warn!(
+                        event = "sessions.list_reachable_failed",
+                        executor = %name,
+                        error = %e,
+                        "list_sessions исполнителя недоступен — деградация по исполнителю"
+                    );
+                    failed.push(name.clone());
                 }
             }
         }
-        Ok(out)
+        (out, failed)
+    }
+
+    /// Число известных исполнителей — гард «все отказали» у потребителей
+    /// reachable-скана (кроны: файр откладывается, когда файрить некому).
+    pub fn executors_total(&self) -> usize {
+        self.all.len()
     }
 
     /// Экспорт сессии с веером по исполнителям: дефолт → остальные,

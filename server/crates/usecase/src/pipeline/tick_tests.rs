@@ -2664,19 +2664,21 @@ async fn dead_stage_and_candidate_hold_blind_when_list_unavailable() {
 }
 
 #[tokio::test]
-async fn mixed_health_candidate_decided_by_status_fallback_at_cup_gate() {
-    // смешанное здоровье (ревью Common #1263): ЧУЖОЙ исполнитель отказной
-    // (дефолтный redmi), свой (kisa) жив — зрение проекта Some, кандидат
-    // без сестры доходит до CUP-гейта и решается СТАТУСНЫМ подсчётом
-    // fallback'а: строка с сессией + кандидат дают fallback_active=2 —
-    // кап 1 держит кандидата (held_cup), кап 7 пропускает спавн
-    // (консервативный кап против шторма при деградации, не паралич)
+async fn mixed_health_cup_counts_only_reachable_busy() {
+    // Отказной исполнитель не морозит живой (#1450): redmi (дефолт)
+    // недоступен, доска p на живом kisa. Бывший strict-фолбэк считал бы
+    // кап по статусам всех строк (2: мёртвая сессия + кандидат) — тот же
+    // механизм сутки держал прод при капе 7 и 37 активных строках
+    // (инцидент 21.11). Теперь кап = реальный busy живых списков (0):
+    // мёртвая сессия строки 66 респавнится, кандидат 67 спавнится.
+    // Строки самого отказного держит слепой hold (#1263), зрение проекта
+    // чужой отказ не гасит.
     let rows = || {
         let mut session_row = task(66, Status::InProgress);
         let mut f = TaskFields::default();
         f.set_session(
             Slot::Dev,
-            uwuwu_domain::SessionRef::parse("ses_live_66").unwrap(),
+            uwuwu_domain::SessionRef::parse("ses_dead_66").unwrap(),
         );
         session_row.apply_fields(f);
         vec![session_row, task(67, Status::InProgress)]
@@ -2685,6 +2687,12 @@ async fn mixed_health_candidate_decided_by_status_fallback_at_cup_gate() {
         let mut redmi = FakeSessions::new();
         redmi.list_fails = true;
         let kisa = FakeSessions::new();
+        // list и GET согласованы: сессии нет в list → она мёртва и в
+        // liveness (контракт second source #1163)
+        kisa.dead_sessions
+            .lock()
+            .unwrap()
+            .push("ses_dead_66".into());
         let mut by_project = std::collections::HashMap::new();
         by_project.insert(
             "p".to_string(),
@@ -2696,6 +2704,15 @@ async fn mixed_health_candidate_decided_by_status_fallback_at_cup_gate() {
             vec![("kisa".to_string(), by_project["p"].clone())],
             by_project,
         );
+        // prev = текущий статус: мёртвая сессия строки 66 идёт
+        // респавн-путём (не кик-разморозкой)
+        let state = Arc::new(MemState(Mutex::default()));
+        state
+            .0
+            .lock()
+            .unwrap()
+            .statuses
+            .push((66, Status::InProgress));
         let board = Arc::new(FakeBoard {
             rows: std::sync::Mutex::new(rows()),
             log: Mutex::default(),
@@ -2705,9 +2722,6 @@ async fn mixed_health_candidate_decided_by_status_fallback_at_cup_gate() {
             clear_session_fails: AtomicBool::new(false),
             status_fails: AtomicBool::new(false),
         });
-        // master-break #1155 x #1263: struct вырос probes, оба новых
-        // теста #1263 не догнали (тесты мастера не компилировались);
-        // починено попутно в #1259, факт — в отчёте задачи
         let prs = Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
@@ -2718,25 +2732,22 @@ async fn mixed_health_candidate_decided_by_status_fallback_at_cup_gate() {
             sessions: Arc::new(router),
             prs: prs.clone(),
             clock: Arc::new(FixedClock),
-            state: Arc::new(MemState(Mutex::default())),
+            state,
             models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
             boot_ms: 0,
         }
     };
-    let held = build().run(&plan(Mode::Live, 1)).await.unwrap();
+    let out = build().run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
-        held.held_cup, 1,
-        "кандидат решён статусным подсчётом fallback'а (не слепотой и не сестрой)"
+        out.sessions_busy, 0,
+        "кап = busy живых списков, не статусный счёт fallback'а"
     );
-    assert_eq!(held.spawns_done, 0);
-    assert_eq!(held.held_blind, 0, "чужой отказ не слепит зрение проекта");
-    assert_eq!(held.held_live, 0);
-    let under_cap = build().run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
-        under_cap.spawns_done, 1,
-        "под-каповый спавн идёт по статусному fallback'у — деградация не паралич"
+        out.spawns_done, 2,
+        "респавн мёртвой строки и кандидат проходят — деградация не паралич"
     );
-    assert_eq!(under_cap.held_blind, 0);
+    assert_eq!(out.held_cup, 0);
+    assert_eq!(out.held_blind, 0, "чужой отказ не слепит зрение проекта");
 }
 
 #[tokio::test]
