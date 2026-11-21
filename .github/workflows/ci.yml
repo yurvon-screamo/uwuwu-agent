@@ -37,6 +37,7 @@ jobs:
     outputs:
       rust: ${{ steps.areas.outputs.rust }}
       plugins: ${{ steps.areas.outputs.plugins }}
+      stand: ${{ steps.areas.outputs.stand }}
       server_deploy: ${{ steps.areas.outputs.server_deploy }}
     steps:
       - uses: actions/checkout@v7
@@ -59,14 +60,17 @@ jobs:
           if [ "$run_all" = 1 ]; then
             echo "rust=true" >> "$GITHUB_OUTPUT"
             echo "plugins=true" >> "$GITHUB_OUTPUT"
+            echo "stand=true" >> "$GITHUB_OUTPUT"
           else
             files="$(git diff --name-only origin/master...HEAD)"
             rust=false
             plugins=false
+            stand=false
             while IFS= read -r f; do
               case "$f" in
                 server/crates/*|server/Cargo.toml|server/Cargo.lock) rust=true ;;
                 plugins/*|lib/*) plugins=true ;;
+                server/ops/stand/*) stand=true ;;
               esac
             done <<< "$files"
             echo "rust=$rust" >> "$GITHUB_OUTPUT"
@@ -161,6 +165,36 @@ jobs:
       - name: bun test
         run: bun test lib/
 
+  stand-shell:
+    # порт-контракт стендов (#1304): юнит stand_pick_ports + негатив-пины
+    # пяти скриптов (отказ подбора роняет до старта процессов) + интегра-
+    # ция mock.started-за-биндом. Сьют мгновенный, кроме сборки мока —
+    # кеш общий с rust-джобой (shared-key), так что депы переиспользуются.
+    name: stand shell tests
+    needs: changes
+    if: needs.changes.outputs.stand == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+        with:
+          workspaces: server
+          shared-key: rust-ci-deps
+          cache-on-failure: true
+      # protoc: нужен холодной сборке крейта server (prost-build, lance-стек)
+      - name: Install protoc
+        run: |
+          PB_REL="https://github.com/protocolbuffers/protobuf/releases"
+          PB_VER="29.3"
+          curl -sSL "$PB_REL/download/v${PB_VER}/protoc-${PB_VER}-linux-x86_64.zip" -o /tmp/protoc.zip
+          sudo unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+          sudo chmod +x /usr/local/bin/protoc
+          protoc --version
+      - name: stand shell tests
+        run: bash server/ops/stand/tests/stand_tests.sh
+
   qlty:
     # всегда: qlty сам сканирует дифф изменённых строк (нативный upstream),
     # отдельная джоба дешёвая (секунды) и независимо полезна
@@ -214,7 +248,7 @@ jobs:
   # (path-фильтр: область не затронута), сам ничего не исполняет.
   CI:
     name: CI
-    needs: [changes, fmt, rust, plugins, qlty]
+    needs: [changes, fmt, rust, plugins, stand-shell, qlty]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: always()
