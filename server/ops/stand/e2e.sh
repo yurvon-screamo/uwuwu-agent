@@ -30,11 +30,18 @@
 # Запуск: server/ops/stand/e2e.sh   (из каталога server; cargo build сам)
 # Выход: 0 — ок; 1 — провал с диагнозом. Логи/state/config — mktemp-рандир
 # (печатается в упавших сообщениях). Параллельные прогоны изолированы по
-# рандиру; при занятых дефолтных портах: PORT_MOCK=X PORT_SRV=Y bash e2e.sh
+# рандиру и портам: без оверрайдов порты подбираются свободными
+# (stand_ports.sh, печатаются при старте) — гонка параллельных стендов
+# снята классом (#1304). Ручной оверрайд: PORT_MOCK=X PORT_SRV=Y bash
+# e2e.sh (MOCK2_PORT — второй мок фазы 3) — занятость на зовущем.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."   # server/
-PORT_MOCK="${PORT_MOCK:-8099}"; PORT_SRV="${PORT_SRV:-8090}"
+source "$(dirname "$0")/stand_ports.sh"
+# Порты: оверрайд задан — как есть; не задан — свободные из пробы-бинда
+read -r PORT_SRV_D PORT_MOCK_D MOCK2_PORT_D <<<"$(stand_pick_ports 3)"
+PORT_MOCK="${PORT_MOCK:-$PORT_MOCK_D}"; PORT_SRV="${PORT_SRV:-$PORT_SRV_D}"
+MOCK2_PORT="${MOCK2_PORT:-$MOCK2_PORT_D}"
 BEARER="${UWUWU_SERVER_BEARER:-stand-e2e-bearer}"
 SEED_N=2046
 # Рандир логов/state: /tmp по умолчанию; UWUWU_STAND_RUN_DIR — оверрайд
@@ -55,6 +62,8 @@ MOCK_PID=""; SRV_PID=""; MOCK2_PID=""
 
 say()  { printf '\033[1;34m[e2e]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[e2e FAIL]\033[0m %s\n' "$*"; KEEP=1; exit 1; }
+
+say "порты: сервер $PORT_SRV, мок $PORT_MOCK, мок-2 $MOCK2_PORT"
 
 cleanup() { # только СВОИ процессы (pid-scoped): параллельные стенды не трогаем
   for pid in "$SRV_PID" "$MOCK_PID" "$MOCK2_PID"; do
@@ -166,8 +175,9 @@ wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
 SRV_PID=""; MOCK_PID=""; MOCK2_PID=""
 sleep 1
 rm -f "$STATE"
-MOCK2_PORT=$((PORT_MOCK + 1))   # сессионная изоляция: константа 8098
-                                # сталкивала параллельные стенды на фазе 3
+# MOCK2_PORT — самостоятельный порт второго мока (подбор/оверрайд на верху
+# скрипта): сосед-деривация PORT_MOCK+1 снесена — само соседство было
+# источником столкновений параллельных стендов (#1304)
 LOG_MOCK2="$RUN_DIR/mock2.log"
 LOG_SRV_MULTI="$RUN_DIR/server-multi.log"
 CONFIG_MULTI="$RUN_DIR/config.memory-multi.toml"
