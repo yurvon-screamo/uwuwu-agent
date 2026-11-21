@@ -1933,15 +1933,16 @@ mod tests {
         // Permission-отказ: Display содержит «не rate limit» — старый
         // строковый матч читал его как rate limit (код-ревью Common-1)
         let permission = UsecaseError::Board(
-            "gh graphql [PERMISSION]: HTTP 403 (не rate limit): проверь GH_TOKEN/права токена"
+            "gh graphql [PERMISSION]: HTTP 403 (not rate limit): check GH_TOKEN / the token's permissions"
                 .into(),
         );
         assert!(!is_rate_limited(&permission), "Permission — не rate limit");
         let limited = UsecaseError::Board(
-            "gh graphql [RATE_LIMITED]: GitHub rate limit (core): квота исчерпана".into(),
+            "gh graphql [RATE_LIMITED]: GitHub rate limit (core): the quota is exhausted".into(),
         );
         assert!(is_rate_limited(&limited));
-        let backoff = UsecaseError::Board("gh graphql [RATE_LIMITED]: бэкофф ещё 4 мин".into());
+        let backoff =
+            UsecaseError::Board("gh graphql [RATE_LIMITED]: backoff for another 4 min".into());
         assert!(is_rate_limited(&backoff));
         let unrelated = UsecaseError::Board("graphql errors: NOT_FOUND".into());
         assert!(!is_rate_limited(&unrelated));
@@ -1972,14 +1973,14 @@ mod tests {
         let transport = gh_transport_tagged("не-JSON (HTTP 502 Bad Gateway): eof".into());
         assert!(is_transport_flap(&transport));
         let limited = UsecaseError::Board(
-            "gh graphql [RATE_LIMITED]: GitHub rate limit (core): квота исчерпана".into(),
+            "gh graphql [RATE_LIMITED]: GitHub rate limit (core): the quota is exhausted".into(),
         );
         assert!(
             !is_transport_flap(&limited),
             "rate limit — не транспортный класс"
         );
         let permission = UsecaseError::Board(
-            "gh graphql [PERMISSION]: HTTP 403 (не rate limit): проверь GH_TOKEN/права токена"
+            "gh graphql [PERMISSION]: HTTP 403 (not rate limit): check GH_TOKEN / the token's permissions"
                 .into(),
         );
         assert!(
@@ -2008,9 +2009,10 @@ mod tests {
             None,
             "флап на второй попытке → исчерпание, Err наверх как есть"
         );
-        let limited = UsecaseError::Board("gh graphql [RATE_LIMITED]: бэкофф ещё 4 мин".into());
+        let limited =
+            UsecaseError::Board("gh graphql [RATE_LIMITED]: backoff for another 4 min".into());
         let permission = UsecaseError::Board(
-            "gh graphql [PERMISSION]: HTTP 403 (не rate limit): проверь GH_TOKEN/права токена"
+            "gh graphql [PERMISSION]: HTTP 403 (not rate limit): check GH_TOKEN / the token's permissions"
                 .into(),
         );
         let graphql_errors = UsecaseError::Board("graphql errors: NOT_FOUND".into());
