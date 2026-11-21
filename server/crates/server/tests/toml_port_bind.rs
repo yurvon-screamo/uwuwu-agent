@@ -79,6 +79,13 @@ fn toml_port_key_reaches_http_bind() {
     let port = free_port();
     let (mut child, log, dir) = spawn_server(port);
 
+    // Подтверждение бинда в логе — событие http.listening с нашим портом
+    // (JSON-лог сервера, оба поля одного tracing-события). Греп закрывает
+    // TOCTOU-окно free_port: чужой слушатель на отпущенном ephemeral-порту
+    // дал бы зелёный connect без нашей строки в логе.
+    let bind_line = format!("\"event\":\"http.listening\",\"port\":{port}");
+    let logged = || std::fs::read_to_string(&log).is_ok_and(|l| l.contains(&bind_line));
+
     // TCP-connect на TOML-порт до успеха, смерти ребёнка или таймаута.
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut bound = false;
@@ -92,13 +99,32 @@ fn toml_port_key_reaches_http_bind() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+
+    // Строка http.listening может отставать от успешного connect на
+    // миллисекунды — дать логу дозаписаться до kill (2с максимум).
+    if bound {
+        let mut logged_now = logged();
+        let write_deadline = Instant::now() + Duration::from_secs(2);
+        while !logged_now && Instant::now() < write_deadline {
+            if child.try_wait().map_or(true, |s| s.is_some()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            logged_now = logged();
+        }
+    }
+
     let _ = child.kill();
     let _ = child.wait();
+
+    // Лог читается до очистки каталога: после remove_dir_all файла нет,
+    // и диагностика падения была бы всегда пустой (Low 1 тест-ревью).
+    let log_contents = std::fs::read_to_string(&log).unwrap_or_default();
     std::fs::remove_dir_all(&dir).ok(); // lancedb/логи — мусор за собой
 
     assert!(
-        bound,
-        "сервер не слушал TOML-порт {port}; лог:\n{}",
-        std::fs::read_to_string(&log).unwrap_or_default()
+        bound && log_contents.contains(&bind_line),
+        "сервер не подтвердил http.listening port={port} (bound={bound}); лог:\n{}",
+        log_contents
     );
 }
