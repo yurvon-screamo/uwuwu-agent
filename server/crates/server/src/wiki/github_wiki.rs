@@ -275,10 +275,10 @@ mod tests {
         // различимо помечать оба носителя — тихая слепота устранена
         let adr = out
             .iter()
-            .find(|l| l.starts_with("Projects/uwuwu/ADR (неоднозначно:"))
+            .find(|l| l.starts_with("Projects/uwuwu/ADR (ambiguous:"))
             .expect("строка ADR с пометкой коллизии в живом листинге");
         assert!(
-            adr.contains("файл «Projects/uwuwu/ADR.md» + папка «Projects/uwuwu/ADR/»"),
+            adr.contains("file «Projects/uwuwu/ADR.md» + folder «Projects/uwuwu/ADR/»"),
             "оба носителя названы: {adr}"
         );
         // Дети папки без изменений; неколлизионный файл без пометки

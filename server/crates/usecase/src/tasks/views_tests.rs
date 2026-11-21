@@ -81,7 +81,7 @@ async fn person_show_without_doc_is_loud_not_found() {
     let err = PersonView::new(wiki).show().await.unwrap_err();
     match err {
         ViewError::NotFound(what) => assert!(
-            what.contains("персона"),
+            what.contains("persona"),
             "в сообщении назван отсутствующий носитель: {what}"
         ),
         other => panic!("ожидается NotFound, получено: {other:?}"),
@@ -108,13 +108,13 @@ fn sorted(mut out: Vec<String>) -> Vec<String> {
 async fn docs_ls_collision_marks_both_carriers() {
     // Пара «файл X.md + папка X/» в одном каталоге (#1385): строка X обязана
     // различимо помечать оба носителя — тихая слепота листинга запрещена.
-    // Формат пометки закреплён контрактом: якорь « (неоднозначно:».
+    // Формат пометки закреплён контрактом: якорь « (ambiguous:».
     let view = DocsView::new(docs_wiki(&["X", "X/a", "X/b"]));
     let out = sorted(view.list("X").await.unwrap());
     assert_eq!(
         out,
         vec![
-            "X (неоднозначно: файл «X.md» + папка «X/»)".to_string(),
+            "X (ambiguous: file «X.md» + folder «X/»)".to_string(),
             "X/a".to_string(),
             "X/b".to_string(),
         ]
@@ -124,14 +124,14 @@ async fn docs_ls_collision_marks_both_carriers() {
 #[tokio::test]
 async fn docs_ls_collision_dash_stem_stays_parseable() {
     // Стемы с « — » в вики реальны (ADR-тайтлы): пометка не должна ломать
-    // слаг-префикс — якорь реза « (неоднозначно:» уникален и не встречается
+    // слаг-префикс — якорь реза « (ambiguous:» уникален и не встречается
     // в слаге.
     let view = DocsView::new(docs_wiki(&["A — B", "A — B/c"]));
     let out = sorted(view.list("A — B").await.unwrap());
     assert_eq!(
         out,
         vec![
-            "A — B (неоднозначно: файл «A — B.md» + папка «A — B/»)".to_string(),
+            "A — B (ambiguous: file «A — B.md» + folder «A — B/»)".to_string(),
             "A — B/c".to_string(),
         ]
     );
@@ -146,7 +146,7 @@ async fn docs_ls_nested_collision_annotates_stem_only() {
     assert_eq!(
         out,
         vec![
-            "a/b (неоднозначно: файл «a/b.md» + папка «a/b/»)".to_string(),
+            "a/b (ambiguous: file «a/b.md» + folder «a/b/»)".to_string(),
             "a/b/c".to_string(),
         ]
     );
@@ -200,7 +200,7 @@ async fn docs_ls_stem_neighbor_not_leaked_into_listing() {
     assert_eq!(
         out,
         vec![
-            "X (неоднозначно: файл «X.md» + папка «X/»)".to_string(),
+            "X (ambiguous: file «X.md» + folder «X/»)".to_string(),
             "X/a".to_string(),
         ]
     );

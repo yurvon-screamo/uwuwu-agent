@@ -162,7 +162,7 @@ impl TaskWriteUseCase {
     fn dup_check(&self, rows: &[Task], title: &str) -> UsecaseResult<()> {
         if rows.iter().any(|t| t.title() == title) {
             return Err(UsecaseError::Board(format!(
-                "тайтл «{title}» уже есть на доске — дубль запрещён"
+                "title «{title}» already exists on the board — duplicates forbidden"
             )));
         }
         Ok(())
@@ -223,12 +223,12 @@ impl TaskWriteUseCase {
 impl TaskWriter for TaskWriteUseCase {
     async fn create(&self, project: &str, spec: NewTask) -> UsecaseResult<u64> {
         if spec.title.trim().is_empty() {
-            return Err(UsecaseError::Board("тайтл пуст".into()));
+            return Err(UsecaseError::Board("title is empty".into()));
         }
         let board = self.board_of(project);
         if board.is_empty() {
             return Err(UsecaseError::Board(format!(
-                "проект «{project}» вне конфига"
+                "project «{project}» is not in the config"
             )));
         }
         let rows = self.board.read_board(&board).await?;
@@ -246,14 +246,14 @@ impl TaskWriter for TaskWriteUseCase {
                     event = "dup_check.search_failed",
                     title = %spec.title.trim(),
                     error = %e,
-                    "REST-поиск тайтлов недоступен — холодный гард пропущен (первичный снапшот-гард отработал)"
+                    "the REST title search is unavailable — the cold guard is skipped (the primary snapshot guard already ran)"
                 );
                 Vec::new()
             }
         };
         if !cold.is_empty() {
             return Err(UsecaseError::Board(format!(
-                "тайтл «{}» уже занят issue #{} — дубль запрещён (строка вне снапшота: холодный ящик)",
+                "title «{}» is already taken by issue #{} — duplicates forbidden (the row is outside the snapshot: cold box)",
                 spec.title.trim(),
                 cold[0]
             )));
@@ -318,7 +318,7 @@ impl TaskWriter for TaskWriteUseCase {
         let board = self.board_of(project);
         if board.is_empty() {
             return Err(UsecaseError::Board(format!(
-                "проект «{project}» вне конфига"
+                "project «{project}» is not in the config"
             )));
         }
         let need_rows = patch.title.is_some();
@@ -342,15 +342,15 @@ impl TaskWriter for TaskWriteUseCase {
             let current = match self.board.row_status(&board, number).await? {
                 None => {
                     return Err(UsecaseError::Board(format!(
-                        "строка #{number} не на доске «{board}» \
-                         (статус на носителе отсутствует)"
+                        "row #{number} is not on board «{board}» \
+                         (no status on the carrier)"
                     )))
                 }
                 Some(Status::Empty) => {
                     return Err(UsecaseError::Board(format!(
-                        "статус носителя #{number} не читается — запись без \
-                         верифицированного current запрещена (класс разбираемого \
-                         бага #1235), разбор владельца"
+                        "the carrier status of #{number} is unreadable — writing without \
+                         a verified current is forbidden (the class of the triaged \
+                         bug #1235), owner's triage"
                     )))
                 }
                 Some(current) => current,
@@ -397,7 +397,7 @@ impl TaskWriter for TaskWriteUseCase {
                 .any(|t| t.number() != number && t.title() == title)
             {
                 return Err(UsecaseError::Board(format!(
-                    "тайтл «{title}» уже занят другой строкой"
+                    "title «{title}» is already taken by another row"
                 )));
             }
             // холодный ящик (#1293, Low дельта-раунда 2): rename-гард
@@ -411,14 +411,14 @@ impl TaskWriter for TaskWriteUseCase {
                         event = "dup_check.search_failed",
                         title = %title,
                         error = %e,
-                        "REST-поиск тайтлов недоступен при rename — холодный гард пропущен"
+                        "the REST title search is unavailable during rename — the cold guard is skipped"
                     );
                     Vec::new()
                 }
             };
             if let Some(other) = cold.iter().find(|n| **n != number) {
                 return Err(UsecaseError::Board(format!(
-                    "тайтл «{title}» уже занят issue #{other} — дубль запрещён (строка вне снапшота: холодный ящик)"
+                    "title «{title}» is already taken by issue #{other} — duplicates forbidden (the row is outside the snapshot: cold box)"
                 )));
             }
             self.board.rename_issue(number, title).await?;
@@ -428,14 +428,14 @@ impl TaskWriter for TaskWriteUseCase {
         let mut field_patch: Vec<(&str, Option<String>)> = Vec::new();
         if let Some(b) = &patch.branch {
             let name = uwuwu_domain::BranchName::parse(b).ok_or_else(|| {
-                UsecaseError::Board(format!("ветка «{b}» не валидна (пробелы/глоб-символы)"))
+                UsecaseError::Board(format!("branch «{b}» is invalid (spaces/glob characters)"))
             })?;
             field_patch.push(("Branch", Some(name.as_str().to_string())));
             want_branch = Some(name.as_str().to_string());
         }
         if let Some(p) = &patch.pr {
             let url = uwuwu_domain::PrUrl::parse(p)
-                .ok_or_else(|| UsecaseError::Board(format!("PR «{p}» не http(s)-URL")))?;
+                .ok_or_else(|| UsecaseError::Board(format!("PR «{p}» is not an http(s) URL")))?;
             field_patch.push(("PR", Some(url.as_str().to_string())));
             want_pr = Some(url.as_str().to_string());
         }
@@ -479,7 +479,7 @@ impl TaskWriter for TaskWriteUseCase {
 
     async fn comment(&self, number: u64, text: &str, reply_to: Option<&str>) -> UsecaseResult<()> {
         if text.trim().is_empty() {
-            return Err(UsecaseError::Board("коммент пуст".into()));
+            return Err(UsecaseError::Board("the comment is empty".into()));
         }
         let body = match reply_to {
             Some(anchor) => format!("> {anchor}\n\n{text}"),
@@ -523,8 +523,8 @@ impl TaskWriter for TaskWriteUseCase {
                     "Пост коммента не подтвердился чтением ленты носителя"
                 );
                 Err(UsecaseError::Board(format!(
-                    "коммент #{number}: пост не подтвердился чтением ленты носителя — \
-                     не ретраить слепо (риск дубля), сверь task_get"
+                    "comment #{number}: the post was not confirmed by reading the carrier feed — \
+                     do not retry blindly (duplicate risk), verify via task_get"
                 )))
             }
             Delivery::Blind => {
@@ -555,7 +555,7 @@ impl TaskWriter for TaskWriteUseCase {
             }
         }
         Err(UsecaseError::Board(format!(
-            "строка #{number} не на досках конфига"
+            "row #{number} is not on the configured boards"
         )))
     }
 
@@ -574,7 +574,7 @@ impl TaskWriter for TaskWriteUseCase {
         // мусорный project не пишет «мимо доски» молча (ревью #1331 Low)
         if board.is_empty() {
             return Err(UsecaseError::Board(format!(
-                "проект «{project}» вне конфига"
+                "project «{project}» is not in the config"
             )));
         }
         self.board.replace_body(number, clean).await?;
@@ -608,8 +608,8 @@ impl TaskWriter for TaskWriteUseCase {
                     "Запись тела не подтвердилась контрольным чтением носителя"
                 );
                 Err(UsecaseError::Board(format!(
-                    "тело #{number}: запись не подтвердилась чтением носителя — \
-                     GitHub отдаёт не записанное; не ретраить слепо, сверь task_get"
+                    "body #{number}: the write was not confirmed by reading the carrier — \
+                     GitHub returns something other than what was written; do not retry blindly, verify via task_get"
                 )))
             }
             Delivery::Blind => {
@@ -637,17 +637,19 @@ impl TaskWriter for TaskWriteUseCase {
         base_hash: &str,
     ) -> UsecaseResult<SectionEditReport> {
         if section.trim().is_empty() {
-            return Err(UsecaseError::Board("секция пуста — укажи заголовок".into()));
+            return Err(UsecaseError::Board(
+                "the section is empty — provide the heading".into(),
+            ));
         }
         if base_hash.trim().is_empty() {
             return Err(UsecaseError::Board(
-                "base_hash обязателен (body_hash из fm task_get)".into(),
+                "base_hash is required (body_hash from the fm of task_get)".into(),
             ));
         }
         let board = self.board_of(project);
         if board.is_empty() {
             return Err(UsecaseError::Board(format!(
-                "проект «{project}» вне конфига"
+                "project «{project}» is not in the config"
             )));
         }
         let current = self.board.read_issue(&board, number).await?;
@@ -784,12 +786,12 @@ impl EditExpectations {
         let mut out = Vec::new();
         if let Some(t) = &self.title {
             if view.task.title() != t {
-                out.push("тайтл");
+                out.push("title");
             }
         }
         if let Some(b) = &self.branch {
             if view.task.branch().map(|x| x.as_str()) != Some(b.as_str()) {
-                out.push("ветка");
+                out.push("branch");
             }
         }
         if let Some(u) = &self.pr {
@@ -799,7 +801,7 @@ impl EditExpectations {
         }
         if let Some(p) = &self.priority {
             if view.task.priority() != crate::naming::parse_priority(p) {
-                out.push("приоритет");
+                out.push("priority");
             }
         }
         if let Some(a) = self.automerge {
@@ -877,7 +879,7 @@ impl TaskWriteUseCase {
                         if m.is_empty() {
                             String::new()
                         } else {
-                            format!("не сошлись: {} — ", m.join(", "))
+                            format!("mismatched: {} — ", m.join(", "))
                         }
                     }
                     Err(_) => String::new(),
@@ -889,8 +891,8 @@ impl TaskWriteUseCase {
                     "Запись edit не подтвердилась контрольным чтением носителя"
                 );
                 Err(UsecaseError::Board(format!(
-                    "edit #{number}: запись не подтвердилась чтением носителя ({detail}\
-                     тайтл/ветка/PR/приоритет/automerge) — не ретраить слепо, сверь task_get"
+                    "edit #{number}: the write was not confirmed by reading the carrier ({detail}\
+                     title/branch/PR/priority/automerge) — do not retry blindly, verify via task_get"
                 )))
             }
             Delivery::Blind => {
@@ -1602,7 +1604,7 @@ mod tests {
             .await
             .expect_err("фантомная запись тела — громкий отказ");
         assert!(
-            err.to_string().contains("не подтвердилась"),
+            err.to_string().contains("was not confirmed"),
             "текст отказа: {err}"
         );
     }
@@ -1616,7 +1618,7 @@ mod tests {
             .await
             .expect_err("фантомный коммент — громкий отказ");
         assert!(
-            err.to_string().contains("не подтвердился"),
+            err.to_string().contains("was not confirmed"),
             "текст отказа: {err}"
         );
     }
@@ -1640,9 +1642,9 @@ mod tests {
             .await
             .expect_err("фантомный edit — громкий отказ");
         let text = err.to_string();
-        assert!(text.contains("не подтвердилась"), "текст отказа: {text}");
+        assert!(text.contains("was not confirmed"), "текст отказа: {text}");
         assert!(
-            text.contains("не сошлись: ветка"),
+            text.contains("mismatched: branch"),
             "перечень несошедших ключей вычислен, не статичен: {text}"
         );
     }
@@ -1664,7 +1666,7 @@ mod tests {
             .await
             .expect_err("фантомный rename — громкий отказ");
         assert!(
-            err.to_string().contains("не подтвердилась"),
+            err.to_string().contains("was not confirmed"),
             "текст отказа: {err}"
         );
     }
