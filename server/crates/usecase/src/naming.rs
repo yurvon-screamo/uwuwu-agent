@@ -21,7 +21,7 @@ pub fn status_name(s: Status) -> &'static str {
         Status::UserReview => "Review",
         Status::Done => "Done",
         Status::NeedsAttention => "Needs attention",
-        Status::Wait => "Вейт",
+        Status::Wait => "Wait",
         Status::Deleted => "Deleted",
         Status::Empty => "",
     }
@@ -44,6 +44,7 @@ pub fn parse_status(raw: &str) -> Status {
         "Review" => Status::UserReview,
         "Done" => Status::Done,
         "Needs attention" => Status::NeedsAttention,
+        "Wait" => Status::Wait,
         "Вейт" => Status::Wait,
         "Deleted" => Status::Deleted,
         _ => Status::Empty,
@@ -248,6 +249,17 @@ mod tests {
         }
         assert_eq!(parse_status("мусор"), Status::Empty);
         assert_eq!(parse_status(""), Status::Empty);
+    }
+
+    #[test]
+    fn status_wait_alias() {
+        // Алиас «Вейт» — мост совместимости переименования: прод-сервер до
+        // деплоя нового бинарника пишет «Вейт», а state.rs парсит last_status
+        // тем же parse_status. Удаление алиаса должно валить этот тест,
+        // а не молча ломать чтение легаси-значений.
+        assert_eq!(status_name(Status::Wait), "Wait");
+        assert_eq!(parse_status("Wait"), Status::Wait);
+        assert_eq!(parse_status("Вейт"), Status::Wait);
     }
 
     #[test]
