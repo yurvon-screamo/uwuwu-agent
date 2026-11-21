@@ -927,6 +927,10 @@ impl TickUseCase {
                 Ok(StallAct::Pinged) => out.stall_pings += 1,
                 Ok(StallAct::SoftPinged) => {
                     out.soft_pings += 1;
+                    // доставленный ход занимает слот капа в этом же тике
+                    // (#1231 семантика общих счётчиков: без инкремента K
+                    // idle-строк масс-сталла видят один снапшот и оверселят кап)
+                    *active_now += 1;
                     // мягкий пинг доставлен — доставка в сессию работает (#1288)
                     self.state.clear_lost_session(&board.board, task.number());
                 }

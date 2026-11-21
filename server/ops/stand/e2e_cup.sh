@@ -10,7 +10,7 @@
 #     reachable-busy живого A (#1450), строки A не морозятся;
 #   V3 восстановление: B возвращается — его очередь выезжает
 #     (слепой hold #1263 снимается);
-#   V4 зомби-флаг: busy>idle старше 30 мин (#1295) не держит слот;
+#   V4 зомби-флаг: busy>idle старше 30 мин (PR #409) не держит слот;
 #   V5 мягкий сталл-пинг: при полном капе держится (#1313),
 #     на свободном слоте доставляется.
 #
@@ -160,13 +160,22 @@ stop_pid "$SRV_PID"; SRV_PID=""
 say "V2: B вниз, A жив с busy×2 — кап по reachable, строки A не морозятся"
 stop_pid "$PID_B"; PID_B=""
 sleep 1
+# held_cup дискриминативен в дельте: событие уже есть с V1 — регрессия
+# reachable→strict ловится только приростом счётчика в окне V2.
+# Окно V2 несёт свой busy-филлер: после дрена V1 busy=B2=1<cup — held бы
+# не возник вовсе; филлер возвращает кап в насыщение (busy×2)
+HELD_BEFORE=$(grep -c '"event":"spawn.held_cup"' "$LOG_SRV" || true)
+HB=$(mk_busy "$PORT_A" 0)
+[ -n "$HB" ] || fail "V2: филлер окна не создан"
+rm -f "$STATE"   # свежие кандидаты без ячеек: дрен V1 израсходовал 3300/3301
 UWUWU_SERVER_CONFIG=$CONFIG UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
   UWUWU_SERVER_MODE=live UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=x \
   UWUWU_MOCK_SEED="Задачи uwuwu:3300:Design:Medium;Задачи uwuwu:3301:Design:Medium;Доска p2:3400:Design:Medium" \
   RUST_LOG=info "$BIN_SRV" >>"$LOG_SRV" 2>&1 &
 SRV_PID=$!
 wait_phase 25
-grep -q '"event":"spawn.held_cup"' "$LOG_SRV" || fail "V2: reachable-кап не держит кандидата A (busy×2 ≥ cup)"
+HELD_AFTER=$(grep -c '"event":"spawn.held_cup"' "$LOG_SRV" || true)
+[ "$HELD_AFTER" -gt "$HELD_BEFORE" ] || fail "V2: новых held_cup в окне V2 нет — reachable-кап не считается"
 P2_BLIND=$(grep -c '"event":"spawn.held_blind_scan"' "$LOG_SRV" || true)
 [ "$P2_BLIND" -ge 1 ] || fail "V2: строка p2 не держится слепым hold (#1263)"
 say "V2 ок: A-кандидаты held_cup по reachable-busy, p2 — blind hold; конвейер жив (tick.completed есть)"
@@ -175,13 +184,18 @@ grep -q '"event":"tick.completed"' "$LOG_SRV" || fail "V2: тик умер на 
 # ===== V3: восстановление B — его очередь выезжает =====
 say "V3: B возвращается — строка p2 3400 спавнится"
 PID_B2=$(start_mock "$PORT_B" "$LOG_B" "plain")
+# кап освобождается под очередь B: busy-филлеры A (B2+HB) гасятся —
+# иначе глобальный кап полон и 3400 ждёт не слепоту, а слот
+for filler in "$HB" "$B2"; do
+  curl -s --max-time 5 -X DELETE "http://127.0.0.1:$PORT_A/api/session/$filler" >/dev/null
+done
 wait_phase 25
 P2_SPAWN=$(grep -oE '"event":"spawn.done","number":3400' "$LOG_SRV" | wc -l || true)
 [ "$P2_SPAWN" -ge 1 ] || fail "V3: строка p2 3400 не выехала после восстановления B"
 say "V3 ок: восстановление исполнителя выпускает его очередь"
 
 # ===== V4: зомби-флаг не держит слот =====
-say "V4: busy-флаг старше 30 мин (#1295) — слот свободен, кандидат едет"
+say "V4: busy-флаг старше 30 мин (PR #409) — слот свободен, кандидат едет"
 stop_pid "$SRV_PID"; SRV_PID=""
 rm -f "$STATE"
 Z=$(mk_busy "$PORT_A" 2100000)   # 35 мин назад — протухший busy
@@ -206,7 +220,7 @@ UWUWU_SERVER_CONFIG=$CONFIG UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
   UWUWU_MOCK_SEED="Задачи uwuwu:3300:Design:Medium;Задачи uwuwu:3301:Design:Medium" \
   RUST_LOG=info "$BIN_SRV" >>"$LOG_SRV" 2>&1 &
 SRV_PID=$!
-sleep 25   # тик: спавны 3300/3301 (слоты свободны после V4 — busy филлер Z протух)
+wait_phase 25   # тик: спавны 3300/3301 (слоты свободны после V4 — busy филлер Z протух)
 # кап полон: два свежих busy-филлера
 F1=$(mk_busy "$PORT_A" 0); F2=$(mk_busy "$PORT_A" 0)
 [ -n "$F1" ] && [ -n "$F2" ] || fail "V5: филлеры не созданы"
@@ -215,7 +229,7 @@ DEV3300=$(grep -oE '"event":"spawn.done","number":3300[^}]*"session":"ses_mock[0
 [ -n "$DEV3300" ] || fail "V5: dev-сессия 3300 не найдена в логе"
 curl -s --max-time 5 -X POST "http://127.0.0.1:$PORT_A/api/session/$DEV3300/age" \
   -H 'Content-Type: application/json' -d "{\"ms\": 960000, \"messages\": true}" >/dev/null
-sleep 25   # тик: сталл-проход 3300 — пинг держится капом
+wait_phase 25   # тик: сталл-проход 3300 — пинг держится капом
 grep -q '"event":"stall.soft_ping_held_cup","number":3300' "$LOG_SRV" \
   || fail "V5: мягкий пинг не держится полным капом"
 grep -q '"event":"stall.soft_pinged"' "$LOG_SRV" \

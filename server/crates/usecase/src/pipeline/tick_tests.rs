@@ -1224,7 +1224,11 @@ fn dev_task(n: u64, session: &str) -> Task {
 
 /// Гейтвей с N busy-сессиями union-скана — харнес held_cup-пинов
 /// сайдкаров (#1313): dreamer/analyst/analyst_review решают по busy.
-pub(crate) fn gateway_with_busy_sessions(count: usize) -> Arc<dyn AgentSessionGateway> {
+/// outcome задаёт кандидатность филлеров для дримера (is_fresh_candidate).
+pub(crate) fn gateway_with_busy_sessions(
+    count: usize,
+    outcome: &str,
+) -> Arc<dyn AgentSessionGateway> {
     let sessions = FakeSessions::new();
     {
         let mut extra = sessions.extra.lock().unwrap();
@@ -1234,7 +1238,7 @@ pub(crate) fn gateway_with_busy_sessions(count: usize) -> Arc<dyn AgentSessionGa
                 agent: String::new(),
                 directory: String::new(),
                 updated_ms: 0,
-                outcome: String::new(),
+                outcome: outcome.to_string(),
                 total_tokens: 100,
                 busy: true,
             });
@@ -1243,11 +1247,10 @@ pub(crate) fn gateway_with_busy_sessions(count: usize) -> Arc<dyn AgentSessionGa
     Arc::new(sessions)
 }
 
-/// Пустая доска — харнес held_cup-пинов волн: гард капа срабатывает до
-/// чтения досок, доска не трогается.
-pub(crate) fn empty_board() -> Arc<dyn TaskBoardRepo> {
+/// Доска с заданными строками — харнес контроль-ранов волн.
+pub(crate) fn board_with_rows(rows: Vec<Task>) -> Arc<dyn TaskBoardRepo> {
     Arc::new(FakeBoard {
-        rows: std::sync::Mutex::new(vec![]),
+        rows: std::sync::Mutex::new(rows),
         log: Mutex::default(),
         comments: Vec::default(),
         fields_fails: false,
@@ -3918,6 +3921,80 @@ async fn soft_ping_held_when_cup_full_then_delivered_on_free_slot() {
     let out2 = u.run(&plan(Mode::Live, 1)).await.unwrap();
     assert_eq!(out2.soft_pings, 1, "свободный слот — пинг доставлен");
     assert_eq!(out2.soft_pings_deferred, 0);
+}
+
+/// #1313 (ревью High): доставленный пинг занимает слот в счётчике тика —
+/// две idle-строки со ставшими ходами при капе 1 получают РОВНО ОДИН пинг
+/// за тик (вторая видит инкремент и держится); без инкремента масс-сталл
+/// оверселлит кап (класс общего счётчика #1200/#1244).
+#[tokio::test]
+async fn soft_ping_mass_stall_oversell_is_capped() {
+    struct BigClock;
+    impl Clock for BigClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            100_000_000
+        }
+    }
+    let rows: Vec<Task> = [71, 72]
+        .iter()
+        .map(|n| {
+            let mut t = task(*n, Status::InProgress);
+            let mut f = TaskFields::default();
+            f.set_session(
+                Slot::Dev,
+                uwuwu_domain::SessionRef::parse(&format!("ses_dev_{n}")).unwrap(),
+            );
+            t.apply_fields(f);
+            t
+        })
+        .collect();
+    let board = Arc::new(FakeBoard {
+        rows: std::sync::Mutex::new(rows),
+        log: Mutex::default(),
+        comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
+        status_fails: AtomicBool::new(false),
+    });
+    let sess = Arc::new(FakeSessions {
+        activity_ms: Some(100_000_000 - 16 * 60_000),
+        idle_reply: true,
+        ..FakeSessions::new()
+    });
+    let u = TickUseCase {
+        board,
+        sessions: Arc::new(SessionRouter::uniform(sess.clone())),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+            probes: Mutex::default(),
+        }),
+        clock: Arc::new(BigClock),
+        state: Arc::new(MemState(Mutex::default())),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        boot_ms: 0,
+    };
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(
+        out.soft_pings, 1,
+        "масс-сталл при капе 1: ровно один пинг за тик — инкремент слота виден второй строке"
+    );
+    assert_eq!(
+        out.soft_pings_deferred, 1,
+        "вторая строка держится уже обновлённым счётчиком"
+    );
+    assert_eq!(
+        sess.prompts.lock().unwrap().len(),
+        1,
+        "промпт один — оверселла нет"
+    );
 }
 
 /// Инцидент 18.11 (#1281): рестарт uwuwu-server не должен парковать живые
