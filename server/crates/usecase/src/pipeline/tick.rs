@@ -1378,6 +1378,7 @@ impl TickUseCase {
                 call.calls,
                 0,
                 call.idle,
+                false,
             )
             .await;
         match judge.decide(&ctx).await {
@@ -1427,7 +1428,6 @@ impl TickUseCase {
     ) -> bool {
         let escalate_after = self.judge_cfg.escalate_after;
         if escalate_after > 0 && rounds >= REVIEW_ROUND_CAP + escalate_after {
-            out.judge_forced += 1;
             tracing::warn!(
                 event = "judge.rounds_forced",
                 number = task.number(),
@@ -1438,15 +1438,6 @@ impl TickUseCase {
                 .session_of(round_slot)
                 .map(str::to_string)
                 .unwrap_or_else(|| "—".into());
-            if let Err(e) = self
-                .board
-                .set_status(&board.board, task.number(), Status::NeedsAttention)
-                .await
-            {
-                out.actions_failed += 1;
-                self.log_action_failed(task, e);
-                return false;
-            }
             let digest = format!(
                 "⚖︎ Судья: гвард кап-точки — {rounds} подряд request_changes \
                  (кап {} + порог {}) — паркинг без вызова модели. Раунд не \
@@ -1454,17 +1445,18 @@ impl TickUseCase {
                  Последняя ревью-сессия: {last}.",
                 REVIEW_ROUND_CAP, escalate_after
             );
-            if let Err(e) = self.board.post_comment(task.number(), &digest).await {
-                out.actions_failed += 1;
-                self.log_action_failed(task, e);
+            let parked = self.judge_round_park(board, task, &digest, out).await;
+            if parked {
+                out.judge_forced += 1;
             }
-            self.state.set_review_rounds(&board.board, task.number(), 0);
-            return true;
+            return parked;
         }
         let Some(judge) = self.judge.as_ref() else {
             return false;
         };
-        let ctx = self.judge_context(board, task, 0, 0, rounds, false).await;
+        let ctx = self
+            .judge_context(board, task, 0, 0, rounds, false, true)
+            .await;
         match judge.decide(&ctx).await {
             Ok(verdict) => {
                 out.judge_calls += 1;
@@ -1490,15 +1482,6 @@ impl TickUseCase {
                     .session_of(round_slot)
                     .map(str::to_string)
                     .unwrap_or_else(|| "—".into());
-                if let Err(e) = self
-                    .board
-                    .set_status(&board.board, task.number(), Status::NeedsAttention)
-                    .await
-                {
-                    out.actions_failed += 1;
-                    self.log_action_failed(task, e);
-                    return false;
-                }
                 let digest = format!(
                     "⚖︎ Судья: {rounds} подряд request_changes — вердикт decision-\
                      модели: цикл не сходится (нужен владелец {:.2}, уверенность \
@@ -1506,12 +1489,7 @@ impl TickUseCase {
                      разбор владельца. Последняя ревью-сессия: {last}.",
                     verdict.owner_needed, verdict.confidence
                 );
-                if let Err(e) = self.board.post_comment(task.number(), &digest).await {
-                    out.actions_failed += 1;
-                    self.log_action_failed(task, e);
-                }
-                self.state.set_review_rounds(&board.board, task.number(), 0);
-                true
+                self.judge_round_park(board, task, &digest, out).await
             }
             Err(e) => {
                 tracing::warn!(
@@ -1524,6 +1502,34 @@ impl TickUseCase {
                     .await
             }
         }
+    }
+
+    /// Хореография паркинга кап-точки — единственная копия (ревью раунда
+    /// 2, L): set_status → дайджест → сброс раундов. false — set_status
+    /// отказал: счётчик стоит на капе, ретрай следующим count-переходом
+    /// (раунд N+1 пройдёт — деградация benign).
+    async fn judge_round_park(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        digest: &str,
+        out: &mut TickOutcome,
+    ) -> bool {
+        if let Err(e) = self
+            .board
+            .set_status(&board.board, task.number(), Status::NeedsAttention)
+            .await
+        {
+            out.actions_failed += 1;
+            self.log_action_failed(task, e);
+            return false;
+        }
+        if let Err(e) = self.board.post_comment(task.number(), digest).await {
+            out.actions_failed += 1;
+            self.log_action_failed(task, e);
+        }
+        self.state.set_review_rounds(&board.board, task.number(), 0);
+        true
     }
 
     /// Автопаркинг кап-точки (старая механика; fallback судьи): кап
@@ -1551,17 +1557,6 @@ impl TickUseCase {
             .session_of(round_slot)
             .map(str::to_string)
             .unwrap_or_else(|| "—".into());
-        if let Err(e) = self
-            .board
-            .set_status(&board.board, task.number(), Status::NeedsAttention)
-            .await
-        {
-            // счётчик стоит на капе: эскалация ретраится следующим
-            // count-переходом (раунд N+1 пройдёт — деградация benign)
-            out.actions_failed += 1;
-            self.log_action_failed(task, e);
-            return false;
-        }
         let digest = format!(
             "⚠︎ Кап ревью-раундов: {next}-й подряд request_changes без approve \
              (порог {REVIEW_ROUND_CAP}) — раунд {} не назначается, строка в \
@@ -1569,13 +1564,7 @@ impl TickUseCase {
              выше; последняя ревью-сессия: {last}.",
             next + 1
         );
-        if let Err(e) = self.board.post_comment(task.number(), &digest).await {
-            out.actions_failed += 1;
-            self.log_action_failed(task, e);
-        }
-        // эскалация состоялась: после разбора владельца — свежий бюджет
-        self.state.set_review_rounds(&board.board, task.number(), 0);
-        true
+        self.judge_round_park(board, task, &digest, out).await
     }
 
     /// Применение вердикта (сталл- и кап-точки; ревизия ADR-106 по санкции
@@ -1756,6 +1745,7 @@ impl TickUseCase {
         calls: u32,
         rounds: u32,
         idle: bool,
+        cap_point: bool,
     ) -> JudgeContext {
         let cfg = self.judge_cfg.clone();
         let body = match self.board.read_issue(&board.board, task.number()).await {
@@ -1844,6 +1834,7 @@ impl TickUseCase {
             comments,
             sessions,
             now_ms: now,
+            cap_point,
         }
     }
 

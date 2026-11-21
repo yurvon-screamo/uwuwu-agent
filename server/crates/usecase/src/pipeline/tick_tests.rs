@@ -8702,6 +8702,65 @@ async fn judge_cap_verdict_parks_row_on_needs_attention() {
 }
 
 #[tokio::test]
+async fn judge_cap_guard_forces_park_without_model_call() {
+    // Гвард кап-точки: раунды CAP + escalate_after → паркинг БЕЗ вызова
+    // модели (set_status + дайджест, счётчик сброс). Тик-уровень форс-ветки
+    // (ревью раунда 2, L: домен judge_step был покрыт, механика тика — нет).
+    let judge = FakeJudge::says(uwuwu_domain::JudgeStatus::InProgress);
+    let cfg = JudgeCfg {
+        enabled: true,
+        escalate_after: 3,
+        ..JudgeCfg::default()
+    };
+    let state = Arc::new(MemState(Mutex::default()));
+    // кап-переход: тик видит смену ReviewResult → InProgress при раундах 7
+    // (CAP 4 + escalate_after 3 — форс-зона)
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((48, Status::ReviewResult));
+    state.0.lock().unwrap().review_rounds.push((48, 7));
+    let (u, board, sessions, _) = judge_usecase(
+        vec![judge_row(48, Status::InProgress, "ses_dev", Slot::Dev)],
+        Some(100_000_000), // активность свежая — сталл-контур молчит
+        true,
+        state,
+        (Some(judge.clone() as Arc<dyn DecisionJudge>), cfg),
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.judge_forced, 1, "форс-паркинг гвардом кап-точки");
+    assert_eq!(
+        judge.calls.lock().unwrap().len(),
+        0,
+        "модель не вызывалась — паркинг без вызова"
+    );
+    assert!(
+        board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l == "status#48=NeedsAttention"),
+        "строка запаркована"
+    );
+    assert!(
+        board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("comment#48=⚖︎ Судья: гвард")),
+        "дайджест гварда в ленте"
+    );
+    assert!(
+        sessions.prompts.lock().unwrap().is_empty(),
+        "осиротевшая ревью-сессия не будится (ревью C3)"
+    );
+}
+
+#[tokio::test]
 async fn judge_cap_verdict_continues_row_without_park() {
     // Кап-точка: вердикт «текущий статус» (пробуждение) — строка
     // продолжает работу, паркинга нет, раунды считаются дальше.

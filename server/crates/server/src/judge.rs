@@ -100,25 +100,38 @@ impl GeminiJudge {
         if let Some(pr) = &ctx.pr_url {
             let _ = writeln!(s, "PR: {pr}.");
         }
-        let _ = writeln!(
-            s,
-            "КОНТЕКСТ КОНВЕЙЕРА: тишина stage-сессии {} мин; ход завершён: {}; \
-             вызовов судьи без смены статуса: {}; подряд request_changes: {};{} \
-             механика: автопинг при тишине 60+ мин, эскалация владельцу после \
-             пингов; кап ревью-раундов = 4 подряд request_changes.",
-            ctx.silence_min,
-            if ctx.idle { "да" } else { "нет" },
-            ctx.judge_calls_no_progress,
-            ctx.review_rounds,
-            if let Some(min) = ctx.restart_recent_min {
-                format!(
-                    " сервер перезапущен {} мин назад (каунтеры могут быть из-под рестарта);",
-                    min
-                )
-            } else {
-                String::new()
-            }
-        );
+        let restart = match ctx.restart_recent_min {
+            Some(min) => format!(
+                " сервер перезапущен {min} мин назад (каунтеры могут быть из-под рестарта);"
+            ),
+            None => String::new(),
+        };
+        if ctx.cap_point {
+            // Кап-точка: сталл-гейт не звучал, тишина/idle не меряются —
+            // ноль в промпте модель читала как «сессия активна прямо
+            // сейчас» (ложный сигнал в решающем промпте; ревью раунда 2).
+            let _ = writeln!(
+                s,
+                "КОНТЕКСТ КОНВЕЙЕРА: точка — кап ревью-раундов, тишина \
+                 stage-сессии не меряется; вызовов судьи без смены статуса: \
+                 {}; подряд request_changes: {};{restart} механика: кап = 4 \
+                 подряд request_changes — выбор между паркингом (цикл не \
+                 сходится, нужен владелец) и ещё одним раундом.",
+                ctx.judge_calls_no_progress, ctx.review_rounds,
+            );
+        } else {
+            let _ = writeln!(
+                s,
+                "КОНТЕКСТ КОНВЕЙЕРА: тишина stage-сессии {} мин; ход завершён: {}; \
+                 вызовов судьи без смены статуса: {}; подряд request_changes: {};{restart} \
+                 механика: автопинг при тишине 60+ мин, эскалация владельцу после \
+                 пингов; кап ревью-раундов = 4 подряд request_changes.",
+                ctx.silence_min,
+                if ctx.idle { "да" } else { "нет" },
+                ctx.judge_calls_no_progress,
+                ctx.review_rounds,
+            );
+        }
         if !ctx.body.is_empty() {
             let _ = writeln!(s, "\nТЕЛО ЗАДАЧИ (усечено):\n{}", ctx.body);
         }
@@ -215,16 +228,18 @@ impl DecisionJudge for GeminiJudge {
             .map_err(|e| UsecaseError::Session(format!("judge: тело ответа: {e}")))?;
         if status == 429 {
             // RetryInfo из тела — единый парсер с семантикой #1363; спать
-            // внутри тика нельзя — Err с задержкой в тексте (fallback тика
-            // сработает, следующий вызов — после интервала судьи)
+            // внутри тика нельзя — структурный Err (fallback тика сработает,
+            // следующий вызов — после интервала судьи; обработчики Err
+            // читают задержку из варианта, не из человеческой строки)
             let parsed: serde_json::Value =
                 serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
             let secs = parse_retry_delay(&parsed)
                 .unwrap_or(RATE_LIMIT_DEFAULT_SECS)
                 .min(RATE_LIMIT_CAP_SECS);
-            return Err(UsecaseError::Session(format!(
-                "judge: 429 rate limit — retry через ~{secs} с (RetryInfo)"
-            )));
+            return Err(UsecaseError::RateLimited {
+                service: "judge".into(),
+                retry_after_secs: Some(secs),
+            });
         }
         if !(200..300).contains(&status) {
             return Err(UsecaseError::Session(format!(
@@ -330,6 +345,7 @@ mod tests {
             body: "тело".into(),
             comments: vec![(1u64, "коммент".into())],
             now_ms: 10_000_000,
+            cap_point: false,
             sessions: vec![JudgeSessionTail {
                 slot: uwuwu_domain::Slot::Dev,
                 text: "ответ".into(),
@@ -349,5 +365,41 @@ mod tests {
         ] {
             assert!(p.contains(section), "промпт должен нести «{section}»");
         }
+    }
+
+    /// Кап-точка: промпт не сообщает ложную тишину («0 мин, ход завершён:
+    /// нет» читалось моделью как «сессия активна сейчас») — честная
+    /// формулировка капа (ревью раунда 2, L).
+    #[test]
+    fn prompt_at_cap_point_reports_no_fake_silence() {
+        let ctx = JudgeContext {
+            board: "uwuwu".into(),
+            number: 42,
+            title: "Т".into(),
+            status: uwuwu_domain::Status::InProgress,
+            slot: uwuwu_domain::Slot::Dev,
+            silence_min: 0,
+            idle: false,
+            judge_calls_no_progress: 2,
+            review_rounds: 5,
+            branch: None,
+            pr_url: None,
+            restart_recent_min: None,
+            body: "тело".into(),
+            comments: vec![],
+            now_ms: 10_000_000,
+            cap_point: true,
+            sessions: vec![],
+        };
+        let p = GeminiJudge::prompt(&ctx);
+        assert!(
+            p.contains("кап ревью-раундов, тишина stage-сессии не меряется"),
+            "кап-точка названа честно"
+        );
+        assert!(
+            !p.contains("тишина stage-сессии 0 мин"),
+            "ложная тишина не попадает в промпт"
+        );
+        assert!(!p.contains("ход завершён: нет"), "ложный idle не в промпте");
     }
 }

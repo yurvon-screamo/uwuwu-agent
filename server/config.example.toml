@@ -56,7 +56,9 @@ peak = { enabled = true, start_min = 360, end_min = 600 }
 # enabled = true
 # model = "gemini-decision-1"
 # every_ms = 7200000        # интервал повторных вызовов на одной тишине
+#                           # (0 — решение на каждом сталл-тике: жжёт квоту)
 # escalate_after = 3        # гвард: вызовов без смены статуса до паркинга
+#                           # (0 — гвард выключен: судья решает бесконечно)
 # comments_tail = 4         # комментов в контексте
 # comment_max_chars = 1500
 # body_max_chars = 6000     # тела бывают 10–40k — TPM-дисциплина
