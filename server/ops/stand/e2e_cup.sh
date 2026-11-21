@@ -228,7 +228,7 @@ F1=$(mk_busy "$PORT_A" 0); F2=$(mk_busy "$PORT_A" 0)
 DEV3300=$(grep -oE '"event":"spawn.done","number":3300[^}]*"session":"ses_mock[0-9a-f]+' "$LOG_SRV" | grep -oE 'ses_mock[0-9a-f]+' | tail -1 || true)
 [ -n "$DEV3300" ] || fail "V5: dev-сессия 3300 не найдена в логе"
 curl -s --max-time 5 -X POST "http://127.0.0.1:$PORT_A/api/session/$DEV3300/age" \
-  -H 'Content-Type: application/json' -d "{\"ms\": 960000, \"messages\": true}" >/dev/null
+  -H 'Content-Type: application/json' -d '{"ms": 960000}' >/dev/null
 wait_phase 25   # тик: сталл-проход 3300 — пинг держится капом
 grep -q '"event":"stall.soft_ping_held_cup","number":3300' "$LOG_SRV" \
   || fail "V5: мягкий пинг не держится полным капом"
