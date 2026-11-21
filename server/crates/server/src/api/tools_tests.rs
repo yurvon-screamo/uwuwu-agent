@@ -1207,7 +1207,7 @@ async fn mcp_task_edit_schema_lists_canonical_statuses() {
         "Ревью тестирования",
         "Review",
         "Needs attention",
-        "Вейт",
+        "Wait",
     ] {
         assert!(
             list.split('/').any(|s| s.trim() == canonical),
