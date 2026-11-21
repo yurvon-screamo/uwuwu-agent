@@ -2217,7 +2217,7 @@ async fn fourth_consecutive_request_changes_escalates() {
             );
             assert!(
                 log.iter()
-                    .any(|l| l.starts_with("comment#40=⚠︎ Кап ревью-раундов")),
+                    .any(|l| l.starts_with("comment#40=⚠︎ Review-round cap")),
                 "дайджест эскалации владельцу: {log:?}"
             );
             assert_eq!(
@@ -2324,10 +2324,10 @@ async fn escalation_digest_names_last_review_session() {
     let log = board.log.lock().unwrap();
     let digest = log
         .iter()
-        .find(|l| l.starts_with("comment#50=⚠︎ Кап ревью-раундов"))
+        .find(|l| l.starts_with("comment#50=⚠︎ Review-round cap"))
         .expect("дайджест эскалации");
     assert!(
-        digest.contains("последняя ревью-сессия: ses_rev_live"),
+        digest.contains("the last review session: ses_rev_live"),
         "id ревью-сессии в дайджесте: {digest}"
     );
     assert_eq!(state.review_rounds("B", 50), 0, "эскалация — свежий бюджет");
@@ -2351,10 +2351,10 @@ async fn escalation_digest_without_session_is_honest_dash() {
     let log = board.log.lock().unwrap();
     let digest = log
         .iter()
-        .find(|l| l.starts_with("comment#51=⚠︎ Кап ревью-раундов"))
+        .find(|l| l.starts_with("comment#51=⚠︎ Review-round cap"))
         .expect("дайджест эскалации");
     assert!(
-        digest.contains("последняя ревью-сессия: —"),
+        digest.contains("the last review session: —"),
         "пустой слот — «—» в дайджесте: {digest}"
     );
 }
@@ -2402,10 +2402,10 @@ async fn test_review_cycle_counts_and_escalates_with_test_review_digest() {
     let log = board.log.lock().unwrap();
     let digest = log
         .iter()
-        .find(|l| l.starts_with("comment#53=⚠︎ Кап ревью-раундов"))
+        .find(|l| l.starts_with("comment#53=⚠︎ Review-round cap"))
         .expect("дайджест эскалации тест-цикла");
     assert!(
-        digest.contains("последняя ревью-сессия: ses_test_rev_live"),
+        digest.contains("the last review session: ses_test_rev_live"),
         "id тест-ревью-сессии в дайджесте: {digest}"
     );
     assert_eq!(state.review_rounds("B", 53), 0, "эскалация — свежий бюджет");
@@ -2543,7 +2543,7 @@ async fn escalation_set_status_failure_retries_next_transition() {
             );
             assert!(
                 log.iter()
-                    .any(|l| l.starts_with("comment#47=⚠︎ Кап ревью-раундов")),
+                    .any(|l| l.starts_with("comment#47=⚠︎ Review-round cap")),
                 "дайджест уходит при успешном ретрае: {log:?}"
             );
             assert_eq!(out.spawns_done, 0, "6-й раунд не назначается");
@@ -2590,7 +2590,7 @@ async fn plan_review_loop_escalates_by_same_cap() {
             );
             assert!(
                 log.iter()
-                    .any(|l| l.starts_with("comment#45=⚠︎ Кап ревью-раундов")),
+                    .any(|l| l.starts_with("comment#45=⚠︎ Review-round cap")),
                 "дайджест эскалации владельцу: {log:?}"
             );
             assert_eq!(out.spawns_done, 0, "5-й круг плана не назначается");

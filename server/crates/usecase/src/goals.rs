@@ -72,8 +72,8 @@ impl GoalsView {
         let goals = self.repo.open_goals(project).await?;
         if goals.is_empty() {
             return Ok(format!(
-                "цели проекта не заведены (носитель: milestones hub-репо; \
-                 ведёт владелец в UI: {})",
+                "no goals set for the project (the carrier: hub-repo milestones; \
+                 maintained by the owner in the UI: {})",
                 self.carrier_url
             ));
         }

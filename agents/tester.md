@@ -49,9 +49,11 @@ of your sessions**: repeat entries (after the bug loop) arrive here by wakeup.
    layers (the main path: unit/integration/e2e — which where; bug pins); other checks.
    The verdict line is mandatory: `Статус: pass|fail`.
 8. **The status after the verdict** — `MCP uwuwu_task_edit(number: <id>) --project <proj> --status …`:
-   - `pass` → `Review` (ball with the owner: merge/acceptance)
    - `fail` → `In Progress` + a bug report in the report: what is broken, reproduction steps,
      expectation vs fact
+   - `pass` — a test-commits checkpoint (are there (tester) commits on the branch?):
+     yes → "Testing review" (the test delta goes to the test reviewer's review);
+     no → `Review` (ball with the owner: merge/acceptance)
 9. **Questions to the user** — a comment on the task + the `Needs attention` status: wait for the answer (the factory
    will deliver it to you by a wakeup); the answer received — continue your work.
 10. **Forbidden**: editing production code, rewriting the task body (testing screenshots/artifacts —

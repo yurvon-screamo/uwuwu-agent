@@ -209,7 +209,7 @@ impl WikiRepo for GitHubWiki {
 
     async fn write_doc(&self, slug: &str, content: &str, message: &str) -> UsecaseResult<()> {
         let Some(w) = &self.writer else {
-            return Err(UsecaseError::Board("wiki write не сконфигурирован".into()));
+            return Err(UsecaseError::Board("wiki write is not configured".into()));
         };
         // инвентаризация кэша сбрасывается: состав изменился
         *self.tree_cache.lock().expect("tree lock") = None;
@@ -224,7 +224,7 @@ impl WikiRepo for GitHubWiki {
         message: &str,
     ) -> UsecaseResult<AppendDocOutcome> {
         let Some(w) = &self.writer else {
-            return Err(UsecaseError::Board("wiki write не сконфигурирован".into()));
+            return Err(UsecaseError::Board("wiki write is not configured".into()));
         };
         w.append_line(&format!("docs/{slug}.md"), line, message)
             .await

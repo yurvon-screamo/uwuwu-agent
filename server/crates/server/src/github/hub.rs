@@ -243,18 +243,18 @@ impl GitHubHub {
             .json(&json!({ "query": query, "variables": variables }))
             .send()
             .await
-            .map_err(|e| gh_transport_tagged(format!("сбой соединения: {e}")))?;
+            .map_err(|e| gh_transport_tagged(format!("connection failure: {e}")))?;
         let status = resp.status();
         let headers = resp.headers().clone();
         let text = resp
             .text()
             .await
-            .map_err(|e| gh_transport_tagged(format!("обрыв чтения ответа: {e}")))?;
+            .map_err(|e| gh_transport_tagged(format!("response read cut off: {e}")))?;
         if let Some(fail) = crate::gherr::classify(status, &headers) {
             return Err(gh_tagged(&fail));
         }
         let body: Value = serde_json::from_str(&text)
-            .map_err(|e| gh_transport_tagged(format!("не-JSON (HTTP {status}): {e}")))?;
+            .map_err(|e| gh_transport_tagged(format!("not JSON (HTTP {status}): {e}")))?;
         if !status.is_success() {
             // 5xx — транспортный класс (#1330: 502/503/504 с валидным телом
             // ретраятся наравне с обрывами); прочие не-успехи — как раньше
@@ -283,7 +283,7 @@ impl GitHubHub {
         }
         body.get("data")
             .cloned()
-            .ok_or_else(|| UsecaseError::Board("graphql: нет data".into()))
+            .ok_or_else(|| UsecaseError::Board("graphql: no data".into()))
     }
 
     /// Чтение gql с коротким ретраем (#1330): разовый транспортный флап
@@ -375,7 +375,7 @@ impl GitHubHub {
     /// Полное чтение доски пагинацией (мимо кеша).
     async fn snapshot_fetch(&self, board: &str) -> UsecaseResult<(Vec<Task>, BoardMeta)> {
         let (owner, name) = self.repo.split_once('/').ok_or_else(|| {
-            UsecaseError::Board(format!("repo в форме owner/name: {}", self.repo))
+            UsecaseError::Board(format!("repo in the owner/name form: {}", self.repo))
         })?;
         let mut meta = BoardMeta::default();
         let mut rows: Vec<Task> = Vec::new();
@@ -396,7 +396,7 @@ impl GitHubHub {
             }
             let nodes = data["repository"]["projectsV2"]["nodes"]
                 .as_array()
-                .ok_or_else(|| UsecaseError::Board("projectsV2.nodes не массив".into()))?;
+                .ok_or_else(|| UsecaseError::Board("projectsV2.nodes is not an array".into()))?;
             let project = nodes
                 .iter()
                 .find(|p| p["title"].as_str() == Some(board))
@@ -1133,7 +1133,7 @@ impl TaskBoardRepo for GitHubHub {
         }
         let number = resp["number"].as_u64().unwrap_or_default();
         if number == 0 {
-            return Err(UsecaseError::Board("create issue: нет номера".into()));
+            return Err(UsecaseError::Board("create issue: no number".into()));
         }
         self.add_to_board(board, number).await?;
         Ok(number)
@@ -1233,7 +1233,7 @@ impl TaskBoardRepo for GitHubHub {
         // item id — из меты снапшота: archiveProjectV2Item ест itemId
         let snap = self.snapshot(board).await?;
         let item = snap.1.items.get(&number).cloned().ok_or_else(|| {
-            UsecaseError::Board(format!("строка #{number} не на доске «{board}»"))
+            UsecaseError::Board(format!("row #{number} is not on board «{board}»"))
         })?;
         let project_id = snap.1.project_id.clone();
         let mutation = r#"
@@ -1306,7 +1306,7 @@ impl TaskBoardRepo for GitHubHub {
         let applied = status.is_success() && resp["body"].as_str() == Some(body_md);
         if !applied {
             return Err(UsecaseError::Board(format!(
-                "replace body #{number}: не применилось (HTTP {status})"
+                "replace body #{number}: not applied (HTTP {status})"
             )));
         }
         Ok(())
