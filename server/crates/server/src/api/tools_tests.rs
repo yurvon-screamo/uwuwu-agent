@@ -1366,7 +1366,7 @@ async fn blob_tools_fail_loud_without_env() {
     )
     .await
     .expect_err("громкий отказ");
-    assert!(err.contains("blob не сконфигурирован"), "{err}");
+    assert!(err.contains("blob is not configured"), "{err}");
     assert!(
         err.contains("UWUWU_S3_ENDPOINT") && err.contains("UWUWU_S3_BUCKET"),
         "{err}"
