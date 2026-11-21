@@ -12,6 +12,9 @@ pub(super) struct RowCtx<'a> {
     pub env_root: &'a str,
     pub bootstrap: &'a str,
     pub sessions: &'a Gateway,
+    /// Носитель доски: свежая проба статуса перед диспатчем (TOCTOU
+    /// ревайва #1431 — снапшот прохода устарает на длинном батче).
+    pub board: &'a dyn crate::ports::TaskBoardRepo,
     pub sightings: &'a [SessionSighting],
     pub policy: EnvGcPolicy,
 }
@@ -68,9 +71,37 @@ fn sessions_in_env<'a>(
         .collect()
 }
 
-/// Снос одной строки-цели: гарды сессий → команда → вердикт.
+/// Снос одной строки-цели: ревалидация статуса → гарды сессий → команда → вердикт.
 pub(super) async fn sweep_row(ctx: &RowCtx<'_>, task: &Task, out: &mut EnvGcOutcome) {
     let number = task.number();
+    // Ревалидация перед диспатчем (TOCTOU ревайва #1431): снапшот прохода
+    // устарает на длинном батче — возрождённая владельцем строка
+    // (fast-track Done → In Progress) отсекается свежей пробой носителя.
+    // Проба недоступна — fail-safe skip («не знаю» ≠ «можно сносить»).
+    match ctx.board.row_status(ctx.board_name, number).await {
+        Ok(Some(st)) if !st.is_terminal() => {
+            out.revoked += 1;
+            tracing::info!(
+                event = "env.revoked",
+                board = ctx.board_name,
+                number,
+                "строка возрождена после снапшота — снос отменён"
+            );
+            return;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            out.failed += 1;
+            tracing::warn!(
+                event = "env.gc_fail",
+                board = ctx.board_name,
+                number,
+                error = %e,
+                "Проба статуса недоступна — строка переедет следующим проходом"
+            );
+            return;
+        }
+    }
     let env_sessions = sessions_in_env(ctx.sightings, ctx.env_root, number);
     // Гард 2: живая сессия в env — строка переедет следующим проходом.
     if env_sessions
@@ -119,7 +150,10 @@ pub(super) async fn sweep_row(ctx: &RowCtx<'_>, task: &Task, out: &mut EnvGcOutc
         return;
     }
     out.dispatched += 1;
-    let marker = format!("ENV-GC {row}");
+    // Хвостовой пробел в маркере: «ENV-GC 143» ложно содержится в чужом
+    // вердикте «ENV-GC 1431 SWEPT» (префиксные row-id одного прохода) —
+    // скрипт всегда печатает verb после row, пробел гарантирует грань.
+    let marker = format!("ENV-GC {row} ");
     let verdict = ctx
         .sessions
         .wait_user_message(ctx.bootstrap, &marker, ENV_GC_VERDICT_DEADLINE_MS)

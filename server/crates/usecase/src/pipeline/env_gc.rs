@@ -48,6 +48,8 @@ pub struct EnvGcOutcome {
     pub absent: usize,
     /// Команда не принята / вердикт FAIL или за дедлайном.
     pub failed: usize,
+    /// Строк, возрождённых после снапшота (ревалидация перед диспатчем).
+    pub revoked: usize,
 }
 
 /// Контекст прохода: всё, что нужно одной доске, — не дублируется
@@ -61,6 +63,8 @@ pub struct EnvGcCtx<'a> {
     pub tasks: &'a [Task],
     pub sessions: &'a Gateway,
     pub models: &'a SpawnModels,
+    /// Носитель доски — свежие пробы статуса строк (ревалидация ревайва).
+    pub board: &'a dyn crate::ports::TaskBoardRepo,
 }
 
 /// Проход env-gc по одной доске: отбор → гарды сессий → shell-снос.
@@ -148,6 +152,7 @@ pub async fn sweep_envs(ctx: &EnvGcCtx<'_>, policy: EnvGcPolicy) -> UsecaseResul
         env_root: ctx.env_root,
         bootstrap: &bootstrap,
         sessions: ctx.sessions,
+        board: ctx.board,
         sightings: &sightings,
         policy,
     };
@@ -161,6 +166,7 @@ pub async fn sweep_envs(ctx: &EnvGcCtx<'_>, policy: EnvGcPolicy) -> UsecaseResul
         board = ctx.board_name,
         candidates = out.candidates,
         held = out.held_live,
+        revoked = out.revoked,
         dispatched = out.dispatched,
         swept = out.swept,
         dirty = out.dirty,
