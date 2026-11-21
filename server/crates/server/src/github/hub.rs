@@ -232,7 +232,7 @@ impl GitHubHub {
         let now = std::time::Instant::now();
         if let Some(until) = self.gql_blocked(now) {
             return Err(UsecaseError::Board(format!(
-                "gh graphql [RATE_LIMITED]: бэкофф ещё {:?}",
+                "gh graphql [RATE_LIMITED]: backoff for another {:?}",
                 until.duration_since(now)
             )));
         }
