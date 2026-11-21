@@ -619,7 +619,9 @@ async fn create_session(
         tokens_in: 0,
         tokens_out: 0,
         busy: false,
-        busy_ms: 0,
+        // дев-ручка стенда (#1313 V4): busy_ms в прошлом — зомби-флаг
+        // (busy > idle старше 30 мин не держит CUP-кап)
+        busy_ms: body["busy_ms_ago"].as_u64().map(|ago| now_ms().saturating_sub(ago)).unwrap_or(0),
         idle_ms: 0,
         dead: mode == "dead",
         reply: None,
