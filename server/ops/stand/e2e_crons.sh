@@ -19,7 +19,9 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."   # server/
 # Порты: оверрайды E2E_CRON_PORT_* заданы — как есть; не заданы — свободные
 # из пробы-бинда (гонка параллельных прогонов снята классом, #1304)
-# shellcheck source=stand_ports.sh
+# stand_ports.sh подключается по пути рантайма ($(dirname "$0")) — статически
+# не следует; сам файл валиден отдельно (SC1091 off на этой строке, #1304)
+# shellcheck disable=SC1091
 source "$(dirname "$0")/stand_ports.sh"
 read -r PORT_SRV_D PORT_MOCK_D <<<"$(stand_pick_ports 2)"
 PORT_MOCK="${E2E_CRON_PORT_MOCK:-$PORT_MOCK_D}"; PORT_SRV="${E2E_CRON_PORT_SRV:-$PORT_SRV_D}"
