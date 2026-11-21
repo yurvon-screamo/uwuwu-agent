@@ -690,17 +690,19 @@ async fn run(
                     match b.sync_index(search::SEMANTIC_SYNC_BUDGET).await {
                         Ok(_) => Ok(()),
                         Err(uwuwu_usecase::UsecaseError::RateLimited {
-                            retry_after_secs,
-                            ..
+                            retry_after_secs, ..
                         }) => {
                             let secs = retry_after_secs
                                 .unwrap_or(search::RATE_LIMIT_DEFAULT_SECS)
                                 .min(search::RATE_LIMIT_CAP_SECS);
                             let until = now + secs * 1000;
                             *backoff.lock().expect("backoff lock") = until;
-                            tracing::warn!(event = "semantic.backoff_rate_limited",
-                                until_ms = until, retry_after_secs = secs,
-                                "Semantic sync: 429, пауза в минутах");
+                            tracing::warn!(
+                                event = "semantic.backoff_rate_limited",
+                                until_ms = until,
+                                retry_after_secs = secs,
+                                "Semantic sync: 429, пауза в минутах"
+                            );
                             Ok(())
                         }
                         Err(e) => {

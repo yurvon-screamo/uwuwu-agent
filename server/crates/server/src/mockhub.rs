@@ -88,6 +88,38 @@ fn parse_seeds(raw: &str) -> Vec<SeedRow> {
         .collect()
 }
 
+/// Семейная ячейка слота: прод-носитель хранит одно значение поля на
+/// семью — «Сессия dev» покрывает Design|Dev, «Сессия ревью» —
+/// PlanReview|ResultReview (github/fields.rs; запись — mirror hub.rs
+/// set_session/clear_session). Мок хранит канонический ключ семьи,
+/// shadow-слоты разворачиваются на выдаче (expand_families).
+fn family_cell(slot: Slot) -> Slot {
+    match slot {
+        Slot::Design => Slot::Dev,
+        Slot::ResultReview => Slot::PlanReview,
+        other => other,
+    }
+}
+
+/// Разворот семейных ячеек на выдаче (mirror github/hub.rs
+/// map_task_fields): одно значение поля видно обоим слотам семьи —
+/// Design-строка видит свою сессию, а после перехода в In Progress
+/// тот же сеанс читается в дев-слоте (прод-геометрия «переезда»
+/// дев-сессии, #1237): тик не спавнит дубль, wake-путь получает
+/// адресата.
+fn expand_families(fields: &TaskFields) -> TaskFields {
+    let mut out = fields.clone();
+    for (canonical, shadow) in [
+        (Slot::Dev, Slot::Design),
+        (Slot::PlanReview, Slot::ResultReview),
+    ] {
+        if let Some(s) = out.session(canonical).cloned() {
+            out.set_session(shadow, s);
+        }
+    }
+    out
+}
+
 pub struct MemoryHub {
     state: Mutex<HubState>,
     /// seed-строки — создаются при пустой доске.
@@ -209,10 +241,11 @@ impl TaskBoardRepo for MemoryHub {
                 .collect();
             // поля (сессии/ветка/PR) — часть строки: без них тик не видит
             // заявленных сессий и решает спавнить (гэп стенда, ловился как
-            // «wakeup не стреляет» — находка e2e ре-энтри)
+            // «wakeup не стреляет» — находка e2e ре-энтри); семейные
+            // ячейки разворачиваются на оба слота семьи (#1237)
             for t in rows.iter_mut() {
                 if let Some(f) = state.fields.get(&t.number()) {
-                    t.apply_fields(f.clone());
+                    t.apply_fields(expand_families(f));
                 }
             }
             rows.sort_by_key(|t| t.number());
@@ -278,7 +311,13 @@ impl TaskBoardRepo for MemoryHub {
         let s = uwuwu_domain::SessionRef::parse(session)
             .ok_or_else(|| UsecaseError::Board("mockhub: session не ses_…".into()))?;
         self.with_state(|state| {
-            state.fields.entry(number).or_default().set_session(slot, s);
+            // семейная ячейка: Design-спавн пишет в тот же ключ, что и
+            // дев-спавн (прод-носитель — одно поле «Сессия dev», #1237)
+            state
+                .fields
+                .entry(number)
+                .or_default()
+                .set_session(family_cell(slot), s);
             Ok(())
         })
     }
@@ -331,13 +370,25 @@ impl TaskBoardRepo for MemoryHub {
 
     async fn clear_session(&self, _board: &str, number: u64, slot: Slot) -> UsecaseResult<()> {
         self.with_state(|state| {
-            state.fields.entry(number).or_default().clear_session(slot);
+            // clear одной стороны семьи снимает ячейку целиком (одно
+            // поле носителя — mirror hub.rs clear_session, #1237)
+            state
+                .fields
+                .entry(number)
+                .or_default()
+                .clear_session(family_cell(slot));
             Ok(())
         })
     }
 
     async fn issue_fields(&self, number: u64) -> UsecaseResult<TaskFields> {
-        self.with_state(|state| Ok(state.fields.get(&number).cloned().unwrap_or_default()))
+        self.with_state(|state| {
+            Ok(state
+                .fields
+                .get(&number)
+                .map(expand_families)
+                .unwrap_or_default())
+        })
     }
 
     async fn post_comment(&self, number: u64, body: &str) -> UsecaseResult<String> {
@@ -378,9 +429,10 @@ impl TaskBoardRepo for MemoryHub {
                 .cloned()
                 .ok_or_else(|| UsecaseError::Board(format!("mockhub: #{number} нет")))?;
             // поля (сессии/ветка/PR) — часть строки: рид синхронен
-            // read_board (реальный hub несёт поля inline в GET issue)
+            // read_board (реальный hub несёт поля inline в GET issue);
+            // семейные ячейки разворачиваются на оба слота семьи (#1237)
             if let Some(f) = state.fields.get(&number) {
-                task.apply_fields(f.clone());
+                task.apply_fields(expand_families(f));
             }
             let body = state.bodies.get(&number).cloned().unwrap_or_default();
             let comments = state.comments.get(&number).cloned().unwrap_or_default();
@@ -1112,5 +1164,117 @@ mod tests {
             .await
             .expect("статус архивной строки");
         assert_eq!(status, Some(Status::Done), "статус не потерян");
+    }
+
+    /// Семейная семантика носителя стенда (#1237, mirror github/hub.rs):
+    /// Design-спавн пишет в канонический ключ семьи («Сессия dev» = Dev),
+    /// чтение разворачивает ячейку на оба слота — дев-сессия «переезжает»
+    /// из Design в In Progress без нового спавна (прод-геометрия wake).
+    /// До фикса: per-slot запись давала пустой дев-слот — тик спавнил
+    /// свежего дева, wake-путь без адресата.
+    #[tokio::test]
+    async fn design_session_reads_in_dev_slot_after_transition() {
+        let hub = MemoryHub::with_seeds(parse_seeds("2049:Design"));
+        hub.read_board("Задачи uwuwu")
+            .await
+            .expect("материализация сида");
+        hub.set_session("Задачи uwuwu", 2049, Slot::Design, "ses_design1")
+            .await
+            .expect("запись design-сессии");
+        let rows = hub.read_board("Задачи uwuwu").await.expect("доска");
+        let t = rows.iter().find(|t| t.number() == 2049).expect("строка");
+        assert_eq!(
+            t.session_of(Slot::Design),
+            Some("ses_design1"),
+            "Design-слот видит сессию"
+        );
+        assert_eq!(
+            t.session_of(Slot::Dev),
+            Some("ses_design1"),
+            "семейная ячейка: та же сессия в дев-слоте — переход Design → In Progress не спавнит нового дева"
+        );
+    }
+
+    /// Design-запись surfaceится в IssueFieldStore::load как «Сессия dev»
+    /// (#1237): одна ячейка семьи — MCP-чтение полей согласовано с тиком
+    /// (до фикса load был слеп к Design-ключу).
+    #[tokio::test]
+    async fn fields_load_surfaces_design_session_as_dev_field() {
+        let hub = MemoryHub::with_seeds(parse_seeds("2049:Design"));
+        hub.read_board("Задачи uwuwu")
+            .await
+            .expect("материализация сида");
+        hub.set_session("Задачи uwuwu", 2049, Slot::Design, "ses_design1")
+            .await
+            .expect("запись design-сессии");
+        let fields = uwuwu_usecase::IssueFieldStore::load(&hub, 2049)
+            .await
+            .expect("поля");
+        assert_eq!(
+            fields.get(crate::github::F_DEV_SESSION).map(String::as_str),
+            Some("ses_design1"),
+            "Design-спавн виден как «Сессия dev»"
+        );
+    }
+
+    /// Clear одной стороны семьи снимает ячейку целиком (#1237): одно
+    /// поле носителя — clear_session(Dev) и clear_session(Design) равнозначны.
+    #[tokio::test]
+    async fn clear_session_removes_family_cell_from_both_sides() {
+        let hub = MemoryHub::with_seeds(parse_seeds("2049:Design"));
+        hub.read_board("Задачи uwuwu")
+            .await
+            .expect("материализация сида");
+        hub.set_session("Задачи uwuwu", 2049, Slot::Design, "ses_design1")
+            .await
+            .expect("запись design-сессии");
+        hub.clear_session("Задачи uwuwu", 2049, Slot::Dev)
+            .await
+            .expect("clear дев-слотом");
+        let rows = hub.read_board("Задачи uwuwu").await.expect("доска");
+        let t = rows.iter().find(|t| t.number() == 2049).expect("строка");
+        assert_eq!(t.session_of(Slot::Design), None, "ячейка снята для Design");
+        assert_eq!(t.session_of(Slot::Dev), None, "ячейка снята для Dev");
+        // симметрично: запись дев-слотом, clear design-слотом
+        hub.set_session("Задачи uwuwu", 2049, Slot::Dev, "ses_dev2")
+            .await
+            .expect("запись дев-сессии");
+        hub.clear_session("Задачи uwuwu", 2049, Slot::Design)
+            .await
+            .expect("clear design-слотом");
+        let rows = hub.read_board("Задачи uwuwu").await.expect("доска");
+        let t = rows.iter().find(|t| t.number() == 2049).expect("строка");
+        assert_eq!(t.session_of(Slot::Design), None);
+        assert_eq!(t.session_of(Slot::Dev), None);
+    }
+
+    /// Ревью-семья — та же схема (#1237): «Сессия ревью» покрывает
+    /// PlanReview|ResultReview, clear одной стороны снимает обе.
+    #[tokio::test]
+    async fn review_family_cell_shared_across_review_slots() {
+        let hub = MemoryHub::with_seed(Some((9, Status::ReviewPlan)));
+        hub.read_board("B").await.expect("материализация сида");
+        hub.set_session("B", 9, Slot::PlanReview, "ses_review1")
+            .await
+            .expect("запись ревью-сессии");
+        let rows = hub.read_board("B").await.expect("доска");
+        let t = rows.iter().find(|t| t.number() == 9).expect("строка");
+        assert_eq!(t.session_of(Slot::PlanReview), Some("ses_review1"));
+        assert_eq!(
+            t.session_of(Slot::ResultReview),
+            Some("ses_review1"),
+            "ревью-семья: одна ячейка на оба ревью-слота"
+        );
+        hub.clear_session("B", 9, Slot::ResultReview)
+            .await
+            .expect("clear result-слотом");
+        let rows = hub.read_board("B").await.expect("доска");
+        let t = rows.iter().find(|t| t.number() == 9).expect("строка");
+        assert_eq!(
+            t.session_of(Slot::PlanReview),
+            None,
+            "clear одной стороны снимает семейную ячейку"
+        );
+        assert_eq!(t.session_of(Slot::ResultReview), None);
     }
 }
