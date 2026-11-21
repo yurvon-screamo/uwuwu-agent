@@ -39,7 +39,7 @@ fn message_activity_ms(msg: &Value) -> Option<u64> {
         .or_else(|| t["created"].as_u64())
 }
 
-/// busy-вердикт сессии по времени (#1231 семантика + #1295 зомби-гард):
+/// busy-вердикт сессии по времени (#1231 семантика + PR #409 зомби-гард):
 /// busy ⟺ busy > idle И флаг свежее 30 минут (оборванный ход оставляет
 /// busy>idle навсегда — крэш/рестарт исполнителя; 12 зомби на redmi
 /// держали глобальный кап при 1 работающей, 18.11).
@@ -81,7 +81,7 @@ fn parse_session_page(
             list.iter()
                 .filter_map(|s| {
                     // busy ⟺ busy > idle (сверено с бинарём 2.3.0, #1231),
-                    // зомби-гард 30 мин (#1295) — см. session_busy.
+                    // зомби-гард 30 мин (PR #409) — см. session_busy.
                     // При апгрейде opencode семантику перепроверить.
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -791,7 +791,7 @@ mod tests {
 
     #[test]
     fn zombie_busy_flag_expires_after_half_hour() {
-        // #1295: busy-флаг оборванного хода (busy > idle навсегда после
+        // PR #409: busy-флаг оборванного хода (busy > idle навсегда после
         // крэша/рестарта исполнителя) не должен держать кап: ход старше
         // 30 минут без завершения — протух. Свежий busy — держит.
         let now = std::time::SystemTime::now()
@@ -946,7 +946,7 @@ mod tests {
         // #1231: busy ⟺ time.busy > time.idle — ход в полёте (Started
         // пишет time.busy, idle-финал пишет time.idle). outcome — атрибут
         // последнего завершённого хода, живость не выражает.
-        // #1295: плюс зомби-гард — флаг busy свежее 30 мин (фикстуры
+        // PR #409: плюс зомби-гард — флаг busy свежее 30 мин (фикстуры
         // динамические от now: статичные ms протухают по определению).
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

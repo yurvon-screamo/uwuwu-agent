@@ -3,6 +3,8 @@
 pub mod actions;
 pub mod analyst;
 pub mod analyst_review;
+#[cfg(test)]
+mod cup_pins_tests;
 pub mod dreamer;
 pub mod env_gc;
 #[cfg(test)]
