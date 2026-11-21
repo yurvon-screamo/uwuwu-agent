@@ -25,6 +25,7 @@ cd "$(dirname "$0")/../.."   # server/
 # Порты: оверрайды заданы — как есть; не заданы — свободные из пробы-бинда:
 # и с e2e.sh, и между параллельными прогонами самого peak столкновений нет
 # (#1304). stand_ports.sh — первая python3-зависимость этого скрипта
+# shellcheck source=stand_ports.sh
 source "$(dirname "$0")/stand_ports.sh"
 read -r PORT_SRV_D PORT_MOCK_D <<<"$(stand_pick_ports 2)"
 PORT_MOCK="${PORT_MOCK:-$PORT_MOCK_D}"; PORT_SRV="${PORT_SRV:-$PORT_SRV_D}"

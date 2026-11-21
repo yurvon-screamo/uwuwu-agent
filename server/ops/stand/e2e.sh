@@ -37,6 +37,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."   # server/
+# shellcheck source=stand_ports.sh
 source "$(dirname "$0")/stand_ports.sh"
 # Порты: оверрайд задан — как есть; не задан — свободные из пробы-бинда
 read -r PORT_SRV_D PORT_MOCK_D MOCK2_PORT_D <<<"$(stand_pick_ports 3)"

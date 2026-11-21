@@ -15,6 +15,7 @@ cd "$(dirname "$0")/../.."   # server/
 # Порты: оверрайды E2E_PORT_* заданы — как есть (занятость на зовущем);
 # не заданы — свободные из пробы-бинда: гонка параллельных стендов снята
 # классом (инцидент 17.11: чужой e2e занимал дефолтные 8090–8099, #1304)
+# shellcheck source=stand_ports.sh
 source "$(dirname "$0")/stand_ports.sh"
 read -r PORT_TG_D PORT_MOCK_D PORT_SRV_D <<<"$(stand_pick_ports 3)"
 PORT_TG="${E2E_PORT_TG:-$PORT_TG_D}"; PORT_MOCK="${E2E_PORT_MOCK:-$PORT_MOCK_D}"; PORT_SRV="${E2E_PORT_SRV:-$PORT_SRV_D}"
