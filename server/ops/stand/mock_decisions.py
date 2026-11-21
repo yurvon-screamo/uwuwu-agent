@@ -12,7 +12,6 @@
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
 
 LOCK = threading.Lock()
 CALLS = 0
