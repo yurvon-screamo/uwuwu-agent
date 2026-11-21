@@ -300,6 +300,39 @@ async fn session_list_matches_pin_wrapper_and_agent_semantics() {
         items.iter().any(|i| i["agent"].as_str() == Some("dreamer")),
         "role-сессия без строкового agent-ключа",
     );
+    // Направленные оси default-сессии: в общем цикле они живут только в
+    // else-ветке (agent-ключа нет) — дрейф «строковый agent у всех
+    // (включая default)» оставлял бы обе оси непроверенными (мутация
+    // ревью #1254). Гвард: probe-сессия ищется по title, её отсутствие —
+    // тоже красный.
+    let default_item = items.iter().find(|i| i["title"] == "default probe");
+    d.expect(
+        "session_list.default_present",
+        default_item.is_some(),
+        "default-probe-сессии нет в списке",
+    );
+    if let Some(item) = default_item {
+        let agent_present = item
+            .as_object()
+            .map(|o| o.contains_key("agent"))
+            .unwrap_or(false);
+        d.expect(
+            &format!(
+                "session_list.default_session.agent_key[{}]",
+                pin.default_agent_key
+            ),
+            !agent_present,
+            "agent-ключ у default-сессии (пин заявляет absent)",
+        );
+        d.expect(
+            &format!(
+                "session_list.default_session.outcome[{}]",
+                pin.default_outcome
+            ),
+            item.get("outcome").map(Value::is_null).unwrap_or(false),
+            "outcome у default-сессии не null",
+        );
+    }
     d.finish("session-list");
 }
 
