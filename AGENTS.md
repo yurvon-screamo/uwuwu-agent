@@ -75,7 +75,8 @@ Take a task to the end — the task body is a living document:
 
 After the code review approve (clean or delta-approve) the reviewer sets «Testing» — the factory
 spawns/wakes the tester (a primary agent `tester`, 1 task = 1 session, cwd = the task worktree).
-The verdict arrives as a wakeup comment on the task: `pass` → `Review`, ball with the user
+The verdict arrives as a wakeup comment on the task: `pass` — a test-commits checkpoint: with (tester)
+commits on the branch → "Testing review" (its own contour — below), without → `Review`, ball with the user
 (merge/acceptance); `fail` (a bug report with reproduction steps) → the developer fixes the bug,
 runs the self-check, pushes and sets "Result review" — code review of the fix is mandatory before
 returning to the tester, the re-entry goes into the same test session with a delta prompt (checking

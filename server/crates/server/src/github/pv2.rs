@@ -208,7 +208,7 @@ impl Pv2Rest {
             .await?;
         if !fields.status.is_success() {
             return Err(UsecaseError::Board(format!(
-                "доска «{board}»: каталог полей HTTP {}",
+                "board «{board}»: field catalog HTTP {}",
                 fields.status
             )));
         }
@@ -254,7 +254,7 @@ impl Pv2Rest {
             let resp = self.rest(reqwest::Method::GET, &url, None).await?;
             if !resp.status.is_success() {
                 return Err(UsecaseError::Board(format!(
-                    "доска «{board}»: list items HTTP {}",
+                    "board «{board}»: list items HTTP {}",
                     resp.status
                 )));
             }
@@ -279,7 +279,7 @@ impl Pv2Rest {
         // молчаливая обрезка хвоста = «строка не на доске» для живых строк
         // (ревью 2 Common-1) — громкий гард, зеркально snapshot_fetch
         Err(UsecaseError::Board(format!(
-            "доска «{board}»: item index превысил {ITEM_PAGES} страниц — гард"
+            "board «{board}»: the item index exceeded {ITEM_PAGES} pages — the guard"
         )))
     }
 
@@ -347,7 +347,7 @@ impl Pv2Rest {
         let owner = self.owner()?;
         let Some(item) = self.item_id(board, number).await? else {
             return Err(UsecaseError::Board(format!(
-                "строка #{number} не на доске «{board}»"
+                "row #{number} is not on board «{board}»"
             )));
         };
         let resp = self
@@ -364,7 +364,7 @@ impl Pv2Rest {
             .await?;
         if !resp.status.is_success() {
             return Err(UsecaseError::Board(format!(
-                "patch status #{number}: не применилось (HTTP {})",
+                "patch status #{number}: not applied (HTTP {})",
                 resp.status
             )));
         }
@@ -415,7 +415,7 @@ impl Pv2Rest {
             .await?;
         if !resp.status.is_success() {
             return Err(UsecaseError::Board(format!(
-                "delete item #{number} (item {item_id}): не применилось (HTTP {})",
+                "delete item #{number} (item {item_id}): not applied (HTTP {})",
                 resp.status
             )));
         }
@@ -452,7 +452,7 @@ impl Pv2Rest {
             .await?;
         if !resp.status.is_success() {
             return Err(UsecaseError::Board(format!(
-                "add #{number}: не применилось (HTTP {})",
+                "add #{number}: not applied (HTTP {})",
                 resp.status
             )));
         }
