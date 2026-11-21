@@ -1100,5 +1100,39 @@ SRV_PID=""; MOCK_PID=""
 sleep 1
 say "фаза 14 ок: observe без мутаций, live снёс кандидата по вердикту мока, свежая не тронута, bootstrap погашен"
 
+# 14c: реальный скрипт сноса на фикстуре — shell-граница под автотестом
+# (мок 14b эмулирует исход команды; гарды и грамматика самого
+# task-env-gc.sh до этого проверялись только ручными смоуками)
+say "фаза 14c: реальный task-env-gc.sh — SWEPT/DIRTY/FOREIGN/NOREPO/ABSENT, идемпотентность"
+GC_FIX="$RUN_DIR/envgc-fixture"
+GC_SCRIPT="$PWD/ops/task-env-gc.sh"
+mkdir -p "$GC_FIX/checkout"
+git -C "$GC_FIX/checkout" init -q
+git -C "$GC_FIX/checkout" -c user.email=e2e@stand -c user.name=e2e commit --allow-empty -q -m init
+gc_sweep() { ( cd "$GC_FIX/checkout" && UWUWU_ENV_ROOT="$GC_FIX/envs" bash "$GC_SCRIPT" sweep "$1" ); }
+# clean: ворктри зарегистрирован в чекауте-фикстуре, porcelain пуст → SWEPT
+git -C "$GC_FIX/checkout" worktree add -q -b work/task-990001 "$GC_FIX/envs/990001/repo"
+V=$(gc_sweep 990001); [ "$V" = "ENV-GC 990001 SWEPT" ] || fail "clean-фикстура не SWEPT: $V"
+[ -d "$GC_FIX/envs/990001" ] && fail "clean-фикстура пережила снос"
+git -C "$GC_FIX/checkout" worktree list --porcelain | grep -q 990001 && fail "worktree чистой фикстуры не снят"
+git -C "$GC_FIX/checkout" branch --list work/task-990001 | grep -q . && fail "ветка чистой фикстуры не удалена"
+V=$(gc_sweep 990001); [ "$V" = "ENV-GC 990001 ABSENT" ] || fail "повторный снос не ABSENT: $V"
+# dirty: незакоммиченная правка → DIRTY, env жив
+git -C "$GC_FIX/checkout" worktree add -q -b work/task-990002 "$GC_FIX/envs/990002/repo"
+echo dirt > "$GC_FIX/envs/990002/repo/dirty.txt"
+V=$(gc_sweep 990002); [ "$V" = "ENV-GC 990002 DIRTY" ] || fail "грязная фикстура не DIRTY: $V"
+[ -d "$GC_FIX/envs/990002" ] || fail "грязный env снесён молча"
+# foreign: repo/.git без регистрации в чекауте → FOREIGN, env жив
+mkdir -p "$GC_FIX/envs/990003/repo"; git -C "$GC_FIX/envs/990003/repo" init -q
+V=$(gc_sweep 990003); [ "$V" = "ENV-GC 990003 FOREIGN" ] || fail "чужой env не FOREIGN: $V"
+[ -d "$GC_FIX/envs/990003" ] || fail "чужой env снесён"
+# norepo: env без repo/.git → NOREPO, env жив
+mkdir -p "$GC_FIX/envs/990004/repo"; echo '{"x":1}' > "$GC_FIX/envs/990004/repo/data.json"
+V=$(gc_sweep 990004); [ "$V" = "ENV-GC 990004 NOREPO" ] || fail "env без repo не NOREPO: $V"
+[ -d "$GC_FIX/envs/990004" ] || fail "norepo-env снесён"
+# absent: каталога нет → ABSENT
+V=$(gc_sweep 990005); [ "$V" = "ENV-GC 990005 ABSENT" ] || fail "отсутствующий env не ABSENT: $V"
+say "14c ок: реальный скрипт вернул все вердикты, грязный/чужой/без-repo выжили, повтор ABSENT"
+
 
 say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри + мульти-экзекьютор + гард #1163 + self-эхо + слепой hold #1263 + преемпшен CUP #1259 + давка-волна #1412 + клин #1293 + дример #1306 + phantom-квитанции #1331 + lost-сессия #1288: десинк-парковка + lost-resurrection + env-gc #1431); логи: $RUN_DIR"
