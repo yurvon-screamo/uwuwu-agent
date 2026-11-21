@@ -4593,12 +4593,12 @@ async fn spawn_prompt_test_stage_marker_contract() {
         Slot::Test,
     );
     assert!(
-        !tester_prompt.contains("тестовая дельта ветки"),
+        !tester_prompt.contains("the branch's test delta"),
         "tester-промпт без stage-маркера тест-ревьювера"
     );
     // чекпойнт pass тестировщика: развилка по (tester)-коммитам названа
     assert!(
-        tester_prompt.contains("Ревью тестирования") && tester_prompt.contains("(tester)-коммиты"),
+        tester_prompt.contains("Testing review") && tester_prompt.contains("(tester) commits"),
         "finish-инструкция тестировщика несёт чекпойнт pass: {tester_prompt}"
     );
     let test_review_prompt = crate::pipeline::actions::spawn_prompt(
@@ -4607,11 +4607,11 @@ async fn spawn_prompt_test_stage_marker_contract() {
         Slot::TestReview,
     );
     assert!(
-        test_review_prompt.contains("тестовая дельта ветки"),
+        test_review_prompt.contains("the branch's test delta"),
         "stage-маркер тест-ревьювера в промпте: {test_review_prompt}"
     );
     assert!(
-        test_review_prompt.contains("«Review»") && test_review_prompt.contains("«Тестирование»"),
+        test_review_prompt.contains("«Review»") && test_review_prompt.contains("«Testing»"),
         "finish-инструкция тест-ревьювера называет оба вердикт-статуса: {test_review_prompt}"
     );
 }

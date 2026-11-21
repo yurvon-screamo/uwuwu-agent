@@ -147,8 +147,14 @@ fn stage_action_of_prompt(prompt: &str) -> Option<(&'static str, &'static str, &
         Some(uwuwu_domain::Slot::Dev) => ("dev", "Result review", "реализация завершена (мок)"),
         Some(uwuwu_domain::Slot::ResultReview) => ("result", "Testing", "ревью approve (мок)"),
         // дефолт стенда: pass с тест-коммитами → ревью тестирования (#1413)
-        Some(uwuwu_domain::Slot::Test) => ("test", "Testing review", "тест pass, есть тест-коммиты (мок)"),
-        Some(uwuwu_domain::Slot::TestReview) => ("test-review", "Review", "тест-ревью: чисто (мок)"),
+        Some(uwuwu_domain::Slot::Test) => (
+            "test",
+            "Testing review",
+            "тест pass, есть тест-коммиты (мок)",
+        ),
+        Some(uwuwu_domain::Slot::TestReview) => {
+            ("test-review", "Review", "тест-ревью: чисто (мок)")
+        }
         _ if prompt.contains(
             ANALYST_WAVE_MARKER
                 .split("{project}")
@@ -1314,7 +1320,6 @@ mod tests {
 
     #[test]
     fn stage_markers_map_to_canon_transitions() {
-=======
         // маркеры приходят из источника (STAGE_PROMPTS spawn_prompt,
         // ANALYST*_WAVE_MARKER волн) — копий нет, связка механическая;
         // проверяется сам маппинг «маркер → канон-статус» мока
@@ -1323,7 +1328,8 @@ mod tests {
             uwuwu_domain::Slot::Dev => "Result review",
             uwuwu_domain::Slot::PlanReview => "In Progress",
             uwuwu_domain::Slot::ResultReview => "Testing",
-            uwuwu_domain::Slot::Test => "Review",
+            uwuwu_domain::Slot::Test => "Testing review",
+            uwuwu_domain::Slot::TestReview => "Review",
         };
         for (slot, marker) in uwuwu_usecase::STAGE_PROMPTS {
             let (_, status, _) = stage_action_of_prompt(marker).unwrap();
@@ -1360,17 +1366,33 @@ mod tests {
 
     #[test]
     fn test_review_scripted_verdicts_follow_canon() {
-        // #1413: сценарные вердикты тест-контура — гиркин-ветки
-        let (stage, status, _) = stage_action_of_prompt("тестирование: качество фичи").unwrap();
-        assert_eq!((stage, status), ("test", "Ревью тестирования"));
-        let (stage, status, _) =
-            stage_action_of_prompt("ревью тестирования: тестовая дельта ветки").unwrap();
+        // #1413: сценарные вердикты тест-контура — гиркин-ветки; маркеры —
+        // из STAGE_PROMPTS-констант (канон #1383), не копии
+        let test_marker = uwuwu_usecase::STAGE_PROMPTS
+            .iter()
+            .find(|(slot, _)| *slot == uwuwu_domain::Slot::Test)
+            .map(|(_, m)| *m)
+            .unwrap();
+        let (stage, status, _) = stage_action_of_prompt(test_marker).unwrap();
+        assert_eq!((stage, status), ("test", "Testing review"));
+        let test_review_marker = uwuwu_usecase::STAGE_PROMPTS
+            .iter()
+            .find(|(slot, _)| *slot == uwuwu_domain::Slot::TestReview)
+            .map(|(_, m)| *m)
+            .unwrap();
+        let (stage, status, _) = stage_action_of_prompt(test_review_marker).unwrap();
         assert_eq!((stage, status), ("test-review", "Review"));
-        // action_for_status: wakeup-путь по текущему статусу строки
-        let (next, _) = action_for_status("Тестирование");
-        assert_eq!(next, "Ревью тестирования");
-        let (next, _) = action_for_status("Ревью тестирования");
+        // action_for_status: wakeup-путь по текущему статусу строки —
+        // доменный парсер принимает и канон, и легаси-русское имя
+        let (next, _) = action_for_status("Testing");
+        assert_eq!(next, "Testing review");
+        let (next, _) = action_for_status("Testing review");
         assert_eq!(next, "Review");
+        let (next_legacy, _) = action_for_status("Тестирование");
+        assert_eq!(
+            next_legacy, "Testing review",
+            "легаси-имя резолвится в тот же переход"
+        );
     }
 
     #[test]
