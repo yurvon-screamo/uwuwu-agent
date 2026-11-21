@@ -272,15 +272,17 @@ case "$S2047" in
   *) fail "2047 не эскалировал в Needs attention, статус: [$S2047]" ;;
 esac
 
-# kill мок-2 (транспортная смерть): strict-union CUP → фолбэк на статусный
-# подсчёт; дример/аналитика на strict — sidecar.tick_failed (решения по
-# агрегату честно останавливаются), тик конвейера продолжает жить
+# kill мок-2 (транспортная смерть): деградация union-скана по исполнителю
+# (#1450 — отказ одного не морозит конвейер, событие
+# sessions.list_reachable_failed вместо бывшего cup.list_sessions_failed);
+# тик конвейера продолжает жить
 BEFORE_TICKS=$(grep -c '"event":"tick.completed"' "$LOG_SRV_MULTI" || true)
 kill "$MOCK2_PID" 2>/dev/null || true
 sleep 25   # 2+ тика на отказе
 AFTER_TICKS=$(grep -c '"event":"tick.completed"' "$LOG_SRV_MULTI" || true)
 [ "$AFTER_TICKS" -gt "$BEFORE_TICKS" ] || fail "тик умер после отказа исполнителя (тик-луп встал)"
-grep -q 'cup.list_sessions_failed' "$LOG_SRV_MULTI" || fail "нет CUP-фолбэка (strict union не отработал)"
+grep -q 'sessions.list_reachable_failed' "$LOG_SRV_MULTI" \
+  || fail "нет деградации union-скана (sessions.list_reachable_failed не увиден)"
 grep -q '"sidecar":"dreamer"' "$LOG_SRV_MULTI" || fail "нет sidecar.tick_failed дримера (strict union не отработал)"
 curl -s --max-time 5 "http://127.0.0.1:$PORT_MOCK/api/session" >/dev/null || fail "мок-1 недоступен после отказа мок-2"
 say "отказ исполнителя: CUP-фолбэк + strict-остановка дримера, тик живёт ($BEFORE_TICKS → $AFTER_TICKS тиков)"
