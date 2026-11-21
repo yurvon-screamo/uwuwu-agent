@@ -179,10 +179,14 @@ impl TaskBoardRepo for FakeBoard {
         _p: &str,
         title: &str,
         _body: &str,
+        _kind: Option<&str>,
     ) -> UsecaseResult<u64> {
         let n = self.rows.lock().unwrap().len() as u64 + 100;
         self.log.lock().unwrap().push(format!("create:{title}"));
         Ok(n)
+    }
+    async fn set_issue_type(&self, _n: u64, _kind: &str) -> UsecaseResult<()> {
+        Ok(())
     }
     async fn rename_issue(&self, _n: u64, _t: &str) -> UsecaseResult<()> {
         Ok(())
@@ -1554,8 +1558,12 @@ impl TaskBoardRepo for CommentBoard {
         _p: &str,
         _title: &str,
         _body: &str,
+        _kind: Option<&str>,
     ) -> UsecaseResult<u64> {
         Ok(1)
+    }
+    async fn set_issue_type(&self, _n: u64, _kind: &str) -> UsecaseResult<()> {
+        Ok(())
     }
     async fn rename_issue(&self, _n: u64, _t: &str) -> UsecaseResult<()> {
         Ok(())
@@ -5665,8 +5673,12 @@ impl TaskBoardRepo for FakeMultiBoard {
         _p: &str,
         _title: &str,
         _body: &str,
+        _kind: Option<&str>,
     ) -> UsecaseResult<u64> {
         Ok(1)
+    }
+    async fn set_issue_type(&self, _n: u64, _kind: &str) -> UsecaseResult<()> {
+        Ok(())
     }
     async fn rename_issue(&self, _n: u64, _t: &str) -> UsecaseResult<()> {
         Ok(())
@@ -6072,8 +6084,18 @@ impl TaskBoardRepo for CloseBoard {
     async fn read_issue(&self, _: &str, _: u64) -> UsecaseResult<crate::ports::IssueView> {
         Err(crate::error::UsecaseError::Board("мок".into()))
     }
-    async fn create_issue(&self, _: &str, _: &str, _: &str, _: &str) -> UsecaseResult<u64> {
+    async fn create_issue(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+    ) -> UsecaseResult<u64> {
         Ok(1)
+    }
+    async fn set_issue_type(&self, _: u64, _: &str) -> UsecaseResult<()> {
+        Ok(())
     }
     async fn rename_issue(&self, _: u64, _: &str) -> UsecaseResult<()> {
         Ok(())

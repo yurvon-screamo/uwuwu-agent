@@ -1,6 +1,8 @@
 //! Агрегат Task: строка доски + сессии стадий + переходы статусов.
 //! Чистый домен: ноль зависимостей. Инварианты канона — здесь и в тестах.
 
+use crate::task_type::TaskType;
+
 /// Статусы канона досок uwuwu. Analys/Review Analys — стадия аналитики
 /// (входящий поток, замена триажа #1135). Empty — строка без статуса
 /// (легаси-черновик владельца: конвейер не трогает).
@@ -394,6 +396,9 @@ pub struct Task {
     /// стадий. По образцу automerge: пишется на носитель явно (create),
     /// читается с колонки доски.
     direct: bool,
+    /// Тип задачи (нативный issue Type — единственный носитель, #1271):
+    /// None — не задан (native-null строки, неизвестное имя, дефолт Task).
+    kind: Option<TaskType>,
     /// Дата закрытия issue (unix ms): None — issue открыт либо носитель
     /// дату не сообщает. Клин холодного ящика (#1293) отбирает
     /// терминальные строки по возрасту закрытия.
@@ -410,6 +415,7 @@ impl Task {
             priority: Priority::Empty,
             automerge: false,
             direct: false,
+            kind: None,
             closed_at: None,
             fields: TaskFields::default(),
         }
@@ -460,6 +466,16 @@ impl Task {
     /// Флаг direct (create-only, #1357): строка прямого поручения.
     pub fn direct(&self) -> bool {
         self.direct
+    }
+
+    /// Тип задачи (нативный issue Type, #1271): None — не задан.
+    pub fn kind(&self) -> Option<TaskType> {
+        self.kind
+    }
+
+    /// Запись типа с носителя (parse issue Type) или через edit (#1271).
+    pub fn set_kind(&mut self, kind: Option<TaskType>) {
+        self.kind = kind;
     }
 
     pub fn branch(&self) -> Option<&BranchName> {
@@ -987,6 +1003,19 @@ mod tests {
             Priority::Empty,
         ));
         assert_eq!(t.priority(), Priority::High);
+    }
+
+    #[test]
+    fn kind_defaults_to_none_and_set_kind_carries() {
+        // #1271: тип — нативный issue Type; fresh-строка без типа (native
+        // null, неизвестное имя, дефолт Task) читается None без ошибки
+        let mut t = task(Status::Analys);
+        assert_eq!(t.kind(), None);
+        t.set_kind(Some(TaskType::Refactoring));
+        assert_eq!(t.kind(), Some(TaskType::Refactoring));
+        // снос значения носителем (PATCH type=null) — легальная мутация
+        t.set_kind(None);
+        assert_eq!(t.kind(), None);
     }
 
     const DAY_MS: u64 = 86_400_000;

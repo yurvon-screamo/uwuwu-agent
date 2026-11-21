@@ -1549,3 +1549,118 @@ async fn goal_list_on_mcp_surface_unknown_project_is_honest() {
         .expect_err("проект вне конфига фикстуры — честный NotFound");
     assert!(err.contains("вне конфига"), "{err}");
 }
+
+// ——— Носитель типа — нативный issue Type (#1271): главный сценарий ———
+// Сквозной круг на MCP-поверхности против MemoryHub: create(type) кладёт
+// нативный тип в носитель, edit(type) меняет, чтения (task_get fm-шапка,
+// task_list колонка) показывают канонное имя из носителя; мусорный type —
+// громкий отказ до мутаций.
+#[tokio::test]
+async fn task_type_native_carrier_roundtrip_on_mcp_surface() {
+    let (tools, memory) = hub();
+    let n = call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "носитель типа", "type": "bug", "body": "## П" }),
+    )
+    .await
+    .expect("create ок");
+    let number: u64 = n
+        .trim()
+        .split('#')
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .and_then(|s| s.parse().ok())
+        .expect("номер в ответе");
+
+    // create(type=bug) → нативный Bug на агрегате носителя
+    let rows = memory.read_board("Задачи uwuwu").await.unwrap();
+    let row = rows.iter().find(|t| t.number() == number).unwrap();
+    assert_eq!(row.kind(), Some(uwuwu_domain::TaskType::Bug));
+
+    // edit(type=docs) → тип заменён в носителе
+    call(
+        &tools,
+        "task_edit",
+        json!({ "number": number, "project": "uwuwu", "type": "docs" }),
+    )
+    .await
+    .expect("edit type ок");
+    let rows = memory.read_board("Задачи uwuwu").await.unwrap();
+    let row = rows.iter().find(|t| t.number() == number).unwrap();
+    assert_eq!(row.kind(), Some(uwuwu_domain::TaskType::Docs));
+
+    // task_get: fm-шапка несёт канонное имя из носителя
+    let get = call(
+        &tools,
+        "task_get",
+        json!({ "number": number, "project": "uwuwu" }),
+    )
+    .await
+    .expect("task_get ок");
+    assert!(get.contains("type: docs"), "fm-шапка с типом: {get}");
+
+    // task_list: колонка типа
+    let list = call(&tools, "task_list", json!({ "project": "uwuwu" }))
+        .await
+        .expect("task_list ок");
+    let row_line = list
+        .lines()
+        .find(|l| l.contains("носитель типа"))
+        .expect("строка в списке");
+    assert!(row_line.contains(" docs "), "колонка типа: {row_line}");
+
+    // мусорный type в edit — громкий отказ, носитель не тронут
+    let err = call(
+        &tools,
+        "task_edit",
+        json!({ "number": number, "project": "uwuwu", "type": "blabla" }),
+    )
+    .await
+    .expect_err("мусорный тип отвергнут");
+    assert!(err.contains("неизвестный тип"), "{err}");
+    let rows = memory.read_board("Задачи uwuwu").await.unwrap();
+    let row = rows.iter().find(|t| t.number() == number).unwrap();
+    assert_eq!(row.kind(), Some(uwuwu_domain::TaskType::Docs));
+}
+
+/// create без type — дефолт Feature канона на носителе (#1271): fm-шапка
+/// и колонка списка показывают feature; нативный дефолт Task и null-хвост
+/// рендера пустого типа пинятся на уровне разбора (parse_page) и naming.
+#[tokio::test]
+async fn task_type_create_default_feature_renders_on_mcp_surface() {
+    let (tools, memory) = hub();
+    let n = call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "native-null строка", "body": "## П" }),
+    )
+    .await
+    .expect("create ок");
+    let number: u64 = n
+        .trim()
+        .split('#')
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .and_then(|s| s.parse().ok())
+        .expect("номер в ответе");
+    let get = call(
+        &tools,
+        "task_get",
+        json!({ "number": number, "project": "uwuwu" }),
+    )
+    .await
+    .expect("task_get ок");
+    assert!(get.contains("type: feature"), "дефолт feature: {get}");
+    let list = call(&tools, "task_list", json!({ "project": "uwuwu" }))
+        .await
+        .expect("task_list ок");
+    let row_line = list
+        .lines()
+        .find(|l| l.contains("native-null строка"))
+        .expect("строка в списке");
+    assert!(row_line.contains(" feature "), "колонка типа: {row_line}");
+    let rows = memory.read_board("Задачи uwuwu").await.unwrap();
+    let row = rows.iter().find(|t| t.number() == number).unwrap();
+    assert_eq!(row.kind(), Some(uwuwu_domain::TaskType::Feature));
+}

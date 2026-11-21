@@ -81,7 +81,7 @@ pub fn tool_descriptors() -> Value {
                 "title": string("тайтл (уникален на доске)"),
                 "project": string("проект; дефолт uwuwu"),
                 "body": string("markdown-тело (Постановка…)"),
-                "type": string("bug|spike|docs|other|feature|refactoring|legacy|qa|infrastructure"),
+                "type": string(&type_enum_list()),
                 "priority": string("high|medium|low; дефолт medium"),
                 "automerge": json!({"type":"boolean","description":"автомерж: мерж PR при входе в Review, строка остаётся в Review; дефолт true (у direct — false)"}),
                 "direct": json!({"type":"boolean","description":"direct-задача (#1357): строка сразу In Progress, агент сам финализирует в Review мимо фабричных стадий. Только по прямому поручению владельца — дословная цитата поручения в теле; дефолт false"})
@@ -89,7 +89,7 @@ pub fn tool_descriptors() -> Value {
         ),
         tool(
             "task_edit",
-            "Правка ячеек задачи: статус/ветка/PR/приоритет/тайтл",
+            "Правка ячеек задачи: статус/ветка/PR/приоритет/тайтл/тип",
             object(json!({
                 "number": integer("номер задачи"),
                 "project": string("проект; дефолт uwuwu"),
@@ -98,7 +98,8 @@ pub fn tool_descriptors() -> Value {
                 "pr": string("URL PR"),
                 "priority": string("high|medium|low"),
                 "title": string("новый тайтл"),
-                "automerge": json!({"type":"boolean","description":"автомерж on/off (до-пометка старых строк)"})
+                "automerge": json!({"type":"boolean","description":"автомерж on/off (до-пометка старых строк)"}),
+                "type": string(&(type_enum_list() + "; пусто — не трогать"))
             }))
         ),
         tool(
@@ -306,10 +307,11 @@ impl ToolHub {
         let mut out = String::new();
         for t in rows {
             out.push_str(&format!(
-                "{:>6}  {:<14} {:<7} {}\n",
+                "{:>6}  {:<14} {:<7} {:<15} {}\n",
                 t.number(),
                 uwuwu_usecase::status_name(t.status()),
                 format!("{:?}", t.priority()).to_lowercase(),
+                t.kind().map(uwuwu_usecase::task_type_name).unwrap_or(""),
                 t.title()
             ));
         }
@@ -320,7 +322,7 @@ impl ToolHub {
         let number = need_number(args)?;
         let view = self.tasks.card(project, number).await.map_err(view_err)?;
         let mut out = format!(
-            "#{} {} — {}\n\n--- fm ---\nbranch: {}\npr: {}\nautomerge: {}\ndirect: {}\nbody_hash: {}\n\n",
+            "#{} {} — {}\n\n--- fm ---\nbranch: {}\npr: {}\nautomerge: {}\ndirect: {}\ntype: {}\nbody_hash: {}\n\n",
             view.task.number(),
             view.task.title(),
             uwuwu_usecase::status_name(view.task.status()),
@@ -328,6 +330,12 @@ impl ToolHub {
             view.task.pr().map(|u| u.as_str()).unwrap_or("—"),
             view.task.automerge(),
             view.task.direct(),
+            // канонное имя (словарь MCP-поверхности); None — «—» как
+            // branch/pr (native-null хвост, дефолт Task; #1271)
+            view.task
+                .kind()
+                .map(uwuwu_usecase::task_type_name)
+                .unwrap_or("—"),
             uwuwu_usecase::body_hash(&view.body),
         );
         out.push_str(&view.body);
@@ -472,12 +480,7 @@ impl ToolHub {
     }
 
     async fn task_create(&self, project: &str, args: &Value) -> Result<Value, String> {
-        let raw_kind = arg_str(args, "type");
-        if !raw_kind.is_empty() && uwuwu_usecase::parse_task_type(&raw_kind).is_none() {
-            return Err(format!(
-                "неизвестный тип «{raw_kind}»: bug|spike|docs|feature|refactoring|legacy|qa|infrastructure|other"
-            ));
-        }
+        let kind = parse_type_arg(&arg_str(args, "type"))?;
         let direct = args
             .get("direct")
             .and_then(|v| v.as_bool())
@@ -501,7 +504,7 @@ impl ToolHub {
         let spec = uwuwu_usecase::NewTask {
             title: arg_str(args, "title"),
             body_md: arg_str(args, "body"),
-            kind: uwuwu_usecase::parse_task_type(&raw_kind),
+            kind,
             priority: arg_str(args, "priority"),
             automerge,
             direct,
@@ -520,6 +523,7 @@ impl ToolHub {
 
     async fn task_edit(&self, project: &str, args: &Value) -> Result<Value, String> {
         let number = need_number(args)?;
+        let kind = parse_type_arg(&arg_str(args, "type"))?;
         let patch = uwuwu_usecase::TaskPatch {
             status: str_arg(args, "status").map(|s| uwuwu_usecase::parse_status(&s)),
             branch: str_arg(args, "branch"),
@@ -527,6 +531,7 @@ impl ToolHub {
             priority: str_arg(args, "priority"),
             title: str_arg(args, "title"),
             automerge: args.get("automerge").and_then(|v| v.as_bool()),
+            kind,
         };
         if patch.is_empty() {
             return Err("пустой патч: укажи хотя бы одно поле".into());
@@ -696,6 +701,27 @@ impl ToolHub {
 
 fn view_err(e: uwuwu_usecase::ViewError) -> String {
     e.to_string()
+}
+
+/// Перечень типов канона для дескрипторов и текстов отказов: один
+/// источник с валидацией (пин enum-паритета — зеркало #1298).
+fn type_enum_list() -> String {
+    uwuwu_usecase::TASK_TYPES
+        .iter()
+        .map(|t| uwuwu_usecase::task_type_name(*t))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// Разбор аргумента `type` (create/edit, #1271): пусто — None, мусор —
+/// громкий отказ с канонным перечнем до мутаций доски.
+fn parse_type_arg(raw: &str) -> Result<Option<uwuwu_domain::TaskType>, String> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    uwuwu_usecase::parse_task_type(raw)
+        .map(Some)
+        .ok_or_else(|| format!("неизвестный тип «{raw}»: {}", type_enum_list()))
 }
 
 /// Значение строкового аргумента: отсутствующий или не-строковый — пустая строка.
@@ -1013,36 +1039,45 @@ mod tests {
 
     #[test]
     fn task_create_type_schema_matches_validation_canon() {
-        // Инвариант: перечень типов в дескрипторе task_create (description
-        // поля type, сплит по '|') — полный матч с каноном валидации:
-        // каждый токен парсится и ни один тип канона не потерян.
+        // Инвариант enum-паритета дескрипторов (#1298; #1271 добавил
+        // task_edit.type): перечень типов в описании поля type (сплит по
+        // '|', аннотация после "; " срезается) — полный матч с каноном
+        // валидации: каждый токен парсится и ни один тип канона не потерян.
         let list = tool_descriptors();
-        let schema_type = list
-            .as_array()
-            .unwrap()
+        let schema_types = ["task_create", "task_edit"]
             .iter()
-            .find(|t| t["name"] == "task_create")
-            .expect("task_create в дескрипторах")["inputSchema"]["properties"]["type"]
-            ["description"]
-            .as_str()
-            .expect("description поля type");
-
-        let mut schema_types: Vec<&str> = schema_type.split('|').map(str::trim).collect();
-        for token in &schema_types {
-            assert!(
-                uwuwu_usecase::parse_task_type(token).is_some(),
-                "схема обещает тип, отвергаемый валидацией: «{token}»"
-            );
-        }
+            .map(|tool_name| {
+                let description = list
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|t| t["name"] == *tool_name)
+                    .expect("тул в дескрипторах")["inputSchema"]["properties"]["type"]
+                    ["description"]
+                    .as_str()
+                    .expect("description поля type");
+                let enums = description.split_once("; ").map_or(description, |(e, _)| e);
+                enums.split('|').map(str::trim).collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
         let mut canon_types: Vec<&str> = uwuwu_usecase::TASK_TYPES
             .iter()
             .map(|t| uwuwu_usecase::task_type_name(*t))
             .collect();
-        schema_types.sort_unstable();
         canon_types.sort_unstable();
-        assert_eq!(
-            schema_types, canon_types,
-            "перечень task_create.type != канон валидации"
-        );
+        for tokens in &schema_types {
+            for token in tokens {
+                assert!(
+                    uwuwu_usecase::parse_task_type(token).is_some(),
+                    "схема обещает тип, отвергаемый валидацией: «{token}»"
+                );
+            }
+            let mut sorted = tokens.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                sorted, canon_types,
+                "перечень type дескриптора != канон валидации"
+            );
+        }
     }
 }
