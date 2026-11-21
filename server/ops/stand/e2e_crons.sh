@@ -4,7 +4,8 @@
 # ран по расписанию → журнальная строка в cron/<имя>/Журнал.
 #
 # Полный цикл «мастер на новом пути → файр → журнал» без GitHub/LLM:
-#   mock_opencode (8159) + uwuwu-server (memory hub, 8150).
+#   mock_opencode + uwuwu-server (memory hub); порты — подбор/оверрайд,
+#   см. блок портов ниже.
 #
 # Ключевые несчастья того же контура:
 #   fm без project → cron.master_invalid (мастер невидим, не файрится);
@@ -16,9 +17,11 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."   # server/
-# Порты env-перезаписываемые, несмежные с e2e/e2e_bots (параллельные стенды
-# задач на одной машине не дерутся — инцидент 17.11, #1304)
-PORT_MOCK="${E2E_CRON_PORT_MOCK:-8159}"; PORT_SRV="${E2E_CRON_PORT_SRV:-8150}"
+# Порты: оверрайды E2E_CRON_PORT_* заданы — как есть; не заданы — свободные
+# из пробы-бинда (гонка параллельных прогонов снята классом, #1304)
+source "$(dirname "$0")/stand_ports.sh"
+read -r PORT_SRV_D PORT_MOCK_D <<<"$(stand_pick_ports 2)"
+PORT_MOCK="${E2E_CRON_PORT_MOCK:-$PORT_MOCK_D}"; PORT_SRV="${E2E_CRON_PORT_SRV:-$PORT_SRV_D}"
 BEARER="${UWUWU_SERVER_BEARER:-stand-e2e-bearer}"
 STATE=ops/state.json
 

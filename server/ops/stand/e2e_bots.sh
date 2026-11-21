@@ -4,16 +4,20 @@
 # reply вечной сессии (mock_opencode) → sendMessage владельцу.
 #
 # Полный цикл «один док = один бот» без GitHub/LLM/ТГ:
-#   mock_tg (8098) + mock_opencode (8099) + uwuwu-server (memory hub).
+#   mock_tg + mock_opencode + uwuwu-server (memory hub); порты —
+#   подбор/оверрайд, см. блок портов ниже.
 #
 # Запуск: server/ops/stand/e2e_bots.sh   (из каталога server; cargo build сам)
 # Выход: 0 — ок; 1 — провал с диагнозом. Логи: /tmp/uwuwu-stand-bots-*.log
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."   # server/
-# Порты — env-перезаписываемые: параллельные стенды разных задач на одной
-# машине не дерутся (инцидент 17.11: чужой e2e занял дефолтные 8090–8099)
-PORT_TG="${E2E_PORT_TG:-8098}"; PORT_MOCK="${E2E_PORT_MOCK:-8099}"; PORT_SRV="${E2E_PORT_SRV:-8090}"
+# Порты: оверрайды E2E_PORT_* заданы — как есть (занятость на зовущем);
+# не заданы — свободные из пробы-бинда: гонка параллельных стендов снята
+# классом (инцидент 17.11: чужой e2e занимал дефолтные 8090–8099, #1304)
+source "$(dirname "$0")/stand_ports.sh"
+read -r PORT_TG_D PORT_MOCK_D PORT_SRV_D <<<"$(stand_pick_ports 3)"
+PORT_TG="${E2E_PORT_TG:-$PORT_TG_D}"; PORT_MOCK="${E2E_PORT_MOCK:-$PORT_MOCK_D}"; PORT_SRV="${E2E_PORT_SRV:-$PORT_SRV_D}"
 BEARER="${UWUWU_SERVER_BEARER:-stand-e2e-bearer}"
 TOKEN="tok-e2e-probe"
 # логи per-run (суффикс порта): параллельные стенды не пишут в один файл
@@ -44,8 +48,8 @@ cargo build -q --bin uwuwu-server --bin mock_opencode
 rm -f "$STATE"
 
 # конфиг стенда с executor-url прогона (дефолтный config.memory.toml не
-# трогаем; порт сервера в TOML не читается — config.rs: port() = env PORT
-# > дефолт, поэтому серверный порт задаётся env-ом при запуске ниже)
+# трогаем; серверный порт резолвится env PORT > TOML port_cfg > дефолт —
+# config.rs port(); стенд задаёт его env-ом явно при запуске ниже, #1328)
 sed -e "s|http://127.0.0.1:8099|http://127.0.0.1:$PORT_MOCK|" \
     ops/config.memory.toml > ops/config.memory.e2e.toml
 
