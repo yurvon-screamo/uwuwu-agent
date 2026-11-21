@@ -136,7 +136,7 @@ pub struct Config {
     #[serde(default)]
     pub sweep_days: u32,
     #[serde(default = "default_port")]
-    port_cfg: u16,
+    port: u16,
     pub hub: HubCfg,
     pub executor: ExecutorCfg,
     /// Дополнительные именованные исполнители (#1203); пусто — один
@@ -210,7 +210,7 @@ impl Config {
         std::env::var("PORT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(self.port_cfg)
+            .unwrap_or(self.port)
     }
 
     pub fn load(path: &std::path::Path) -> Result<Self, ConfigError> {
@@ -722,7 +722,11 @@ env_root = "/tmp/env"
         std::env::remove_var("PORT");
         let raw = format!("port = 18090\n{}", minimal());
         let cfg = toml::from_str::<Config>(&raw).expect("toml парсится");
-        assert_eq!(cfg.port(), 18090, "TOML port проигран дефолту — ключ съеден");
+        assert_eq!(
+            cfg.port(),
+            18090,
+            "TOML port проигран дефолту — ключ съеден"
+        );
 
         // фаза 2 (регресс-охрана): env PORT старше TOML
         std::env::set_var("PORT", "5555");
