@@ -2303,6 +2303,34 @@ mod tests {
 
     #[test]
     #[ignore] // живой прогон: GH_TOKEN + сеть к api.github.com (read-only)
+    fn live_read_issue_sees_native_issue_type() {
+        // #1271: REST-путь read_issue обязан нести нативный issue Type —
+        // issue["type"]["name"] → set_kind (fm-вью task_get). Строки
+        // sandbox: #1265 — Feature на носителе, #1175 — native-null хвост.
+        let repo =
+            std::env::var("UWUWU_HUB_REPO").unwrap_or_else(|_| "yurvon-screamo/uwuwu-hub".into());
+        let token = std::env::var("GH_TOKEN").expect("GH_TOKEN");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let hub = GitHubHub::new(repo, token);
+            let view = hub.read_issue("Задачи sandbox", 1265).await.expect("1265");
+            assert_eq!(
+                view.task.kind(),
+                Some(uwuwu_domain::TaskType::Feature),
+                "REST-вью слеп к нативному issue Type у #1265: \
+                 read_issue-парс issue[\"type\"] деградировал (#1271)"
+            );
+            let view = hub.read_issue("Задачи sandbox", 1175).await.expect("1175");
+            assert_eq!(
+                view.task.kind(),
+                None,
+                "native-null хвост #1175 обязан читаться пустым типом без ошибки (#1271)"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore] // живой прогон: GH_TOKEN + сеть к api.github.com (read-only)
     fn live_read_issue_sees_automerge() {
         // БАГ-ПИН ручного прогона #1232 (tester, 17.11): fm-вью task_get
         // показывает automerge: false при Autodone=on на носителе —
