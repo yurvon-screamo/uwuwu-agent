@@ -284,6 +284,19 @@ pub trait AgentSessionGateway: Send + Sync {
     async fn last_activity_ms(&self, session: &str) -> UsecaseResult<Option<u64>>;
     /// Последний ассистентский ответ сессии (для ботов: ожидание реплая).
     async fn last_assistant_reply(&self, session: &str) -> UsecaseResult<Option<AssistantReply>>;
+    /// Дождаться user-сообщения сессии, содержащего `marker`, не дольше
+    /// `deadline_ms`; вердикты env-gc (#1431): shell-вывод slash-команды
+    /// доезжает user-сообщением bootstrap-сессии. None — дедлайн. Опрос
+    /// с паузами — инфра-забота адаптера (runtime), юзкейс агностичен.
+    /// Дефолт None: фейки без env-gc не должны уметь канал.
+    async fn wait_user_message(
+        &self,
+        _session: &str,
+        _marker: &str,
+        _deadline_ms: u64,
+    ) -> UsecaseResult<Option<String>> {
+        Ok(None)
+    }
     /// Список сессий исполнителя (для дримера: idle-детект).
     async fn list_sessions(&self) -> UsecaseResult<Vec<SessionInfo>>;
     /// Экспорт сессии (сообщения/сводка) — контент для дримера.
