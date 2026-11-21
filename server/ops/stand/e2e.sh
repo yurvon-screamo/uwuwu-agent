@@ -283,9 +283,10 @@ AFTER_TICKS=$(grep -c '"event":"tick.completed"' "$LOG_SRV_MULTI" || true)
 [ "$AFTER_TICKS" -gt "$BEFORE_TICKS" ] || fail "тик умер после отказа исполнителя (тик-луп встал)"
 grep -q 'sessions.list_reachable_failed' "$LOG_SRV_MULTI" \
   || fail "нет деградации union-скана (sessions.list_reachable_failed не увиден)"
-grep -q '"sidecar":"dreamer"' "$LOG_SRV_MULTI" || fail "нет sidecar.tick_failed дримера (strict union не отработал)"
+grep -q '"event":"dreamer.list_degraded"' "$LOG_SRV_MULTI" \
+  || fail "нет dreamer.list_degraded (дример не отразил деградацию union-скана)"
 curl -s --max-time 5 "http://127.0.0.1:$PORT_MOCK/api/session" >/dev/null || fail "мок-1 недоступен после отказа мок-2"
-say "отказ исполнителя: CUP-фолбэк + strict-остановка дримера, тик живёт ($BEFORE_TICKS → $AFTER_TICKS тиков)"
+say "отказ исполнителя: деградация по исполнителю (#1450), дример по живому union, тик живёт ($BEFORE_TICKS → $AFTER_TICKS тиков)"
 kill "$SRV_PID" "$MOCK_PID" "$MOCK2_PID" 2>/dev/null || true
 wait "$SRV_PID" "$MOCK_PID" "$MOCK2_PID" 2>/dev/null || true
 SRV_PID=""; MOCK_PID=""; MOCK2_PID=""
