@@ -1222,6 +1222,46 @@ fn dev_task(n: u64, session: &str) -> Task {
     t
 }
 
+/// Гейтвей с N busy-сессиями union-скана — харнес held_cup-пинов
+/// сайдкаров (#1313): dreamer/analyst/analyst_review решают по busy.
+pub(crate) fn gateway_with_busy_sessions(count: usize) -> Arc<dyn AgentSessionGateway> {
+    let sessions = FakeSessions::new();
+    {
+        let mut extra = sessions.extra.lock().unwrap();
+        for i in 0..count {
+            extra.push(crate::ports::SessionInfo {
+                id: format!("ses_busy_{i}"),
+                agent: String::new(),
+                directory: String::new(),
+                updated_ms: 0,
+                outcome: String::new(),
+                total_tokens: 100,
+                busy: true,
+            });
+        }
+    }
+    Arc::new(sessions)
+}
+
+/// Пустая доска — харнес held_cup-пинов волн: гард капа срабатывает до
+/// чтения досок, доска не трогается.
+pub(crate) fn empty_board() -> Arc<dyn TaskBoardRepo> {
+    Arc::new(FakeBoard {
+        rows: std::sync::Mutex::new(vec![]),
+        log: Mutex::default(),
+        comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
+        status_fails: AtomicBool::new(false),
+    })
+}
+
+/// Чистый state тика для сайдкар-пинов.
+pub(crate) fn empty_tick_state() -> Arc<dyn TickStateStore> {
+    Arc::new(MemState(Mutex::default()))
+}
+
 /// Юзкейс будильника: настраиваемые комменты, активность и idle-фаза хода
 /// (сценарии self-эха #1204).
 fn wake_usecase(
@@ -4107,6 +4147,82 @@ async fn escalation_deferred_when_liveness_probe_unreliable() {
             .iter()
             .any(|l| l.contains("NeedsAttention")),
         "строка не паркуется, пока проба недостоверна"
+    );
+}
+
+/// Пин ADR-101 (#1313): Design-фантом (ход умер, запись сессии жива,
+/// тишина) проходит сталл-детект наравне с In Progress — эскалация
+/// уводит статус из LLM-активных, слот CUP освобождается.
+#[tokio::test]
+async fn design_phantom_stall_escalates_and_frees_cup_slot() {
+    const NOW: u64 = 100_000_000;
+    struct BigClock;
+    impl Clock for BigClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            NOW
+        }
+    }
+    let mut design = task(45, Status::Design);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Design,
+        uwuwu_domain::SessionRef::parse("ses_design_45").unwrap(),
+    );
+    design.apply_fields(f);
+    let board = Arc::new(FakeBoard {
+        rows: std::sync::Mutex::new(vec![design]),
+        log: Mutex::default(),
+        comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
+        status_fails: AtomicBool::new(false),
+    });
+    let sess = Arc::new(FakeSessions {
+        activity_ms: Some(NOW - 25 * 60_000),
+        idle_reply: true,
+        ..Default::default()
+    });
+    // раунд пингов Design-статуса, заработанный текущим процессом
+    let seeded = MemState(Mutex::new(MemStateInner {
+        stalls: vec![
+            (45, Status::Design, NOW - 40 * 60_000),
+            (45, Status::Design, NOW - 35 * 60_000),
+        ],
+        ..Default::default()
+    }));
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sess.clone())),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+            probes: Mutex::default(),
+        }),
+        clock: Arc::new(BigClock),
+        state: Arc::new(seeded),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        boot_ms: NOW - 50 * 60_000,
+    };
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.stall_flagged, 1,
+        "Design-фантом эскалирует — сталл-детект слот-генеричен"
+    );
+    assert!(
+        board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("status#45=NeedsAttention")),
+        "статус ушёл из LLM-активных — слот капа свободен"
     );
 }
 
