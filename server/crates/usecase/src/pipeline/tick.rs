@@ -301,44 +301,22 @@ impl TickUseCase {
             }
             let _ = bp;
         }
-        // CUP единый (#1231) поверх пер-исполнительного зрения (#1263):
-        // union-скан одним проходом — busy-подсчёт CUP + слепки гарда
-        // «одна живая сессия на строку». Старый подсчёт (outcome-фильтр
-        // «живых» + per-session idle-пробы) терял сессии на 2+ ходе:
-        // outcome — атрибут последнего завершённого хода и при новом ходе
-        // не очищается (разбор #1231: 12 активных при cap=7). В union
-        // входят все источники: стадии, сайдкары, кроны, боты, ручные
-        // сессии владельца — единый кап на исполнителя.
-        // Strict для CUP (#1203/#1231): отказ ЛЮБОГО исполнителя → оба
-        // источника None — частичный список исказил бы busy-подсчёт и
-        // спрятал живую сироту от гарда (дубль-спавн); фолбэк — статусный
-        // подсчёт, консервативно против спавн-шторма (спавнить некому
-        // всё равно). Гард спавна читает список СВОЕГО исполнителя
-        // (sight_by_executor): отказ чужого зрение проекта не гасит
-        // (#1263). Кандидаты без сессии — очередь, не нагрузка (#1244).
+        // CUP единый (#1231) с деградацией по исполнителю (#1450):
+        // отказ одного исполнителя больше не обнуляет зрение конвейера.
+        // Кап = реальный busy union-списка ЖИВЫХ исполнителей; отказной
+        // вклад не даёт — его строки держит слепой hold (#1263), спавн
+        // к нему невозможен, а занятые слоты мертвы вместе с ним.
+        // Бывший strict-фолбэк («любой отказ → статусный счёт всех
+        // досок») при одном офлайн-ноуте морозил весь конвейер: 37
+        // активных строк при капе 7 = сутки spawns=0 (инцидент 21.11).
+        // Гард спавна читает список СВОЕГО исполнителя (sight_by_executor,
+        // #1263): живая сирота отказного исполнителя спрятана от дубль-
+        // спавна слепотой его проектов, а не глобальным параличом.
         let per_exec = self.sessions.list_sessions_per_executor().await;
-        let all_ok = per_exec.iter().all(|(_, r)| r.is_ok());
-        let scan: Option<Vec<crate::ports::SessionInfo>> = if all_ok {
-            Some(
-                per_exec
-                    .iter()
-                    .filter_map(|(_, r)| r.as_ref().ok())
-                    .flatten()
-                    .cloned()
-                    .collect(),
-            )
-        } else {
-            let mut executors_failed = Vec::new();
-            for (name, r) in &per_exec {
-                if let Err(e) = r {
-                    executors_failed.push(name.clone());
-                    tracing::warn!(event = "cup.list_sessions_failed", executor = %name,
-                        error = %e, "list_sessions исполнителя недоступен — CUP по статусам");
-                }
-            }
-            out.executors_failed = executors_failed;
-            None
-        };
+        // Контракт слияния — одна точка с роутером (router::merge_reachable,
+        // ревью #1450): extend живых + имена отказных с warn по каждому.
+        let (scan, executors_failed) = crate::router::merge_reachable(&per_exec);
+        out.executors_failed = executors_failed;
         // Пер-проектное зрение: слепки по исполнителям, доска получает свой
         let mut sight_by_executor: HashMap<String, Option<Vec<SessionSighting>>> = HashMap::new();
         for (name, r) in &per_exec {
@@ -357,7 +335,11 @@ impl TickUseCase {
             sight_by_executor.insert(name.clone(), list);
         }
         let mut fallback_active = 0usize;
-        if scan.is_none() {
+        // Статусный фолбэк — только при ПОЛНОМ отказе всех исполнителей
+        // (#1450): пустой union при живых исполнителях — это «слотов нет»,
+        // а не «зрения нет».
+        let any_ok = per_exec.iter().any(|(_, r)| r.is_ok());
+        if !any_ok {
             for (_, tasks) in boards.iter() {
                 for t in tasks.iter() {
                     if t.status().is_active() {
@@ -368,49 +350,49 @@ impl TickUseCase {
         }
         // Пул жертв преемпшена (#1259) на #1231-базе: busy берётся из
         // union-скана (SessionInfo.busy), не пер-сессионными пробами.
-        // Blind/fallback (scan None) пул не наполняет — гасить без зрения
-        // нельзя (#1263); idle-жертвы не попадают (капа не держат);
-        // high/medium не гасятся никогда. Не-строки (кроны/боты/ручные)
-        // вне пула структурно — отбор только по строкам досок.
+        // Сессии отказного исполнителя в скан не входят (#1450) — их
+        // строки отсеются поиском: гасить без зрения нельзя (#1263);
+        // idle-жертвы не попадают (капа не держат); high/medium не
+        // гасятся никогда. Не-строки (кроны/боты/ручные) вне пула
+        // структурно — отбор только по строкам досок.
         let preempt_pool = PreemptPool::default();
-        if let Some(list) = &scan {
-            for (bp, tasks) in boards.iter() {
-                for t in tasks.iter() {
-                    if !t.status().is_active() {
-                        continue;
-                    }
-                    let Some(slot) = t.stage_slot() else { continue };
-                    let Some(session) = t.session_of(slot) else {
-                        continue;
-                    };
-                    let Some(info) = list.iter().find(|s| s.id == *session) else {
-                        continue; // мёртвая — гасить нечего
-                    };
-                    if !info.busy {
-                        continue; // idle не держит кап
-                    }
-                    if !matches!(t.priority(), Priority::Low | Priority::Empty) {
-                        continue;
-                    }
-                    let spawned_ms = self
-                        .state
-                        .last_spawn_ms(&bp.board, t.number(), slot)
-                        .unwrap_or(0);
-                    preempt_pool.push(PreemptCandidate {
-                        project: bp.project.clone(),
-                        board: bp.board.clone(),
-                        slot,
-                        number: t.number(),
-                        session: session.to_string(),
-                        priority: t.priority(),
-                        spawned_ms,
-                    });
+        for (bp, tasks) in boards.iter() {
+            for t in tasks.iter() {
+                if !t.status().is_active() {
+                    continue;
                 }
+                let Some(slot) = t.stage_slot() else { continue };
+                let Some(session) = t.session_of(slot) else {
+                    continue;
+                };
+                let Some(info) = scan.iter().find(|s| s.id == *session) else {
+                    continue; // мёртвая/невидимая — гасить нечего
+                };
+                if !info.busy {
+                    continue; // idle не держит кап
+                }
+                if !matches!(t.priority(), Priority::Low | Priority::Empty) {
+                    continue;
+                }
+                let spawned_ms = self
+                    .state
+                    .last_spawn_ms(&bp.board, t.number(), slot)
+                    .unwrap_or(0);
+                preempt_pool.push(PreemptCandidate {
+                    project: bp.project.clone(),
+                    board: bp.board.clone(),
+                    slot,
+                    number: t.number(),
+                    session: session.to_string(),
+                    priority: t.priority(),
+                    spawned_ms,
+                });
             }
         }
-        let global_active: usize = match &scan {
-            Some(list) => list.iter().filter(|s| s.busy).count(),
-            None => fallback_active,
+        let global_active: usize = if any_ok {
+            scan.iter().filter(|s| s.busy).count()
+        } else {
+            fallback_active
         };
         out.sessions_busy = global_active;
         // Счётчик капа — один на весь тик, общий для всех досок (#1244):
