@@ -1086,14 +1086,18 @@ impl TaskBoardRepo for GitHubHub {
         project: &str,
         title: &str,
         body: &str,
+        kind_name: Option<&str>,
     ) -> UsecaseResult<u64> {
+        let mut payload =
+            json!({ "title": title, "body": body, "labels": [format!("proj:{project}")] });
+        if let Some(kind) = kind_name {
+            payload["type"] = json!(kind);
+        }
         let (status, resp) = self
             .rest(
                 reqwest::Method::POST,
                 &format!("/repos/{}/issues", self.repo),
-                Some(
-                    json!({ "title": title, "body": body, "labels": [format!("proj:{project}")] }),
-                ),
+                Some(payload),
             )
             .await?;
         if !status.is_success() {
@@ -1102,12 +1106,44 @@ impl TaskBoardRepo for GitHubHub {
                 resp.to_string().chars().take(140).collect::<String>()
             )));
         }
+        // эхо типа (#1271): GitHub отвечает 422 на неизвестное имя, но
+        // «silently dropped» без push-доступа приходит 201 без типа —
+        // тихая потеря носителя ловится здесь, а не чтением агента
+        if let Some(kind) = kind_name {
+            if resp["type"]["name"].as_str() != Some(kind) {
+                return Err(UsecaseError::Board(format!(
+                    "create issue: тип «{kind}» не принят носителем (эхо: {}) — \
+                     словарь issue Type репо или права токена",
+                    resp["type"]["name"].as_str().unwrap_or("null")
+                )));
+            }
+        }
         let number = resp["number"].as_u64().unwrap_or_default();
         if number == 0 {
             return Err(UsecaseError::Board("create issue: нет номера".into()));
         }
         self.add_to_board(board, number).await?;
         Ok(number)
+    }
+
+    async fn set_issue_type(&self, number: u64, kind_name: &str) -> UsecaseResult<()> {
+        let (_, resp) = self
+            .rest(
+                reqwest::Method::PATCH,
+                &format!("/repos/{}/issues/{number}", self.repo),
+                Some(json!({ "type": kind_name })),
+            )
+            .await?;
+        // сверка эха — симметрично create (#1271): тихий дроп без
+        // push-доступа не проходит как успех
+        if resp["type"]["name"].as_str() != Some(kind_name) {
+            return Err(UsecaseError::Board(format!(
+                "edit #{number}: тип «{kind_name}» не принят носителем (эхо: {}) — \
+                 словарь issue Type репо или права токена",
+                resp["type"]["name"].as_str().unwrap_or("null")
+            )));
+        }
+        Ok(())
     }
 
     async fn issue_fields(&self, number: u64) -> UsecaseResult<uwuwu_domain::TaskFields> {

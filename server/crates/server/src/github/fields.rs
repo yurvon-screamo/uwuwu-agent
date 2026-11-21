@@ -224,9 +224,9 @@ impl IssueFields {
 
 /// Тело POST /user/issue-fields по имени поля. Опции single_select несут
 /// priority: без него GitHub отвечает 422 на свежей среде (баг-репорт
-/// #1357 круг 1; рабочий образец — ветка «Тип»). «Тип» — single-select
-/// канона (инцидент #1149); автомерж (#1232) — single_select off/on;
-/// direct (#1357) — тот же паттерн; прочие имена — текст.
+/// #1357 круг 1). «Тип» снят (#1271): носитель типа — нативный issue Type,
+/// ensure-минт пересоздал бы снесённое поле; автомерж (#1232) —
+/// single_select off/on; direct (#1357) — тот же паттерн; прочие имена — текст.
 fn ensure_field_body(name: &str) -> Value {
     let on_off = |on_color: &str| {
         json!({
@@ -237,21 +237,6 @@ fn ensure_field_body(name: &str) -> Value {
         })
     };
     match name {
-        "Тип" => {
-            let colors = [
-                "red", "purple", "blue", "gray", "gray", "green", "yellow", "orange", "pink",
-                "green", "blue",
-            ];
-            let options: Vec<Value> = uwuwu_usecase::TASK_TYPES
-                .iter()
-                .enumerate()
-                .map(|(i, t)| {
-                    json!({ "name": uwuwu_usecase::task_type_name(*t), "color": colors[i],
-                            "priority": i + 1 })
-                })
-                .collect();
-            json!({ "name": name, "data_type": "single_select", "options": options })
-        }
         "Automerge" | "Autodone" => {
             let mut body = on_off("green");
             body["name"] = json!(name);
@@ -341,14 +326,11 @@ mod tests {
                 );
             }
         }
-        // «Тип» — рабочий образец, тоже под пином
-        let kind = ensure_field_body("Тип");
-        for opt in kind["options"].as_array().expect("options") {
-            assert!(
-                opt["priority"].as_u64().is_some(),
-                "«Тип» опция без priority"
-            );
-        }
+        // «Тип» снят с ensure (#1271): тип живёт в нативном issue Type,
+        // ensure-минт пересоздал бы снесённое владельцем поле (self-heal
+        // store) — arm удалён, имя уходит в текстовую ветку как прочий мусор
+        let legacy_kind = ensure_field_body("Тип");
+        assert_eq!(legacy_kind["data_type"], "text");
         // прочие имена — текст (без options)
         let text = ensure_field_body("Сессия dev");
         assert_eq!(text["data_type"], "text");

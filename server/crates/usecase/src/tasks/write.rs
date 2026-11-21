@@ -69,10 +69,12 @@ pub struct SectionEditReport {
 #[async_trait]
 pub trait TaskWriter: Send + Sync {
     /// Создание: Analys (create-дефолт #1135), лейбл proj:<project>,
-    /// fm-скелет; дубль тайтла — ошибка.
+    /// fm-скелет; дубль тайтла — ошибка. Тип — нативный issue Type в теле
+    /// POST (дефолт Feature; #1271).
     async fn create(&self, project: &str, spec: NewTask) -> UsecaseResult<u64>;
-    /// Правка: статус/ветка/PR/приоритет/тайтл (статус — поле доски,
-    /// ветка/PR/приоритет — нативные поля issue, тайтл — rename).
+    /// Правка: статус/ветка/PR/приоритет/тайтл/тип (статус — поле доски,
+    /// ветка/PR/приоритет — нативные поля issue, тип — нативный issue
+    /// Type #1271, тайтл — rename).
     async fn edit(&self, project: &str, number: u64, patch: TaskPatch) -> UsecaseResult<()>;
     /// Заявка сессии в слот (dev — по умолчанию).
     async fn claim(&self, number: u64, session: &str, slot: Option<Slot>) -> UsecaseResult<()>;
@@ -117,6 +119,9 @@ pub struct TaskPatch {
     pub title: Option<String>,
     /// Автомерж on/off (#1232): до-пометка старых строк, выключение.
     pub automerge: Option<bool>,
+    /// Тип задачи (#1271): нативный issue Type, PATCH {"type": имя}.
+    /// None — не трогать (снос значения патчем не предусмотрен).
+    pub kind: Option<TaskType>,
 }
 
 impl TaskPatch {
@@ -131,6 +136,7 @@ impl TaskPatch {
                 priority: None,
                 title: None,
                 automerge: None,
+                kind: None,
             }
         )
     }
@@ -265,16 +271,14 @@ impl TaskWriter for TaskWriteUseCase {
                 project,
                 spec.title.trim(),
                 &render_create_body(&spec),
+                Some(naming::task_type_native_name(
+                    spec.kind.unwrap_or(uwuwu_domain::TaskType::Feature),
+                )),
             )
             .await?;
-        // тип — нативное поле issue (fm снесён); Тип в снапшоте не живёт
-        let kind = spec.kind.unwrap_or(uwuwu_domain::TaskType::Feature);
-        self.fields
-            .store(
-                number,
-                &[("Тип", Some(naming::task_type_name(kind).to_string()))],
-            )
-            .await?;
+        // тип уехал в теле POST create (нативный issue Type, #1271):
+        // атомарно, дрейф между issue и полем невозможен; тихий дроп
+        // без push-доступа ловит сверка эха на границе носителя
         // Приоритет/Automerge/Direct — ячейки снапшота доски: единая точка
         // записи board-адаптера с кеш-гигиеной (#1258; add_to_board
         // инвалидирует ДО записи полей — окно кеша без полей закрывается
@@ -458,6 +462,15 @@ impl TaskWriter for TaskWriteUseCase {
             want_priority = patch.priority.clone();
             want_automerge = patch.automerge;
         }
+        // тип — нативный issue Type (#1271): PATCH {"type": имя}, мимо
+        // снапшота доски; контрольное чтение ниже сверяет парс носителя
+        let mut want_kind: Option<uwuwu_domain::TaskType> = None;
+        if let Some(kind) = patch.kind {
+            self.board
+                .set_issue_type(number, naming::task_type_native_name(kind))
+                .await?;
+            want_kind = Some(kind);
+        }
         self.verify_edit_delivery(
             &board,
             number,
@@ -467,6 +480,7 @@ impl TaskWriter for TaskWriteUseCase {
                 pr: want_pr,
                 priority: want_priority,
                 automerge: want_automerge,
+                kind: want_kind,
             },
         )
         .await
@@ -737,7 +751,14 @@ where
 /// Консервативно: строго набор/порядок ключей рендера, любой посторонний
 /// контент («--- fm ---» внутри текста) не трогается.
 fn strip_task_get_header(md: &str) -> &str {
-    const KEYS: [&str; 5] = ["branch: ", "pr: ", "automerge: ", "direct: ", "body_hash: "];
+    const KEYS: [&str; 6] = [
+        "branch: ",
+        "pr: ",
+        "automerge: ",
+        "direct: ",
+        "type: ",
+        "body_hash: ",
+    ];
     let Some(rest) = md.strip_prefix("--- fm ---\n") else {
         return md;
     };
@@ -763,6 +784,7 @@ struct EditExpectations {
     pr: Option<String>,
     priority: Option<String>,
     automerge: Option<bool>,
+    kind: Option<TaskType>,
 }
 
 impl EditExpectations {
@@ -773,39 +795,49 @@ impl EditExpectations {
                 &self.branch,
                 &self.pr,
                 &self.priority,
-                self.automerge
+                self.automerge,
+                self.kind,
             ),
-            (None, None, None, None, None)
+            (None, None, None, None, None, None)
         )
     }
 
     /// Несошедшие ключи последнего чтения — в текст громкой ошибки.
     fn mismatches(&self, view: &crate::ports::IssueView) -> Vec<&'static str> {
         let mut out = Vec::new();
-        if let Some(t) = &self.title {
-            if view.task.title() != t {
-                out.push("тайтл");
-            }
+        if self
+            .title
+            .as_deref()
+            .is_some_and(|t| view.task.title() != t)
+        {
+            out.push("тайтл");
         }
-        if let Some(b) = &self.branch {
-            if view.task.branch().map(|x| x.as_str()) != Some(b.as_str()) {
-                out.push("ветка");
-            }
+        if self
+            .branch
+            .as_deref()
+            .is_some_and(|b| view.task.branch().map(|x| x.as_str()) != Some(b))
+        {
+            out.push("ветка");
         }
-        if let Some(u) = &self.pr {
-            if view.task.pr().map(|x| x.as_str()) != Some(u.as_str()) {
-                out.push("PR");
-            }
+        if self
+            .pr
+            .as_deref()
+            .is_some_and(|u| view.task.pr().map(|x| x.as_str()) != Some(u))
+        {
+            out.push("PR");
         }
-        if let Some(p) = &self.priority {
-            if view.task.priority() != crate::naming::parse_priority(p) {
-                out.push("приоритет");
-            }
+        if self
+            .priority
+            .as_deref()
+            .is_some_and(|p| view.task.priority() != crate::naming::parse_priority(p))
+        {
+            out.push("приоритет");
         }
-        if let Some(a) = self.automerge {
-            if view.task.automerge() != a {
-                out.push("automerge");
-            }
+        if self.automerge.is_some_and(|a| view.task.automerge() != a) {
+            out.push("automerge");
+        }
+        if self.kind.is_some_and(|k| view.task.kind() != Some(k)) {
+            out.push("тип");
         }
         out
     }
@@ -890,7 +922,7 @@ impl TaskWriteUseCase {
                 );
                 Err(UsecaseError::Board(format!(
                     "edit #{number}: запись не подтвердилась чтением носителя ({detail}\
-                     тайтл/ветка/PR/приоритет/automerge) — не ретраить слепо, сверь task_get"
+                     тайтл/ветка/PR/приоритет/automerge/тип) — не ретраить слепо, сверь task_get"
                 )))
             }
             Delivery::Blind => {
@@ -906,7 +938,8 @@ impl TaskWriteUseCase {
     }
 }
 
-/// Тело новой задачи: чистый markdown (fm снесён; приоритет/тип — нативные поля).
+/// Тело новой задачи: чистый markdown (fm снесён; приоритет — нативное
+/// глобальное поле, тип — нативный issue Type #1271).
 /// Инвариант держит граница: fm-шапку (агенты копируют старый канон)
 /// вырезаем из любого входа — тело не несёт fm независимо от дисциплины
 /// вызывающего (инцидент #1151: дример завёл задачу с fm в теле).
@@ -980,6 +1013,7 @@ mod tests {
         priority: Option<String>,
         automerge: bool,
         direct: bool,
+        kind: Option<TaskType>,
         status: Status,
     }
 
@@ -994,6 +1028,7 @@ mod tests {
                 priority: None,
                 automerge: false,
                 direct: false,
+                kind: None,
                 status: Status::Empty,
             }
         }
@@ -1027,6 +1062,7 @@ mod tests {
             ));
             task.set_automerge(self.automerge);
             task.set_direct(self.direct);
+            task.set_kind(self.kind);
             IssueView {
                 task,
                 body: self.body.clone(),
@@ -1134,8 +1170,22 @@ mod tests {
             _project: &str,
             _title: &str,
             _body: &str,
+            kind_name: Option<&str>,
         ) -> UsecaseResult<u64> {
+            // POST с type (#1271): имя «принято» носителем — Carrier видит
+            // парс (как живой GitHub: эхо ответа = состояние носителя)
+            if !self.phantom {
+                self.carrier.lock().expect("fake carrier").kind =
+                    kind_name.and_then(crate::naming::parse_task_type);
+            }
             Ok(1)
+        }
+        async fn set_issue_type(&self, _n: u64, kind_name: &str) -> UsecaseResult<()> {
+            if !self.phantom {
+                self.carrier.lock().expect("fake carrier").kind =
+                    crate::naming::parse_task_type(kind_name);
+            }
+            Ok(())
         }
         async fn rename_issue(&self, _n: u64, t: &str) -> UsecaseResult<()> {
             if !self.phantom {
@@ -1358,7 +1408,8 @@ mod tests {
             "create потерял automerge (мимо board-порта)"
         );
         // fields.store больше не несёт ячейку снапшота (Приоритет/Automerge —
-        // единая точка записи board-адаптера); Тип остаётся нативным полем
+        // единая точка записи board-адаптера); тип уехал в POST create
+        // (нативный issue Type, #1271) — в полях его тоже нет
         assert!(!fields
             .stored
             .lock()
@@ -1435,6 +1486,77 @@ mod tests {
             board.carrier.lock().expect("fake carrier").status,
             Status::Empty,
             "set_status для обычной строки не вызывается"
+        );
+    }
+
+    /// Тип уезжает в POST create нативным именем (#1271): маппинг канона
+    /// в словарь issue Type и дефолт Feature (канон create) — на носителе.
+    #[tokio::test]
+    async fn create_carries_native_issue_type() {
+        let fields = Arc::new(FakeFields::default());
+        let (u, board) = writecase(fields.clone());
+        let mut s = spec("тело");
+        s.kind = Some(TaskType::Bug);
+        u.create("uwuwu", s).await.unwrap();
+        assert_eq!(
+            board.carrier.lock().expect("fake carrier").kind,
+            Some(TaskType::Bug),
+            "Bug → нативный «Bug» в POST, носитель читает парс"
+        );
+
+        let (u, board) = writecase(fields.clone());
+        u.create("uwuwu", spec("без типа")).await.unwrap();
+        assert_eq!(
+            board.carrier.lock().expect("fake carrier").kind,
+            Some(TaskType::Feature),
+            "None → дефолт feature канона create"
+        );
+    }
+
+    /// edit(type): нативный issue Type записан и подтверждён контрольным
+    /// чтением (#1271, честная квитанция #1331).
+    #[tokio::test]
+    async fn edit_kind_is_verified_by_carrier_read() {
+        let fields = Arc::new(FakeFields::default());
+        let (u, board) = writecase(fields);
+        u.edit(
+            "uwuwu",
+            1,
+            TaskPatch {
+                kind: Some(TaskType::Refactoring),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("edit type доставлен");
+        assert_eq!(
+            board.carrier.lock().expect("fake carrier").kind,
+            Some(TaskType::Refactoring),
+        );
+    }
+
+    /// Фантомный edit(type): PATCH «принят», носитель типа не видит —
+    /// громкий отказ с вычисленным перечнем («не сошлись: тип»).
+    #[tokio::test]
+    async fn phantom_edit_kind_is_loud() {
+        let fields = Arc::new(FakeFields::default());
+        let u = writecase_carrier(fields, true, false);
+        let err = u
+            .edit(
+                "uwuwu",
+                1,
+                TaskPatch {
+                    kind: Some(TaskType::Docs),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("фантомный edit type — громкий отказ");
+        let text = err.to_string();
+        assert!(text.contains("не подтвердилась"), "текст отказа: {text}");
+        assert!(
+            text.contains("не сошлись: тип"),
+            "перечень несошедших ключей вычислен: {text}"
         );
     }
 
@@ -1559,16 +1681,17 @@ mod tests {
 
     /// Дисплей-шапка task_get срезается на границе записи (fm-стек
     /// инцидента #1331: агент копирует вывод task_get назад в task_body).
+    /// Набор ключей = рендер MCP (#1271: +type, порядок = порядок KEYS).
     #[test]
     fn task_get_display_header_is_stripped() {
-        let md = "--- fm ---\nbranch: work/task-1331\npr: —\nautomerge: true\ndirect: false\nbody_hash: 9de430c691c92328\n\n## Постановка\nтекст";
+        let md = "--- fm ---\nbranch: work/task-1331\npr: —\nautomerge: true\ndirect: false\ntype: refactoring\nbody_hash: 9de430c691c92328\n\n## Постановка\nтекст";
         assert_eq!(strip_task_get_header(md), "## Постановка\nтекст");
     }
 
     #[test]
     fn task_get_header_in_middle_is_kept() {
         let md =
-            "## Секция\n\n--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\nbody_hash: h\n\nтекст";
+            "## Секция\n\n--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\ntype: bug\nbody_hash: h\n\nтекст";
         assert_eq!(
             strip_task_get_header(md),
             md,
@@ -1581,6 +1704,11 @@ mod tests {
         // неполный набор ключей — не рендер task_get
         let md = "--- fm ---\nbranch: x\npr: y\n\n## Тело";
         assert_eq!(strip_task_get_header(md), md);
+        // легаси-рендер без type (#1271) — не текущая шапка: консервативно
+        // не трогается (срезает строго набор ключей актуального рендера)
+        let md_legacy =
+            "--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\nbody_hash: h\n\n## Т";
+        assert_eq!(strip_task_get_header(md_legacy), md_legacy);
         // посторонняя строка в «шапке» — не трогаем
         let md2 = "--- fm ---\nbranch: x\nслучайная строка\nautomerge: true\nbody_hash: h\n\n## Т";
         assert_eq!(strip_task_get_header(md2), md2);
