@@ -655,7 +655,10 @@ impl GitHubHub {
                 json!({ "owner": owner, "name": repo, "number": number }),
             )
             .await?;
-        let issue = &data["data"]["repository"]["issue"];
+        // gql()/gql_retrying() возвращают body["data"] — envelope уже
+        // unwrapнут (багфикс дельты тест-раунда: двойной unwrap давал
+        // всегда None → каждая статусная запись отказывала на живом хабе)
+        let issue = &data["repository"]["issue"];
         if issue.is_null() {
             return Ok(None);
         }
@@ -696,7 +699,23 @@ impl GitHubHub {
                     return VerifyOutcome::Ok(raw);
                 }
                 Err(e) if is_rate_limited(&e) => return VerifyOutcome::SkippedRateLimited,
-                _ => {}
+                // не-rate-limited отказ (транспорт/парс) — не глотаем:
+                // диагностика бюджетных исходов вслепую стоила часа
+                // разбора тест-раунда (#1437)
+                Err(e) => tracing::warn!(
+                    event = "board.verify_attempt_failed",
+                    number,
+                    attempt = attempt + 1,
+                    error = %e,
+                    "попытка verify не сошлась (не rate limit) — ретрай в бюджете"
+                ),
+                Ok(other) => tracing::debug!(
+                    event = "board.verify_attempt_miss",
+                    number,
+                    attempt = attempt + 1,
+                    carrier = ?other.map(|(raw, _)| raw),
+                    "носитель прочитан, значение не совпало (read-лаг или no-op)"
+                ),
             }
         }
         VerifyOutcome::Mismatch
