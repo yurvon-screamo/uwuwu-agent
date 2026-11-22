@@ -262,43 +262,24 @@ impl BoardStatusRenameUseCase {
     /// Rename одной опции Status одной доски (атомарность на доску;
     /// rename по всем доскам — цикл вызовов агентом). Фазы: валидация
     /// входа → pre-image (журнал до мутации) → дословная мутация →
-    /// post-verify → отчёт.
+    /// post-verify → отчёт. Контекст фаз — RenameFlow (одна связка).
     pub async fn rename(&self, project: &str, from: &str, to: &str) -> UsecaseResult<RenameReport> {
         let (from, to) = validate_names(from, to)?;
-        let (from, to) = (from.as_str(), to.as_str());
         let board = self.board_of(project)?;
-        let (image, option, distribution) = self.pre_image(&board, from, to).await?;
-        // 3. Мутация: дословный набор, одно имя.
-        let option_id = option.id.clone();
-        let expected = expected_options(&image.options, &option_id, to);
-        let payload = self.repo.rename(&image, &option_id, to).await?;
-        // 4. Post-verify (мимо кэшей): payload → каталог (окно попыток на
+        let flow = self.pre_image(&board, &from, &to).await?;
+        // Мутация: дословный набор, одно имя.
+        let expected = expected_options(&flow.image.options, &flow.option_id, &to);
+        let payload = self.repo.rename(&flow.image, &flow.option_id, &to).await?;
+        // Post-verify (мимо кэшей): payload → каталог (окно попыток на
         // read-лаг) → непустота fieldValues.
         self.repo.invalidate_meta(&board);
-        let (dist_after, lagged) = self
-            .verify_fresh(&board, from, to, &expected, &payload, &distribution)
-            .await?;
-        Ok(self.report(
-            &board,
-            &image.options,
-            &expected,
-            from,
-            to,
-            option_id,
-            distribution,
-            &dist_after,
-            lagged,
-        ))
+        let (dist_after, lagged) = self.verify_fresh(&flow, &expected, &payload).await?;
+        Ok(flow.report(self, &expected, dist_after, lagged))
     }
 
     /// Pre-image: свежие пробы носителя (мимо кэшей) + write-ahead журнал
-    /// (ДО мутации) + сводка в лог.
-    async fn pre_image(
-        &self,
-        board: &str,
-        from: &str,
-        to: &str,
-    ) -> UsecaseResult<(StatusFieldImage, StatusOption, HashMap<u64, Option<String>>)> {
+    /// (ДО мутации) + сводка в лог. Возврат — контекст фаз RenameFlow.
+    async fn pre_image(&self, board: &str, from: &str, to: &str) -> UsecaseResult<RenameFlow> {
         let image = self.repo.fresh_field(board).await?;
         let option = image
             .options
@@ -336,7 +317,14 @@ impl BoardStatusRenameUseCase {
             journal = %self.journal.path_hint(),
             "pre-image written before mutation"
         );
-        Ok((image, option, distribution))
+        Ok(RenameFlow {
+            board: board.to_string(),
+            from: from.to_string(),
+            to: to.to_string(),
+            image,
+            option_id: option.id,
+            distribution,
+        })
     }
 
     /// Post-verify: payload мутации → контрольные чтения каталога
@@ -344,15 +332,12 @@ impl BoardStatusRenameUseCase {
     /// значений. Возврат — after-дистрибуция + флаг лага (для warn).
     async fn verify_fresh(
         &self,
-        board: &str,
-        from: &str,
-        to: &str,
+        flow: &RenameFlow,
         expected: &[StatusOption],
         payload: &[StatusOption],
-        before: &HashMap<u64, Option<String>>,
     ) -> UsecaseResult<(HashMap<u64, Option<String>>, bool)> {
         if let VerifyOutcome::Fail(reason) = verify_surface(expected, payload) {
-            return Err(self.verify_failed(board, reason));
+            return Err(self.verify_failed(&flow.board, reason));
         }
         // каталог REST не несёт color/description — сверка по id+name
         // (оформление проверено по payload'у мутации)
@@ -370,7 +355,7 @@ impl BoardStatusRenameUseCase {
                 // пауза между контрольными чтениями (секундный лаг видимости)
                 self.clock.sleep_ms(1000);
             }
-            let catalog = self.repo.verify_catalog(board).await?;
+            let catalog = self.repo.verify_catalog(&flow.board).await?;
             let as_options: Vec<StatusOption> = catalog
                 .into_iter()
                 .map(|(id, name)| StatusOption {
@@ -382,45 +367,61 @@ impl BoardStatusRenameUseCase {
                 .collect();
             match verify_surface(&expected_names_only, &as_options) {
                 VerifyOutcome::Ok => break,
-                VerifyOutcome::Fail(reason) => return Err(self.verify_failed(board, reason)),
+                VerifyOutcome::Fail(reason) => return Err(self.verify_failed(&flow.board, reason)),
                 VerifyOutcome::Lag if attempt + 1 == VERIFY_ATTEMPTS => {
                     lagged = true;
                 }
                 VerifyOutcome::Lag => {}
             }
         }
-        let dist_after = self.repo.fresh_distribution(board).await?;
-        match verify_distribution(from, to, before, &dist_after) {
+        let dist_after = self.repo.fresh_distribution(&flow.board).await?;
+        match verify_distribution(&flow.from, &flow.to, &flow.distribution, &dist_after) {
             VerifyOutcome::Ok => {}
-            VerifyOutcome::Fail(reason) => return Err(self.verify_failed(board, reason)),
+            VerifyOutcome::Fail(reason) => return Err(self.verify_failed(&flow.board, reason)),
             // старые имена при живой привязке — read-лаг дистрибуции
             VerifyOutcome::Lag => lagged = true,
         }
         Ok((dist_after, lagged))
     }
 
+    fn verify_failed(&self, board: &str, reason: String) -> UsecaseError {
+        UsecaseError::Board(format!(
+            "POST-VERIFY FAILED on board \"{board}\": {reason}. Possible option loss — \
+             compare the carrier with the pre-image journal BEFORE manual rollback: {}",
+            self.journal.path_hint()
+        ))
+    }
+}
+
+/// Контекст фаз одной rename-операции (доска, имена, pre-image образ):
+/// живёт от pre-image до отчёта, фазы принимают связку вместо россыпи.
+struct RenameFlow {
+    board: String,
+    from: String,
+    to: String,
+    image: StatusFieldImage,
+    option_id: String,
+    distribution: HashMap<u64, Option<String>>,
+}
+
+impl RenameFlow {
     /// Отчёт успеха (warn: не-каноническое имя; лаг контрольного чтения).
-    #[allow(clippy::too_many_arguments)]
     fn report(
         &self,
-        board: &str,
-        options_before: &[StatusOption],
+        usecase: &BoardStatusRenameUseCase,
         expected: &[StatusOption],
-        from: &str,
-        to: &str,
-        option_id: String,
-        distribution: HashMap<u64, Option<String>>,
-        dist_after: &HashMap<u64, Option<String>>,
+        dist_after: HashMap<u64, Option<String>>,
         lagged: bool,
     ) -> RenameReport {
         let mut warnings = Vec::new();
         // warn только на не-парсящееся имя: строки выпадут из рабочих
         // списков сервера; канон→канон (и даже другой канон) — валидный
         // rename класса #1441, его помечать нечем
-        if parse_status(to) == uwuwu_domain::Status::Empty {
+        if parse_status(&self.to) == uwuwu_domain::Status::Empty {
             warnings.push(format!(
-                "new name \"{to}\" is not a canonical board status — rows with it \
-                 drop out of pipeline working lists"
+                "new name \"{}\" is not a canonical board status — rows with it \
+                 drop out of pipeline working lists",
+                self.to
             ));
         }
         if lagged {
@@ -431,25 +432,17 @@ impl BoardStatusRenameUseCase {
             ));
         }
         RenameReport {
-            board: board.to_string(),
-            from: from.to_string(),
-            to: to.to_string(),
-            option_id,
+            board: self.board.clone(),
+            from: self.from.clone(),
+            to: self.to.clone(),
+            option_id: self.option_id.clone(),
             options_total: expected.len(),
-            rows_total: distribution.len(),
-            histogram_before: histogram(options_before, &distribution),
-            histogram_after: histogram(expected, dist_after),
+            rows_total: self.distribution.len(),
+            histogram_before: histogram(&self.image.options, &self.distribution),
+            histogram_after: histogram(expected, &dist_after),
             warnings,
-            journal_path: self.journal.path_hint(),
+            journal_path: usecase.journal.path_hint(),
         }
-    }
-
-    fn verify_failed(&self, board: &str, reason: String) -> UsecaseError {
-        UsecaseError::Board(format!(
-            "POST-VERIFY FAILED on board \"{board}\": {reason}. Possible option loss — \
-             compare the carrier with the pre-image journal BEFORE manual rollback: {}",
-            self.journal.path_hint()
-        ))
     }
 }
 
