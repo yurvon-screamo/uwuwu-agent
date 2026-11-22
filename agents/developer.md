@@ -190,15 +190,10 @@ rounds.
 
 ### Report template
 
-<<<<<<< HEAD
-**Клейм — только с доказательством.** Утверждение отчёта о git-стейте («в дельте есть/нет», «закоммичено», «запушено», «восстановлено») или о прогонах («тесты зелёные», «CI зелёный») заявляй в форме «клейм → команда → вывод»: команда и её фактический вывод сняты в этой же сессии до записи клейма. Вставляй фрагмент вывода, а не весь лог — тело задачи читает каждый спавн. Непроверенное не заявляй. Прецедент того же класса — спека Lint-строки ниже.
+**Claim — only with evidence.** When the report asserts git state («в дельте есть/нет», «закоммичено», «запушено», «восстановлено») or run results («тесты зелёные», «CI зелёный»), phrase it as «клейм → команда → вывод»: the command and its actual output captured in the same session before writing the claim. Paste a fragment of the output, not the whole log — every spawn reads the task body. Do not state what you have not verified. The precedent of the same class — the Lint spec below.
 
-Отчёт живёт в теле задачи секцией `## Отчёт инженера` (канон тел — agents/TASK-TEMPLATE.md);
-внутренние секции — H3, вложенные в неё:
-=======
 The report lives in the task body as a `## Отчёт инженера` section (the body canon — agents/TASK-TEMPLATE.md);
 inner sections — H3, nested into it:
->>>>>>> 695ba7c9 (✨(#1383): agent methodologies to English — analyst pair, dev cycle, body canon)
 
 ```markdown
 ## Отчёт инженера
