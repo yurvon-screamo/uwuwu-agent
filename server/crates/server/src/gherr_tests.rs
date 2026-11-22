@@ -87,7 +87,7 @@ fn core_message_carries_reset_time_and_wait_minutes() {
         text.contains("2027-01-15 08:00"),
         "absolute reset time: {text}"
     );
-    assert!(text.contains("~8 мин"), "relative wait: {text}");
+    assert!(text.contains("~8 min"), "relative wait: {text}");
 }
 
 #[test]
@@ -95,7 +95,7 @@ fn core_message_is_loud_without_reset_header() {
     let text = GhFail::Core { reset_epoch: None }.to_string();
     assert!(text.contains("rate limit"), "class name present: {text}");
     assert!(
-        text.contains("подожди или отложи ход"),
+        text.contains("wait or defer the turn"),
         "agent recipe: {text}"
     );
 }
@@ -218,9 +218,9 @@ fn core_message_renders_live_reset_epoch() {
     }
     .to_string();
     assert!(text.contains("2026-11-17 01:17 UTC"), "absolute: {text}");
-    assert!(text.contains("подожди или отложи ход"), "recipe: {text}");
+    assert!(text.contains("wait or defer the turn"), "recipe: {text}");
     let now = Utc.timestamp_opt(1794876940, 0).single().expect("now");
     let rendered = format_reset(1794878220, now);
     assert!(rendered.contains("2026-11-17 01:17 UTC"), "abs: {rendered}");
-    assert!(rendered.contains("~21 мин"), "relative: {rendered}");
+    assert!(rendered.contains("~21 min"), "relative: {rendered}");
 }

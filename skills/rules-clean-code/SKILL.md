@@ -24,24 +24,24 @@ When exceeded, decompose — don't rationalize.
 
 Exception: generated code, or a single cohesive algorithm that cannot be split without leaking internal state. If a file legitimately exceeds the limit, document WHY at the top (`// Single cohesive X parser; splitting would expose internals`). **Noise is never an excuse** — a 400-line file full of redundant comments violates this rule, not satisfies it.
 
-### Качество кода важнее краткости
+### Code quality over brevity
 
-НЕ СЖИМАЙ ЛОГИКУ в ущерб читаемости. Размер файла — не метрика качества.
+Do NOT compress logic at the expense of readability. File size is not a quality metric.
 
-**Запрещено (это про структуру алгоритма, а НЕ про комментарии):**
+**Forbidden (this is about the algorithm's structure, NOT about comments):**
 
-- Схлопывать многострочные конструкции в одну строку
-- Убирать пустые строки, которые разделяют логические блоки
-- Сокращать имена переменных/функций без веской причины
-- Объединять независимые операции в одну строку через `&&`, `;` и т.п.
+- Collapsing multi-line constructs into one line
+- Removing blank lines that separate logical blocks
+- Shortening variable/function names without a good reason
+- Joining independent operations into one line via `&&`, `;` etc.
 
-**Допустимые сокращения** — только те, которые улучшают понимание кода:
+**Acceptable shortcuts** — only those that improve code comprehension:
 
-- Использование синтаксического сахара языка (деструктуризация, `?.`, `??` и т.д.)
-- Удаление реально избыточного/дублирующегося кода (DRY)
-- Замена многословной конструкции на идиоматичную для языка
+- Using the language's syntactic sugar (destructuring, `?.`, `??`, etc.)
+- Removing genuinely redundant/duplicated code (DRY)
+- Replacing a verbose construct with a language-idiomatic one
 
-> «Читаемость» = понятные имена, логическое разделение, идиоматичный код. НЕ = больше комментариев. Большой файл — нормально, но только за счёт логики, а не шума.
+> «Readability» = clear names, logical separation, idiomatic code. NOT = more comments. A large file is fine, but only due to logic, not noise.
 
 ## Naming
 
@@ -98,6 +98,6 @@ DRY applies to domain knowledge, not identical-looking code. Two identical fragm
 
 ## Change discipline
 
-- **Subtract Before You Add**: если изменение раздувает сложность — сначала вычти (убери ставшее лишним), потом добавляй новое.
-- **Attack the Premise**: два фикса, разделяющих одну посылку, упали на одном гейте → запиши посылку одним предложением, найди, кто держит дисбаланс, устрани её — не начинай третий фикс.
-- Не усложняй ради гипотетической гонки состояний или маловероятного сценария: сначала покажи юзеру проблему, вероятность и цену усложнения — получи согласие.
+- **Subtract Before You Add**: if a change bloats complexity — first subtract (remove what became redundant), then add the new.
+- **Attack the Premise**: two fixes sharing one premise failed on the same gate → write the premise in one sentence, find what holds the imbalance, fix it — do not start a third fix.
+- Do not complicate for a hypothetical race or an unlikely scenario: first show the user the problem, its probability and the cost of the complication — get consent.

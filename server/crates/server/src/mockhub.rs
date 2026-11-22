@@ -266,8 +266,8 @@ impl TaskBoardRepo for MemoryHub {
         // класс отказа, чтобы e2e-фаза 11 проверяла контракт целиком.
         if phantom_writes() {
             return Err(UsecaseError::Board(format!(
-                "статус #{number}: запись «{}» не подтвердилась свежим чтением \
-                 носителя — не применилось (phantom-режим стенда)",
+                "status #{number}: write \"{}\" not confirmed by fresh carrier read — \
+                 not applied (stand phantom mode)",
                 uwuwu_usecase::status_name(status)
             )));
         }
@@ -957,7 +957,7 @@ mod tests {
             .await
             .expect_err("фантомный переход в закрытую строку отклонён гардом");
         assert!(
-            format!("{err}").contains("вне канона"),
+            format!("{err}").contains("outside the pipeline canon"),
             "громкая канон-ошибка про терминальность, получили: {err}"
         );
     }

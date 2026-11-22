@@ -200,7 +200,7 @@ impl TaskCleanUseCase {
             .iter()
             .find(|(p, _)| p == project)
             .map(|(_, b)| b.clone())
-            .ok_or_else(|| UsecaseError::Board(format!("проект «{project}» вне конфига")))
+            .ok_or_else(|| UsecaseError::Board(format!("project «{project}» is not in the config")))
     }
 
     /// Нормировка входа: дедуп, детерминированный порядок, батч-кап.
@@ -210,7 +210,7 @@ impl TaskCleanUseCase {
         uniq.dedup();
         if uniq.len() > CLEAN_BATCH_CAP {
             return Err(UsecaseError::Board(format!(
-                "батч {} строк — кап {CLEAN_BATCH_CAP} (дроби вызовы)",
+                "a batch of {} rows — the cap is {CLEAN_BATCH_CAP} (split the calls)",
                 uniq.len()
             )));
         }
@@ -233,7 +233,7 @@ impl TaskCleanUseCase {
         let issue = match self.clean.fresh_issue(number).await {
             Ok(i) => i,
             Err(e) => {
-                return divergent(number, format!("проба issue не состоялась: {e}"));
+                return divergent(number, format!("the issue probe did not complete: {e}"));
             }
         };
         let Some(issue) = issue else {
@@ -241,7 +241,7 @@ impl TaskCleanUseCase {
             // read-лага/ручной снос issue) — fail-closed, ADR-025
             return divergent(
                 number,
-                "item на доске, issue в репо не найден — источники противоречивы".to_string(),
+                "the item is on the board, the issue is not found in the repo — the sources contradict".to_string(),
             );
         };
         let verdict = classify(&issue);
@@ -268,7 +268,7 @@ impl TaskCleanUseCase {
             .collect();
         if !divergent.is_empty() {
             return Err(UsecaseError::Board(format!(
-                "батч отклонён (fail-closed), снос не выполнялся: {}",
+                "the batch is rejected (fail-closed), nothing was deleted: {}",
                 divergent.join("; ")
             )));
         }
@@ -279,8 +279,8 @@ impl TaskCleanUseCase {
             .collect();
         if !unacked.is_empty() {
             return Err(UsecaseError::Board(format!(
-                "не-Draft строки требуют подтверждения владельца (ack): {} — \
-                 dry-run выше, подтверждённые номера передай в ack",
+                "non-Draft rows require the owner's confirmation (ack): {} — \
+                 the dry-run above; pass the confirmed numbers into ack",
                 unacked.join("; ")
             )));
         }
@@ -339,8 +339,8 @@ impl TaskCleanUseCase {
         for row in &deleted {
             if let Err(e) = self.clean.remove_row(&board, row.number, row.item_id).await {
                 return Err(UsecaseError::Board(format!(
-                    "снос #{}: {e} — часть батча могла снестись; журнал {} \
-                     (task_undo восстановит, идемпотентно)",
+                    "delete #{}: {e} — part of the batch may have been deleted; journal {} \
+                     (task_undo restores, idempotent)",
                     row.number, journal.id
                 )));
             }
@@ -358,13 +358,13 @@ impl TaskCleanUseCase {
         let found = self.journals.get(project, journal)?.ok_or_else(|| {
             let ids = self.journals.ids(project).unwrap_or_default();
             let tail = if ids.is_empty() {
-                "журналов нет".to_string()
+                "no journals".to_string()
             } else {
-                format!("доступны: {}", ids.join(", "))
+                format!("available: {}", ids.join(", "))
             };
             UsecaseError::Board(format!(
-                "журнал {} проекта {project} не найден; {tail}",
-                journal.unwrap_or("(свежий)")
+                "journal {} of project {project} not found; {tail}",
+                journal.unwrap_or("(latest)")
             ))
         })?;
         // индекс — один фетч на вызов (квотная дисциплина, ревью Common-1):
@@ -390,7 +390,7 @@ impl TaskCleanUseCase {
                     row.number,
                     row.title.clone(),
                     UndoOutcome::Failed(format!(
-                        "{e} (статус «{}» доставь task_edit)",
+                        "{e} (status «{}» — deliver it via task_edit)",
                         row.status_raw.as_deref().unwrap_or("—")
                     )),
                 )),
@@ -814,7 +814,10 @@ mod tests {
             .execute("uwuwu", &[2], &[])
             .await
             .expect_err("Dead (не-Draft) без ack — отказ");
-        assert!(err.to_string().contains("подтверждения"), "текст: {err}");
+        assert!(
+            err.to_string().contains("require the owner's confirmation"),
+            "текст: {err}"
+        );
     }
 
     #[tokio::test]
@@ -829,7 +832,10 @@ mod tests {
             .await
             .expect_err("Divergent валит весь батч");
         assert!(err.to_string().contains("fail-closed"), "текст: {err}");
-        assert!(err.to_string().contains("противоречивы"), "деталь: {err}");
+        assert!(
+            err.to_string().contains("the sources contradict"),
+            "деталь: {err}"
+        );
         assert!(carrier.events.lock().expect("c").is_empty(), "сносов нет");
     }
 
@@ -893,7 +899,7 @@ mod tests {
             .execute("uwuwu", &[1], &[])
             .await
             .expect_err("устаревший item id — громкий отказ");
-        assert!(err.to_string().contains("журнал"), "журнал назван: {err}");
+        assert!(err.to_string().contains("journal"), "журнал назван: {err}");
         assert_eq!(
             journals.entries.lock().expect("j").len(),
             1,
@@ -932,7 +938,7 @@ mod tests {
     async fn unknown_project_is_loud() {
         let (u, _, _) = rig();
         let err = u.plan("чужой", &[1]).await.expect_err("проект вне конфига");
-        assert!(err.to_string().contains("вне конфига"));
+        assert!(err.to_string().contains("is not in the config"));
     }
 
     // --- undo ---
@@ -986,7 +992,7 @@ mod tests {
             .await
             .expect_err("журнал не найден");
         assert!(
-            err.to_string().contains("доступны"),
+            err.to_string().contains("available:"),
             "перечень в отказе: {err}"
         );
         assert!(

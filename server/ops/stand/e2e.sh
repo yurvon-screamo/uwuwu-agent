@@ -853,17 +853,17 @@ print(t.split('#')[1].split(' ')[0])") || fail "create на фантом-сте�
 BODY_RESP=$(mcp task_body "{\"number\":$PH_N,\"body\":\"## Постановка\n\nфантомное тело\n\"}")
 printf '%s' "$BODY_RESP" | grep -q '"isError":true' \
   || fail "task_body на фантоме не отказал: $BODY_RESP"
-printf '%s' "$BODY_RESP" | grep -q 'не подтвердилась' \
+printf '%s' "$BODY_RESP" | grep -q 'was not confirmed' \
   || fail "текст отказа body без вердикта контрольного чтения: $BODY_RESP"
 COMMENT_RESP=$(mcp task_comment "{\"number\":$PH_N,\"text\":\"probe-1331\"}")
 printf '%s' "$COMMENT_RESP" | grep -q '"isError":true' \
   || fail "task_comment на фантоме не отказал: $COMMENT_RESP"
-printf '%s' "$COMMENT_RESP" | grep -q 'не подтвердился' \
+printf '%s' "$COMMENT_RESP" | grep -q 'was not confirmed' \
   || fail "текст отказа comment без вердикта контрольного чтения: $COMMENT_RESP"
 EDIT_RESP=$(mcp task_edit "{\"number\":$PH_N,\"branch\":\"work/task-1331\"}")
 printf '%s' "$EDIT_RESP" | grep -q '"isError":true' \
   || fail "task_edit(branch) на фантоме не отказал: $EDIT_RESP"
-printf '%s' "$EDIT_RESP" | grep -q 'не подтвердилась' \
+printf '%s' "$EDIT_RESP" | grep -q 'was not confirmed' \
   || fail "текст отказа edit без вердикта контрольного чтения: $EDIT_RESP"
 # статусная ветка (#1437): phantom set_status → громкий отказ с вердиктом
 # контрольного чтения — врущая квитанция «обновлена» на статусе невозможна.
@@ -872,7 +872,7 @@ printf '%s' "$EDIT_RESP" | grep -q 'не подтвердилась' \
 EDIT_STATUS_RESP=$(mcp task_edit "{\"number\":$PH_N,\"status\":\"Review Analys\"}")
 printf '%s' "$EDIT_STATUS_RESP" | grep -q '"isError":true' \
   || fail "task_edit(status) на фантоме не отказал: $EDIT_STATUS_RESP"
-printf '%s' "$EDIT_STATUS_RESP" | grep -q 'не подтвердилась' \
+printf '%s' "$EDIT_STATUS_RESP" | grep -q 'not confirmed' \
   || fail "текст отказа статусной записи без вердикта контрольного чтения: $EDIT_STATUS_RESP"
 CARRIER=$(mcp task_get "{\"number\":$PH_N}")
 printf '%s' "$CARRIER" | grep -q 'фантомное тело' \
@@ -895,16 +895,16 @@ import json,sys
 t = json.load(sys.stdin)['result']['content'][0]['text']
 print(t.split('#')[1].split(' ')[0])") || fail "create на честном стенде не отдал номер: $CREATED"
 HONEST=$(mcp task_body "{\"number\":$H_N,\"body\":\"## Постановка\n\nчестное тело\n\"}")
-printf '%s' "$HONEST" | grep -q 'заменено' || fail "task_body на честном носителе отказал: $HONEST"
-printf '%s' "$HONEST" | grep -q 'не подтверждена' \
+printf '%s' "$HONEST" | grep -q 'replaced' || fail "task_body на честном носителе отказал: $HONEST"
+printf '%s' "$HONEST" | grep -q 'delivery not confirmed' \
   && fail "честная запись получила маркер непроверенности: $HONEST"
 HONEST_C=$(mcp task_comment "{\"number\":$H_N,\"text\":\"probe-ok\"}")
-printf '%s' "$HONEST_C" | grep -q 'коммент отправлен' \
+printf '%s' "$HONEST_C" | grep -q 'comment posted to' \
   || fail "task_comment на честном носителе отказал: $HONEST_C"
 # статусная квитанция честного носителя (#1437): подтверждение в тексте.
 # Легальное ребро Analys → Review Analys (гейт #1280 пройден create'ом)
 HONEST_S=$(mcp task_edit "{\"number\":$H_N,\"status\":\"Review Analys\"}")
-printf '%s' "$HONEST_S" | grep -q 'носитель подтверждает' \
+printf '%s' "$HONEST_S" | grep -q 'carrier confirms' \
   || fail "честная статусная запись без подтверждения в квитанции: $HONEST_S"
 kill "$SRV_PID" 2>/dev/null || true; wait "$SRV_PID" 2>/dev/null || true; SRV_PID=""
 sleep 1
@@ -958,7 +958,7 @@ case "$S" in
   *attention*|*Needs*) say "строка запаркована: $S" ;;
   *) fail "строка не в Needs attention после lost.escalated: $S" ;;
 esac
-mcp task_get "{\"number\":$SEED_N}" | grep -q 'Сессия потеряна' \
+mcp task_get "{\"number\":$SEED_N}" | grep -q 'Session lost' \
   || fail "нет коммента с причиной парковки на строке"
 # анти-дубль: respawn при живом списке запрещён — спавн ровно один
 SPAWNS=$(grep -c '"event":"spawn.done"' "$LOG_SRV_LOST" || true)
@@ -980,7 +980,7 @@ say "фаза 13: lost-resurrection #1288 — сессия скрыта из lis
 # скрыта из list, GET 200 (probe Alive), prompt/switch_agent → 404.
 # lost-рука видит «сессии нет в списке» → resurrection гвардами
 # Dead-ветки; 404 свежих спавнов — сирота-делит (анти-ре-энтри),
-# луп-гвард >4 паркует («Респавн-петля», юнит-класс T2 живьём).
+# луп-гвард >4 паркует («Respawn loop», юнит-класс T2 живьём).
 rm -f "$STATE"
 LOG_SRV_LRES="$RUN_DIR/server-lres.log"
 MOCK_MODE=plain MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=1500 \
@@ -1020,8 +1020,8 @@ case "$S" in
   *attention*|*Needs*) say "луп-гвард запарковал: $S" ;;
   *) fail "строка не в Needs attention после respawn-петли: $S" ;;
 esac
-mcp task_get "{\"number\":$SEED_N}" | grep -q 'Респавн-петля' \
-  || fail "нет коммента «Респавн-петля» на строке"
+mcp task_get "{\"number\":$SEED_N}" | grep -q 'Respawn loop' \
+  || fail "нет коммента «Respawn loop» на строке"
 # анти-ре-энтри: одна respawn-попытка за тик — create/delete пары чисты
 # (bootstrap+work пары + сироты; deleted = created - живые work-сессии)
 CREATED=$(grep -c '"event":"mock.session_created"' "$LOG_MOCK" || true)

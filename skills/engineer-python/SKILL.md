@@ -5,7 +5,7 @@ description: Python expertise - type hints, async/await, pydantic, dataclasses, 
 
 # Python Development Standards
 
-> Общие правила (размеры, комментарии, SRP, naming) — в `rules-clean-code`. Здесь только Python-специфика.
+> General rules (sizes, comments, SRP, naming) — in `rules-clean-code`. Only Python specifics here.
 
 ## Typing
 

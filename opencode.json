@@ -12,23 +12,23 @@
   "$schema": "https://opencode.ai/config.json",
   "commands": {
     "bdd-plan": {
-      "template": "Сформулируй это в виде ряда гиркин сценариев на русском, чтобы мы точно поняли друг друга."
+      "template": "Phrase this as a series of Gherkin scenarios in Russian, so we understand each other precisely."
     },
     "fast": {
-      "template": "Юзер считает это простой задачей, действуй без задачи в uwuwu task."
+      "template": "The user considers this a simple task; act without a uwuwu task."
     },
     "goal": {
-      "template": "goal: $ARGUMENTS\n(Пользователь ушёл — действуй полностью самостоятельно, не жди указаний и вопросов.)",
+      "template": "goal: $ARGUMENTS\n(The user has left — act fully autonomously, do not wait for instructions or questions.)",
       "description": "GOAL-режим: агент работает автономно до достижения цели, судья проверяет по фактам"
     },
     "search": {
-      "template": "Хватит гадать. Сначала ресерч - интернет/wiki/access/документация"
+      "template": "Stop guessing. Research first — internet/wiki/access/documentation"
     },
     "tdd": {
-      "template": "Начни работу над багом с TDD - сначала воспроизвести баг, и только потом план и исправление. В TDD подходе ты не ждешь от меня апрува. Если не получится воспроизвести баг, то ничего не делай и зови меня"
+      "template": "Start the bug work with TDD - first reproduce the bug, only then the plan and the fix. In the TDD approach you do not wait for my approval. If you cannot reproduce the bug, do nothing and call me"
     },
     "worktree": {
-      "template": "Работай в свежем git worktree, как закончишь работу создавай PR, включай watch за статусом CI + не забудь удалить worktree как все закончишь и ci будет зеленым."
+      "template": "Work in a fresh git worktree; when done, create a PR, watch the CI status, and remember to remove the worktree once everything is done and CI is green."
     },
     "goal-stop": {
       "template": "goal-stop",

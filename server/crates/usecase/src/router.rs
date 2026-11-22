@@ -154,7 +154,7 @@ impl SessionRouter {
             }
         }
         Err(UsecaseError::Session(format!(
-            "export_session {session} — исполнители: {}",
+            "export_session {session} — executors: {}",
             failures.join("; ")
         )))
     }

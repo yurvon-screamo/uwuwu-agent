@@ -246,7 +246,7 @@ impl GitHubHub {
         let now = std::time::Instant::now();
         if let Some(until) = self.gql_blocked(now) {
             return Err(UsecaseError::Board(format!(
-                "gh graphql [RATE_LIMITED]: бэкофф ещё {:?}",
+                "gh graphql [RATE_LIMITED]: backoff for another {:?}",
                 until.duration_since(now)
             )));
         }
@@ -257,18 +257,18 @@ impl GitHubHub {
             .json(&json!({ "query": query, "variables": variables }))
             .send()
             .await
-            .map_err(|e| gh_transport_tagged(format!("сбой соединения: {e}")))?;
+            .map_err(|e| gh_transport_tagged(format!("connection failure: {e}")))?;
         let status = resp.status();
         let headers = resp.headers().clone();
         let text = resp
             .text()
             .await
-            .map_err(|e| gh_transport_tagged(format!("обрыв чтения ответа: {e}")))?;
+            .map_err(|e| gh_transport_tagged(format!("response read cut off: {e}")))?;
         if let Some(fail) = crate::gherr::classify(status, &headers) {
             return Err(gh_tagged(&fail));
         }
         let body: Value = serde_json::from_str(&text)
-            .map_err(|e| gh_transport_tagged(format!("не-JSON (HTTP {status}): {e}")))?;
+            .map_err(|e| gh_transport_tagged(format!("not JSON (HTTP {status}): {e}")))?;
         if !status.is_success() {
             // 5xx — транспортный класс (#1330: 502/503/504 с валидным телом
             // ретраятся наравне с обрывами); прочие не-успехи — как раньше
@@ -297,7 +297,7 @@ impl GitHubHub {
         }
         body.get("data")
             .cloned()
-            .ok_or_else(|| UsecaseError::Board("graphql: нет data".into()))
+            .ok_or_else(|| UsecaseError::Board("graphql: no data".into()))
     }
 
     /// Чтение gql с коротким ретраем (#1330): разовый транспортный флап
@@ -389,7 +389,7 @@ impl GitHubHub {
     /// Полное чтение доски пагинацией (мимо кеша).
     async fn snapshot_fetch(&self, board: &str) -> UsecaseResult<(Vec<Task>, BoardMeta)> {
         let (owner, name) = self.repo.split_once('/').ok_or_else(|| {
-            UsecaseError::Board(format!("repo в форме owner/name: {}", self.repo))
+            UsecaseError::Board(format!("repo in the owner/name form: {}", self.repo))
         })?;
         let mut meta = BoardMeta::default();
         let mut rows: Vec<Task> = Vec::new();
@@ -410,13 +410,13 @@ impl GitHubHub {
             }
             let nodes = data["repository"]["projectsV2"]["nodes"]
                 .as_array()
-                .ok_or_else(|| UsecaseError::Board("projectsV2.nodes не массив".into()))?;
+                .ok_or_else(|| UsecaseError::Board("projectsV2.nodes is not an array".into()))?;
             let project = nodes
                 .iter()
                 .find(|p| p["title"].as_str() == Some(board))
                 .ok_or_else(|| {
                     UsecaseError::Board(format!(
-                        "доска «{board}» не найдена среди {} шт",
+                        "board «{board}» not found among {} boards",
                         nodes.len()
                     ))
                 })?;
@@ -435,7 +435,7 @@ impl GitHubHub {
                 }
                 if meta.project_id.is_empty() {
                     return Err(UsecaseError::Board(format!(
-                        "доска «{board}»: нет project id"
+                        "board «{board}»: no project id"
                     )));
                 }
             }
@@ -449,7 +449,7 @@ impl GitHubHub {
             cursor = items["pageInfo"]["endCursor"].as_str().map(String::from);
         }
         Err(UsecaseError::Board(format!(
-            "доска «{board}» превысила {MAX_PAGES} страниц — гард"
+            "board «{board}» exceeded the {MAX_PAGES} pages — the guard"
         )))
     }
 
@@ -689,6 +689,10 @@ impl GitHubHub {
     /// echo мутации материал лога, не квитанции. Бюджет покрывает
     /// измеренную конвергенцию ~2с (проба S1); исчерпание бюджета —
     /// аномалия (лаг листа REST сюда не относится), громкий отказ.
+    /// Сравнение доменное (parse_status), не строковое: в окне
+    /// merge→rename (#1383) носитель отвечает легаси-русским именем
+    /// опции при английском каноне — raw в Confirmed может быть
+    /// легаси-русским, семантика равна.
     async fn verify_status(&self, board: &str, number: u64, expected: Status) -> VerifyOutcome {
         for attempt in 0..VERIFY_GQL_ATTEMPTS {
             if attempt > 0 {
@@ -754,9 +758,9 @@ impl GitHubHub {
                 self.status_cache.invalidate(&number.to_string());
                 self.pv2.invalidate_status(board, number);
                 Err(UsecaseError::Board(format!(
-                    "статус #{number}: запись «{}» не подтвердилась свежим чтением \
-                     носителя — мутация не применилась или носитель аномален; \
-                     не ретраить слепо, сверь носитель",
+                    "status #{number}: write \"{}\" not confirmed by fresh carrier read — \
+                     mutation not applied or carrier anomalous; do not retry blindly, \
+                     check the carrier",
                     uwuwu_usecase::status_name(status)
                 )))
             }
@@ -881,7 +885,9 @@ fn item_values(item: &Value) -> ItemValues {
                 .unwrap_or_default();
             match field {
                 "Status" => out.status = value.to_string(),
-                crate::github::fields::F_PRIORITY | "Priority" => out.priority = value.to_string(),
+                crate::github::fields::F_PRIORITY | "Приоритет" => {
+                    out.priority = value.to_string()
+                }
                 // автомерж (#1232): новое имя, legacy «Autodone» — back-compat
                 "Automerge" | "Autodone" => out.automerge = value == "on" || value == "true",
                 uwuwu_usecase::F_DIRECT => out.direct = value == "on",
@@ -930,11 +936,14 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
     }
     // Приоритет с носителя: один парсер со snapshot-путём (naming::
     // parse_priority — trim/регистр/русские варианты); неизвестное — Empty.
+    // Ключ канона + легаси «Приоритет» (контракт окна merge→rename #1383:
+    // физическое issue-поле может нести старый лейбл до rename владельцем).
     // Без мапинга гейт пика морозил бы ВСЕ спавны, включая high
     // (инцидент #1170: high-таска deferred_peak'илась, ревьювер не
     // поднимался в окно GLM).
     let priority = raw
         .get(crate::github::fields::F_PRIORITY)
+        .or_else(|| raw.get("Приоритет"))
         .map(|v| uwuwu_usecase::parse_priority(v))
         .unwrap_or(uwuwu_domain::Priority::Empty);
     // VCS-жизненный цикл явный; пара (Branch, PR) — кодовый цикл с веткой.
@@ -1236,7 +1245,7 @@ impl TaskBoardRepo for GitHubHub {
         }
         let number = resp["number"].as_u64().unwrap_or_default();
         if number == 0 {
-            return Err(UsecaseError::Board("create issue: нет номера".into()));
+            return Err(UsecaseError::Board("create issue: no number".into()));
         }
         self.add_to_board(board, number).await?;
         Ok(number)
@@ -1336,7 +1345,7 @@ impl TaskBoardRepo for GitHubHub {
         // item id — из меты снапшота: archiveProjectV2Item ест itemId
         let snap = self.snapshot(board).await?;
         let item = snap.1.items.get(&number).cloned().ok_or_else(|| {
-            UsecaseError::Board(format!("строка #{number} не на доске «{board}»"))
+            UsecaseError::Board(format!("row #{number} is not on board «{board}»"))
         })?;
         let project_id = snap.1.project_id.clone();
         let mutation = r#"
@@ -1409,7 +1418,7 @@ impl TaskBoardRepo for GitHubHub {
         let applied = status.is_success() && resp["body"].as_str() == Some(body_md);
         if !applied {
             return Err(UsecaseError::Board(format!(
-                "replace body #{number}: не применилось (HTTP {status})"
+                "replace body #{number}: not applied (HTTP {status})"
             )));
         }
         Ok(())
@@ -1854,7 +1863,8 @@ mod tests {
             .settle_write_through("B", 7, &VerifyOutcome::Mismatch, Status::InProgress)
             .expect_err("mismatch — громкая ошибка");
         assert!(
-            err.to_string().contains("не подтвердилась"),
+            err.to_string()
+                .contains("not confirmed by fresh carrier read"),
             "текст отказа: {err}"
         );
         assert!(
@@ -2103,15 +2113,16 @@ mod tests {
         // Permission-отказ: Display содержит «не rate limit» — старый
         // строковый матч читал его как rate limit (код-ревью Common-1)
         let permission = UsecaseError::Board(
-            "gh graphql [PERMISSION]: HTTP 403 (не rate limit): проверь GH_TOKEN/права токена"
+            "gh graphql [PERMISSION]: HTTP 403 (not rate limit): check GH_TOKEN / the token's permissions"
                 .into(),
         );
         assert!(!is_rate_limited(&permission), "Permission — не rate limit");
         let limited = UsecaseError::Board(
-            "gh graphql [RATE_LIMITED]: GitHub rate limit (core): квота исчерпана".into(),
+            "gh graphql [RATE_LIMITED]: GitHub rate limit (core): the quota is exhausted".into(),
         );
         assert!(is_rate_limited(&limited));
-        let backoff = UsecaseError::Board("gh graphql [RATE_LIMITED]: бэкофф ещё 4 мин".into());
+        let backoff =
+            UsecaseError::Board("gh graphql [RATE_LIMITED]: backoff for another 4 min".into());
         assert!(is_rate_limited(&backoff));
         let unrelated = UsecaseError::Board("graphql errors: NOT_FOUND".into());
         assert!(!is_rate_limited(&unrelated));
@@ -2142,14 +2153,14 @@ mod tests {
         let transport = gh_transport_tagged("не-JSON (HTTP 502 Bad Gateway): eof".into());
         assert!(is_transport_flap(&transport));
         let limited = UsecaseError::Board(
-            "gh graphql [RATE_LIMITED]: GitHub rate limit (core): квота исчерпана".into(),
+            "gh graphql [RATE_LIMITED]: GitHub rate limit (core): the quota is exhausted".into(),
         );
         assert!(
             !is_transport_flap(&limited),
             "rate limit — не транспортный класс"
         );
         let permission = UsecaseError::Board(
-            "gh graphql [PERMISSION]: HTTP 403 (не rate limit): проверь GH_TOKEN/права токена"
+            "gh graphql [PERMISSION]: HTTP 403 (not rate limit): check GH_TOKEN / the token's permissions"
                 .into(),
         );
         assert!(
@@ -2178,9 +2189,10 @@ mod tests {
             None,
             "флап на второй попытке → исчерпание, Err наверх как есть"
         );
-        let limited = UsecaseError::Board("gh graphql [RATE_LIMITED]: бэкофф ещё 4 мин".into());
+        let limited =
+            UsecaseError::Board("gh graphql [RATE_LIMITED]: backoff for another 4 min".into());
         let permission = UsecaseError::Board(
-            "gh graphql [PERMISSION]: HTTP 403 (не rate limit): проверь GH_TOKEN/права токена"
+            "gh graphql [PERMISSION]: HTTP 403 (not rate limit): check GH_TOKEN / the token's permissions"
                 .into(),
         );
         let graphql_errors = UsecaseError::Board("graphql errors: NOT_FOUND".into());

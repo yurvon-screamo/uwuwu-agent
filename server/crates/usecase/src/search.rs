@@ -46,22 +46,22 @@ impl SearchUseCase {
                 Ok(slugs) => {
                     for slug in slugs {
                         out.push(SearchHit {
-                            section: "полнотекст",
+                            section: "fulltext",
                             slug,
-                            score: "токены AND".into(),
+                            score: "AND tokens".into(),
                         });
                     }
                 }
                 Err(e) => out.push(SearchHit {
-                    section: "полнотекст",
-                    slug: format!("— недоступен: {e}"),
+                    section: "fulltext",
+                    slug: format!("— unavailable: {e}"),
                     score: String::new(),
                 }),
             }
         } else {
             out.push(SearchHit {
-                section: "полнотекст",
-                slug: "— индекс не построен".into(),
+                section: "fulltext",
+                slug: "— the index is not built".into(),
                 score: String::new(),
             });
         }
@@ -71,21 +71,21 @@ impl SearchUseCase {
                     Ok(hits) => {
                         for (score, slug) in hits {
                             out.push(SearchHit {
-                                section: "семантика",
+                                section: "semantic",
                                 slug,
                                 score: format!("{score:.2}"),
                             });
                         }
                     }
                     Err(e) => out.push(SearchHit {
-                        section: "семантика",
-                        slug: format!("— недоступна: {e}"),
+                        section: "semantic",
+                        slug: format!("— unavailable: {e}"),
                         score: String::new(),
                     }),
                 },
                 None => out.push(SearchHit {
-                    section: "семантика",
-                    slug: "— индекс не построен".into(),
+                    section: "semantic",
+                    slug: "— the index is not built".into(),
                     score: String::new(),
                 }),
             }

@@ -89,7 +89,7 @@ FILTER=$(mcp cron_list '{"project":"uwuwu"}')
 echo "$FILTER" | grep -q 'Проба-крон' || fail "фильтр uwuwu потерял Проба-крона: $FILTER"
 echo "$FILTER" | grep -q 'Чужой' && fail "фильтр uwuwu протянул чужой project: $FILTER"
 EMPTY=$(mcp cron_list '{"project":"origa"}')
-echo "$EMPTY" | grep -q 'не найдены' || fail "пустой фильтр не внятно пуст: $EMPTY"
+echo "$EMPTY" | grep -q 'no crons for project origa' || fail "пустой фильтр не внятно пуст: $EMPTY"
 say "фильтр project работает: свой — есть, чужой — нет, пустой — внятно пуст"
 
 # ---------- файр по расписанию (1m) + журнальная строка ----------
@@ -105,7 +105,7 @@ say "файр: $FIRED"
 
 sleep 2
 JOURNAL=$(mcp docs_read '{"slug":"cron/Проба-крон/Журнал"}')
-echo "$JOURNAL" | grep -q 'запуск (демон)' || fail "журнальная строка не записана на новый путь: $JOURNAL"
+echo "$JOURNAL" | grep -q 'run (daemon)' || fail "журнальная строка не записана на новый путь: $JOURNAL"
 echo "$JOURNAL" | grep -q '2026-..-..T..:..:..+09:00' || fail "штамп журнала не в JST: $JOURNAL"
 say "журнал на cron/Проба-крон/Журнал: строка запуска с JST-штампом"
 

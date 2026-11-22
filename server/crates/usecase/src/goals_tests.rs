@@ -44,8 +44,8 @@ async fn list_renders_number_title_gist() {
 #[tokio::test]
 async fn empty_goals_hint_carrier_and_url() {
     let md = view(vec![]).list("origa").await.unwrap();
-    assert!(md.contains("цели проекта не заведены"));
-    assert!(md.contains("milestones hub-репо"));
+    assert!(md.contains("no goals set for the project"));
+    assert!(md.contains("hub-repo milestones"));
     assert!(md.contains("https://github.com/acme/hub/milestones"));
 }
 
@@ -54,7 +54,10 @@ async fn unknown_project_is_honest_not_found() {
     let err = view(vec![]).list("ckii").await.unwrap_err();
     match err {
         ViewError::NotFound(msg) => {
-            assert!(msg.contains("вне конфига"), "actual: {msg}")
+            assert!(
+                msg.contains("is not in the pipeline config"),
+                "actual: {msg}"
+            )
         }
         other => panic!("expected NotFound, got {other:?}"),
     }

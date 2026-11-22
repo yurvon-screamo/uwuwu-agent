@@ -129,8 +129,8 @@ impl CronUseCase {
         self.wiki
             .append_doc(
                 journal,
-                &format!("- {stamp} запуск (демон)"),
-                &format!("cron: запуск {slug}"),
+                &format!("- {stamp} run (daemon)"),
+                &format!("cron: run {slug}"),
             )
             .await
             .map(|_: AppendDocOutcome| ())?;
@@ -298,12 +298,14 @@ fn cron_name(slug: &str) -> &str {
 }
 
 /// Инвариант DS: ран не закрылся = сигнал сбоя — последняя строка
-/// журнала «запуск» без сводки старше 2 часов → warn (наблюдаемость).
+/// журнала «run (daemon)»/«запуск (демон)» старше 2 часов → warn
+/// (наблюдаемость). Маркеры оба: tolerant-окно migrate→rename #1383.
 fn warn_stale_run(slug: &str, journal_md: &str, now: u64) {
     let Some(last) = journal_md.lines().rev().find(|l| !l.trim().is_empty()) else {
         return;
     };
-    if !last.contains("запуск (демон)") {
+    let is_run_start = last.contains("run (daemon)") || last.contains("запуск (демон)");
+    if !is_run_start {
         return;
     }
     let stale = parse_iso_ms(last.split_whitespace().nth(1).unwrap_or_default())
@@ -335,12 +337,15 @@ pub fn parse_master(slug: &str, md: &str) -> Option<CronMaster> {
     })
 }
 
-/// Последний запуск из журнала: epoch ms строки «- <ISO-штамп> запуск …».
+/// Последний запуск из журнала: epoch ms строки «- <ISO-штамп> run (daemon)»
+/// или легаси «- <ISO-штамп> запуск (демон)» (tolerant, #1383). Различающий
+/// суффикс «(daemon)» защищает от ложных матчей английских сводок со
+/// словом «run».
 fn last_run_ms(journal: &str) -> Option<u64> {
     journal
         .lines()
         .rev()
-        .find(|l| l.contains("запуск"))
+        .find(|l| l.contains("run (daemon)") || l.contains("запуск (демон)"))
         .and_then(|l| parse_iso_ms(l.split_whitespace().nth(1)?))
 }
 
@@ -367,12 +372,12 @@ fn run_prompt(project: &str, master: &CronMaster, journal: &str) -> String {
     // имя крона — средний сегмент слага мастера cron/<имя>/README
     let name = cron_name(&master.slug);
     format!(
-        "Крон-ран «{title}» (проект {project}).\n\n\
-         ## Инструкция мастера\n\n{body}\n\n\
-         ## Журнал (последние записи, сверху новые)\n\n{tail}\n\n\
-         Выполни ран автономно. Сводку допиши в журнал:\n\
-         uwuwu_docs_append {{slug: \"cron/{name}/Журнал\", line: \"- <итог одной строкой>\"}}.\n\
-         Блокер — коммент в задачу-хвост не нужен; просто зафиксируй в журнале.",
+        "Cron run «{title}» (project {project}).\n\n\
+         ## Master instruction\n\n{body}\n\n\
+         ## Journal (latest entries, newest on top)\n\n{tail}\n\n\
+         Run autonomously. Append the summary to the journal:\n\
+         uwuwu_docs_append {{slug: \"cron/{name}/Журнал\", line: \"- <outcome in one line>\"}}.\n\
+         No blocker comments to tail tasks needed; just record it in the journal.",
         title = master.title,
         body = master.body,
         tail = tail.into_iter().rev().collect::<Vec<_>>().join("\n"),
@@ -478,11 +483,22 @@ mod tests {
 
     #[test]
     fn last_run_reads_iso_stamp() {
-        let journal = "- мусор\n- 2026-11-15T02:29:00+09:00 запуск (демон)\n- 2026-11-15T03:00:00+09:00 сводка";
+        // легаси-русский маркер в журнале — tolerant-чтение (#1383)
+        let legacy = "- мусор\n- 2026-11-15T02:29:00+09:00 запуск (демон)\n- 2026-11-15T03:00:00+09:00 сводка";
         assert_eq!(
-            last_run_ms(journal),
+            last_run_ms(legacy),
             fm_lite_parse("2026-11-15T02:29:00+09:00")
         );
+        // новый канон-маркер
+        let english =
+            "- 2026-11-15T02:29:00+09:00 run (daemon)\n- 2026-11-15T03:00:00+09:00 summary done";
+        assert_eq!(
+            last_run_ms(english),
+            fm_lite_parse("2026-11-15T02:29:00+09:00")
+        );
+        // англоязычная сводка со словом «run» без суффикса — не матч
+        let tricky = "- 2026-11-16T09:00:00+09:00 audit run completed, 3 findings";
+        assert_eq!(last_run_ms(tricky), None);
         assert_eq!(last_run_ms("пусто"), None);
     }
 
@@ -751,7 +767,7 @@ mod tests {
         assert_eq!(fired.len(), 1, "файр при свободном слоте");
         assert_eq!(sessions.spawned.lock().unwrap().len(), 1);
         let journal = wiki.0.lock().unwrap()["cron/тест/Журнал"].clone();
-        assert!(journal.contains("запуск (демон)"), "{journal}");
+        assert!(journal.contains("run (daemon)"), "{journal}");
     }
 
     #[tokio::test]
