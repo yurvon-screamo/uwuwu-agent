@@ -412,14 +412,16 @@ async fn dreamer_spawn_carries_model_from_server_map() {
 async fn cron_run_carries_model_from_server_map() {
     // Arrange
     let sessions = CaptureSessions::new(vec![]);
-    let u = CronUseCase {
-        wiki: Arc::new(CronWiki),
-        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
-        clock: Arc::new(TestClock),
-        models: models(),
-        projects: std::collections::HashMap::from([("uwuwu".to_string(), "/tmp".to_string())]),
-        cup: 7,
-    };
+    let u = CronUseCase::new(
+        Arc::new(CronWiki),
+        Arc::new(SessionRouter::uniform(sessions.clone())),
+        Arc::new(TestClock),
+        models(),
+        std::collections::HashMap::from([("uwuwu".to_string(), "/tmp".to_string())]),
+        7,
+        crate::crons::MemCronState::new(),
+        None,
+    );
 
     // Act
     let fired = u.tick().await.unwrap();
