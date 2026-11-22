@@ -3,6 +3,7 @@
 //! веточной пробы у шлюза нет (fm-ветка вторична, project_repo — репо
 //! доски в hub, не репо кода задачи). Тесты — gitea_tests.rs.
 
+use crate::github::HTTP_TIMEOUT;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -81,6 +82,7 @@ impl GiteaPrGateway {
             tokens,
             http: reqwest::Client::builder()
                 .user_agent(concat!("uwuwu-server/", env!("CARGO_PKG_VERSION")))
+                .timeout(HTTP_TIMEOUT)
                 .build()
                 .expect("reqwest client"),
         }
