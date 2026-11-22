@@ -750,7 +750,7 @@ impl GitHubHub {
                     "verify пропущен (rate limit): мутация принята GitHub, квитанция Unverified, write-through сохранён"
                 );
                 Ok(StatusDelivery::Unverified {
-                    reason: "rate limit GraphQL — подтверждение не выполнено".into(),
+                    reason: "GraphQL rate limit — confirmation not performed".into(),
                 })
             }
             VerifyOutcome::Mismatch => {
