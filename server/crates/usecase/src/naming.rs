@@ -335,7 +335,16 @@ mod tests {
             TaskType::Infrastructure,
         ] {
             assert_eq!(parse_task_type(task_type_name(t)), Some(t));
+            // круг через нативный словарь issue Type (#1271; tester #1383:
+            // ассерты восстановлены из master — функция фиксапа ребейза
+            // осталась без тестов)
+            assert_eq!(parse_task_type(task_type_native_name(t)), Some(t));
         }
+        // нативный дефолт Task и нативная капс канона читаются честно:
+        // «Task» — не канонный тип (None), капс гасится lowercase-парсом
+        assert_eq!(parse_task_type("Task"), None);
+        assert_eq!(parse_task_type("Bug"), Some(TaskType::Bug));
+        assert_eq!(task_type_native_name(TaskType::Bug), "Bug");
         // idea/analys выведены: старые значения — неизвестный тип
         assert_eq!(parse_task_type("idea"), None);
         assert_eq!(parse_task_type("analys"), None);

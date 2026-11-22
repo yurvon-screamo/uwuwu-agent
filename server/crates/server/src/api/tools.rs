@@ -1043,36 +1043,48 @@ mod tests {
 
     #[test]
     fn task_create_type_schema_matches_validation_canon() {
-        // Инвариант: перечень типов в дескрипторе task_create (description
-        // поля type, сплит по '|') — полный матч с каноном валидации:
-        // каждый токен парсится и ни один тип канона не потерян.
+        // Инвариант enum-паритета дескрипторов (#1298; #1271 добавил
+        // task_edit.type): перечень типов в описании поля type (сплит по
+        // '|', аннотация после "; " срезается) — полный матч с каноном
+        // валидации: каждый токен парсится и ни один тип канона не потерян.
+        // (tester #1383: пин восстановлен из master — ребейз унёс до-#1271
+        // версию с одним task_create, и потеря task_edit.type в схеме
+        // перестала ловиться.)
         let list = tool_descriptors();
-        let schema_type = list
-            .as_array()
-            .unwrap()
+        let schema_types = ["task_create", "task_edit"]
             .iter()
-            .find(|t| t["name"] == "task_create")
-            .expect("task_create в дескрипторах")["inputSchema"]["properties"]["type"]
-            ["description"]
-            .as_str()
-            .expect("description поля type");
-
-        let mut schema_types: Vec<&str> = schema_type.split('|').map(str::trim).collect();
-        for token in &schema_types {
-            assert!(
-                uwuwu_usecase::parse_task_type(token).is_some(),
-                "схема обещает тип, отвергаемый валидацией: «{token}»"
-            );
-        }
+            .map(|tool_name| {
+                let description = list
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|t| t["name"] == *tool_name)
+                    .expect("тул в дескрипторах")["inputSchema"]["properties"]["type"]
+                    ["description"]
+                    .as_str()
+                    .expect("description поля type");
+                let enums = description.split_once("; ").map_or(description, |(e, _)| e);
+                enums.split('|').map(str::trim).collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
         let mut canon_types: Vec<&str> = uwuwu_usecase::TASK_TYPES
             .iter()
             .map(|t| uwuwu_usecase::task_type_name(*t))
             .collect();
-        schema_types.sort_unstable();
         canon_types.sort_unstable();
-        assert_eq!(
-            schema_types, canon_types,
-            "перечень task_create.type != канон валидации"
-        );
+        for tokens in &schema_types {
+            for token in tokens {
+                assert!(
+                    uwuwu_usecase::parse_task_type(token).is_some(),
+                    "схема обещает тип, отвергаемый валидацией: «{token}»"
+                );
+            }
+            let mut sorted = tokens.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                sorted, canon_types,
+                "перечень type дескриптора != канон валидации"
+            );
+        }
     }
 }

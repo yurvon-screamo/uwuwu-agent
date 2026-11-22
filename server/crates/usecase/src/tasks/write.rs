@@ -999,6 +999,7 @@ mod tests {
         priority: Option<String>,
         automerge: bool,
         direct: bool,
+        kind: Option<TaskType>,
         status: Status,
     }
 
@@ -1013,6 +1014,7 @@ mod tests {
                 priority: None,
                 automerge: false,
                 direct: false,
+                kind: None,
                 status: Status::Empty,
             }
         }
@@ -1044,6 +1046,7 @@ mod tests {
                 vcs,
                 priority,
             ));
+            task.set_kind(self.kind);
             task.set_automerge(self.automerge);
             task.set_direct(self.direct);
             IssueView {
@@ -1153,11 +1156,21 @@ mod tests {
             _project: &str,
             _title: &str,
             _body: &str,
-            _kind_name: Option<&str>,
+            kind_name: Option<&str>,
         ) -> UsecaseResult<u64> {
+            // POST с type (#1271): имя «принято» носителем — Carrier видит
+            // парс (как живой GitHub: эхо ответа = состояние носителя)
+            if !self.phantom {
+                self.carrier.lock().expect("fake carrier").kind =
+                    kind_name.and_then(crate::naming::parse_task_type);
+            }
             Ok(1)
         }
-        async fn set_issue_type(&self, _n: u64, _kind_name: &str) -> UsecaseResult<()> {
+        async fn set_issue_type(&self, _n: u64, kind_name: &str) -> UsecaseResult<()> {
+            if !self.phantom {
+                self.carrier.lock().expect("fake carrier").kind =
+                    crate::naming::parse_task_type(kind_name);
+            }
             Ok(())
         }
         async fn rename_issue(&self, _n: u64, t: &str) -> UsecaseResult<()> {
@@ -1458,6 +1471,80 @@ mod tests {
             board.carrier.lock().expect("fake carrier").status,
             Status::Empty,
             "set_status для обычной строки не вызывается"
+        );
+    }
+
+    /// Тип уезжает в POST create нативным именем (#1271): маппинг канона
+    /// в словарь issue Type и дефолт Feature (канон create) — на носителе.
+    /// (tester #1383: пины восстановлены из master — ребейз унёс их вместе
+    /// с kind-капчей фейка; на ветке тот же контракт накрыт только на
+    /// MCP-поверхности, usecase-уровень остался голым.)
+    #[tokio::test]
+    async fn create_carries_native_issue_type() {
+        let fields = Arc::new(FakeFields::default());
+        let (u, board) = writecase(fields.clone());
+        let mut s = spec("тело");
+        s.kind = Some(TaskType::Bug);
+        u.create("uwuwu", s).await.unwrap();
+        assert_eq!(
+            board.carrier.lock().expect("fake carrier").kind,
+            Some(TaskType::Bug),
+            "Bug → нативный «Bug» в POST, носитель читает парс"
+        );
+
+        let (u, board) = writecase(fields.clone());
+        u.create("uwuwu", spec("без типа")).await.unwrap();
+        assert_eq!(
+            board.carrier.lock().expect("fake carrier").kind,
+            Some(TaskType::Feature),
+            "None → дефолт feature канона create"
+        );
+    }
+
+    /// edit(type): нативный issue Type записан и подтверждён контрольным
+    /// чтением (#1271, честная квитанция #1331).
+    #[tokio::test]
+    async fn edit_kind_is_verified_by_carrier_read() {
+        let fields = Arc::new(FakeFields::default());
+        let (u, board) = writecase(fields);
+        u.edit(
+            "uwuwu",
+            1,
+            TaskPatch {
+                kind: Some(TaskType::Refactoring),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("edit type доставлен");
+        assert_eq!(
+            board.carrier.lock().expect("fake carrier").kind,
+            Some(TaskType::Refactoring),
+        );
+    }
+
+    /// Фантомный edit(type): PATCH «принят», носитель типа не видит —
+    /// громкий отказ с вычисленным перечнем («mismatched: type»).
+    #[tokio::test]
+    async fn phantom_edit_kind_is_loud() {
+        let fields = Arc::new(FakeFields::default());
+        let u = writecase_carrier(fields, true, false);
+        let err = u
+            .edit(
+                "uwuwu",
+                1,
+                TaskPatch {
+                    kind: Some(TaskType::Docs),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("фантомный edit type — громкий отказ");
+        let text = err.to_string();
+        assert!(text.contains("was not confirmed"), "текст отказа: {text}");
+        assert!(
+            text.contains("mismatched: type"),
+            "перечень несошедших ключей вычислен: {text}"
         );
     }
 

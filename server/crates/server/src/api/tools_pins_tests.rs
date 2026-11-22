@@ -284,3 +284,125 @@ async fn create_get_list_roundtrip_reports_analys_receipt() {
     assert!(list.contains("круговерть"));
     assert!(list.contains("Analys"));
 }
+
+// ---- Пины статуса Wait на живом диспетчере (#1441) ----
+// (tester #1383: пины восстановлены из master — ребейз унёс файл целиком
+// по --theirs, и четыре пина #1441 выпали из контура.)
+
+/// task_edit ставит Wait, чтение возвращает канон Wait (create → edit →
+/// get → list на живом диспетчере, не юнит).
+#[tokio::test]
+async fn status_wait_edit_reads_back_canon_wait() {
+    let tools = hub();
+    let created = call(
+        &tools,
+        "task_create",
+        json!({ "title": "wait-прогон", "direct": true }),
+    )
+    .await
+    .expect("create direct");
+    assert_eq!(
+        created,
+        "direct task #1 created (In Progress) on the uwuwu board"
+    );
+    let edited = call(
+        &tools,
+        "task_edit",
+        json!({ "number": 1, "status": "Wait" }),
+    )
+    .await
+    .expect("edit Wait");
+    assert_eq!(edited, "task #1 updated");
+    let get = call(&tools, "task_get", json!({ "number": 1 }))
+        .await
+        .expect("get");
+    assert!(get.starts_with("#1 wait-прогон — Wait"));
+    let list = call(&tools, "task_list", json!({})).await.expect("list");
+    assert!(list.contains("Wait"), "строка в Wait видна в списке");
+}
+
+/// Алиас «Вейт» — мост совместимости (#1441): парсится в Wait и ставит
+/// канон-опцию Wait идемпотентно (повторная установка не отказ).
+#[tokio::test]
+async fn status_weit_alias_sets_canon_wait() {
+    let tools = hub();
+    call(
+        &tools,
+        "task_create",
+        json!({ "title": "wait-алиас", "direct": true }),
+    )
+    .await
+    .expect("create direct");
+    let edited = call(
+        &tools,
+        "task_edit",
+        json!({ "number": 1, "status": "Вейт" }),
+    )
+    .await
+    .expect("edit алиасом");
+    assert_eq!(edited, "task #1 updated");
+    let get = call(&tools, "task_get", json!({ "number": 1 }))
+        .await
+        .expect("get");
+    assert!(
+        get.starts_with("#1 wait-алиас — Wait"),
+        "алиас ставит канон Wait"
+    );
+}
+
+/// Нераспознанный статус — громкий отказ гарда канона, состояние строки
+/// не меняется (Empty не ставится молча).
+#[tokio::test]
+async fn status_garbage_is_loud_guard_reject() {
+    let tools = hub();
+    call(
+        &tools,
+        "task_create",
+        json!({ "title": "wait-мусор", "direct": true }),
+    )
+    .await
+    .expect("create direct");
+    call(
+        &tools,
+        "task_edit",
+        json!({ "number": 1, "status": "Wait" }),
+    )
+    .await
+    .expect("edit Wait");
+    let err = call(
+        &tools,
+        "task_edit",
+        json!({ "number": 1, "status": "Ерунда" }),
+    )
+    .await
+    .expect_err("отказ");
+    assert_eq!(
+        err,
+        "board: transition Wait → Empty outside the pipeline canon"
+    );
+    let get = call(&tools, "task_get", json!({ "number": 1 }))
+        .await
+        .expect("get");
+    assert!(
+        get.starts_with("#1 wait-мусор — Wait"),
+        "статус не изменился"
+    );
+}
+
+/// Контракт тула task_edit (#1441): строка канона статусов несёт «Wait»,
+/// старое имя «Вейт» из описания убрано — агент видит новый канон.
+#[tokio::test]
+async fn task_edit_descriptor_carries_wait_canon() {
+    let desc = super::tools::tool_descriptors();
+    let edit = desc
+        .as_array()
+        .expect("дескрипторы — массив")
+        .iter()
+        .find(|t| t["name"] == "task_edit")
+        .expect("task_edit в дескрипторах");
+    let status = edit["inputSchema"]["properties"]["status"]["description"]
+        .as_str()
+        .expect("status description");
+    assert!(status.contains("/Wait"), "канон в описании тула: {status}");
+    assert!(!status.contains("Вейт"), "старое имя не в контракте тула");
+}
