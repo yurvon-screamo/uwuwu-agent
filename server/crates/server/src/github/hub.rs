@@ -1796,6 +1796,296 @@ impl uwuwu_usecase::IssueIndexSource for GitHubHub {
 }
 
 #[cfg(test)]
+mod board_status_live_tests {
+    //! Живой e2e rename статуса (#1447): реальный носитель, гвард
+    //! UWUWU_E2E=1 (образец — goals_live_tests). Ловит дрейф контракта
+    //! GraphQL-мутации/чтений (то, что MemoryHub-пины поймать не могут):
+    //! fresh_field парсит живой каталог, rename уходит по option-id с
+    //! дословным оформлением, post-verify проходит на живом носителе,
+    //! значение draft-строки следует за rename (GraphQL-проверка —
+    //! draft-строки вне issue-number индекса дистрибуции, живой факт
+    //! ручного прогона #1447). Артефакты (sandbox-доска, draft-строка,
+    //! temp-журнал) сносятся рамками прогона; заголовок доски несёт маркер
+    //! live-e2e-1447 — протечка при панике в setup заметна владельцу.
+
+    use super::GitHubHub;
+    use crate::clock::SystemClock;
+    use crate::rename_journal::JsonStatusPreImages;
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+    use uwuwu_usecase::Clock as _;
+    use uwuwu_usecase::{BoardStatusRenameUseCase, BoardStatusRepo};
+
+    const OWNER: &str = "yurvon-screamo";
+    const REPO: &str = "yurvon-screamo/uwuwu-hub";
+    const FROM: &str = "In Progress";
+    const TO: &str = "Вейт"; // канон-статус (parse_status → Wait) — warn-ветки не задеваем
+
+    /// Строка контрольного каталога: (id, name, color, description).
+    type CatalogRow = (String, String, Option<String>, Option<String>);
+
+    /// Лучшее усилие мутации setup/teardown: тест-инфраструктура,
+    /// падение teardown — не ложный красный фичи (артефакт уйдёт
+    /// владельцу по маркеру live-e2e-1447).
+    async fn raw_gql(hub: &GitHubHub, query: &str, vars: Value) -> Option<Value> {
+        hub.gql(query, vars).await.ok().map(|mut data| {
+            // один корень data — отдаём его содержимое
+            data.as_object_mut()
+                .map(|m| Value::Object(m.clone()))
+                .unwrap_or(Value::Null)
+        })
+    }
+
+    #[tokio::test]
+    async fn live_board_status_rename_by_id_values_follow() {
+        if std::env::var("UWUWU_E2E").as_deref() != Ok("1") {
+            return;
+        }
+        let token = std::env::var("GH_TOKEN").unwrap_or_default();
+        assert!(!token.is_empty(), "UWUWU_E2E=1: нужен GH_TOKEN");
+        let hub = Arc::new(GitHubHub::new(REPO.into(), token));
+        let ts = SystemClock.now_ms();
+        let board_title = format!("Задачи live-e2e-1447-{ts}");
+
+        // --- setup: sandbox-доска, линк к репо (fresh_field ищет через
+        // repository.projectsV2 — нелинкованная свежая доска невидима,
+        // живой факт ручного прогона #1447), draft-строка со статусом.
+        let owner_id = raw_gql(
+            &hub,
+            "query($login:String!){user(login:$login){id}}",
+            json!({ "login": OWNER }),
+        )
+        .await
+        .expect("живой носитель: ownerId")[&"user"][&"id"]
+            .as_str()
+            .expect("ownerId")
+            .to_string();
+        let project_id = raw_gql(
+            &hub,
+            "mutation($ownerId:ID!,$title:String!){createProjectV2(input:{ownerId:$ownerId,\
+             title:$title}){projectV2{id}}}",
+            json!({ "ownerId": owner_id, "title": board_title }),
+        )
+        .await
+        .expect("живой носитель: createProjectV2")[&"createProjectV2"][&"projectV2"][&"id"]
+            .as_str()
+            .expect("project id")
+            .to_string();
+        let repo_id = raw_gql(
+            &hub,
+            &format!("query{{repository(owner:\"{OWNER}\",name:\"uwuwu-hub\"){{id}}}}"),
+            json!({}),
+        )
+        .await
+        .expect("живой носитель: repoId")[&"repository"][&"id"]
+            .as_str()
+            .expect("repo id")
+            .to_string();
+        raw_gql(
+            &hub,
+            "mutation($projectId:ID!,$repositoryId:ID!){linkProjectV2ToRepository(input:{\
+             projectId:$projectId,repositoryId:$repositoryId}){repository{id}}}",
+            json!({ "projectId": project_id, "repositoryId": repo_id }),
+        )
+        .await
+        .expect("линк sandbox-доски к репо");
+        let field = raw_gql(
+            &hub,
+            "query($projectId:ID!){node(id:$projectId){... on ProjectV2{field(name:\"Status\"){\
+             ... on ProjectV2SingleSelectField{id options{id name color description}}}}}}",
+            json!({ "projectId": project_id }),
+        )
+        .await
+        .expect("дефолт Status-поле новой доски")[&"node"][&"field"]
+            .clone();
+        let options = field[&"options"].as_array().expect("опции Status").clone();
+        assert!(
+            options.iter().any(|o| o[&"name"] == FROM),
+            "дефолт-набор без «{FROM}» — тест правится на актуальный дефолт носителя"
+        );
+        let field_id = field[&"id"].as_str().expect("field node id").to_string();
+        let from_option_id = options
+            .iter()
+            .find(|o| o[&"name"].as_str() == Some(FROM))
+            .and_then(|o| o[&"id"].as_str())
+            .expect("option id from")
+            .to_string();
+        let item_id = raw_gql(
+            &hub,
+            "mutation($projectId:ID!){addProjectV2DraftIssue(input:{projectId:$projectId,\
+             title:\"live-e2e-1447 row\"}){projectItem{id}}}",
+            json!({ "projectId": project_id }),
+        )
+        .await
+        .expect("draft-строка")[&"addProjectV2DraftIssue"][&"projectItem"][&"id"]
+            .as_str()
+            .expect("item id")
+            .to_string();
+        raw_gql(
+            &hub,
+            "mutation($projectId:ID!,$itemId:ID!,$fieldId:ID!,$optionId:String!){\
+             updateProjectV2ItemFieldValue(input:{projectId:$projectId,itemId:$itemId,\
+             fieldId:$fieldId,value:{singleSelectOptionId:$optionId}}){projectV2Item{id}}}",
+            json!({
+                "projectId": project_id,
+                "itemId": item_id,
+                "fieldId": field_id,
+                "optionId": from_option_id
+            }),
+        )
+        .await
+        .expect("статус draft-строки");
+
+        // --- поток операции: usecase на живом адаптере (тот же объект,
+        // что за MCP-тулом; arm-пины — tools_pins_tests на MemoryHub).
+        let journal_path = std::env::temp_dir().join(format!("uwuwu-1447-live-{ts}.json"));
+        let usecase = BoardStatusRenameUseCase {
+            repo: hub.clone() as Arc<dyn BoardStatusRepo>,
+            journal: Arc::new(JsonStatusPreImages::load(journal_path.clone())),
+            boards: vec![("live-e2e".into(), board_title.clone())],
+            clock: Arc::new(SystemClock),
+        };
+        let report = usecase
+            .rename("live-e2e", FROM, TO)
+            .await
+            .expect("живой rename по option-id");
+        assert_eq!(report.option_id, from_option_id, "id опции сохранён");
+        assert_eq!(report.options_total, options.len());
+        assert!(
+            report.warnings.is_empty(),
+            "канон→канон без warn: {:?}",
+            report.warnings
+        );
+        assert!(
+            report.histogram_after.contains_key(TO),
+            "гистограмма после: новое имя в каталоге"
+        );
+
+        // write-ahead журнал: verbatim pre-image до мутации
+        let journal: Value =
+            serde_json::from_str(&std::fs::read_to_string(&journal_path).expect("журнал"))
+                .expect("журнал парсится");
+        let stored = &journal[&"by_board"][board_title.as_str()];
+        assert_eq!(stored[&"from"], json!(FROM), "журнал: from");
+        assert_eq!(stored[&"to"], json!(TO), "журнал: to");
+        let stored_options = stored[&"options"].as_array().expect("журнал: опции");
+        assert_eq!(stored_options.len(), options.len(), "журнал: полный набор");
+        for o in &options {
+            let found = stored_options
+                .iter()
+                .find(|s| s[&"id"] == o[&"id"])
+                .expect("журнал: опция из pre-image");
+            assert_eq!(found[&"color"], o[&"color"], "журнал: color дословно");
+            assert_eq!(
+                found[&"description"], o[&"description"],
+                "журнал: описание дословно"
+            );
+        }
+        // draft-строки вне issue-number индекса дистрибуции (живой факт
+        // #1447) — распределение здесь пусто, значение строки проверено ниже по GraphQL
+        assert_eq!(
+            stored[&"distribution"].as_object().map(|m| m.len()),
+            Some(0),
+            "журнал: только draft-строки — их нет в дистрибуции"
+        );
+
+        // --- контрольный перечит носителя мимо операции: id-набор цел,
+        // оформление дословно, имя сменилось у ровно одной опции (read-лаг
+        // носителя — окно ретраев; структурное расхождение — красный тест).
+        let hub_repo = hub.clone();
+        let mut post: Option<Vec<CatalogRow>> = None;
+        for _ in 0..10 {
+            match hub_repo.fresh_field(&board_title).await {
+                Ok(image) => {
+                    let got: Vec<_> = image
+                        .options
+                        .iter()
+                        .map(|o| {
+                            (
+                                o.id.clone(),
+                                o.name.clone(),
+                                o.color.clone(),
+                                o.description.clone(),
+                            )
+                        })
+                        .collect();
+                    let renamed = got
+                        .iter()
+                        .find(|(id, ..)| *id == from_option_id)
+                        .map(|(_, name, ..)| name.clone());
+                    if renamed.as_deref() == Some(TO) {
+                        post = Some(got);
+                        break;
+                    }
+                }
+                Err(e) => panic!("fresh_field после rename: {e}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let post = post.expect("каталог не подтвердил новое имя за окно ретраев");
+        assert_eq!(post.len(), options.len(), "набор опций сжался/расширился");
+        for (id, name, color, description) in &post {
+            let pre = options
+                .iter()
+                .find(|o| o[&"id"].as_str() == Some(id.as_str()))
+                .expect("чужая опция в каталоге после rename");
+            assert_eq!(
+                color.as_deref(),
+                pre[&"color"].as_str().filter(|s| !s.is_empty()),
+                "color опции {name} изменён"
+            );
+            assert_eq!(
+                description.as_deref(),
+                pre[&"description"].as_str().filter(|s| !s.is_empty()),
+                "description опции {name} изменён"
+            );
+            let expected_name = if id == &from_option_id {
+                TO
+            } else {
+                pre[&"name"].as_str().expect("имя")
+            };
+            assert_eq!(name, expected_name, "имя опции после rename");
+        }
+
+        // значение draft-строки следует за rename (option-id семантика)
+        let values = raw_gql(
+            &hub,
+            "query($itemId:ID!){node(id:$itemId){... on ProjectV2Item{fieldValues(first:10){\
+             nodes{... on ProjectV2ItemFieldSingleSelectValue{name}}}}}}",
+            json!({ "itemId": item_id }),
+        )
+        .await
+        .expect("fieldValues draft-строки")[&"node"][&"fieldValues"][&"nodes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let value_name = values
+            .iter()
+            .filter_map(|n| n[&"name"].as_str())
+            .find(|n| *n == FROM || *n == TO)
+            .expect("строка потеряла Status-значение");
+        assert_eq!(value_name, TO, "значение строки следует за renamed опцией");
+
+        // --- teardown: draft-сироты и доска сносятся (журнал — temp, за собой).
+        let _ = raw_gql(
+            &hub,
+            "mutation($projectId:ID!,$itemId:ID!){deleteProjectV2Item(input:{projectId:$projectId,\
+             itemId:$itemId}){clientMutationId}}",
+            json!({ "projectId": project_id, "itemId": item_id }),
+        )
+        .await;
+        let _ = raw_gql(
+            &hub,
+            "mutation($projectId:ID!){deleteProjectV2(input:{projectId:$projectId}){\
+             clientMutationId}}",
+            json!({ "projectId": project_id }),
+        )
+        .await;
+        let _ = std::fs::remove_file(&journal_path);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use uwuwu_domain::TaskType;
