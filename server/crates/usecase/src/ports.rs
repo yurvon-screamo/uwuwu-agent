@@ -16,7 +16,7 @@ pub type FmMutator =
 /// служит только свежее чтение носителя (мимо write-through и
 /// индексного кеша). Текст ответа MCP task_edit строится из этого
 /// исхода, не из факта отсутствия ошибки.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatusDelivery {
     /// Носитель подтвердил запись свежим чтением; actual — raw-имя
     /// статуса с носителя (может расходиться с каноническим

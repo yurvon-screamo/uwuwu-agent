@@ -880,10 +880,6 @@ impl EditExpectations {
 }
 
 impl TaskWriteUseCase {
-    /// direct-флаг с носителя (#1357): ребро In Progress → Review гвардится
-    /// флагом — на этом ребре (и только на нём) флаг читается свежим
-    /// fields.load, на остальных false. Отдельный метод: edit не несёт
-    /// редкой читающей ветки (smell-гигиена дельты).
     /// Current для гарда канона edit(): wt-чтение носителя (свежее
     /// против снапшота, #1235); идемпотентная переустановка (current ==
     /// target) доверяет только свежему носителю (#1437, симптом 2) —
@@ -911,6 +907,10 @@ impl TaskWriteUseCase {
         )
     }
 
+    /// direct-флаг с носителя (#1357): ребро In Progress → Review гвардится
+    /// флагом — на этом ребре (и только на нём) флаг читается свежим
+    /// fields.load, на остальных false. Отдельный метод: edit не несёт
+    /// редкой читающей ветки (smell-гигиена дельты).
     async fn carrier_direct(&self, number: u64, current: Status, to: Status) -> bool {
         if !(current == Status::InProgress && to == Status::UserReview) {
             return false;

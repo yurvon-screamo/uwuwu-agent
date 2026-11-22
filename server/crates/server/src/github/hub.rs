@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use uwuwu_domain::{Status, Task};
-use uwuwu_usecase::{CommentRef, Goal, GoalsRepo, IssueView, TaskBoardRepo};
+use uwuwu_usecase::{CommentRef, Goal, GoalsRepo, IssueView, StatusDelivery, TaskBoardRepo};
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 pub struct GitHubHub {
@@ -632,7 +632,9 @@ impl GitHubHub {
     /// 14–22с листа REST и «навсегда» слепого GET item, #1236). Raw-имя
     /// Status на доске `board` + closed issue (терминальная резолюция
     /// #1403 в том же запросе — второе чтение не нужно). None — строки
-    /// на этой доске нет.
+    /// на этой доске нет. Транспорт — gql_retrying (#1330): одиночный
+    /// флап не роняет гард/verify; окно first:100 с запасом против
+    /// измеренной кромки (максимум 6 полей на строке живой доски).
     async fn gql_issue_status(
         &self,
         board: &str,
@@ -644,11 +646,11 @@ impl GitHubHub {
             .split_once('/')
             .ok_or_else(|| UsecaseError::Board(format!("repo: {}", self.repo)))?;
         let data = self
-            .gql(
+            .gql_retrying(
                 "query($owner:String!,$name:String!,$number:Int!){\
                  repository(owner:$owner,name:$name){issue(number:$number){state \
-                 projectItems(first:10){nodes{project{number} \
-                 fieldValues(first:10){nodes{... on ProjectV2ItemFieldSingleSelectValue{name \
+                 projectItems(first:100){nodes{project{number} \
+                 fieldValues(first:100){nodes{... on ProjectV2ItemFieldSingleSelectValue{name \
                  field{... on ProjectV2SingleSelectField{name}}}}}}}}}}",
                 json!({ "owner": owner, "name": repo, "number": number }),
             )
@@ -700,38 +702,46 @@ impl GitHubHub {
         VerifyOutcome::Mismatch
     }
 
-    /// Пост-мутационная гигиена кэша по исходу verify (семья #1213/#1437):
-    /// Mismatch после бюджета — аномалия (конвергенция GraphQL ~2с,
-    /// проба S1): откат write-through (инвалидация всех кешей) + громкий
-    /// отказ — возможно-ложное значение не доживает TTL-окно.
+    /// Пост-мутационная гигиена кэша по исходу verify (семья #1213/#1437)
+    /// и маппинг исхода в квитанцию — единая точка: Ok → Confirmed{actual};
+    /// rate-limit → честная Unverified (success не заявляется, write-through
+    /// сохранён — окно возможно-ложного значения ограничено TTL); Mismatch
+    /// после бюджета — аномалия (конвергенция GraphQL ~2с, проба S1): откат
+    /// write-through (инвалидация всех кешей) + громкий отказ.
     fn settle_write_through(
         &self,
         board: &str,
         number: u64,
         outcome: &VerifyOutcome,
         status: Status,
-    ) -> UsecaseResult<()> {
+    ) -> UsecaseResult<StatusDelivery> {
         match outcome {
-            VerifyOutcome::Ok(_) => {}
-            VerifyOutcome::SkippedRateLimited => tracing::warn!(
-                event = "board.verify_skipped",
-                number,
-                to = %uwuwu_usecase::status_name(status),
-                "verify пропущен (rate limit): мутация принята GitHub, квитанция Unverified, write-through сохранён"
-            ),
+            VerifyOutcome::Ok(actual) => Ok(StatusDelivery::Confirmed {
+                actual: actual.clone(),
+            }),
+            VerifyOutcome::SkippedRateLimited => {
+                tracing::warn!(
+                    event = "board.verify_skipped",
+                    number,
+                    to = %uwuwu_usecase::status_name(status),
+                    "verify пропущен (rate limit): мутация принята GitHub, квитанция Unverified, write-through сохранён"
+                );
+                Ok(StatusDelivery::Unverified {
+                    reason: "rate limit GraphQL — подтверждение не выполнено".into(),
+                })
+            }
             VerifyOutcome::Mismatch => {
                 self.invalidate_snapshot(board);
                 self.status_cache.invalidate(&number.to_string());
                 self.pv2.invalidate_status(board, number);
-                return Err(UsecaseError::Board(format!(
+                Err(UsecaseError::Board(format!(
                     "статус #{number}: запись «{}» не подтвердилась свежим чтением \
                      носителя — мутация не применилась или носитель аномален; \
                      не ретраить слепо, сверь носитель",
                     uwuwu_usecase::status_name(status)
-                )));
+                )))
             }
         }
-        Ok(())
     }
 
     /// Комменты задачи: свежий хвост (direction=desc, последние 100),
@@ -937,8 +947,7 @@ impl TaskBoardRepo for GitHubHub {
         board: &str,
         number: u64,
         status: Status,
-    ) -> UsecaseResult<uwuwu_usecase::StatusDelivery> {
-        use uwuwu_usecase::StatusDelivery;
+    ) -> UsecaseResult<StatusDelivery> {
         let name = uwuwu_usecase::status_name(status);
         // last-known статус строки — для ребра в логах (Low-2 код-ревью
         // #1235); источник — локальный статусный кеш, GraphQL не тратим
@@ -956,7 +965,7 @@ impl TaskBoardRepo for GitHubHub {
         // verify-after-write (#1437): доказательство — только точечный
         // GraphQL-рид носителя мимо кешей; echo мутации материал лога.
         let outcome = self.verify_status(board, number, status).await;
-        self.settle_write_through(board, number, &outcome, status)?;
+        let delivery = self.settle_write_through(board, number, &outcome, status)?;
         tracing::info!(
             event = "board.set_status",
             board,
@@ -966,16 +975,7 @@ impl TaskBoardRepo for GitHubHub {
             confirmed_echo = confirmed.as_deref().unwrap_or("—"),
             "Статусная запись: исход verify — в квитанции (from — last-known из кеша)"
         );
-        Ok(match outcome {
-            VerifyOutcome::Ok(actual) => StatusDelivery::Confirmed { actual },
-            // после settle сюда доходит только rate-limit (Mismatch — Err);
-            // success не заявляется — квитанция честно Unverified
-            VerifyOutcome::SkippedRateLimited | VerifyOutcome::Mismatch => {
-                StatusDelivery::Unverified {
-                    reason: "rate limit GraphQL — подтверждение не выполнено".into(),
-                }
-            }
-        })
+        Ok(delivery)
     }
 
     async fn row_status(&self, board: &str, number: u64) -> UsecaseResult<Option<Status>> {
@@ -1773,11 +1773,18 @@ mod tests {
     }
 
     #[test]
-    fn settle_ok_keeps_write_through() {
+    fn settle_ok_keeps_write_through_and_confirms() {
         let hub = hub_after_write_through("B", 7, Status::InProgress);
         let outcome = VerifyOutcome::Ok("In Progress".to_string());
-        hub.settle_write_through("B", 7, &outcome, Status::InProgress)
-            .expect("Ok — кэш не трогается");
+        let delivery = hub
+            .settle_write_through("B", 7, &outcome, Status::InProgress)
+            .expect("Ok — кэш не трогается, квитанция Confirmed");
+        assert_eq!(
+            delivery,
+            uwuwu_usecase::StatusDelivery::Confirmed {
+                actual: "In Progress".to_string()
+            }
+        );
         let snap = hub
             .snap_cache
             .get("B", std::time::Instant::now())
@@ -1799,13 +1806,18 @@ mod tests {
         // RATE_LIMITED: write-through сохраняем — окно возможно-ложного
         // значения ограничено TTL, квитанция честно Unverified (#1437)
         let hub = hub_after_write_through("B", 7, Status::InProgress);
-        hub.settle_write_through(
-            "B",
-            7,
-            &VerifyOutcome::SkippedRateLimited,
-            Status::InProgress,
-        )
-        .expect("skip — не ошибка");
+        let delivery = hub
+            .settle_write_through(
+                "B",
+                7,
+                &VerifyOutcome::SkippedRateLimited,
+                Status::InProgress,
+            )
+            .expect("skip — не ошибка");
+        assert!(
+            matches!(delivery, uwuwu_usecase::StatusDelivery::Unverified { .. }),
+            "skip — честная Unverified-квитанция: {delivery:?}"
+        );
         assert!(
             hub.snap_cache.get("B", std::time::Instant::now()).is_some(),
             "write-through сохранён"
