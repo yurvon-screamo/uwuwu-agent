@@ -50,6 +50,9 @@ struct FakeRepo {
     /// FIFO стейл-снимков каталога для verify_catalog (лаг-симуляция);
     /// исчерпан — чтение живого каталога.
     stale_catalog: Mutex<Vec<Vec<StatusOption>>>,
+    /// true — verify_catalog отвечает транспортным отказом (рамка
+    /// post-мутационного чтения, раунд 2 Low-1).
+    catalog_reads_fail: Mutex<bool>,
     /// Переопределение after-дистрибуции (None — свежая: from→to).
     dist_after_override: Mutex<Option<HashMap<u64, Option<String>>>>,
     /// Счётчик fresh_distribution: первый вызов — pre-image.
@@ -66,6 +69,7 @@ impl FakeRepo {
             dist_before,
             payload_override: Mutex::new(None),
             stale_catalog: Mutex::new(Vec::new()),
+            catalog_reads_fail: Mutex::new(false),
             dist_after_override: Mutex::new(None),
             dist_calls: Mutex::new(0),
             mutations: Mutex::new(Vec::new()),
@@ -165,6 +169,9 @@ impl BoardStatusRepo for FakeRepo {
     }
 
     async fn verify_catalog(&self, _board: &str) -> UsecaseResult<Vec<(String, String)>> {
+        if *self.catalog_reads_fail.lock().expect("lock") {
+            return Err(UsecaseError::Board("HTTP 502 (fake transport flap)".into()));
+        }
         let mut stale = self.stale_catalog.lock().expect("lock");
         let snapshot = if !stale.is_empty() {
             stale.remove(0)
@@ -528,4 +535,22 @@ async fn payload_lost_styling_refuses() {
         .await
         .expect_err("fail");
     assert!(err.to_string().contains("lost its styling"), "{}", err);
+}
+
+/// Ревью #1447 раунд 2 Low-1: транспортный отказ контрольного чтения ПОСЛЕ
+/// применённой мутации несёт рамку «rename уже применён» + путь журнала —
+/// не голый HTTP-ошибку, читаемую как «ничего не произошло».
+#[tokio::test]
+async fn post_mutation_read_failure_carries_journal_frame() {
+    let (usecase, repo) = uc(FakeRepo::new(sample_options(), sample_dist()));
+    // мутация прошла, контрольные чтения легли транспортом
+    *repo.catalog_reads_fail.lock().expect("lock") = true;
+    let err = usecase
+        .rename("uwuwu", "Wait", "Тест")
+        .await
+        .expect_err("fail");
+    let text = err.to_string();
+    assert!(text.contains("POST-MUTATION CARRIER READ FAILED"), "{text}");
+    assert!(text.contains("already applied"), "{text}");
+    assert!(text.contains("/data/rename-pre-image.json"), "{text}");
 }

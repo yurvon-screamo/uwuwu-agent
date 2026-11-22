@@ -431,7 +431,14 @@ impl BoardStatusRenameUseCase {
                 // пауза между контрольными чтениями (секундный лаг видимости)
                 self.clock.sleep_ms(1000);
             }
-            let catalog = self.repo.verify_catalog(&flow.board).await?;
+            // контрольное чтение после УЖЕ применённой мутации: транспортный
+            // отказ не «ничего не произошло» — рамка журнала обязательна
+            // (ревью #1447 раунд 2 Low-1)
+            let catalog = self
+                .repo
+                .verify_catalog(&flow.board)
+                .await
+                .map_err(|e| self.post_mutation_read_failed(&flow.board, e))?;
             let as_options: Vec<StatusOption> = catalog
                 .into_iter()
                 .map(|(id, name)| StatusOption {
@@ -450,7 +457,11 @@ impl BoardStatusRenameUseCase {
                 VerifyOutcome::Lag => {}
             }
         }
-        let dist_after = self.repo.fresh_distribution(&flow.board).await?;
+        let dist_after = self
+            .repo
+            .fresh_distribution(&flow.board)
+            .await
+            .map_err(|e| self.post_mutation_read_failed(&flow.board, e))?;
         match verify_distribution(&flow.from, &flow.to, &flow.distribution, &dist_after) {
             VerifyOutcome::Ok => {}
             VerifyOutcome::Fail(reason) => return Err(self.verify_failed(&flow.board, reason)),
@@ -464,6 +475,18 @@ impl BoardStatusRenameUseCase {
         UsecaseError::Board(format!(
             "POST-VERIFY FAILED on board \"{board}\": {reason}. Possible option loss — \
              compare the carrier with the pre-image journal BEFORE manual rollback: {}",
+            self.journal.path_hint()
+        ))
+    }
+
+    /// Отказ контрольного чтения ПОСЛЕ применённой мутации: рамка «rename
+    /// уже применён и подтверждён payload» — голый HTTP-ошибку агент может
+    /// прочитать как «ничего не произошло» и пойти на слепой повтор.
+    fn post_mutation_read_failed(&self, board: &str, e: UsecaseError) -> UsecaseError {
+        UsecaseError::Board(format!(
+            "POST-MUTATION CARRIER READ FAILED on board \"{board}\": {e}. The rename \
+             was already applied and payload-confirmed; the board may differ from the \
+             pre-image — compare with the journal BEFORE any action: {}",
             self.journal.path_hint()
         ))
     }

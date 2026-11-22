@@ -1704,7 +1704,11 @@ impl uwuwu_usecase::BoardStatusRepo for GitHubHub {
     }
 
     async fn verify_catalog(&self, board: &str) -> UsecaseResult<Vec<(String, String)>> {
-        // мета перечитана после invalidate_meta — носитель, не кеш
+        // каждое контрольное чтение — свежий фетч носителя: окно ретраев
+        // verify обязано видеть живой каталог, а не собственный снимок
+        // первой попытки (ревью #1447 раунд 2 Common-1: meta TTL 600с
+        // замораживал окно — попытки 2-3 были localhost-хитами)
+        self.pv2.invalidate_meta(board);
         let meta = self.pv2.meta(board).await?;
         Ok(meta
             .options
