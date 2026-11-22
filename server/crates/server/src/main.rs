@@ -20,6 +20,7 @@ mod gitea;
 #[cfg(test)]
 mod gitea_tests;
 mod github;
+mod judge;
 mod mockhub;
 mod prgate;
 mod s3;
@@ -282,6 +283,34 @@ async fn run(
         }
         None => uwuwu_usecase::SpawnModels::canonical(),
     });
+    // Судья (#1364): opt-in владельца ([judge].enabled) + живой ключ.
+    // Нет ключа — громкий warn и контур off (тик живёт старой механикой).
+    let (judge, judge_cfg): (
+        Option<Arc<dyn uwuwu_usecase::DecisionJudge>>,
+        uwuwu_usecase::JudgeCfg,
+    ) = match cfg.judge.as_ref() {
+        Some(j) if j.enabled => {
+            let judge_cfg = uwuwu_usecase::JudgeCfg::from(j.clone());
+            match crate::judge::GeminiJudge::from_env(j.model.clone(), j.rpm_limit, clock.clone()) {
+                Some(judge) => {
+                    tracing::info!(
+                        event = "judge.enabled",
+                        model = j.model.as_deref().unwrap_or("gemini-decision-1"),
+                        "Судья включена: сталл- и кап-точки под вердиктом"
+                    );
+                    (Some(Arc::new(judge)), judge_cfg)
+                }
+                None => {
+                    tracing::warn!(
+                        event = "judge.no_key",
+                        "Судья включена в конфиге, но GEMINI_API_KEY нет — контур off"
+                    );
+                    (None, judge_cfg)
+                }
+            }
+        }
+        _ => (None, uwuwu_usecase::JudgeCfg::default()),
+    };
     let usecase = Arc::new(TickUseCase {
         board: board.clone(),
         sessions: sessions.clone(),
@@ -290,6 +319,8 @@ async fn run(
         state: state.clone(),
         models: spawn_models.clone(),
         boot_ms: clock.now_ms(),
+        judge,
+        judge_cfg,
     });
 
     let shared: Arc<std::sync::RwLock<TickOutcome>> = Arc::default();

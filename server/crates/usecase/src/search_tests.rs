@@ -45,10 +45,10 @@ async fn fulltext_failure_renders_honest_section_line() {
 
     let fulltext_line = hits
         .iter()
-        .find(|hit| hit.section == "полнотекст")
+        .find(|hit| hit.section == "fulltext")
         .expect("секция полнотекста присутствует при отказе");
     assert!(
-        fulltext_line.slug.contains("недоступен") && fulltext_line.slug.contains("сломано"),
+        fulltext_line.slug.contains("unavailable") && fulltext_line.slug.contains("сломано"),
         "отказ рендерится строкой с причиной, факт: {fulltext_line:?}"
     );
 }
@@ -61,7 +61,7 @@ async fn fulltext_hits_render_as_section_entries() {
 
     let found = hits
         .iter()
-        .find(|hit| hit.section == "полнотекст" && hit.slug == "Projects/uwuwu/README");
+        .find(|hit| hit.section == "fulltext" && hit.slug == "Projects/uwuwu/README");
     assert!(found.is_some(), "попадание полнотекста в выдаче: {hits:?}");
 }
 
@@ -81,10 +81,10 @@ async fn semantic_failure_renders_honest_section_line() {
 
     let semantic_line = hits
         .iter()
-        .find(|hit: &&SearchHit| hit.section == "семантика")
+        .find(|hit: &&SearchHit| hit.section == "semantic")
         .expect("секция семантики присутствует при отказе");
     assert!(
-        semantic_line.slug.contains("недоступна") && semantic_line.slug.contains("30508"),
+        semantic_line.slug.contains("unavailable") && semantic_line.slug.contains("30508"),
         "отказ с retry-after виден в строке, факт: {semantic_line:?}"
     );
 }
