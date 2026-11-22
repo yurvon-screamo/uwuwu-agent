@@ -1063,4 +1063,50 @@ mod tests {
         assert_eq!(s.review_rounds("B", 1), 0, "старейший ключ срезан капом");
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn bot_lessons_hash_round_trip_and_orphan_reset() {
+        // #1424 (тестер): lessons-hash (agent-режим) переживает рестарт;
+        // Some(0) — «носитель опустел, уроки отозваны» — не схлопывается
+        // в None (иначе следующий ход ложно доставит уроки снова);
+        // сброс None на несуществующей строке не заводит сироту-строку.
+        let dir = std::env::temp_dir().join(format!("uwuwu-state-lessons-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        {
+            let s = store(path.clone());
+            assert_eq!(
+                s.bot_lessons_hash("bot/a"),
+                None,
+                "старый state без поля — уроков нет"
+            );
+            s.set_bot_lessons_hash("bot/a", Some(0)); // отзыв: hash пустого носителя
+            s.set_bot_lessons_hash("bot/b", Some(77));
+            TickStateStore::save(&s).unwrap();
+        }
+        let s = store(path.clone());
+        assert_eq!(
+            s.bot_lessons_hash("bot/a"),
+            Some(0),
+            "Some(0) переживает рестарт и не читается как None"
+        );
+        assert_eq!(s.bot_lessons_hash("bot/b"), Some(77));
+        s.set_bot_lessons_hash("bot/ghost", None);
+        TickStateStore::save(&s).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let bots = json.get("bots").expect("секция bots");
+        assert!(
+            bots.get("bot/ghost").is_none(),
+            "сброс None на несуществующей строке не заводит сироту: {bots}"
+        );
+        assert!(
+            bots.get("bot/a")
+                .expect("строка a жива")
+                .get("lessons_hash")
+                .is_some(),
+            "lessons_hash сериализуется в state.json"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
