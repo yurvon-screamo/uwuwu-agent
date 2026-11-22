@@ -15,6 +15,8 @@ pub struct ToolHub {
     pub writer: Arc<TaskWriteUseCase>,
     /// Батч-снос строк доски (#1158): guard-вердикты + write-ahead undo.
     pub clean: Arc<uwuwu_usecase::TaskCleanUseCase>,
+    /// Rename статуса канбана (#1447): pre-image журнал → мутация → verify.
+    pub status: Arc<uwuwu_usecase::BoardStatusRenameUseCase>,
     pub wiki: Arc<dyn uwuwu_usecase::WikiRepo>,
     /// Роутер «проект → executor»: session_export веером по исполнителям.
     pub sessions: Arc<uwuwu_usecase::SessionRouter>,
@@ -166,6 +168,21 @@ pub fn tool_descriptors() -> Value {
             }))
         ),
         tool(
+            "board_status_rename",
+            "Rename a board Status option by option id (#1447): fresh pre-image \
+             (option set + row distribution) is written to the write-ahead journal, \
+             then the carrier receives the verbatim pre-image set with one name \
+             changed, then fresh post-verify; any divergence is a loud refusal with \
+             the journal path for manual rollback. Non-destructive by id: row values \
+             follow the renamed option. Replacing the whole option set is NOT exposed",
+            object(json!({
+                "from": string("current option name"),
+                "to": string("new option name (canonical board statuses parse; \
+                              non-canonical names get a warning, not a refusal)"),
+                "project": string("проект; дефолт uwuwu")
+            }))
+        ),
+        tool(
             "docs_append",
             "Append a line to the end of a wiki doc (cron journals, experience classes; ff-only commit)",
             object(json!({
@@ -290,6 +307,7 @@ impl ToolHub {
             "task_close" => self.task_close(args).await,
             "task_clean" => self.task_clean(&project, args).await,
             "task_undo" => self.task_undo(&project, args).await,
+            "board_status_rename" => self.board_status_rename(&project, args).await,
             "task_body" => self.task_body(&project, args).await,
             "task_body_section" => self.task_body_section(&project, args).await,
             "blob_put" => self.blob_put(&project, args).await,
@@ -616,6 +634,19 @@ impl ToolHub {
             .await
             .map_err(|e| e.to_string())?;
         ok_text(render_undo(&report))
+    }
+
+    /// Rename статуса канбана (#1447): строки тула — английские (#1383),
+    /// ошибки юзкейса проходят как есть.
+    async fn board_status_rename(&self, project: &str, args: &Value) -> Result<Value, String> {
+        let from = str_arg(args, "from").ok_or("from is required (current option name)")?;
+        let to = str_arg(args, "to").ok_or("to is required (new option name)")?;
+        let report = self
+            .status
+            .rename(project, &from, &to)
+            .await
+            .map_err(|e| e.to_string())?;
+        ok_text(render_status_rename(&report))
     }
 
     async fn task_body(&self, project: &str, args: &Value) -> Result<Value, String> {
@@ -962,6 +993,40 @@ fn render_undo(report: &uwuwu_usecase::UndoReport) -> String {
     out
 }
 
+/// Отчёт rename статуса (#1447): английский (#1383) — строки тула ходят
+/// в каждую сессию агентам.
+fn render_status_rename(report: &uwuwu_usecase::RenameReport) -> String {
+    let mut out = format!(
+        "Renamed \"{}\" → \"{}\" on board \"{}\" (option id kept: {})\n\
+         Options: {}; rows seen: {}\n\
+         Histogram before: {}\n\
+         Histogram after: {}\n\
+         Pre-image journal: {}",
+        report.from,
+        report.to,
+        report.board,
+        report.option_id,
+        report.options_total,
+        report.rows_total,
+        fmt_histogram(&report.histogram_before),
+        fmt_histogram(&report.histogram_after),
+        report.journal_path,
+    );
+    for warning in &report.warnings {
+        out.push_str(&format!("\nWARNING: {warning}"));
+    }
+    out
+}
+
+/// «Draft=3, In Progress=12» — детерминированный порядок BTreeMap.
+fn fmt_histogram(histogram: &std::collections::BTreeMap<String, usize>) -> String {
+    histogram
+        .iter()
+        .map(|(name, count)| format!("{name}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
     json!({ "name": name, "description": description, "inputSchema": input_schema })
 }
@@ -1022,6 +1087,7 @@ mod tests {
             "task_close",
             "task_clean",
             "task_undo",
+            "board_status_rename",
             "task_body",
             "task_body_section",
             "blob_put",
@@ -1039,7 +1105,7 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "нет инструмента {expected}");
         }
-        assert_eq!(names.len(), 23, "контракт поверхности: {names:?}");
+        assert_eq!(names.len(), 24, "контракт поверхности: {names:?}");
     }
 
     #[test]

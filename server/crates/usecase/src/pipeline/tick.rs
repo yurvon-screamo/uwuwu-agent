@@ -4,7 +4,10 @@
 use super::actions::{LostAct, WakeAct};
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
-use crate::ports::{Clock, Liveness, PrGateway, TaskBoardRepo, TickStateStore};
+use crate::ports::{
+    Clock, DecisionJudge, JudgeCfg, JudgeContext, JudgeSessionTail, Liveness, PrGateway,
+    TaskBoardRepo, TickStateStore,
+};
 use crate::router::SessionRouter;
 use crate::spawn_models::SpawnModels;
 use serde::Serialize;
@@ -94,6 +97,16 @@ pub struct TickOutcome {
     pub stall_flagged: usize,
     /// Строк, снятых с раунда капом ревью-раундов (#1311).
     pub review_flagged: usize,
+    /// Вызовов судьи (#1364): точек сталла/капа, где вердикт запрошен.
+    pub judge_calls: usize,
+    /// Переносов строки вердиктом судьи (set_status, ADR-106 ревизия).
+    pub judge_transitions: usize,
+    /// Пробуждений вердиктом без переноса (вердикт = текущий статус).
+    pub judge_wakeups: usize,
+    /// Принудительных паркингов гвардом судьи (вызовы без прогресса).
+    pub judge_forced: usize,
+    /// Вердиктов, отклонённых гардом каноничности (hold-эквивалент).
+    pub judge_rejected: usize,
     /// Строк, запаркованных порогом потерянных доставок (#1288).
     pub session_lost_flagged: usize,
     /// Отложенные политикой (пик/CUP) respawn'ы потерянных сессий (#1288):
@@ -179,6 +192,13 @@ pub struct TickUseCase {
     /// недействителен (инцидент 18.11 #1281: persisted каунтеры volume
     /// переживают пересоздание контейнера, парковка по чужому раунду).
     pub boot_ms: u64,
+    /// Судья — decision-модель статусных решений (#1364). None — контур
+    /// выключен ([judge].enabled=false или нет ключа): тик живёт старой
+    /// механикой; Err вызова — fallback на неё же (судья — улучшение,
+    /// не зависимость).
+    pub judge: Option<Arc<dyn DecisionJudge>>,
+    /// Конфиг контура судьи (пороги/тримы/гвард — канон плана #1364).
+    pub judge_cfg: JudgeCfg,
 }
 
 /// Причина hold спавна: зрение недоступно или в env живая сестра.
@@ -258,6 +278,31 @@ pub(crate) struct RowContext<'a> {
     pub(crate) enrich_failed: &'a HashSet<u64>,
     /// Кандидаты-жертвы преемпшена (#1259): busy low/empty-активы.
     pub(crate) preempts: &'a PreemptPool,
+}
+
+/// Цель судьи на тике: строка+слот+сессия и факты сталл-точки. Свёртка
+/// параметров (qlty function-parameters: judge_apply/judge_stall_action).
+struct JudgeCall<'a> {
+    board: &'a BoardPlan,
+    task: &'a Task,
+    slot: Slot,
+    session: &'a str,
+    /// Тишина stage-сессии (ms), вызовов без смены статуса и признак
+    /// завершённого хода на момент решения (пробы гейта, не пересбор из
+    /// хвостов — ревью L6: пустой сбор хвостов давал ложное «ход завершён»).
+    silence: u64,
+    calls: u32,
+    idle: bool,
+}
+
+/// Char-safe обрезка строки до `max` символов (UTF-8: индексация байтами
+/// рвёт многобайтовые символы — русский текст контекста судьи).
+fn trim_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max).collect();
+    format!("{cut}…")
 }
 
 impl TickUseCase {
@@ -920,6 +965,7 @@ impl TickUseCase {
                         policy: plan.policy,
                         active_now: *active_now,
                     },
+                    out,
                 )
                 .await
             {
@@ -1032,46 +1078,22 @@ impl TickUseCase {
                 if !escalate {
                     return false;
                 }
-                out.review_flagged += 1;
-                tracing::warn!(
-                    event = "review.rounds_escalated",
-                    number = task.number(),
-                    rounds = next,
-                    cap = REVIEW_ROUND_CAP,
-                    "Кап ревью-раундов: подряд request_changes без approve"
-                );
-                // дайджест: id последней ревью-сессии из слота строки
-                // (на счёт-переходе слот ревью ещё не очищен — очистка
-                // идёт при ре-входе в ревью); нет сессии — честное «—»
-                let last = task
-                    .session_of(round_slot)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| "—".into());
-                if let Err(e) = self
-                    .board
-                    .set_status(&board.board, task.number(), Status::NeedsAttention)
-                    .await
-                {
-                    // счётчик стоит на капе: эскалация ретраится следующим
-                    // count-переходом (раунд N+1 пройдёт — деградация benign)
-                    out.actions_failed += 1;
-                    self.log_action_failed(task, e);
-                    return false;
+                // Контур судьи (#1364): автопаркинг капа заменяется вердиктом
+                // decision-модели (она видит ленту — «цикл не сходится»).
+                // Форс-паркинг без вызова: раунды CAP+escalate_after — гвард
+                // сверху судьи, бесконечных «ещё раунд» нет. Err — fallback
+                // на автопаркинг ниже. Цикл капа — стадия prev: тест-кап
+                // (#1413, ReviewTesting→Testing) — fail-возвраты тест-
+                // ревьювера, не request_changes; строка к этому тику уже в
+                // Testing (в матрице судьи), поэтому гард — по prev.
+                if self.judge_enabled() && prev.is_some_and(uwuwu_domain::judge_stage) {
+                    return self
+                        .judge_round_action(board, task, out, round_slot, next)
+                        .await;
                 }
-                let digest = format!(
-                    "⚠︎ Review-round cap: the {next}th request_changes in a row without an approve \
-                     (the {REVIEW_ROUND_CAP} threshold) — round {} is not assigned, the row is in \
-                     Needs attention, owner's triage. The findings and verdicts — in the thread \
-                     above; the last review session: {last}.",
-                    next + 1
-                );
-                if let Err(e) = self.board.post_comment(task.number(), &digest).await {
-                    out.actions_failed += 1;
-                    self.log_action_failed(task, e);
-                }
-                // эскалация состоялась: после разбора владельца — свежий бюджет
-                self.state.set_review_rounds(&board.board, task.number(), 0);
-                true
+                return self
+                    .review_round_force_park(board, task, out, round_slot, next)
+                    .await;
             }
             ReviewRoundStep::Reset => {
                 self.state.set_review_rounds(&board.board, task.number(), 0);
@@ -1161,6 +1183,7 @@ impl TickUseCase {
         board: &BoardPlan,
         task: &Task,
         cup: CupGate,
+        out: &mut TickOutcome,
     ) -> UsecaseResult<StallAct> {
         let Some(slot) = task.stage_slot() else {
             return Ok(StallAct::None);
@@ -1197,13 +1220,25 @@ impl TickUseCase {
             return Ok(StallAct::None);
         }
         let idle = self.session_idle(board, &session).await;
-        let (gate, every, soft) = if idle {
+        let (gate, mut every, soft) = if idle {
             (STALL_SOFT_SILENCE_MS, STALL_SOFT_EVERY_MS, true)
         } else {
             (STALL_SILENCE_MS, STALL_PING_EVERY_MS, false)
         };
         if silence < gate {
             return Ok(StallAct::None);
+        }
+        // Судья (#1364): пороги тишины старой механики — её гейтинг,
+        // интервал повторных решений — свой ([judge].every_ms; у soft-класса
+        // старый интервал 30 мин держал бы повторный вердикт полчаса —
+        // вскрыто e2e 14b: wake погасил шум, повторный вызов не наступал).
+        // Override строго ПОД судьёй (по judge_stage): стадии вне полномочий
+        // судьи (ReviewTesting #1413) сохраняют каденс старой механики —
+        // override до статус-гарда замедлял бы эскалацию тест-ревью-зависов
+        // вчетверо (2 ч вместо 30 мин; ревью раунд 4, Common-2).
+        let judge_here = self.judge_enabled() && uwuwu_domain::judge_stage(task.status());
+        if judge_here {
+            every = self.judge_cfg.every_ms;
         }
         // раунд = статус: смена статуса обнуляет счётчик пингов
         let (prev_status, last_ping, mut count) = self
@@ -1233,6 +1268,25 @@ impl TickUseCase {
         let now = self.clock.now_ms();
         if count > 0 && now.saturating_sub(last_ping) < every {
             return Ok(StallAct::None);
+        }
+        // Контур судьи (#1364): тот же гейтинг (тишина, раунд по статусу,
+        // интервал повторов, рестарт-инвариант #1281), решение — вердикт
+        // decision-модели вместо пингов/автопаркинга. Err вызова — fallback
+        // на старую механику ниже: судья — улучшение, не зависимость.
+        // Стадии вне матрицы (ReviewTesting #1413 — вердикт тест-ревьювера)
+        // остаются на пингах старой механики: вызов судьи там сжёг бы API —
+        // любой вердикт гард отклоняет (judge_stage).
+        if judge_here {
+            let call = JudgeCall {
+                board,
+                task,
+                slot,
+                session: &session,
+                silence,
+                calls: count,
+                idle: soft,
+            };
+            return self.judge_stall_action(&call, soft, now, cup, out).await;
         }
         self.stall_action(board, task, slot, &session, soft, silence, count, now, cup)
             .await
@@ -1316,6 +1370,600 @@ impl TickUseCase {
         self.state
             .mark_stall_ping(&board.board, task.number(), task.status(), now);
         Ok(StallAct::Flagged)
+    }
+
+    // —— Контур судьи (#1364) ——
+
+    /// Судья включён: порт есть и конфиг enabled (opt-in владельца).
+    fn judge_enabled(&self) -> bool {
+        self.judge_cfg.enabled && self.judge.is_some()
+    }
+
+    /// Судья на сталл-точке (#1364): замена пингов/автопаркинга. Гвард
+    /// сверху — escalate_after вызовов без смены статуса строки →
+    /// принудительный паркинг без нового вызова модели (слово владельца
+    /// «порог 3 сверху судьи»; спайковый урок C7 — судья-«hold на всём»
+    /// не глушит страховку). Err вердикта — fallback на старую механику.
+    async fn judge_stall_action(
+        &self,
+        call: &JudgeCall<'_>,
+        soft: bool,
+        now: u64,
+        cup: CupGate,
+        out: &mut TickOutcome,
+    ) -> UsecaseResult<StallAct> {
+        if uwuwu_domain::judge_step(call.calls, self.judge_cfg.escalate_after)
+            == uwuwu_domain::JudgeStep::ForceEscalate
+        {
+            return self
+                .judge_park(
+                    call,
+                    &format!(
+                        "⚖︎ Judge: guard — {} calls in a row without a status change \
+                         (the {} threshold). The row is in Needs attention without \
+                         a new model call. Owner's triage.",
+                        call.calls, self.judge_cfg.escalate_after
+                    ),
+                    out,
+                )
+                .await;
+        }
+        let Some(judge) = self.judge.as_ref() else {
+            // Инвариант judge_enabled() (гейт судьи выше) нарушен — порт
+            // отсутствует при включённом контуре. Не глотаем действие
+            // молча: деградация в старую механику сталл-детекта
+            // (ревью раунд 4, Low).
+            tracing::warn!(
+                event = "judge.port_missing",
+                number = call.task.number(),
+                "Порт судьи отсутствует при enabled-гейте — fallback на старую механику"
+            );
+            return self
+                .stall_action(
+                    call.board,
+                    call.task,
+                    call.slot,
+                    call.session,
+                    soft,
+                    call.silence,
+                    call.calls,
+                    now,
+                    cup,
+                )
+                .await;
+        };
+        let ctx = self
+            .judge_context(
+                call.board,
+                call.task,
+                call.silence,
+                call.calls,
+                0,
+                call.idle,
+                false,
+            )
+            .await;
+        match judge.decide(&ctx).await {
+            Ok(verdict) => {
+                out.judge_calls += 1;
+                self.judge_apply(call, &verdict, now, out).await
+            }
+            Err(e) => {
+                tracing::warn!(
+                    event = "judge.err",
+                    number = call.task.number(),
+                    error = %e,
+                    "Судья недоступна — fallback на старую механику сталл-детекта"
+                );
+                self.stall_action(
+                    call.board,
+                    call.task,
+                    call.slot,
+                    call.session,
+                    soft,
+                    call.silence,
+                    call.calls,
+                    now,
+                    cup,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Судья на кап-точке ревью-раундов (#1364): автопаркинг заменяется
+    /// вердиктом (судья видит ленту — «цикл не сходится»). Два исхода:
+    /// паркинг (вердикт Needs attention — дайджест с факторами вердикта)
+    /// или «ещё раунд» (без мутаций — раунды считаются дальше, следующий
+    /// cap-переход переспросит). Промптов сессиям здесь нет: review-слот
+    /// очищен round_transition'ом до вызова — будить осиротевшую ревью-
+    /// сессию = дубль активного агента (ревью C3). Форс-паркинг без вызова:
+    /// раунды CAP + escalate_after (escalate_after=0 — гвард выключен,
+    /// семантика judge_step — ревью L4). Err — fallback на автопаркинг.
+    /// true — строка снята с тика.
+    async fn judge_round_action(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        out: &mut TickOutcome,
+        round_slot: Slot,
+        rounds: u32,
+    ) -> bool {
+        let escalate_after = self.judge_cfg.escalate_after;
+        if escalate_after > 0 && rounds >= REVIEW_ROUND_CAP + escalate_after {
+            tracing::warn!(
+                event = "judge.rounds_forced",
+                number = task.number(),
+                rounds = rounds,
+                "Судья: гвард кап-точки — раунды за пределом, паркинг без вызова"
+            );
+            let last = task
+                .session_of(round_slot)
+                .map(str::to_string)
+                .unwrap_or_else(|| "—".into());
+            let digest = format!(
+                "⚖︎ Judge: cap-point guard — {rounds} request_changes in a row \
+                 (the {} cap + the {} threshold) — parking without a model call. \
+                 The round is not assigned, the row is in Needs attention, \
+                 owner's triage. The last review session: {last}.",
+                REVIEW_ROUND_CAP, escalate_after
+            );
+            let parked = self.judge_round_park(board, task, &digest, out).await;
+            if parked {
+                out.judge_forced += 1;
+            }
+            return parked;
+        }
+        let Some(judge) = self.judge.as_ref() else {
+            // Инвариант judge_enabled() (гейт кап-ветки выше) нарушен —
+            // порт отсутствует при включённом контуре. Не глотаем решение
+            // молча: деградация в старый автопаркинг кап-точки
+            // (ревью раунд 4, Low).
+            tracing::warn!(
+                event = "judge.port_missing",
+                number = task.number(),
+                "Порт судьи отсутствует на кап-точке — fallback на автопаркинг"
+            );
+            return self
+                .review_round_force_park(board, task, out, round_slot, rounds)
+                .await;
+        };
+        let ctx = self
+            .judge_context(board, task, 0, 0, rounds, false, true)
+            .await;
+        match judge.decide(&ctx).await {
+            Ok(verdict) => {
+                out.judge_calls += 1;
+                if uwuwu_domain::verdict_target(task.status(), verdict.status)
+                    != Some(Status::NeedsAttention)
+                {
+                    // «ещё раунд»: строка продолжает работу, мутаций и
+                    // промптов нет (ревью-слот очищен до вызова — ревью C3)
+                    tracing::info!(
+                        event = "judge.rounds_continue",
+                        number = task.number(),
+                        rounds = rounds,
+                        owner_needed = format!("{:.2}", verdict.owner_needed),
+                        confidence = format!("{:.2}", verdict.confidence),
+                        "Судья: цикл ещё сходится — раунд продолжается без паркинга"
+                    );
+                    return false;
+                }
+                // паркинг вердиктом: дайджест с факторами вердикта
+                let last = task
+                    .session_of(round_slot)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "—".into());
+                let digest = format!(
+                    "⚖︎ Judge: {rounds} request_changes in a row — the decision-model \
+                     verdict: the loop does not converge (owner needed {:.2}, \
+                     confidence {:.2}). The round is not assigned, the row is in \
+                     Needs attention, owner's triage. The last review session: {last}.",
+                    verdict.owner_needed, verdict.confidence
+                );
+                // инкременты после set_status (Low раунда 3): счётчики тика —
+                // аудит судьи, отказ set_status не насчитывает паркинг,
+                // которого не было
+                let parked = self.judge_round_park(board, task, &digest, out).await;
+                if parked {
+                    out.review_flagged += 1;
+                    out.judge_transitions += 1;
+                }
+                parked
+            }
+            Err(e) => {
+                tracing::warn!(
+                    event = "judge.err",
+                    number = task.number(),
+                    error = %e,
+                    "Судья недоступна на кап-точке — fallback на автопаркинг"
+                );
+                self.review_round_force_park(board, task, out, round_slot, rounds)
+                    .await
+            }
+        }
+    }
+
+    /// Хореография паркинга кап-точки — единственная копия (ревью раунда
+    /// 2, L): race-чек → set_status → дайджест → сброс раундов. Race-чек —
+    /// контур судьи (ревью раунд 4, Low): паркинг — тоже set_status,
+    /// стейл-вердикт не перетирает свежую агентскую транзакцию; legacy-путь
+    /// (judge off, автопаркинг) сохраняет прежний безусловный паркинг —
+    /// инвариант «тик бит-в-бит при [judge] off». false — статус строки
+    /// сменился во время вызова ИЛИ set_status отказал: счётчик стоит
+    /// на капе, ретрай следующим count-переходом (раунд N+1 пройдёт —
+    /// деградация benign).
+    async fn judge_round_park(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        digest: &str,
+        out: &mut TickOutcome,
+    ) -> bool {
+        // race-чек (ревью раунд 4, Low): вердикт собирался секунды —
+        // статус строки мог уехать. Отказ пробы трактуется как stale:
+        // мутаций нет, ретрай следующим тиком
+        if self.judge_enabled() {
+            let fresh = match self.board.row_status(&board.board, task.number()).await {
+                Ok(st) => st == Some(task.status()),
+                Err(e) => {
+                    tracing::warn!(
+                        event = "judge.round_park_probe_err",
+                        number = task.number(),
+                        error = %e,
+                        "Race-проба статуса перед кап-паркингом недостоверна — мутаций нет"
+                    );
+                    out.actions_failed += 1;
+                    false
+                }
+            };
+            if !fresh {
+                tracing::info!(
+                    event = "judge.round_park_stale",
+                    number = task.number(),
+                    "Кап-паркинг устарел — статус строки сменился во время вызова"
+                );
+                return false;
+            }
+        }
+        if let Err(e) = self
+            .board
+            .set_status(&board.board, task.number(), Status::NeedsAttention)
+            .await
+        {
+            out.actions_failed += 1;
+            self.log_action_failed(task, e);
+            return false;
+        }
+        if let Err(e) = self.board.post_comment(task.number(), digest).await {
+            out.actions_failed += 1;
+            self.log_action_failed(task, e);
+        }
+        self.state.set_review_rounds(&board.board, task.number(), 0);
+        true
+    }
+
+    /// Автопаркинг кап-точки (старая механика; fallback судьи): кап
+    /// достигнут — Needs attention + структурный дайджест, счётчик сброс.
+    async fn review_round_force_park(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        out: &mut TickOutcome,
+        round_slot: Slot,
+        next: u32,
+    ) -> bool {
+        tracing::warn!(
+            event = "review.rounds_escalated",
+            number = task.number(),
+            rounds = next,
+            cap = REVIEW_ROUND_CAP,
+            "Кап ревью-раундов: подряд request_changes без approve"
+        );
+        // дайджест: id последней ревью-сессии из слота строки
+        // (на счёт-переходе слот ревью ещё не очищен — очистка
+        // идёт при ре-входе в ревью); нет сессии — честное «—»
+        let last = task
+            .session_of(round_slot)
+            .map(str::to_string)
+            .unwrap_or_else(|| "—".into());
+        let digest = format!(
+            "⚠︎ Review-round cap: the {next}th request_changes in a row without an approve \
+             (the {REVIEW_ROUND_CAP} threshold) — round {} is not assigned, the row is in \
+             Needs attention, owner's triage. The findings and verdicts — in the thread \
+             above; the last review session: {last}.",
+            next + 1
+        );
+        let parked = self.judge_round_park(board, task, &digest, out).await;
+        // инкремент после set_status (Low раунда 3, класс verdict-ветки):
+        // отказ паркинга не насчитывает эскалацию, которой не было
+        if parked {
+            out.review_flagged += 1;
+        }
+        parked
+    }
+
+    /// Применение вердикта (сталл- и кап-точки; ревизия ADR-106 по санкции
+    /// владельца 20.11 — сервер переносит статус по структурированному
+    /// choice, не по текстам). Каноничность перехода — verdict_target;
+    /// нелегальный вердикт — отклонён, hold-эквивалент (мутаций нет,
+    /// счётчик гварда растёт). Вердикт = текущий статус — пробуждение
+    /// агента без переноса. Race-чек (L2): статус строки сверяется перед
+    /// set_status — вердикт не перетирает свежую агентскую транзакцию.
+    async fn judge_apply(
+        &self,
+        call: &JudgeCall<'_>,
+        verdict: &uwuwu_domain::JudgeVerdict,
+        now: u64,
+        out: &mut TickOutcome,
+    ) -> UsecaseResult<StallAct> {
+        let board = call.board;
+        let task = call.task;
+        let slot = call.slot;
+        let session = call.session;
+        let silence = call.silence;
+        let calls = call.calls;
+        let current = task.status();
+        // вызов записан в носитель ДО применения: отклонённый/стейл вердикт —
+        // тоже вызов без прогресса, гвард растёт от каждого (иначе модель с
+        // устойчиво нелегальным choice перезапрашивается каждый тик до
+        // исчерпания rpm-полосы — ревью C1); перенос статуса ниже сбрасывает
+        // носитель clear_stall'ом
+        self.state
+            .mark_stall_ping(&board.board, task.number(), current, now);
+        let Some(target) = uwuwu_domain::verdict_target(current, verdict.status) else {
+            out.judge_rejected += 1;
+            tracing::warn!(
+                event = "judge.rejected",
+                number = task.number(),
+                verdict = verdict.status.key(),
+                current = ?current,
+                "Вердикт судьи отклонён гардом каноничности — hold-эквивалент"
+            );
+            return Ok(StallAct::None);
+        };
+        if target == current {
+            // пробуждение без переноса — функциональный наследник мягкого
+            // пинга: судья считает, что агент должен продолжить
+            self.judge_prompt(
+                board,
+                slot,
+                session,
+                &format!(
+                    "⚖︎ Pipeline judge: the row has been silent for {} min — keep \
+                     working. Finish the turn with a status transaction \
+                     (uwuwu_task_edit).",
+                    silence / 60_000
+                ),
+            )
+            .await?;
+            out.judge_wakeups += 1;
+            tracing::info!(
+                event = "judge.wake",
+                number = task.number(),
+                owner_needed = format!("{:.2}", verdict.owner_needed),
+                confidence = format!("{:.2}", verdict.confidence),
+                "Судья: пробуждение агента без переноса"
+            );
+            return Ok(StallAct::None);
+        }
+        // race-чек (ревью L2): вердикт собирался секунды — статус строки
+        // мог уехать агентской транзакцией; не перетираем свежий переход
+        if self.board.row_status(&board.board, task.number()).await? != Some(current) {
+            tracing::info!(
+                event = "judge.stale",
+                number = task.number(),
+                "Вердикт судьи устарел — статус строки сменился во время вызова"
+            );
+            return Ok(StallAct::None);
+        }
+        self.board
+            .set_status(&board.board, task.number(), target)
+            .await?;
+        let digest = format!(
+            "⚖︎ Judge: the row moved to {} (silence {} min; owner needed: \
+             {:.2}; confidence {:.2}; calls without progress: {}). The reason — \
+             the decision-model verdict on the task context (body, comment \
+             thread, session tails). ADR-106 revision #1364.",
+            naming::status_name(target),
+            silence / 60_000,
+            verdict.owner_needed,
+            verdict.confidence,
+            calls + 1
+        );
+        if let Err(e) = self.board.post_comment(task.number(), &digest).await {
+            // перенос состоялся; коммент — наблюдаемость, не критичный путь
+            out.actions_failed += 1;
+            self.log_action_failed(task, e);
+        }
+        // Промпт старой сессии НЕ отправляется (ревью C2): адресат — агент
+        // прошлой стадии, контракту новой стадии он не отвечает; «перенос =
+        // пинг» реализуется самим переносом — агент новой стадии спавнится
+        // штатной механикой следующего тика. Промпт осиротевшей сессии —
+        // сожжённый LLM-раунд не на том агенте.
+        self.state.clear_stall(&board.board, task.number());
+        out.judge_transitions += 1;
+        tracing::info!(
+            event = "judge.moved",
+            number = task.number(),
+            target = ?target,
+            owner_needed = format!("{:.2}", verdict.owner_needed),
+            confidence = format!("{:.2}", verdict.confidence),
+            "Судья: перенос строки вердиктом"
+        );
+        if target == Status::NeedsAttention {
+            return Ok(StallAct::Flagged);
+        }
+        Ok(StallAct::None)
+    }
+
+    /// Принудительный паркинг гварда судьи (без вызова модели).
+    async fn judge_park(
+        &self,
+        call: &JudgeCall<'_>,
+        digest: &str,
+        out: &mut TickOutcome,
+    ) -> UsecaseResult<StallAct> {
+        let board = call.board;
+        let task = call.task;
+        let session = call.session;
+        tracing::warn!(
+            event = "judge.forced",
+            number = task.number(),
+            "Судья: гвард вызовов без прогресса — принудительный паркинг"
+        );
+        // race-чек (ревью раунд 4, Low): паркинг — тоже set_status,
+        // гвард не перетирает свежую агентскую транзакцию; stale —
+        // строка ушла сама, гвард-счётчик живёт дальше по носителю
+        if self.board.row_status(&board.board, task.number()).await? != Some(task.status()) {
+            tracing::info!(
+                event = "judge.park_stale",
+                number = task.number(),
+                "Принудительный паркинг устарел — статус строки сменился во время тика"
+            );
+            return Ok(StallAct::None);
+        }
+        self.board
+            .set_status(&board.board, task.number(), Status::NeedsAttention)
+            .await?;
+        if let Err(e) = self.board.post_comment(task.number(), digest).await {
+            out.actions_failed += 1;
+            self.log_action_failed(task, e);
+        }
+        // будим агента: строка покидает активную стадию
+        self.judge_prompt(
+            board,
+            task.stage_slot().unwrap_or(Slot::Dev),
+            session,
+            "⚖︎ Pipeline judge: the row moved to Needs attention — the turn is \
+             finished, work is paused until owner's triage.",
+        )
+        .await?;
+        self.state.clear_stall(&board.board, task.number());
+        out.judge_forced += 1;
+        Ok(StallAct::Flagged)
+    }
+
+    /// Промпт агенту слота от судьи: пин агента слота (#1300) + прямой
+    /// промпт — механика мягкого пинга. Ошибка доставки — Err вызывающему
+    /// (тик переживёт: вердикт применён до промпта).
+    async fn judge_prompt(
+        &self,
+        board: &BoardPlan,
+        slot: Slot,
+        session: &str,
+        text: &str,
+    ) -> UsecaseResult<()> {
+        let gw = self.sessions.project(&board.project);
+        if let Some(agent) = Agent::of_slot(slot) {
+            gw.switch_agent(session, agent).await?;
+        }
+        gw.prompt(session, text).await
+    }
+
+    /// Сборка JudgeContext (#1364): тело, хвост ленты, серверные факты,
+    /// хвосты сессий слотов. Отказы чтений — не блокируют вердикт:
+    /// контекст неполон, warn-лог (судья решает по тому, что есть).
+    #[allow(clippy::too_many_arguments)]
+    async fn judge_context(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        silence: u64,
+        calls: u32,
+        rounds: u32,
+        idle: bool,
+        cap_point: bool,
+    ) -> JudgeContext {
+        let cfg = self.judge_cfg.clone();
+        let body = match self.board.read_issue(&board.board, task.number()).await {
+            Ok(view) => trim_chars(&view.body, cfg.body_max_chars),
+            Err(e) => {
+                tracing::warn!(
+                    event = "judge.ctx_body_err",
+                    number = task.number(),
+                    error = %e,
+                    "Тело задачи в контекст судьи не попало"
+                );
+                String::new()
+            }
+        };
+        let comments: Vec<(u64, String)> = match self.board.latest_comments(task.number()).await {
+            Ok(list) => {
+                let mut v: Vec<(u64, String)> = list
+                    .into_iter()
+                    .map(|c| (c.created_ms, trim_chars(&c.body, cfg.comment_max_chars)))
+                    .collect();
+                v.sort_by_key(|(ms, _)| std::cmp::Reverse(*ms));
+                v.truncate(cfg.comments_tail);
+                v
+            }
+            Err(e) => {
+                tracing::warn!(
+                    event = "judge.ctx_comments_err",
+                    number = task.number(),
+                    error = %e,
+                    "Лента комментов в контекст судьи не попала"
+                );
+                Vec::new()
+            }
+        };
+        let mut sessions = Vec::new();
+        for slot in [
+            Slot::Design,
+            Slot::Dev,
+            Slot::PlanReview,
+            Slot::ResultReview,
+            Slot::Test,
+        ] {
+            let Some(session) = task.session_of(slot) else {
+                continue;
+            };
+            match self
+                .sessions
+                .project(&board.project)
+                .last_assistant_reply(session)
+                .await
+            {
+                Ok(Some(reply)) => sessions.push(JudgeSessionTail {
+                    slot,
+                    text: trim_chars(&reply.text, cfg.msg_max_chars),
+                    finished: reply.finished,
+                }),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        event = "judge.ctx_session_err",
+                        number = task.number(),
+                        slot = naming::slot_key(slot),
+                        error = %e,
+                        "Хвост сессии в контекст судьи не попал"
+                    );
+                }
+            }
+        }
+        let now = self.clock.now_ms();
+        let restart_recent_min = (now.saturating_sub(self.boot_ms) < 60 * 60_000)
+            .then_some((now.saturating_sub(self.boot_ms)) / 60_000);
+        JudgeContext {
+            board: board.board.clone(),
+            number: task.number(),
+            title: task.title().to_string(),
+            status: task.status(),
+            slot: task.stage_slot().unwrap_or(Slot::Dev),
+            silence_min: silence / 60_000,
+            idle,
+            judge_calls_no_progress: calls,
+            review_rounds: rounds,
+            branch: task.branch().map(|b| b.as_str().to_string()),
+            pr_url: task.pr().map(|p| p.as_str().to_string()),
+            restart_recent_min,
+            body,
+            comments,
+            sessions,
+            now_ms: now,
+            cap_point,
+        }
     }
 
     /// Один раунд пинга: мягкий — прямым промптом в сессию (мгновенное

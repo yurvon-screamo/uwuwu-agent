@@ -1,7 +1,9 @@
-//! Задачи: запись (write), чистка (clean, #1158) и вьюхи (views).
+//! Задачи: запись (write), чистка (clean, #1158), rename статуса канбана
+//! (board_status, #1447) и вьюхи (views).
 
 #[cfg(test)]
 mod analys_exit_gate_tests;
+pub mod board_status;
 pub mod clean;
 #[cfg(test)]
 mod edit_guard_tests;

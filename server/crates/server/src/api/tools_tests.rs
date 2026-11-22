@@ -658,6 +658,12 @@ async fn fast_track_from_draft_and_todo() {
             boards: vec![("uwuwu".to_string(), "Задачи uwuwu".to_string())],
             clock: Arc::new(SystemClock),
         }),
+        status: Arc::new(uwuwu_usecase::BoardStatusRenameUseCase {
+            repo: memory.clone() as Arc<dyn uwuwu_usecase::BoardStatusRepo>,
+            journal: Arc::new(super::test_support::StubPreImages),
+            boards: vec![("uwuwu".to_string(), "Задачи uwuwu".to_string())],
+            clock: Arc::new(SystemClock),
+        }),
         wiki,
         sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(sessions)),
         search: Arc::new(SearchUseCase { semantic: None }),

@@ -161,6 +161,75 @@ pub struct Config {
     /// Автокомпакт вечных сессий ботов (#1221); нет секции — off.
     #[serde(default)]
     pub compact: Option<CompactCfg>,
+    /// Судья конвейера (#1364); нет секции — off (opt-in владельца).
+    #[serde(default)]
+    pub judge: Option<JudgeToml>,
+}
+
+/// Секция `[judge]` (#1364): порты вызовов и тримы контекста. Ключ —
+/// env `GEMINI_API_KEY` (секреты не в конфиге).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct JudgeToml {
+    /// Opt-in: без явного true контур судьи не работает.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Модель decision API (дефолт кода — gemini-decision-1).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Интервал повторных вызовов на одной тишине (ms).
+    #[serde(default = "default_judge_every_ms")]
+    pub every_ms: u64,
+    /// Гвард сверху судьи: вызовов без смены статуса до принудительного
+    /// паркинга (слово владельца «порог 3»).
+    #[serde(default = "default_judge_escalate_after")]
+    pub escalate_after: u32,
+    #[serde(default = "default_judge_comments_tail")]
+    pub comments_tail: usize,
+    #[serde(default = "default_judge_comment_chars")]
+    pub comment_max_chars: usize,
+    #[serde(default = "default_judge_body_chars")]
+    pub body_max_chars: usize,
+    #[serde(default = "default_judge_msg_chars")]
+    pub msg_max_chars: usize,
+    /// Полоса вызовов (в минуту) — квоты тира волны (#1362/#1363).
+    #[serde(default = "default_judge_rpm")]
+    pub rpm_limit: usize,
+}
+
+fn default_judge_every_ms() -> u64 {
+    2 * 60 * 60_000
+}
+fn default_judge_escalate_after() -> u32 {
+    3
+}
+fn default_judge_comments_tail() -> usize {
+    4
+}
+fn default_judge_comment_chars() -> usize {
+    1500
+}
+fn default_judge_body_chars() -> usize {
+    6000
+}
+fn default_judge_msg_chars() -> usize {
+    800
+}
+fn default_judge_rpm() -> usize {
+    5
+}
+
+impl From<JudgeToml> for uwuwu_usecase::JudgeCfg {
+    fn from(j: JudgeToml) -> Self {
+        uwuwu_usecase::JudgeCfg {
+            enabled: j.enabled,
+            every_ms: j.every_ms,
+            escalate_after: j.escalate_after,
+            comments_tail: j.comments_tail,
+            comment_max_chars: j.comment_max_chars,
+            body_max_chars: j.body_max_chars,
+            msg_max_chars: j.msg_max_chars,
+        }
+    }
 }
 
 fn default_poll() -> u64 {

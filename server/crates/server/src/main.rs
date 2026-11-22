@@ -20,8 +20,10 @@ mod gitea;
 #[cfg(test)]
 mod gitea_tests;
 mod github;
+mod judge;
 mod mockhub;
 mod prgate;
+mod rename_journal;
 mod s3;
 mod search;
 mod state;
@@ -268,6 +270,11 @@ async fn run(
     let clean_journals = Arc::new(clean_journal::JsonCleanJournals::load(
         cfg.state_path(&config_path).with_file_name("undo.json"),
     ));
+    // write-ahead pre-image журнал rename статуса (#1447): рядом со state.json
+    let rename_preimages = Arc::new(rename_journal::JsonStatusPreImages::load(
+        cfg.state_path(&config_path)
+            .with_file_name("rename-pre-image.json"),
+    ));
     let spawn_models = Arc::new(match cfg.executor.models.as_ref() {
         Some(raw) => {
             let mut map = std::collections::HashMap::new();
@@ -282,6 +289,34 @@ async fn run(
         }
         None => uwuwu_usecase::SpawnModels::canonical(),
     });
+    // Судья (#1364): opt-in владельца ([judge].enabled) + живой ключ.
+    // Нет ключа — громкий warn и контур off (тик живёт старой механикой).
+    let (judge, judge_cfg): (
+        Option<Arc<dyn uwuwu_usecase::DecisionJudge>>,
+        uwuwu_usecase::JudgeCfg,
+    ) = match cfg.judge.as_ref() {
+        Some(j) if j.enabled => {
+            let judge_cfg = uwuwu_usecase::JudgeCfg::from(j.clone());
+            match crate::judge::GeminiJudge::from_env(j.model.clone(), j.rpm_limit, clock.clone()) {
+                Some(judge) => {
+                    tracing::info!(
+                        event = "judge.enabled",
+                        model = j.model.as_deref().unwrap_or("gemini-decision-1"),
+                        "Судья включена: сталл- и кап-точки под вердиктом"
+                    );
+                    (Some(Arc::new(judge)), judge_cfg)
+                }
+                None => {
+                    tracing::warn!(
+                        event = "judge.no_key",
+                        "Судья включена в конфиге, но GEMINI_API_KEY нет — контур off"
+                    );
+                    (None, judge_cfg)
+                }
+            }
+        }
+        _ => (None, uwuwu_usecase::JudgeCfg::default()),
+    };
     let usecase = Arc::new(TickUseCase {
         board: board.clone(),
         sessions: sessions.clone(),
@@ -290,6 +325,8 @@ async fn run(
         state: state.clone(),
         models: spawn_models.clone(),
         boot_ms: clock.now_ms(),
+        judge,
+        judge_cfg,
     });
 
     let shared: Arc<std::sync::RwLock<TickOutcome>> = Arc::default();
@@ -410,6 +447,17 @@ async fn run(
                     as Arc<dyn uwuwu_usecase::CleanBoardRepo>,
             },
             journals: clean_journals,
+            boards: boards_cfg.clone(),
+            clock: clock.clone(),
+        }),
+        status: Arc::new(uwuwu_usecase::BoardStatusRenameUseCase {
+            // rename статуса канбана (#1447): driver-независимо, как clean
+            repo: match &memory_hub {
+                Some(mem) => mem.clone() as Arc<dyn uwuwu_usecase::BoardStatusRepo>,
+                None => github_hub.clone().expect("gh-хаб собран при driver=github")
+                    as Arc<dyn uwuwu_usecase::BoardStatusRepo>,
+            },
+            journal: rename_preimages,
             boards: boards_cfg.clone(),
             clock: clock.clone(),
         }),

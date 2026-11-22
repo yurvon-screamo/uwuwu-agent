@@ -49,13 +49,18 @@ pub use pipeline::{
     ANALYST_WAVE_MARKER, STAGE_PROMPTS,
 };
 pub use ports::{
-    AgentSessionGateway, AppendDocOutcome, AssistantReply, Clock, CommentRef, DreamerMark,
-    FmMutator, IssueDigest, IssueFieldStore, IssueIndexSource, IssueView, Liveness, PrGateway,
-    PrState, SessionInfo, SessionSpec, TaskBoardRepo, TickStateStore, WikiRepo,
+    AgentSessionGateway, AppendDocOutcome, AssistantReply, Clock, CommentRef, DecisionJudge,
+    DreamerMark, FmMutator, IssueDigest, IssueFieldStore, IssueIndexSource, IssueView, JudgeCfg,
+    JudgeContext, JudgeSessionTail, Liveness, PrGateway, PrState, SessionInfo, SessionSpec,
+    TaskBoardRepo, TickStateStore, WikiRepo,
 };
 pub use router::SessionRouter;
 pub use search::{sync_allowed, SearchHit, SearchUseCase, SemanticBackend};
 pub use spawn_models::SpawnModels;
+pub use tasks::board_status::{
+    BoardStatusRenameUseCase, BoardStatusRepo, RenameReport, StatusFieldImage, StatusOption,
+    StatusPreImage, StatusPreImageStore, VERIFY_ATTEMPTS,
+};
 pub use tasks::body_hash;
 pub use tasks::clean::{
     CleanBoardRepo, CleanExecReport, CleanJournal, CleanJournalStore, CleanRow, CleanRowReport,
