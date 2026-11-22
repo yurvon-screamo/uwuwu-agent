@@ -88,7 +88,10 @@ describe("ci.yml — контракт автодеплоя uwuwu-server (uwuwu#1
     // Агрегатор держит required-чек branch protection: если добавить deploy
     // в needs, красный деплой начнёт блокировать мержи (а skipped-deploy
     // потребует allowed-семантики) — регресс контракта ADR-063.
-    expect(lastMapping(aggregator, "needs")).toBe("[changes, fmt, rust, plugins, qlty]")
+    // stand-shell (#1304) — тест-контур стенда, в деплой-гейт не входит.
+    expect(lastMapping(aggregator, "needs")).toBe(
+      "[changes, fmt, rust, plugins, stand-shell, qlty]",
+    )
   })
 
   test("RAILWAY_TOKEN берётся только из secrets — токен не попадает в код", () => {
