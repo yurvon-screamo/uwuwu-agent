@@ -11,9 +11,7 @@ use lancedb::arrow::arrow_array::{
 };
 use lancedb::arrow::arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lancedb::connection::ConnectBuilder;
-use lancedb::index::scalar::{FtsIndexBuilder, FullTextSearchQuery};
-use lancedb::index::{Index, IndexType};
-use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::query::ExecutableQuery;
 use lancedb::table::Table;
 use lancedb::Connection;
 use std::collections::HashMap;
@@ -56,7 +54,8 @@ pub struct LanceSemanticBackend {
     /// Задачи для индекса (юзер-стори «по вики/задачам/опыту»); None — стенд.
     issues: Option<Arc<dyn uwuwu_usecase::IssueIndexSource>>,
     db: Connection,
-    embeddings: Arc<dyn Embedder>,
+    /// Источник векторов (Gemini-клиент); query-модуль зовёт embed_query.
+    pub(super) embeddings: Arc<dyn Embedder>,
 }
 
 /// Размерность векторной колонки живой таблицы (FixedSizeList list_size).
@@ -157,12 +156,9 @@ impl LanceSemanticBackend {
         Ok(this)
     }
 
-    /// FTS-индекс на тексте чанков: без него полнотекст молча пуст —
-    /// ланс не даёт брутфорс-план на колонке без инвертированного индекса
-    /// (корень «мёртвого полнотекста» #1473, квото-независимый). Создаётся
-    /// один раз при открытии; дописанные после индексации строки покрывает
-    /// flat-путь ланса. Отказ создания не роняет открытие: семантика и
-    /// sync живут, полнотекст честно пуст до следующего бута (warn).
+    /// FTS-индекс на тексте чанков (детали и гард — search/fts.rs): без него
+    /// полнотекст молча пуст (#1473). Отказ не роняет открытие: семантика
+    /// и sync живут, полнотекст честно пуст до следующего бута (warn).
     async fn ensure_fts_index(&self) {
         let table = match self.chunks().await {
             Ok(table) => table,
@@ -175,38 +171,13 @@ impl LanceSemanticBackend {
                 return;
             }
         };
-        let has_fts = match table.list_indices().await {
-            Ok(indices) => indices.iter().any(|i| {
-                matches!(i.index_type, IndexType::FTS) && i.columns.iter().any(|c| c == "text")
-            }),
-            Err(e) => {
-                tracing::warn!(
-                    event = "semantic.fts_index_skip",
-                    error = %e,
-                    "FTS-индекс не проверен: список индексов недоступен"
-                );
-                return;
-            }
-        };
-        if has_fts {
-            return;
-        }
-        if let Err(e) = table
-            .create_index(&["text"], Index::FTS(FtsIndexBuilder::default()))
-            .execute()
-            .await
-        {
+        if let Err(e) = super::fts::ensure_fts_index(&table).await {
             tracing::warn!(
                 event = "semantic.fts_index_failed",
                 error = %e,
                 "FTS-индекс не создан — полнотекст пуст до следующего бута"
             );
-            return;
         }
-        tracing::info!(
-            event = "semantic.fts_index_created",
-            "FTS-индекс создан — полнотекст жив"
-        );
     }
 
     async fn ensure_tables(&self) -> UsecaseResult<()> {
@@ -228,7 +199,8 @@ impl LanceSemanticBackend {
         Ok(())
     }
 
-    async fn chunks(&self) -> UsecaseResult<Table> {
+    /// Таблица чанков; query-модуль читает её для векторного/FTS-поиска.
+    pub(super) async fn chunks(&self) -> UsecaseResult<Table> {
         self.table_named(CHUNKS).await
     }
 
@@ -466,42 +438,6 @@ impl LanceSemanticBackend {
         Ok(DocSyncOutcome::Reindexed)
     }
 
-    /// Слаги чанков, совпавших с токеном (BM25 по FTS-индексу «текст»).
-    /// Отказ FTS не молчит (#1473): Err пробрасывается в usecase — рендер
-    /// «— недоступен» в секции полнотекста, причина видна в выдаче.
-    async fn token_hits(
-        &self,
-        table: &Table,
-        token: &str,
-        top: usize,
-    ) -> UsecaseResult<std::collections::HashSet<String>> {
-        let q = FullTextSearchQuery::new(token.to_string());
-        let stream = table
-            .query()
-            .full_text_search(q)
-            .limit(top * 3)
-            .execute()
-            .await
-            .map_err(|e| {
-                tracing::warn!(event = "semantic.fts_unavailable", error = %e, "FTS недоступен");
-                err(format!("fts: {e}"))
-            })?;
-        use futures::stream::StreamExt;
-        let mut stream = stream;
-        let mut hits = std::collections::HashSet::new();
-        while let Some(batch) = stream.next().await {
-            let batch = batch.map_err(|e| err(format!("fts stream: {e}")))?;
-            if let Some(col) = batch.column_by_name("slug") {
-                if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
-                    for i in 0..arr.len() {
-                        hits.insert(arr.value(i).to_string());
-                    }
-                }
-            }
-        }
-        Ok(hits)
-    }
-
     /// Фаза задач синка: дайджесты recent_issues до остатка бюджета тика.
     async fn sync_issues(
         &self,
@@ -530,65 +466,14 @@ impl LanceSemanticBackend {
 
 #[async_trait]
 impl SemanticBackend for LanceSemanticBackend {
+    /// Векторный топ-k; мясо — search/query.rs (сплит read-пути #1473).
     async fn search(&self, query: &str, top: usize) -> UsecaseResult<Vec<(f32, String)>> {
-        let qv = self.embeddings.embed_query(query).await?;
-        let vq = self
-            .chunks()
-            .await?
-            .vector_search(qv.clone())
-            .map_err(|e| err(format!("vector build: {e}")))?;
-        let stream = vq
-            .limit(top * 3)
-            .execute()
-            .await
-            .map_err(|e| err(format!("vector: {e}")))?;
-        use futures::stream::StreamExt;
-        let mut stream = stream;
-        let mut best: HashMap<String, f32> = HashMap::new();
-        while let Some(batch) = stream.next().await {
-            let batch = batch.map_err(|e| err(format!("vstream: {e}")))?;
-            let slugs = batch
-                .column_by_name("slug")
-                .and_then(|c| c.as_any().downcast_ref::<LargeStringArray>());
-            let dists = batch
-                .column_by_name("_distance")
-                .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
-            if let (Some(s), Some(d)) = (slugs, dists) {
-                for i in 0..s.len() {
-                    let similarity = 1.0 - d.value(i);
-                    let e = best.entry(s.value(i).to_string()).or_insert(f32::MIN);
-                    if similarity > *e {
-                        *e = similarity;
-                    }
-                }
-            }
-        }
-        let mut out: Vec<(f32, String)> = best.into_iter().map(|(k, v)| (v, k)).collect();
-        out.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        out.truncate(top);
-        Ok(out)
+        super::query::vector_search(self, query, top).await
     }
 
+    /// BM25-полнотекст по токенам; мясо — search/query.rs.
     async fn fulltext(&self, tokens: &[String], top: usize) -> UsecaseResult<Vec<String>> {
-        let table = self.chunks().await?;
-        let mut per_token: Vec<std::collections::HashSet<String>> = Vec::new();
-        for token in tokens {
-            per_token.push(self.token_hits(&table, token, top).await?);
-        }
-        // AND-семантика токенов
-        let mut it = per_token.into_iter();
-        let Some(first) = it.next() else {
-            return Ok(Vec::new());
-        };
-        let mut inter: Vec<String> = first.into_iter().collect();
-        for set in it {
-            inter.retain(|s| set.contains(s));
-            if inter.is_empty() {
-                break;
-            }
-        }
-        inter.truncate(top);
-        Ok(inter)
+        super::query::fulltext(self, tokens, top).await
     }
 
     /// Исход синка одного носителя: проиндексирован / не изменился /

@@ -13,6 +13,12 @@ pub mod semantic_backend;
 #[path = "../../src/search/budget.rs"]
 pub mod budget;
 
+#[path = "../../src/search/fts.rs"]
+pub mod fts;
+
+#[path = "../../src/search/query.rs"]
+pub mod query;
+
 #[path = "../../src/search/maintenance.rs"]
 pub mod maintenance;
 

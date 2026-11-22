@@ -16,6 +16,14 @@ pub mod search {
     pub mod budget;
 
     #[allow(dead_code)]
+    #[path = "../../src/search/fts.rs"]
+    pub mod fts;
+
+    #[allow(dead_code)]
+    #[path = "../../src/search/query.rs"]
+    pub mod query;
+
+    #[allow(dead_code)]
     #[path = "../../src/search/semantic.rs"]
     pub mod semantic;
 
