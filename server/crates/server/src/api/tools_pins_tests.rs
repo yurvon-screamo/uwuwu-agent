@@ -306,7 +306,7 @@ async fn status_wait_edit_reads_back_canon_wait() {
     )
     .await
     .expect("edit Wait");
-    assert_eq!(edited, "задача #1 обновлена");
+    assert_eq!(edited, "задача #1 обновлена, носитель подтверждает: «Wait»");
     let get = call(&tools, "task_get", json!({ "number": 1 }))
         .await
         .expect("get");
@@ -334,7 +334,7 @@ async fn status_weit_alias_sets_canon_wait() {
     )
     .await
     .expect("edit алиасом");
-    assert_eq!(edited, "задача #1 обновлена");
+    assert_eq!(edited, "задача #1 обновлена, носитель подтверждает: «Wait»");
     let get = call(&tools, "task_get", json!({ "number": 1 }))
         .await
         .expect("get");

@@ -116,16 +116,30 @@ impl<T> TtlCache<T> {
     }
 }
 
-/// Исход verify-after-write (#1235, семья #1213).
+/// Исход verify-after-write (#1235, семья #1213): доказательство —
+/// только свежее чтение носителя мимо кешей (#1437); echo мутации
+/// материал лога, не квитанции.
 enum VerifyOutcome {
-    /// Чтение подтвердило запись.
-    Ok,
+    /// Свежее чтение подтвердило запись; String — raw-имя статуса носителя.
+    Ok(String),
     /// Rate limit: ретраи не продолжаем — мутация принята GitHub,
     /// write-through сохранён (окно возможно-ложного кэша ограничено TTL).
     SkippedRateLimited,
-    /// Три чтения не подтвердили запись — громкий отказ + откат write-through.
+    /// Бюджет свежих чтений исчерпан без применения — read-лаг Projects v2
+    /// (минутного масштаба, проба #1236) или мутация не применилась.
+    /// Квитанция Unverified (success не заявляется), write-through держит
+    /// записанное до TTL; ловля dropped-записи — контрольное чтение
+    /// носителя агентом и сталл-детект конвейера.
     Mismatch,
 }
+
+/// Бюджет verify статусной записи (#1437): попыток и пауз между ними.
+/// Точечный GraphQL-рид (issue → projectItems → fieldValues) сходится
+/// ~2с (проба S1: 1.96–2.33с) — 5×1с покрывает измеренный разброс с
+/// запасом; цена квоты — один точечный рид на попытку (квотная
+/// дисциплина ADR-113 держится: полные снапшоты досок verify не тянет).
+const VERIFY_GQL_ATTEMPTS: usize = 5;
+const VERIFY_GQL_PAUSE_MS: u64 = 1000;
 
 /// Единый тег классификации в тексте отказа gql-транспорта: kind —
 /// «RATE_LIMITED» (Core/Secondary и GraphQL-лимит) или «PERMISSION»
@@ -577,29 +591,107 @@ impl GitHubHub {
         self.snap_cache.put(board, (rows, meta), now);
     }
 
-    /// Контрольное чтение после мутации статуса (семья #1213): ответ
-    /// мутации с искомым значением — быстрый путь без доп. запросов;
-    /// иначе до 3 чтений НОСИТЕЛЯ (мимо write-through — иначе verify
-    /// самоподтверждался бы собственной записью) с паузой 1 с.
-    /// Rate limit — ретраи не продолжаются (мутация принята GitHub);
-    /// сетевой сбой и рассогласование — полный цикл, дальше громкий отказ.
-    async fn verify_status(
+    /// Парс raw-статуса носителя с терминальной резолюцией (#1403):
+    /// None/пустое — строка без читаемого поля (None); Done терминален
+    /// сразу (state не читаем, бюджет REST); иначе state-резолюция
+    /// guard_status. Оба чтения гарда — wt (row_status) и свежее
+    /// (fresh_row_status, #1437) — отвечают одной семантикой.
+    async fn resolve_carrier_status(
+        &self,
+        number: u64,
+        raw: Option<String>,
+    ) -> UsecaseResult<Option<Status>> {
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        if raw.trim().is_empty() {
+            return Ok(None);
+        }
+        let parsed = uwuwu_usecase::parse_status(&raw);
+        if parsed == Status::Done {
+            return Ok(Some(Status::Done));
+        }
+        let closed = match self.issue_state_closed(number).await {
+            Ok(closed) => Some(closed),
+            Err(e) => {
+                tracing::warn!(
+                    event = "row_status.state_unreadable",
+                    number,
+                    error = %e,
+                    "state issue не читался — гард отвечает парсом поля (#1403)"
+                );
+                None
+            }
+        };
+        Ok(Some(guard_status(parsed, closed)))
+    }
+
+    /// Свежее чтение статуса строки носителя мимо обоих кешей (wt и
+    /// items-индекс) (#1437): точечный GraphQL — issue → projectItems →
+    /// fieldValues, конвергенция ~2с (проба S1 #1437: 1.96–2.33с против
+    /// 14–22с листа REST и «навсегда» слепого GET item, #1236). Raw-имя
+    /// Status на доске `board` + closed issue (терминальная резолюция
+    /// #1403 в том же запросе — второе чтение не нужно). None — строки
+    /// на этой доске нет.
+    async fn gql_issue_status(
         &self,
         board: &str,
         number: u64,
-        expected: Status,
-        confirmed: Option<String>,
-    ) -> VerifyOutcome {
-        if confirmed.as_deref() == Some(uwuwu_usecase::status_name(expected)) {
-            return VerifyOutcome::Ok;
+    ) -> UsecaseResult<Option<(String, Option<bool>)>> {
+        let meta = self.pv2.meta(board).await?;
+        let (owner, repo) = self
+            .repo
+            .split_once('/')
+            .ok_or_else(|| UsecaseError::Board(format!("repo: {}", self.repo)))?;
+        let data = self
+            .gql(
+                "query($owner:String!,$name:String!,$number:Int!){\
+                 repository(owner:$owner,name:$name){issue(number:$number){state \
+                 projectItems(first:10){nodes{project{number} \
+                 fieldValues(first:10){nodes{... on ProjectV2ItemFieldSingleSelectValue{name \
+                 field{... on ProjectV2SingleSelectField{name}}}}}}}}}}",
+                json!({ "owner": owner, "name": repo, "number": number }),
+            )
+            .await?;
+        let issue = &data["data"]["repository"]["issue"];
+        if issue.is_null() {
+            return Ok(None);
         }
-        for attempt in 0..3 {
-            if attempt > 0 {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let closed = Some(issue["state"] == "CLOSED");
+        for item in issue["projectItems"]["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if item["project"]["number"].as_u64() != Some(meta.project_number) {
+                continue;
             }
-            match self.pv2.fetch_status(board, number).await {
-                Ok(Some(raw)) if uwuwu_usecase::parse_status(&raw) == expected => {
-                    return VerifyOutcome::Ok;
+            let raw = item["fieldValues"]["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|v| v["field"]["name"] == "Status")
+                .and_then(|v| v["name"].as_str())
+                .unwrap_or_default()
+                .to_string();
+            return Ok(Some((raw, closed)));
+        }
+        Ok(None)
+    }
+
+    /// Контрольное чтение после мутации статуса (#1437): доказательство
+    /// применения — только точечный GraphQL-рид носителя мимо кешей;
+    /// echo мутации материал лога, не квитанции. Бюджет покрывает
+    /// измеренную конвергенцию ~2с (проба S1); исчерпание бюджета —
+    /// аномалия (лаг листа REST сюда не относится), громкий отказ.
+    async fn verify_status(&self, board: &str, number: u64, expected: Status) -> VerifyOutcome {
+        for attempt in 0..VERIFY_GQL_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(VERIFY_GQL_PAUSE_MS)).await;
+            }
+            match self.gql_issue_status(board, number).await {
+                Ok(Some((raw, _))) if uwuwu_usecase::parse_status(&raw) == expected => {
+                    return VerifyOutcome::Ok(raw);
                 }
                 Err(e) if is_rate_limited(&e) => return VerifyOutcome::SkippedRateLimited,
                 _ => {}
@@ -608,37 +700,33 @@ impl GitHubHub {
         VerifyOutcome::Mismatch
     }
 
-    /// Пост-мутационная гигиена кэша по исходу verify (код-ревью #1235
-    /// Common-3): write-through уже стоит — исход решает, остаётся ли он.
-    /// Ok/SkippedRateLimited → кэш держит записанное значение (окно
-    /// возможно-ложного значения при rate-limit ограничено TTL);
-    /// Mismatch → откат write-through (инвалидация) + громкий отказ —
-    /// не держим возможно-ложное значение дольше TTL wt (240 с, #1346;
-    /// семья #1213).
+    /// Пост-мутационная гигиена кэша по исходу verify (семья #1213/#1437):
+    /// Mismatch после бюджета — аномалия (конвергенция GraphQL ~2с,
+    /// проба S1): откат write-through (инвалидация всех кешей) + громкий
+    /// отказ — возможно-ложное значение не доживает TTL-окно.
     fn settle_write_through(
         &self,
         board: &str,
         number: u64,
-        outcome: VerifyOutcome,
+        outcome: &VerifyOutcome,
         status: Status,
     ) -> UsecaseResult<()> {
         match outcome {
-            VerifyOutcome::Ok => {}
+            VerifyOutcome::Ok(_) => {}
             VerifyOutcome::SkippedRateLimited => tracing::warn!(
                 event = "board.verify_skipped",
                 number,
                 to = %uwuwu_usecase::status_name(status),
-                "verify пропущен (rate limit): мутация принята GitHub, write-through сохранён"
+                "verify пропущен (rate limit): мутация принята GitHub, квитанция Unverified, write-through сохранён"
             ),
             VerifyOutcome::Mismatch => {
                 self.invalidate_snapshot(board);
                 self.status_cache.invalidate(&number.to_string());
-                // write-through Pv2Rest — тот же инвариант: возможно-ложное
-                // значение не доживает TTL-окно (ревью 1 Common-3)
                 self.pv2.invalidate_status(board, number);
                 return Err(UsecaseError::Board(format!(
-                    "статус #{number}: запись «{}» не подтвердилась чтением — \
-                     GitHub отдаёт лаг или мутация не применилась; не ретраить слепо",
+                    "статус #{number}: запись «{}» не подтвердилась свежим чтением \
+                     носителя — мутация не применилась или носитель аномален; \
+                     не ретраить слепо, сверь носитель",
                     uwuwu_usecase::status_name(status)
                 )));
             }
@@ -844,7 +932,13 @@ impl TaskBoardRepo for GitHubHub {
         Ok(self.snapshot(board).await?.0.clone())
     }
 
-    async fn set_status(&self, board: &str, number: u64, status: Status) -> UsecaseResult<()> {
+    async fn set_status(
+        &self,
+        board: &str,
+        number: u64,
+        status: Status,
+    ) -> UsecaseResult<uwuwu_usecase::StatusDelivery> {
+        use uwuwu_usecase::StatusDelivery;
         let name = uwuwu_usecase::status_name(status);
         // last-known статус строки — для ребра в логах (Low-2 код-ревью
         // #1235); источник — локальный статусный кеш, GraphQL не тратим
@@ -859,55 +953,55 @@ impl TaskBoardRepo for GitHubHub {
         // read-лаг Projects v2 минутного масштаба не виден.
         self.write_through_status(board, number, status);
         self.write_through_status_cache(number, status);
-        // verify-after-write (семья #1213): ответ мутации — быстрый путь,
-        // иначе до 3 чтений носителя; rate limit — ретраи не продолжаются.
-        let outcome = self.verify_status(board, number, status, confirmed).await;
-        self.settle_write_through(board, number, outcome, status)?;
+        // verify-after-write (#1437): доказательство — только точечный
+        // GraphQL-рид носителя мимо кешей; echo мутации материал лога.
+        let outcome = self.verify_status(board, number, status).await;
+        self.settle_write_through(board, number, &outcome, status)?;
         tracing::info!(
             event = "board.set_status",
             board,
             number,
             from = from.as_deref().unwrap_or("—"),
             to = %name,
-            "Статус строки обновлён и подтверждён чтением (from — last-known из кеша)"
+            confirmed_echo = confirmed.as_deref().unwrap_or("—"),
+            "Статусная запись: исход verify — в квитанции (from — last-known из кеша)"
         );
-        Ok(())
+        Ok(match outcome {
+            VerifyOutcome::Ok(actual) => StatusDelivery::Confirmed { actual },
+            // после settle сюда доходит только rate-limit (Mismatch — Err);
+            // success не заявляется — квитанция честно Unverified
+            VerifyOutcome::SkippedRateLimited | VerifyOutcome::Mismatch => {
+                StatusDelivery::Unverified {
+                    reason: "rate limit GraphQL — подтверждение не выполнено".into(),
+                }
+            }
+        })
     }
 
     async fn row_status(&self, board: &str, number: u64) -> UsecaseResult<Option<Status>> {
         // Pv2 REST (#1236): гард канона edit() больше не зависит от
         // GraphQL-бакета; project-фильтр — индекс этой доски (прочая
         // привязка строки — не наша строка, Low-1 код-ревью #1235)
-        match self.pv2.read_status(board, number).await? {
-            // Status-значения на носителе нет (строка не на доске /
-            // поле не задано / read-лаг); непустое непарсящееся — Some(Empty)
-            None => Ok(None),
-            Some(raw) if raw.trim().is_empty() => Ok(None),
-            Some(raw) => {
-                let parsed = uwuwu_usecase::parse_status(&raw);
-                if parsed == Status::Done {
-                    // поле уже терминально — state не читаем (бюджет REST)
-                    return Ok(Some(Status::Done));
-                }
-                // Терминальная резолюция (#1403): issue, закрытый мимо
-                // task_close, терминален независимо от отставшего поля —
-                // гард edit() режет фантомные переходы громкой канон-ошибкой
-                // вместо тихой записи в закрытый issue
-                let closed = match self.issue_state_closed(number).await {
-                    Ok(closed) => Some(closed),
-                    Err(e) => {
-                        tracing::warn!(
-                            event = "row_status.state_unreadable",
-                            number,
-                            error = %e,
-                            "state issue не читался — гард отвечает парсом поля (#1403)"
-                        );
-                        None
-                    }
-                };
-                Ok(Some(guard_status(parsed, closed)))
-            }
+        let raw = self.pv2.read_status(board, number).await?;
+        self.resolve_carrier_status(number, raw).await
+    }
+
+    async fn fresh_row_status(&self, board: &str, number: u64) -> UsecaseResult<Option<Status>> {
+        // Свежее чтение носителя мимо обоих кешей (#1437): точечный
+        // GraphQL-рид (~2с конвергенция, проба S1) — материал
+        // идемпотентного гарда edit(); state в том же запросе даёт
+        // терминальную резолюцию #1403 без второго чтения.
+        let Some((raw, closed)) = self.gql_issue_status(board, number).await? else {
+            return Ok(None);
+        };
+        if raw.trim().is_empty() {
+            return Ok(None);
         }
+        let parsed = uwuwu_usecase::parse_status(&raw);
+        if parsed == Status::Done {
+            return Ok(Some(Status::Done));
+        }
+        Ok(Some(guard_status(parsed, closed)))
     }
 
     async fn row_exists(&self, board: &str, number: u64) -> UsecaseResult<bool> {
@@ -1681,7 +1775,8 @@ mod tests {
     #[test]
     fn settle_ok_keeps_write_through() {
         let hub = hub_after_write_through("B", 7, Status::InProgress);
-        hub.settle_write_through("B", 7, VerifyOutcome::Ok, Status::InProgress)
+        let outcome = VerifyOutcome::Ok("In Progress".to_string());
+        hub.settle_write_through("B", 7, &outcome, Status::InProgress)
             .expect("Ok — кэш не трогается");
         let snap = hub
             .snap_cache
@@ -1702,12 +1797,12 @@ mod tests {
     #[test]
     fn settle_rate_limit_skip_keeps_write_through() {
         // RATE_LIMITED: write-through сохраняем — окно возможно-ложного
-        // значения ограничено TTL, шуметь ошибкой на бюджетный отказ не надо
+        // значения ограничено TTL, квитанция честно Unverified (#1437)
         let hub = hub_after_write_through("B", 7, Status::InProgress);
         hub.settle_write_through(
             "B",
             7,
-            VerifyOutcome::SkippedRateLimited,
+            &VerifyOutcome::SkippedRateLimited,
             Status::InProgress,
         )
         .expect("skip — не ошибка");
@@ -1719,11 +1814,13 @@ mod tests {
 
     #[test]
     fn settle_mismatch_rolls_back_write_through_and_errors() {
-        // Деликатная ветка: «success без эффекта» не должен держать ложный
-        // статус в кэше 60–120 с (#1213-семья, код-ревью Common-3)
+        // Бюджет verify на GraphQL-риде покрывает измеренную конвергенцию
+        // ~2с (проба S1 #1437) — исчерпание бюджета = аномалия: «success
+        // без эффекта» не должен держать ложный статус в кэше (#1213-
+        // семья, код-ревью Common-3) — откат + громкий отказ
         let hub = hub_after_write_through("B", 7, Status::InProgress);
         let err = hub
-            .settle_write_through("B", 7, VerifyOutcome::Mismatch, Status::InProgress)
+            .settle_write_through("B", 7, &VerifyOutcome::Mismatch, Status::InProgress)
             .expect_err("mismatch — громкая ошибка");
         assert!(
             err.to_string().contains("не подтвердилась"),

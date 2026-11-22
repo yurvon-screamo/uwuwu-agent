@@ -536,11 +536,26 @@ impl ToolHub {
         if patch.is_empty() {
             return Err("пустой патч: укажи хотя бы одно поле".into());
         }
-        self.writer
+        // Честная квитанция статусной записи (#1437): confirmed — носитель
+        // подтвердил свежим чтением; unverified — GitHub принял, применения
+        // свежие чтения не показали (лаг листа / rate limit): success не
+        // заявляется, агенту предписано контрольное чтение НОСИТЕЛЯ.
+        let receipt = self
+            .writer
             .edit(project, number, patch)
             .await
             .map_err(|e| e.to_string())?;
-        ok_text(format!("задача #{number} обновлена"))
+        ok_text(match receipt.status {
+            Some(uwuwu_usecase::StatusDelivery::Confirmed { actual }) => {
+                format!("задача #{number} обновлена, носитель подтверждает: «{actual}»")
+            }
+            Some(uwuwu_usecase::StatusDelivery::Unverified { reason }) => format!(
+                "задача #{number}: статус принят GitHub, чтение носителя НЕ подтвердило \
+                 ({reason}) — контрольное чтение НОСИТЕЛЯ (gh, доска) обязателен, \
+                 слепой повтор не запускать"
+            ),
+            None => format!("задача #{number} обновлена"),
+        })
     }
 
     async fn task_claim(&self, args: &Value) -> Result<Value, String> {
