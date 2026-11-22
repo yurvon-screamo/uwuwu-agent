@@ -132,8 +132,18 @@ enum VerifyOutcome {
     Fail(String),
 }
 
-/// Чистая сверка одной поверхности (юнит-пины гварда).
-fn verify_surface(expected: &[StatusOption], got: &[StatusOption]) -> VerifyOutcome {
+/// Чистая сверка одной поверхности (юнит-пины гварда). Дискриминация по
+/// тройке (pre, expected, got): набор по id цел; имя опции — ожидаемое
+/// новое (Ok-фактор), исходное старое (Lag-фактор: read-лаг носителя) или
+/// третье/искажённое (Fail: конкурентный писатель или подмена). Оформление
+/// (color/description) сверяется только там, где поверхность их несёт
+/// (payload мутации; REST-каталог отдаёт id+name — expected передаётся
+/// names-only, pre тоже).
+fn verify_surface(
+    pre: &[StatusOption],
+    expected: &[StatusOption],
+    got: &[StatusOption],
+) -> VerifyOutcome {
     // id-набор цел? (потеря/подмена опций — класс инцидента)
     let missing: Vec<&str> = expected
         .iter()
@@ -157,16 +167,45 @@ fn verify_surface(expected: &[StatusOption], got: &[StatusOption]) -> VerifyOutc
             extra.join(", ")
         ));
     }
-    // имена/оформление: цело → Ok; ещё старые → лаг
-    let all_match = expected.iter().all(|e| {
-        got.iter().any(|g| {
-            g.id == e.id && g.name == e.name && g.color == e.color && g.description == e.description
-        })
-    });
-    if all_match {
-        VerifyOutcome::Ok
-    } else {
+    // per-option: новое имя → Ok-фактор; старое (pre-image) → Lag-фактор;
+    // третье/искажённое → немедленный Fail. Оформление — exact-match.
+    let mut lagged = false;
+    for e in expected {
+        let g = got
+            .iter()
+            .find(|g| g.id == e.id)
+            .expect("id присутствует — проверено выше");
+        if g.name != e.name {
+            let pre_name = pre
+                .iter()
+                .find(|p| p.id == e.id)
+                .map(|p| p.name.as_str())
+                .unwrap_or_default();
+            if g.name != pre_name {
+                return VerifyOutcome::Fail(format!(
+                    "option \"{}\" reports unexpected name \"{}\" (expected \"{}\", \
+                     was \"{}\") — concurrent writer or corrupted carrier response",
+                    e.name, g.name, e.name, pre_name
+                ));
+            }
+            lagged = true;
+        }
+        // оформление: сравнение только там, где pre-image его знал
+        // (None не выдумывали и не сравниваем; известное — exact-match)
+        if (e.color.is_some() && g.color != e.color)
+            || (e.description.is_some() && g.description != e.description)
+        {
+            return VerifyOutcome::Fail(format!(
+                "option \"{}\" lost its styling in carrier response (color/description \
+                 changed) — payload does not confirm the new state",
+                e.name
+            ));
+        }
+    }
+    if lagged {
         VerifyOutcome::Lag
+    } else {
+        VerifyOutcome::Ok
     }
 }
 
@@ -267,9 +306,23 @@ impl BoardStatusRenameUseCase {
         let (from, to) = validate_names(from, to)?;
         let board = self.board_of(project)?;
         let flow = self.pre_image(&board, &from, &to).await?;
-        // Мутация: дословный набор, одно имя.
+        // Мутация: дословный набор, одно имя. Отказ носителя (в т.ч.
+        // транспортный/строгий parse payload) мог оставить мутацию
+        // применённой — текст обязан звать к pre-image журналу.
         let expected = expected_options(&flow.image.options, &flow.option_id, &to);
-        let payload = self.repo.rename(&flow.image, &flow.option_id, &to).await?;
+        let payload = self
+            .repo
+            .rename(&flow.image, &flow.option_id, &to)
+            .await
+            .map_err(|e| {
+                UsecaseError::Board(format!(
+                    "RENAME MUTATION FAILED on board \"{}\": {e}. If the mutation \
+                     actually applied, compare the carrier with the pre-image journal \
+                     BEFORE any rollback: {}",
+                    flow.board,
+                    self.journal.path_hint()
+                ))
+            })?;
         // Post-verify (мимо кэшей): payload → каталог (окно попыток на
         // read-лаг) → непустота fieldValues.
         self.repo.invalidate_meta(&board);
@@ -336,11 +389,34 @@ impl BoardStatusRenameUseCase {
         expected: &[StatusOption],
         payload: &[StatusOption],
     ) -> UsecaseResult<(HashMap<u64, Option<String>>, bool)> {
-        if let VerifyOutcome::Fail(reason) = verify_surface(expected, payload) {
-            return Err(self.verify_failed(&flow.board, reason));
+        // payload: носитель обязан подтвердить РОВНО новое состояние —
+        // старые имена/искажения здесь не лаг (ответ post-write), а
+        // ненадёжное подтверждение = громкий отказ (НФТ: молчаливая
+        // потеря запрещена); оформление payload единственный носит.
+        match verify_surface(&flow.image.options, expected, payload) {
+            VerifyOutcome::Ok => {}
+            VerifyOutcome::Fail(reason) => return Err(self.verify_failed(&flow.board, reason)),
+            VerifyOutcome::Lag => {
+                return Err(self.verify_failed(
+                    &flow.board,
+                    "mutation payload does not reflect the new state (old/mismatched \
+                     names in carrier response)"
+                        .into(),
+                ))
+            }
         }
-        // каталог REST не несёт color/description — сверка по id+name
-        // (оформление проверено по payload'у мутации)
+        // каталог REST не несет color/description — сверка по id+name
+        // против pre-image (лаг = старое имя; третье имя = отказ)
+        let pre_names_only: Vec<StatusOption> = flow
+            .image
+            .options
+            .iter()
+            .map(|o| StatusOption {
+                color: None,
+                description: None,
+                ..o.clone()
+            })
+            .collect();
         let expected_names_only: Vec<StatusOption> = expected
             .iter()
             .map(|o| StatusOption {
@@ -365,7 +441,7 @@ impl BoardStatusRenameUseCase {
                     description: None,
                 })
                 .collect();
-            match verify_surface(&expected_names_only, &as_options) {
+            match verify_surface(&pre_names_only, &expected_names_only, &as_options) {
                 VerifyOutcome::Ok => break,
                 VerifyOutcome::Fail(reason) => return Err(self.verify_failed(&flow.board, reason)),
                 VerifyOutcome::Lag if attempt + 1 == VERIFY_ATTEMPTS => {

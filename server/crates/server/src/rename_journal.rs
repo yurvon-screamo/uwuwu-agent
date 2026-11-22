@@ -25,7 +25,10 @@ impl JsonStatusPreImages {
     pub fn load(path: PathBuf) -> Self {
         // повреждённый файл НЕ глотается молча (ревью #1158 Low-2):
         // pre-image — safety-net rename, тихая потеря снимка недопустима;
-        // стартуем пустым с громкой строкой в логе
+        // стартуем пустым с громкой строкой в логе. NotFound — норма
+        // (первый запуск / ещё ни одного rename); прочая IO-ошибка чтения —
+        // громкий warn (нечитанный файл следующий put перезапишет —
+        // restore-материал теряется, владелец должен знать; ревью #1447 Low-2)
         let file = match std::fs::read_to_string(&path) {
             Ok(raw) => match serde_json::from_str::<PreImageFile>(&raw) {
                 Ok(f) => f,
@@ -41,8 +44,17 @@ impl JsonStatusPreImages {
                     PreImageFile::default()
                 }
             },
-            // нет файла — норма (первый запуск / ещё ни одного rename)
-            Err(_) => PreImageFile::default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => PreImageFile::default(),
+            Err(e) => {
+                tracing::warn!(
+                    event = "rename_preimage.unreadable",
+                    path = %path.display(),
+                    error = %e,
+                    "rename-pre-image.json не читается (IO) — последний pre-image \
+                     недоступен до первой записи; следующий rename перезапишет файл"
+                );
+                PreImageFile::default()
+            }
         };
         Self {
             path,

@@ -476,3 +476,56 @@ fn histogram_counts_unknown_names_under_placeholder() {
     assert_eq!(h.get("(unknown)"), Some(&1));
     assert_eq!(h.get("Draft"), Some(&0));
 }
+
+/// Ревью #1447 Common-1: искажённое (третье) имя в контрольном каталоге —
+/// НЕ лаг (лаг = ровно старое имя из pre-image), а громкий отказ.
+#[tokio::test]
+async fn catalog_corrupted_name_refuses_not_lags() {
+    let (usecase, repo) = uc(FakeRepo::new(sample_options(), sample_dist()));
+    // конкурентный писатель переименовал соседнюю опцию Beta → «Zeta»
+    let mut corrupted = sample_options();
+    corrupted[1].name = "Zeta".into();
+    *repo.stale_catalog.lock().expect("lock") = vec![corrupted; VERIFY_ATTEMPTS];
+    let err = usecase
+        .rename("uwuwu", "Wait", "Тест")
+        .await
+        .expect_err("fail");
+    assert!(err.to_string().contains("unexpected name"), "{}", err);
+    assert!(err.to_string().contains("concurrent writer"), "{}", err);
+}
+
+/// Ревью #1447 Common-2a: payload со старыми именами (носитель не подтвердил
+/// новое состояние) — отказ, не тихий проход.
+#[tokio::test]
+async fn payload_with_old_names_refuses() {
+    let (usecase, repo) = uc(FakeRepo::new(sample_options(), sample_dist()));
+    *repo.payload_override.lock().expect("lock") = Some(sample_options());
+    let err = usecase
+        .rename("uwuwu", "Wait", "Тест")
+        .await
+        .expect_err("fail");
+    assert!(
+        err.to_string().contains("does not reflect the new state"),
+        "{}",
+        err
+    );
+}
+
+/// Ревью #1447 Common-2b: payload потерял оформление (color известный pre-image
+/// пропал) — отказ: оформление проверяется ровно там, где оно известно.
+#[tokio::test]
+async fn payload_lost_styling_refuses() {
+    let (usecase, repo) = uc(FakeRepo::new(sample_options(), sample_dist()));
+    let mut stripped = vec![
+        FakeRepo::opt("a1", "Draft", Some("GRAY")),
+        FakeRepo::opt("b2", "Тест", None), // BLUE потерян
+        FakeRepo::opt("c3", "Done", None),
+    ];
+    let _ = &mut stripped;
+    *repo.payload_override.lock().expect("lock") = Some(stripped);
+    let err = usecase
+        .rename("uwuwu", "Wait", "Тест")
+        .await
+        .expect_err("fail");
+    assert!(err.to_string().contains("lost its styling"), "{}", err);
+}

@@ -1572,30 +1572,37 @@ const STATUS_RENAME_MUTATION: &str = r#"
   }"#;
 
 /// Опции из gql-ответа (id/name обязательны; color/description —
-/// непустые строки, пустые → None: носитель отдаёт "").
-fn parse_status_options(raw: &serde_json::Value) -> Vec<uwuwu_usecase::StatusOption> {
-    raw.as_array()
-        .map(|list| {
-            list.iter()
-                .filter_map(|o| {
-                    let id = o["id"].as_str()?;
-                    let name = o["name"].as_str()?;
-                    if id.is_empty() || name.is_empty() {
-                        return None;
-                    }
-                    let s = |v: &serde_json::Value| {
-                        v.as_str().map(str::to_string).filter(|x| !x.is_empty())
-                    };
-                    Some(uwuwu_usecase::StatusOption {
-                        id: id.to_string(),
-                        name: name.to_string(),
-                        color: s(&o["color"]),
-                        description: s(&o["description"]),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+/// непустые строки, пустые → None). Строгий парс: запись без id/name —
+/// громкий отказ, НЕ тихий срез (усечённый pre-image → усечённый
+/// «дословный» payload → replace сносит выброшенные опции — тот механизм,
+/// против которого построена операция; ревью #1447 Common-3).
+fn parse_status_options(
+    raw: &serde_json::Value,
+) -> UsecaseResult<Vec<uwuwu_usecase::StatusOption>> {
+    let list = raw
+        .as_array()
+        .ok_or_else(|| UsecaseError::Board("Status field: options array missing".into()))?;
+    let mut out = Vec::with_capacity(list.len());
+    for o in list {
+        let id = o["id"].as_str().unwrap_or_default();
+        let name = o["name"].as_str().unwrap_or_default();
+        if id.is_empty() || name.is_empty() {
+            return Err(UsecaseError::Board(format!(
+                "Status option entry without id/name in carrier response \
+                 (truncated pre-read?): {:} entries read, offender: {}",
+                out.len(),
+                serde_json::to_string(o).unwrap_or_default()
+            )));
+        }
+        let s = |v: &serde_json::Value| v.as_str().map(str::to_string).filter(|x| !x.is_empty());
+        out.push(uwuwu_usecase::StatusOption {
+            id: id.to_string(),
+            name: name.to_string(),
+            color: s(&o["color"]),
+            description: s(&o["description"]),
+        });
+    }
+    Ok(out)
 }
 
 #[async_trait]
@@ -1615,20 +1622,22 @@ impl uwuwu_usecase::BoardStatusRepo for GitHubHub {
             .as_array()
             .and_then(|nodes| nodes.iter().find(|p| p["title"] == board))
             .ok_or_else(|| {
-                UsecaseError::Board(format!("проект «{board}» в projectsV2 {owner} не найден"))
+                UsecaseError::Board(format!(
+                    "project \"{board}\" not found in projectsV2 {owner}"
+                ))
             })?;
         let field = &project["field"];
         let field_node_id = field["id"]
             .as_str()
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
-                UsecaseError::Board(format!("доска «{board}»: Status-поле без node id"))
+                UsecaseError::Board(format!("board \"{board}\": Status field has no node id"))
             })?
             .to_string();
-        let options = parse_status_options(&field["options"]);
+        let options = parse_status_options(&field["options"])?;
         if options.is_empty() {
             return Err(UsecaseError::Board(format!(
-                "доска «{board}»: Status-поле без опций"
+                "board \"{board}\": Status field has no options"
             )));
         }
         Ok(uwuwu_usecase::StatusFieldImage {
@@ -1685,10 +1694,10 @@ impl uwuwu_usecase::BoardStatusRepo for GitHubHub {
             )
             .await?;
         let payload =
-            parse_status_options(&data["updateProjectV2Field"]["projectV2Field"]["options"]);
+            parse_status_options(&data["updateProjectV2Field"]["projectV2Field"]["options"])?;
         if payload.is_empty() {
             return Err(UsecaseError::Board(
-                "rename: носитель не отдал options в payload мутации (false-success?)".into(),
+                "rename: carrier returned no options in mutation payload (false-success?)".into(),
             ));
         }
         Ok(payload)
