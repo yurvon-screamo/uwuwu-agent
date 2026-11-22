@@ -57,6 +57,10 @@ pub use ports::{
 pub use router::SessionRouter;
 pub use search::{sync_allowed, SearchHit, SearchUseCase, SemanticBackend};
 pub use spawn_models::SpawnModels;
+pub use tasks::board_status::{
+    BoardStatusRenameUseCase, BoardStatusRepo, RenameReport, StatusFieldImage, StatusOption,
+    StatusPreImage, StatusPreImageStore, VERIFY_ATTEMPTS,
+};
 pub use tasks::body_hash;
 pub use tasks::clean::{
     CleanBoardRepo, CleanExecReport, CleanJournal, CleanJournalStore, CleanRow, CleanRowReport,
