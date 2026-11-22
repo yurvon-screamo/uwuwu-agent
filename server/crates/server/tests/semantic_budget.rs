@@ -9,60 +9,17 @@
 mod search;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use search::budget::{budget_day_now, budget_path, write_state, BudgetState, SYNC_DAILY_CAP};
+use search::budget::{
+    budget_day_now, budget_path, read_state, write_state, BudgetState, SYNC_DAILY_CAP,
+};
 use search::semantic::{Embedder, EMBED_MODEL_DIMS};
 use search::semantic_backend::LanceSemanticBackend;
-use uwuwu_usecase::{AppendDocOutcome, SemanticBackend, UsecaseResult, WikiRepo};
-
-struct FakeWiki {
-    docs: HashMap<String, (String, String)>,
-}
-
-#[async_trait]
-impl WikiRepo for FakeWiki {
-    async fn read_doc(&self, slug: &str) -> UsecaseResult<Option<String>> {
-        Ok(self.docs.get(slug).map(|(md, _)| md.clone()))
-    }
-
-    async fn list_docs(&self, prefix: &str) -> UsecaseResult<Vec<String>> {
-        Ok(self
-            .docs
-            .keys()
-            .filter(|slug| slug.starts_with(prefix))
-            .cloned()
-            .collect())
-    }
-
-    async fn doc_shas(&self) -> UsecaseResult<Vec<(String, String)>> {
-        Ok(self
-            .docs
-            .iter()
-            .map(|(slug, (_, sha))| (slug.clone(), sha.clone()))
-            .collect())
-    }
-
-    async fn write_doc(&self, _slug: &str, _content: &str, _message: &str) -> UsecaseResult<()> {
-        Ok(())
-    }
-
-    async fn append_doc(
-        &self,
-        _slug: &str,
-        _line: &str,
-        _message: &str,
-    ) -> UsecaseResult<AppendDocOutcome> {
-        Ok(AppendDocOutcome {
-            created: false,
-            lines: 0,
-        })
-    }
-}
+use search::support::{lance_dir, FakeWiki, TempDirGuard};
+use uwuwu_usecase::{SemanticBackend, UsecaseResult};
 
 /// Счётный мок-эмбеддер: считает вызовы embed_docs (доков) и суммарные
 /// тексты (чанков) — cost реиндекса ceil(чанков/38) считается в бекенде.
@@ -100,25 +57,6 @@ impl Embedder for CountingEmbedder {
     }
 }
 
-fn lance_dir() -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "uwuwu-semantic-budget-{}-{nanos}",
-        std::process::id()
-    ))
-}
-
-struct TempDirGuard(PathBuf);
-
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 const SMALL_MD: &str = "# Док\n\nКомпактный абзац — один чанк, cost = 1.";
 
 /// Тяжёлый док: 50 абзацев по ~1300 символов ≈ 50 чанков → cost = 2
@@ -153,7 +91,7 @@ async fn open_backend(
     wiki: FakeWiki,
     embedder: Arc<dyn Embedder>,
 ) -> (LanceSemanticBackend, TempDirGuard) {
-    let guard = TempDirGuard(lance_dir());
+    let guard = TempDirGuard(lance_dir("budget"));
     let backend = LanceSemanticBackend::open(guard.0.clone(), Arc::new(wiki), None, embedder)
         .await
         .expect("open lance backend");
@@ -193,7 +131,7 @@ async fn sync_spends_are_accounted_in_budget_file() {
     let changed = backend.sync_index(19).await.expect("sync ok");
     assert_eq!(changed, 3, "все три дока проиндексированы");
 
-    let state = search::budget::read_state(&budget_path(&dir.0));
+    let state = read_state(&budget_path(&dir.0));
     assert_eq!(state.day, budget_day_now());
     // 2 малых дока по 1 запросу + тяжёлый (50 чанков) = ceil(50/38) = 2 → 4.
     assert_eq!(
@@ -204,7 +142,7 @@ async fn sync_spends_are_accounted_in_budget_file() {
     // Повторный sync без изменений не тратит бюджет.
     let second = backend.sync_index(19).await.expect("resync ok");
     assert_eq!(second, 0);
-    let after = search::budget::read_state(&budget_path(&dir.0));
+    let after = read_state(&budget_path(&dir.0));
     assert_eq!(after.spent, 4, "неизменённый корпус бюджет не жжёт");
     assert_eq!(embedder.doc_calls(), 3);
 }
@@ -227,7 +165,7 @@ async fn stale_budget_day_resets_the_counter() {
     let changed = backend.sync_index(19).await.expect("sync ok");
 
     assert_eq!(changed, 3, "суточный резет возвращает sync к работе");
-    let state = search::budget::read_state(&budget_path(&dir.0));
+    let state = read_state(&budget_path(&dir.0));
     assert_eq!(state.day, budget_day_now());
     assert_eq!(state.spent, 4);
 }

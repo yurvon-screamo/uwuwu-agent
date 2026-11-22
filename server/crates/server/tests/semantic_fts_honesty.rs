@@ -6,6 +6,8 @@
 //!
 //! Индукция отказа: data-файлы таблицы сносятся при живом манифесте —
 //! open_table читает манифест, execute() падает на отсутствующих файлах.
+//! Санити заодно пиннит корневой фикс: FTS-индекс создаётся при открытии
+//! бекенда, полнотекст ищет латиницу и кириллицу (simple-токенизатор).
 //!
 //! Крейт бинарный, lib-таргета нет: модули search подключаются
 //! зеркалом tests/search/mod.rs (паттерн semantic_slug_escape).
@@ -13,101 +15,18 @@
 mod search;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use async_trait::async_trait;
-use search::semantic::{Embedder, EMBED_MODEL_DIMS};
 use search::semantic_backend::LanceSemanticBackend;
-use uwuwu_usecase::{AppendDocOutcome, SemanticBackend, UsecaseResult, WikiRepo};
+use search::support::{lance_dir, FakeWiki, FixedEmbedder, TempDirGuard};
+use uwuwu_usecase::SemanticBackend;
 
 const SLUG: &str = "Experience/platform/Пин честного полнотекста";
 const DOC_MD: &str = "# Пин #1473\n\nRailway деплой монолита идёт мержем в master.";
 
-struct FakeWiki {
-    docs: HashMap<String, (String, String)>,
-}
-
-#[async_trait]
-impl WikiRepo for FakeWiki {
-    async fn read_doc(&self, slug: &str) -> UsecaseResult<Option<String>> {
-        Ok(self.docs.get(slug).map(|(md, _)| md.clone()))
-    }
-
-    async fn list_docs(&self, prefix: &str) -> UsecaseResult<Vec<String>> {
-        Ok(self
-            .docs
-            .keys()
-            .filter(|slug| slug.starts_with(prefix))
-            .cloned()
-            .collect())
-    }
-
-    async fn doc_shas(&self) -> UsecaseResult<Vec<(String, String)>> {
-        Ok(self
-            .docs
-            .iter()
-            .map(|(slug, (_, sha))| (slug.clone(), sha.clone()))
-            .collect())
-    }
-
-    async fn write_doc(&self, _slug: &str, _content: &str, _message: &str) -> UsecaseResult<()> {
-        Ok(())
-    }
-
-    async fn append_doc(
-        &self,
-        _slug: &str,
-        _line: &str,
-        _message: &str,
-    ) -> UsecaseResult<AppendDocOutcome> {
-        Ok(AppendDocOutcome {
-            created: false,
-            lines: 0,
-        })
-    }
-}
-
-/// Фиксированный мок-эмбеддер: нулевые векторы нужной размерности.
-struct FixedEmbedder;
-
-#[async_trait]
-impl Embedder for FixedEmbedder {
-    async fn embed_docs(&self, docs: &[(String, String)]) -> UsecaseResult<Vec<Vec<f32>>> {
-        Ok(docs
-            .iter()
-            .map(|_| vec![0.0f32; EMBED_MODEL_DIMS])
-            .collect())
-    }
-
-    async fn embed_query(&self, _query: &str) -> UsecaseResult<Vec<f32>> {
-        Ok(vec![0.0f32; EMBED_MODEL_DIMS])
-    }
-}
-
-fn lance_dir() -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "uwuwu-semantic-1473-{}-{nanos}",
-        std::process::id()
-    ))
-}
-
-/// Guard чистит папку при любом исходе теста, паника включительно.
-struct TempDirGuard(PathBuf);
-
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 async fn seeded_backend() -> (LanceSemanticBackend, TempDirGuard) {
-    let guard = TempDirGuard(lance_dir());
+    let guard = TempDirGuard(lance_dir("fts-honesty"));
     let dir = guard.0.clone();
     let wiki = Arc::new(FakeWiki {
         docs: HashMap::from([(
@@ -115,8 +34,7 @@ async fn seeded_backend() -> (LanceSemanticBackend, TempDirGuard) {
             (DOC_MD.to_string(), "sha-1473".to_string()),
         )]),
     });
-    let embeddings: Arc<dyn Embedder> = Arc::new(FixedEmbedder);
-    let backend = LanceSemanticBackend::open(dir, wiki, None, embeddings)
+    let backend = LanceSemanticBackend::open(dir, wiki, None, Arc::new(FixedEmbedder))
         .await
         .expect("open lance backend");
     backend.sync_index(10).await.expect("seed sync ok");
@@ -124,10 +42,9 @@ async fn seeded_backend() -> (LanceSemanticBackend, TempDirGuard) {
 }
 
 /// Снос data-файлов таблицы при живом манифесте: open_table succeeds,
-/// execute() падает. Возвращает Table-директорию для диагностики.
-fn break_data_files(volume: &std::path::Path) {
-    let table_dir = volume.join("chunks.lance");
-    let data_dir = table_dir.join("data");
+/// execute() падает на отсутствующих файлах.
+fn break_data_files(volume: &Path) {
+    let data_dir = volume.join("chunks.lance").join("data");
     std::fs::remove_dir_all(&data_dir).expect("drop data dir");
 }
 

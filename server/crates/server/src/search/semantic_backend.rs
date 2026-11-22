@@ -38,6 +38,14 @@ fn slug_pred(slug: &str) -> String {
     format!("slug = '{}'", slug.replace('\'', "''"))
 }
 
+/// Исход синка одного носителя (#1473): проиндексирован / не изменился /
+/// суточный бюджет исчерпан (стоп всего прогона, не ошибка синка).
+enum DocSyncOutcome {
+    Reindexed,
+    Unchanged,
+    BudgetStop,
+}
+
 pub struct LanceSemanticBackend {
     wiki: Arc<dyn WikiRepo>,
     /// Персист sha-инкремента: /…/semantic_shas.json рядом с Lance-том.
@@ -407,6 +415,56 @@ impl LanceSemanticBackend {
             .map_err(|e| err(format!("add meta {slug}: {e}")))?;
         Ok(())
     }
+    /// Синк вики-дока: чтение, хеш-гард, бюджет, ланс, sha-метка.
+    async fn sync_wiki_doc(
+        &self,
+        slug: &str,
+        sha: &str,
+        known: &HashMap<String, i64>,
+        spend: &mut super::budget::BudgetState,
+    ) -> UsecaseResult<DocSyncOutcome> {
+        let Some(md) = self.wiki.read_doc(slug).await? else {
+            return Ok(DocSyncOutcome::Unchanged);
+        };
+        let h = Self::hash(&md);
+        if known.get(slug).copied() == Some(h) {
+            self.mark_known_sha(slug, sha);
+            return Ok(DocSyncOutcome::Unchanged);
+        }
+        let texts = chunk_text(&md);
+        if !self.daily_budget_admits(spend, texts.len()) {
+            return Ok(DocSyncOutcome::BudgetStop);
+        }
+        self.reindex_doc_chunks(slug, texts, h).await?;
+        self.mark_known_sha(slug, sha);
+        Ok(DocSyncOutcome::Reindexed)
+    }
+
+    /// Синк дайджеста задачи: текст «#N тайтл + тело», хеш-гард, бюджет.
+    async fn sync_issue_digest(
+        &self,
+        digest: &uwuwu_usecase::IssueDigest,
+        known: &HashMap<String, i64>,
+        spend: &mut super::budget::BudgetState,
+    ) -> UsecaseResult<DocSyncOutcome> {
+        let slug = format!("task-{}", digest.number);
+        let text = format!(
+            "#{} {}\n\n{}",
+            digest.number,
+            digest.title,
+            digest.body.chars().take(4000).collect::<String>()
+        );
+        let h = Self::hash(&text);
+        if known.get(&slug).copied() == Some(h) {
+            return Ok(DocSyncOutcome::Unchanged);
+        }
+        let texts = chunk_text(&text);
+        if !self.daily_budget_admits(spend, texts.len()) {
+            return Ok(DocSyncOutcome::BudgetStop);
+        }
+        self.reindex_doc_chunks(&slug, texts, h).await?;
+        Ok(DocSyncOutcome::Reindexed)
+    }
 }
 
 #[async_trait]
@@ -501,6 +559,8 @@ impl SemanticBackend for LanceSemanticBackend {
         Ok(inter)
     }
 
+    /// Исход синка одного носителя: проиндексирован / не изменился /
+    /// суточный бюджет исчерпан (стоп всего прогона).
     async fn sync_index(&self, budget: usize) -> UsecaseResult<usize> {
         // sha-инкремент: git blob-sha из дерева (один вызов) отсекает
         // неизменённые ДО чтения содержимого — иначе сотни read_doc
@@ -519,43 +579,23 @@ impl SemanticBackend for LanceSemanticBackend {
             if known_shas.get(slug).map(String::as_str) == Some(sha.as_str()) {
                 continue; // sha не шевелился — содержимое не читаем
             }
-            if let Some(md) = self.wiki.read_doc(slug).await? {
-                let h = Self::hash(&md);
-                if known.get(slug).copied() != Some(h) {
-                    let texts = chunk_text(&md);
-                    if !self.daily_budget_admits(&mut spend, texts.len()) {
-                        break;
-                    }
-                    self.reindex_doc_chunks(slug, texts, h).await?;
-                    changed += 1;
-                }
-                self.mark_known_sha(slug, sha);
+            match self.sync_wiki_doc(slug, sha, &known, &mut spend).await? {
+                DocSyncOutcome::Reindexed => changed += 1,
+                DocSyncOutcome::BudgetStop => break,
+                DocSyncOutcome::Unchanged => {}
             }
         }
         // задачи в индекс (юзер-стори: «найти решённое раньше по вики/задачам»):
         // слаг task-N — выдача читается task_get по номеру
         if let Some(issues) = &self.issues {
-            if changed < budget {
-                for digest in issues.recent_issues(400).await? {
-                    if changed >= budget {
-                        break;
-                    }
-                    let slug = format!("task-{}", digest.number);
-                    let text = format!(
-                        "#{} {}\n\n{}",
-                        digest.number,
-                        digest.title,
-                        digest.body.chars().take(4000).collect::<String>()
-                    );
-                    let h = Self::hash(&text);
-                    if known.get(&slug).copied() != Some(h) {
-                        let texts = chunk_text(&text);
-                        if !self.daily_budget_admits(&mut spend, texts.len()) {
-                            break;
-                        }
-                        self.reindex_doc_chunks(&slug, texts, h).await?;
-                        changed += 1;
-                    }
+            for digest in issues.recent_issues(400).await? {
+                if changed >= budget {
+                    break;
+                }
+                match self.sync_issue_digest(&digest, &known, &mut spend).await? {
+                    DocSyncOutcome::Reindexed => changed += 1,
+                    DocSyncOutcome::BudgetStop => break,
+                    DocSyncOutcome::Unchanged => {}
                 }
             }
         }
