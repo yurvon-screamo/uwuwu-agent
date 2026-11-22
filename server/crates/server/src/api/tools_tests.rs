@@ -11,6 +11,7 @@ use crate::clock::SystemClock;
 use crate::mockhub::MemoryHub;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use uwuwu_usecase::WikiRepo;
 use uwuwu_usecase::{
     DocsView, PersonView, SearchUseCase, TaskBoardRepo, TaskView, TaskWriteUseCase,
 };
@@ -18,7 +19,11 @@ use uwuwu_usecase::{
 /// Фикстура поверхности: ToolHub фабрики test_support (StubWiki-вики,
 /// memory-blob) — тело читается напрямую через вернувшийся MemoryHub.
 fn hub() -> (Arc<ToolHub>, Arc<MemoryHub>) {
-    tool_hub(Arc::new(StubWiki), blob_usecase())
+    tool_hub(
+        Arc::new(StubWiki),
+        blob_usecase(),
+        Arc::new(StubCronState::default()),
+    )
 }
 
 async fn call(tools: &ToolHub, name: &str, args: Value) -> Result<String, String> {
@@ -677,7 +682,7 @@ async fn fast_track_from_draft_and_todo() {
             Arc::new(uwuwu_usecase::SpawnModels::canonical()),
             Default::default(),
             7,
-            Arc::new(StubCronState),
+            Arc::new(StubCronState::default()),
             None,
         )),
     });
@@ -1366,6 +1371,7 @@ async fn blob_tools_fail_loud_without_env() {
     let (tools, _memory) = tool_hub(
         Arc::new(StubWiki),
         blob_usecase_missing(&["UWUWU_S3_ENDPOINT", "UWUWU_S3_BUCKET"]),
+        Arc::new(StubCronState::default()),
     );
     let err = call(
         &tools,
@@ -1671,4 +1677,38 @@ async fn task_type_create_default_feature_renders_on_mcp_surface() {
     let rows = memory.read_board("Задачи uwuwu").await.unwrap();
     let row = rows.iter().find(|t| t.number() == number).unwrap();
     assert_eq!(row.kind(), Some(uwuwu_domain::TaskType::Feature));
+}
+
+#[tokio::test]
+async fn cron_list_renders_machine_accounting() {
+    // Рендер-путь cron_list (#1480): расписание + машинный учёт из state
+    // (last fire JST-штампом, счётчик отказов); пустое состояние — «never».
+    let wiki = Arc::new(crate::mockhub::MemoryHub::from_env());
+    wiki.write_doc(
+        "cron/тест/README",
+        "---\ntitle: Тест\nschedule: 5m\nproject: uwuwu\n---\nТело",
+        "test master",
+    )
+    .await
+    .unwrap();
+    let seeded = StubCronState::default().with_row(
+        "тест",
+        uwuwu_usecase::CronRow {
+            last_fire_ms: Some(((20771u64 * 86400) + 17 * 3600 + 29 * 60) * 1000),
+            deferred_since_ms: None,
+            run: None,
+            fails: 2,
+        },
+    );
+    let (tools, _memory) = tool_hub(wiki.clone(), blob_usecase(), Arc::new(seeded));
+    let out = call(&tools, "cron_list", json!({})).await.unwrap();
+    assert!(out.contains("Тест [uwuwu]"), "{out}");
+    assert!(out.contains("`every 5 min`"), "{out}");
+    assert!(out.contains("last fire 2026-11-15T02:29:00+09:00"), "{out}");
+    assert!(out.contains("fails 2"), "{out}");
+    // Пустое состояние: «never», отказов нет
+    let (tools, _memory) = tool_hub(wiki, blob_usecase(), Arc::new(StubCronState::default()));
+    let out = call(&tools, "cron_list", json!({})).await.unwrap();
+    assert!(out.contains("last fire never"), "{out}");
+    assert!(out.contains("fails 0"), "{out}");
 }

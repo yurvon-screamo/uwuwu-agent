@@ -184,7 +184,7 @@ pub fn tool_descriptors() -> Value {
         ),
         tool(
             "docs_append",
-            "Append a line to the end of a wiki doc (cron journals, experience classes; ff-only commit)",
+            "Append a line to the end of a wiki doc (experience articles, doc appendices; ff-only commit)",
             object(json!({
                 "slug": string("doc slug (without docs/ and .md)"),
                 "line": string("the whole line (markdown)"),

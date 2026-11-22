@@ -133,11 +133,15 @@ fn json_error(id: Option<Value>, code: i64, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::test_support::{blob_usecase, tool_hub, StubWiki};
+    use crate::api::test_support::{blob_usecase, tool_hub, StubCronState, StubWiki};
     use tower::ServiceExt;
 
     fn app() -> Router {
-        let (tools, _memory) = tool_hub(Arc::new(StubWiki), blob_usecase());
+        let (tools, _memory) = tool_hub(
+            Arc::new(StubWiki),
+            blob_usecase(),
+            Arc::new(StubCronState::default()),
+        );
         let state = Arc::new(McpState {
             bearer: Arc::new("test-bearer".to_string()),
             tools,

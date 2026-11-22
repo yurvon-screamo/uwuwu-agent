@@ -41,6 +41,7 @@ pub(crate) fn blob_usecase_missing(names: &[&str]) -> Arc<uwuwu_usecase::BlobUse
 pub(crate) fn tool_hub(
     wiki: Arc<dyn WikiRepo>,
     blobs: Arc<uwuwu_usecase::BlobUseCase>,
+    crons_state: Arc<dyn uwuwu_usecase::CronStateStore>,
 ) -> (Arc<ToolHub>, Arc<MemoryHub>) {
     let memory = Arc::new(MemoryHub::from_env());
     let board: Arc<dyn uwuwu_usecase::TaskBoardRepo> = memory.clone();
@@ -92,7 +93,7 @@ pub(crate) fn tool_hub(
             Arc::new(uwuwu_usecase::SpawnModels::canonical()),
             Default::default(),
             7,
-            Arc::new(StubCronState),
+            crons_state,
             None,
         )),
     });
@@ -192,16 +193,39 @@ impl uwuwu_usecase::CleanJournalStore for StubJournals {
 /// Сессии в пробах не вызываются: гварды армов стреляют до gateway.
 pub(crate) struct StubSessions;
 
-/// Учёт кронов в пробах: пустые ряды, мутации в никуда (кроны в этих
-/// пробах не файрятся).
+/// Учёт кронов в пробах: seeded-ряды для рендер-проб cron_list
+/// (пустое состояние — дефолт: все кроны «never»).
 #[derive(Default)]
-pub(crate) struct StubCronState;
+pub(crate) struct StubCronState {
+    rows: std::sync::Mutex<std::collections::HashMap<String, uwuwu_usecase::CronRow>>,
+}
+
+impl StubCronState {
+    /// Сидирует ряд учёта крона (имя крона — средний сегмент слага).
+    pub(crate) fn with_row(self, name: &str, row: uwuwu_usecase::CronRow) -> Self {
+        self.rows
+            .lock()
+            .expect("stub state lock")
+            .insert(name.to_string(), row);
+        self
+    }
+}
 
 impl uwuwu_usecase::CronStateStore for StubCronState {
-    fn cron_row(&self, _: &str) -> uwuwu_usecase::CronRow {
-        Default::default()
+    fn cron_row(&self, name: &str) -> uwuwu_usecase::CronRow {
+        self.rows
+            .lock()
+            .expect("stub state lock")
+            .get(name)
+            .cloned()
+            .unwrap_or_default()
     }
-    fn set_cron_row(&self, _: &str, _: uwuwu_usecase::CronRow) {}
+    fn set_cron_row(&self, name: &str, row: uwuwu_usecase::CronRow) {
+        self.rows
+            .lock()
+            .expect("stub state lock")
+            .insert(name.to_string(), row);
+    }
     fn save(&self) -> UsecaseResult<()> {
         Ok(())
     }
