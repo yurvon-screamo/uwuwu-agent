@@ -700,7 +700,6 @@ impl uwuwu_usecase::BoardStatusRepo for MemoryHub {
         self.with_state(|state| {
             self.ensure_seed(state);
             Ok(uwuwu_usecase::StatusFieldImage {
-                project_node_id: "mproj".into(),
                 field_node_id: "mfield".into(),
                 options: state
                     .status_options

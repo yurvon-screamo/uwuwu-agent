@@ -1617,11 +1617,6 @@ impl uwuwu_usecase::BoardStatusRepo for GitHubHub {
             .ok_or_else(|| {
                 UsecaseError::Board(format!("проект «{board}» в projectsV2 {owner} не найден"))
             })?;
-        let project_node_id = project["id"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| UsecaseError::Board(format!("доска «{board}»: проект без node id")))?
-            .to_string();
         let field = &project["field"];
         let field_node_id = field["id"]
             .as_str()
@@ -1637,7 +1632,6 @@ impl uwuwu_usecase::BoardStatusRepo for GitHubHub {
             )));
         }
         Ok(uwuwu_usecase::StatusFieldImage {
-            project_node_id,
             field_node_id,
             options,
         })

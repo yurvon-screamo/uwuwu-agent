@@ -26,11 +26,10 @@ pub struct StatusOption {
     pub description: Option<String>,
 }
 
-/// Свежий каталог Status-поля (pre-image опций): node-id носителей
-/// GraphQL-мутации + полный набор опций.
+/// Свежий каталог Status-поля (pre-image опций): node-id поля (мутация
+/// ищет поле по fieldId напрямую — живая проба #1447) + полный набор опций.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusFieldImage {
-    pub project_node_id: String,
     pub field_node_id: String,
     pub options: Vec<StatusOption>,
 }

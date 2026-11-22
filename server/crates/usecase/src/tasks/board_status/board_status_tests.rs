@@ -108,7 +108,6 @@ impl FakeRepo {
 impl BoardStatusRepo for FakeRepo {
     async fn fresh_field(&self, _board: &str) -> UsecaseResult<StatusFieldImage> {
         Ok(StatusFieldImage {
-            project_node_id: "PVT_test".into(),
             field_node_id: "PVTF_test".into(),
             options: self.live.lock().expect("lock").clone(),
         })
