@@ -21,12 +21,12 @@ pub(crate) fn parse_field_catalog(
         .and_then(|list| list.iter().find(|f| f["name"] == "Status"))
         .ok_or_else(|| {
             UsecaseError::Board(format!(
-                "доска «{board}»: Status-поле в каталоге не найдено"
+                "board «{board}»: the Status field is not in the catalog"
             ))
         })?;
-    let status_field_id = field["id"]
-        .as_u64()
-        .ok_or_else(|| UsecaseError::Board(format!("доска «{board}»: Status-поле без id")))?;
+    let status_field_id = field["id"].as_u64().ok_or_else(|| {
+        UsecaseError::Board(format!("board «{board}»: the Status field has no id"))
+    })?;
     let mut options = HashMap::new();
     if let Some(list) = field["options"].as_array() {
         for option in list {

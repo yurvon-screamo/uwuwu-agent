@@ -444,7 +444,7 @@ async fn row_status_absent_is_fail_closed() {
         .await
         .expect_err("None — fail-closed отказ");
     assert!(
-        err.to_string().contains("не на доске"),
+        err.to_string().contains("is not on board"),
         "текст отказа: {err}"
     );
     assert!(board.writes().is_empty());
@@ -461,7 +461,7 @@ async fn unparseable_carrier_status_is_fail_closed() {
         .await
         .expect_err("непарсящийся статус носителя — fail-closed отказ");
     assert!(
-        err.to_string().contains("не читается"),
+        err.to_string().contains("is unreadable"),
         "текст отказа: {err}"
     );
     assert!(board.writes().is_empty());

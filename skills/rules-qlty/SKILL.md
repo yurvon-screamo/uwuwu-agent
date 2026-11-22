@@ -42,6 +42,6 @@ Find code smells such as duplication and complexity.
 3. **Execution**: Run the command using the `Shell` tool.
 4. **Output analysis**: Review the tool results and fix any detected issues.
 
-Checking structure of N files в output.
-- If N=0 → НЕ доверяй «No issues», в таком случае используй нативный тулчейн как primary linting
-- If  N>0 → qlty валиден, можно доверять.
+Checking structure of N files in the output.
+- If N=0 → do NOT trust «No issues»; in that case use the native toolchain as the primary linter
+- If N>0 → qlty is valid, trust it.

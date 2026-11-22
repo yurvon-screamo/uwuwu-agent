@@ -112,7 +112,7 @@ describe("renderTranscript", () => {
 describe("judgePrompt", () => {
   test("содержит цель, транскрипт и все три вердикта", () => {
     const p = judgePrompt("сделай X", "USER: сделай X")
-    expect(p).toContain("ЦЕЛЬ: сделай X")
+    expect(p).toContain("GOAL: сделай X")
     expect(p).toContain("USER: сделай X")
     expect(p).toContain("GOAL_DONE:")
     expect(p).toContain("GOAL_NOT_DONE:")
@@ -120,7 +120,7 @@ describe("judgePrompt", () => {
   })
 
   test("пустой транскрипт заменяется заглушкой", () => {
-    expect(judgePrompt("X", "")).toContain("(пусто)")
+    expect(judgePrompt("X", "")).toContain("(empty)")
   })
 })
 

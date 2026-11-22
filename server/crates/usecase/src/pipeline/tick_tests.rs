@@ -1206,7 +1206,7 @@ async fn soft_ping_prompt_routes_to_project_executor() {
     assert_eq!(out.soft_pings, 1, "мягкий пинг ушёл");
     let named_prompts = named_gw.prompts.lock().unwrap();
     assert!(
-        named_prompts.iter().any(|p| p.contains("Мягкий пинг")),
+        named_prompts.iter().any(|p| p.contains("Soft ping")),
         "soft-ping на гейтвее проекта: {named_prompts:?}"
     );
     // пин агента слота и на мягком пинге (#1300)
@@ -2229,7 +2229,7 @@ async fn fourth_consecutive_request_changes_escalates() {
             );
             assert!(
                 log.iter()
-                    .any(|l| l.starts_with("comment#40=⚠︎ Кап ревью-раундов")),
+                    .any(|l| l.starts_with("comment#40=⚠︎ Review-round cap")),
                 "дайджест эскалации владельцу: {log:?}"
             );
             assert_eq!(
@@ -2336,10 +2336,10 @@ async fn escalation_digest_names_last_review_session() {
     let log = board.log.lock().unwrap();
     let digest = log
         .iter()
-        .find(|l| l.starts_with("comment#50=⚠︎ Кап ревью-раундов"))
+        .find(|l| l.starts_with("comment#50=⚠︎ Review-round cap"))
         .expect("дайджест эскалации");
     assert!(
-        digest.contains("последняя ревью-сессия: ses_rev_live"),
+        digest.contains("the last review session: ses_rev_live"),
         "id ревью-сессии в дайджесте: {digest}"
     );
     assert_eq!(state.review_rounds("B", 50), 0, "эскалация — свежий бюджет");
@@ -2363,10 +2363,10 @@ async fn escalation_digest_without_session_is_honest_dash() {
     let log = board.log.lock().unwrap();
     let digest = log
         .iter()
-        .find(|l| l.starts_with("comment#51=⚠︎ Кап ревью-раундов"))
+        .find(|l| l.starts_with("comment#51=⚠︎ Review-round cap"))
         .expect("дайджест эскалации");
     assert!(
-        digest.contains("последняя ревью-сессия: —"),
+        digest.contains("the last review session: —"),
         "пустой слот — «—» в дайджесте: {digest}"
     );
 }
@@ -2414,10 +2414,10 @@ async fn test_review_cycle_counts_and_escalates_with_test_review_digest() {
     let log = board.log.lock().unwrap();
     let digest = log
         .iter()
-        .find(|l| l.starts_with("comment#53=⚠︎ Кап ревью-раундов"))
+        .find(|l| l.starts_with("comment#53=⚠︎ Review-round cap"))
         .expect("дайджест эскалации тест-цикла");
     assert!(
-        digest.contains("последняя ревью-сессия: ses_test_rev_live"),
+        digest.contains("the last review session: ses_test_rev_live"),
         "id тест-ревью-сессии в дайджесте: {digest}"
     );
     assert_eq!(state.review_rounds("B", 53), 0, "эскалация — свежий бюджет");
@@ -2555,7 +2555,7 @@ async fn escalation_set_status_failure_retries_next_transition() {
             );
             assert!(
                 log.iter()
-                    .any(|l| l.starts_with("comment#47=⚠︎ Кап ревью-раундов")),
+                    .any(|l| l.starts_with("comment#47=⚠︎ Review-round cap")),
                 "дайджест уходит при успешном ретрае: {log:?}"
             );
             assert_eq!(out.spawns_done, 0, "6-й раунд не назначается");
@@ -2602,7 +2602,7 @@ async fn plan_review_loop_escalates_by_same_cap() {
             );
             assert!(
                 log.iter()
-                    .any(|l| l.starts_with("comment#45=⚠︎ Кап ревью-раундов")),
+                    .any(|l| l.starts_with("comment#45=⚠︎ Review-round cap")),
                 "дайджест эскалации владельцу: {log:?}"
             );
             assert_eq!(out.spawns_done, 0, "5-й круг плана не назначается");
@@ -3865,7 +3865,7 @@ async fn soft_ping_wakes_idle_session_without_transaction() {
         .lock()
         .unwrap()
         .iter()
-        .any(|p| p.contains("Мягкий пинг")));
+        .any(|p| p.contains("Soft ping")));
 }
 
 #[tokio::test]
@@ -4182,15 +4182,15 @@ async fn counters_earned_by_current_process_still_escalate() {
         .find(|l| l.starts_with("comment#64="))
         .expect("эскалация постит коммент");
     assert!(
-        comment.contains("при живой сессии"),
+        comment.contains("with the session alive"),
         "подпись различает причину: агент молчит при живой сессии"
     );
     assert!(
-        comment.contains("проба исполнителя: жива"),
+        comment.contains("executor probe: alive"),
         "вердикт пробы в подписи"
     );
     assert!(
-        comment.contains("автопингов в раунде: 2"),
+        comment.contains("auto-pings in the round: 2"),
         "счётчик доставленных пингов раунда в подписи"
     );
 }
@@ -4571,6 +4571,28 @@ async fn probe_degradation_strip_reaches_threshold_signal() {
     );
 }
 
+#[test]
+fn stage_prompts_spawned_per_slot() {
+    // связка мок-стенда с источником (#1383 круг 3): spawn_prompt обязан
+    // нести дословный маркер стадии из STAGE_PROMPTS — на нём
+    // классифицирует спавн mock_opencode::stage_action_of_prompt
+    let board = BoardPlan {
+        board: "B".into(),
+        project: "p".into(),
+        repo: "a/c".into(),
+        checkout: "/tmp/checkout".into(),
+        env_root: "/tmp/env".into(),
+    };
+    let task = Task::new(7, "t".into(), Status::Design);
+    for (slot, marker) in crate::pipeline::actions::STAGE_PROMPTS {
+        let prompt = crate::pipeline::actions::spawn_prompt(&board, &task, *slot);
+        assert!(
+                prompt.contains(marker),
+                "spawn_prompt слота {slot:?} потерял маркер «{marker}» — мок-стенд перестанет классифицировать стадию"
+            );
+    }
+}
+
 #[tokio::test]
 async fn spawn_prompt_demands_finish_transaction() {
     // Дыра промптинга (владелец 16.11): контракт хода обязан быть в промпте
@@ -4584,9 +4606,12 @@ async fn spawn_prompt_demands_finish_transaction() {
     };
     let task = Task::new(7, "t".into(), Status::Design);
     let prompt = crate::pipeline::actions::spawn_prompt(&board, &task, Slot::Design);
-    assert!(prompt.contains("ЗАСЫПАЕТ"), "промпт объясняет сон сессии");
     assert!(
-        prompt.contains("Ревью плана"),
+        prompt.contains("SLEEPS after the reply"),
+        "промпт объясняет сон сессии"
+    );
+    assert!(
+        prompt.contains("Plan review"),
         "финал хода назван для стадии"
     );
     assert!(
@@ -4618,12 +4643,12 @@ async fn spawn_prompt_test_stage_marker_contract() {
         Slot::Test,
     );
     assert!(
-        !tester_prompt.contains("тестовая дельта ветки"),
+        !tester_prompt.contains("the branch's test delta"),
         "tester-промпт без stage-маркера тест-ревьювера"
     );
     // чекпойнт pass тестировщика: развилка по (tester)-коммитам названа
     assert!(
-        tester_prompt.contains("Ревью тестирования") && tester_prompt.contains("(tester)-коммиты"),
+        tester_prompt.contains("Testing review") && tester_prompt.contains("(tester) commits"),
         "finish-инструкция тестировщика несёт чекпойнт pass: {tester_prompt}"
     );
     let test_review_prompt = crate::pipeline::actions::spawn_prompt(
@@ -4632,11 +4657,11 @@ async fn spawn_prompt_test_stage_marker_contract() {
         Slot::TestReview,
     );
     assert!(
-        test_review_prompt.contains("тестовая дельта ветки"),
+        test_review_prompt.contains("the branch's test delta"),
         "stage-маркер тест-ревьювера в промпте: {test_review_prompt}"
     );
     assert!(
-        test_review_prompt.contains("«Review»") && test_review_prompt.contains("«Тестирование»"),
+        test_review_prompt.contains("«Review»") && test_review_prompt.contains("«Testing»"),
         "finish-инструкция тест-ревьювера называет оба вердикт-статуса: {test_review_prompt}"
     );
 }
@@ -5176,7 +5201,7 @@ async fn dreamer_repeat_wakes_linked_session_without_new_spawn() {
         "промпт в связанную дример-сессию"
     );
     assert!(
-        prompts[0].contains("Повторный прогон"),
+        prompts[0].contains("Repeat run"),
         "wakeup-промпт повторного прогона"
     );
     assert!(
@@ -5245,7 +5270,7 @@ async fn dreamer_respawns_when_linked_dreamer_session_dead() {
         "прогон — в новый носитель"
     );
     assert!(
-        prompts[0].contains("Пост-обработка"),
+        prompts[0].contains("Post-processing"),
         "новый носитель без контекста дедупа получает полный промпт"
     );
 }
@@ -5269,7 +5294,7 @@ async fn dreamer_first_run_links_created_session() {
     let prompts = sessions.prompts.lock().unwrap();
     assert_eq!(prompts.len(), 1);
     assert!(
-        prompts[0].contains("Пост-обработка"),
+        prompts[0].contains("Post-processing"),
         "новый носитель получает полный промпт пост-обработки"
     );
 }
@@ -5765,7 +5790,7 @@ async fn analyst_three_real_rounds_escalate_with_honest_message() {
         .find(|l| l.starts_with("comment#1="))
         .expect("коммент владельцу есть");
     assert!(
-        comment.contains("3 реальных круга (Review Analys → Analys)"),
+        comment.contains("3 full rounds (Review Analys → Analys)"),
         "текст эскалации честный: {comment:?}"
     );
     assert!(
@@ -7310,7 +7335,7 @@ async fn round_stale_reset_gives_true_fresh_round_two_pings_before_escalation() 
         .find(|l| l.starts_with("comment#64="))
         .expect("эскалация постит коммент");
     assert!(
-        comment.contains("автопингов в раунде: 2"),
+        comment.contains("auto-pings in the round: 2"),
         "подпись считает пинги ТЕКУЩЕГО процесса (2), а не persisted-мусор: {comment}",
     );
 }
@@ -8941,7 +8966,7 @@ async fn judge_noise_state_wakes_without_transition() {
             .lock()
             .unwrap()
             .iter()
-            .any(|p| p.contains("Судья конвейера")),
+            .any(|p| p.contains("Pipeline judge")),
         "агент разбужен промптом судьи"
     );
     assert!(
@@ -9012,7 +9037,7 @@ async fn judge_verdict_transitions_row_with_race_check_passing() {
             .lock()
             .unwrap()
             .iter()
-            .any(|l| l.starts_with("comment#42=⚖︎ Судья:")),
+            .any(|l| l.starts_with("comment#42=⚖︎ Judge:")),
         "дайджест вердикта в ленте"
     );
     assert!(
@@ -9081,8 +9106,8 @@ async fn judge_err_falls_back_to_classic_soft_ping() {
             .lock()
             .unwrap()
             .iter()
-            .any(|p| p.contains("Мягкий пинг")),
-        "старый текст мягкого пинга"
+            .any(|p| p.contains("Soft ping")),
+        "старый текст мягкого пинга (English-канон #1383)"
     );
 }
 
@@ -9288,8 +9313,8 @@ async fn judge_stage_guard_test_cap_uses_legacy_force_park() {
             .lock()
             .unwrap()
             .iter()
-            .any(|l| l.starts_with("comment#53=⚠︎ Кап ревью-раундов")),
-        "дайджест старой механики (не «⚖︎ Судья»)"
+            .any(|l| l.starts_with("comment#53=⚠︎ Review-round cap")),
+        "дайджест старой механики (не «⚖︎ Judge»)"
     );
     assert_eq!(
         out.review_flagged, 1,
@@ -9347,7 +9372,7 @@ async fn judge_cap_guard_forces_park_without_model_call() {
             .lock()
             .unwrap()
             .iter()
-            .any(|l| l.starts_with("comment#48=⚖︎ Судья: гвард")),
+            .any(|l| l.starts_with("comment#48=⚖︎ Judge: cap-point")),
         "дайджест гварда в ленте"
     );
     assert!(

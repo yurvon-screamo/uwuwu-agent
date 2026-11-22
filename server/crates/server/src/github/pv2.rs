@@ -10,7 +10,8 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use uwuwu_usecase::{UsecaseError, UsecaseResult};
+use uwuwu_domain::Status;
+use uwuwu_usecase::{status_names, UsecaseError, UsecaseResult};
 
 use super::hub::TtlCache;
 use super::pv2_parse::{next_after, parse_field_catalog, parse_item_entry, parse_status_value};
@@ -21,6 +22,23 @@ pub(crate) struct Pv2Meta {
     pub(crate) project_number: u64,
     pub(crate) status_field_id: u64,
     pub(crate) options: HashMap<String, String>,
+}
+
+/// Резолв option-id Status по имени: канон или легаси (контракт окна
+/// merge→rename #1383 — доска может нести русские опции при английском
+/// каноне; lookup идёт по обоим, канон первым). Опция никогда не
+/// создаётся: авто-создание дало бы дубль-опцию и расщепление строк.
+pub(crate) fn resolve_status_option<'a>(
+    options: &'a HashMap<String, String>,
+    status_name: &str,
+) -> Option<&'a String> {
+    let status = uwuwu_usecase::parse_status(status_name);
+    if status != Status::Empty {
+        if let Some(id) = status_names(status).iter().find_map(|n| options.get(*n)) {
+            return Some(id);
+        }
+    }
+    options.get(status_name)
 }
 
 /// Строка индекса: numeric item id + последнее прочитанное Status-значение
@@ -179,7 +197,7 @@ impl Pv2Rest {
                     .and_then(|project| project["number"].as_u64())
             })
             .ok_or_else(|| {
-                UsecaseError::Board(format!("проект «{board}» в projectsV2 {owner} не найден"))
+                UsecaseError::Board(format!("project «{board}» not found in projectsV2 {owner}"))
             })?;
         let fields = self
             .rest(
@@ -190,7 +208,7 @@ impl Pv2Rest {
             .await?;
         if !fields.status.is_success() {
             return Err(UsecaseError::Board(format!(
-                "доска «{board}»: каталог полей HTTP {}",
+                "board «{board}»: field catalog HTTP {}",
                 fields.status
             )));
         }
@@ -236,7 +254,7 @@ impl Pv2Rest {
             let resp = self.rest(reqwest::Method::GET, &url, None).await?;
             if !resp.status.is_success() {
                 return Err(UsecaseError::Board(format!(
-                    "доска «{board}»: list items HTTP {}",
+                    "board «{board}»: list items HTTP {}",
                     resp.status
                 )));
             }
@@ -261,7 +279,7 @@ impl Pv2Rest {
         // молчаливая обрезка хвоста = «строка не на доске» для живых строк
         // (ревью 2 Common-1) — громкий гард, зеркально snapshot_fetch
         Err(UsecaseError::Board(format!(
-            "доска «{board}»: item index превысил {ITEM_PAGES} страниц — гард"
+            "board «{board}»: the item index exceeded {ITEM_PAGES} pages — the guard"
         )))
     }
 
@@ -321,13 +339,15 @@ impl Pv2Rest {
         status_name: &str,
     ) -> UsecaseResult<Option<String>> {
         let meta = self.meta(board).await?;
-        let option = meta.options.get(status_name).cloned().ok_or_else(|| {
-            UsecaseError::Board(format!("Status-опция «{status_name}» не найдена"))
-        })?;
+        let option = resolve_status_option(&meta.options, status_name)
+            .cloned()
+            .ok_or_else(|| {
+                UsecaseError::Board(format!("Status option not found on board: {status_name}"))
+            })?;
         let owner = self.owner()?;
         let Some(item) = self.item_id(board, number).await? else {
             return Err(UsecaseError::Board(format!(
-                "строка #{number} не на доске «{board}»"
+                "row #{number} is not on board «{board}»"
             )));
         };
         let resp = self
@@ -344,7 +364,7 @@ impl Pv2Rest {
             .await?;
         if !resp.status.is_success() {
             return Err(UsecaseError::Board(format!(
-                "patch status #{number}: не применилось (HTTP {})",
+                "patch status #{number}: not applied (HTTP {})",
                 resp.status
             )));
         }
@@ -395,7 +415,7 @@ impl Pv2Rest {
             .await?;
         if !resp.status.is_success() {
             return Err(UsecaseError::Board(format!(
-                "delete item #{number} (item {item_id}): не применилось (HTTP {})",
+                "delete item #{number} (item {item_id}): not applied (HTTP {})",
                 resp.status
             )));
         }
@@ -432,7 +452,7 @@ impl Pv2Rest {
             .await?;
         if !resp.status.is_success() {
             return Err(UsecaseError::Board(format!(
-                "add #{number}: не применилось (HTTP {})",
+                "add #{number}: not applied (HTTP {})",
                 resp.status
             )));
         }
@@ -441,7 +461,7 @@ impl Pv2Rest {
             .as_object()
             .and_then(|item| item.get("id"))
             .and_then(Value::as_u64)
-            .ok_or_else(|| UsecaseError::Board(format!("add #{number}: нет item id")))?;
+            .ok_or_else(|| UsecaseError::Board(format!("add #{number}: no item id")))?;
         let now = std::time::Instant::now();
         // всегда кладём id в индекс (и при пустом кеше): list items не
         // видит свежедобавленную строку в read-лаг (живая проба

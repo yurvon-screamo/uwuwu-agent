@@ -43,24 +43,46 @@ pub enum UsecaseError {
 impl fmt::Display for UsecaseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Board(m) => write!(f, "доска: {m}"),
-            Self::Session(m) => write!(f, "сессия: {m}"),
+            Self::Board(m) => write!(f, "board: {m}"),
+            Self::Session(m) => write!(f, "session: {m}"),
             Self::Pr(m) => write!(f, "pr: {m}"),
-            Self::State(m) => write!(f, "состояние: {m}"),
+            Self::State(m) => write!(f, "state: {m}"),
             Self::Telegram(m) => write!(f, "telegram: {m}"),
             Self::TelegramTooBig(m) => write!(f, "telegram too big: {m}"),
-            Self::SessionNotFound(m) => write!(f, "сессия не найдена (dead-session): {m}"),
+            Self::SessionNotFound(m) => write!(f, "session not found (dead-session): {m}"),
             Self::Blob(m) => write!(f, "blob: {m}"),
             Self::BlobTooBig(m) => write!(f, "blob too big: {m}"),
-            Self::BlobNotConfigured(m) => write!(f, "blob не сконфигурирован: {m}"),
+            Self::BlobNotConfigured(m) => write!(f, "blob is not configured: {m}"),
             Self::BlobBadKey(m) => write!(f, "blob bad key: {m}"),
             Self::RateLimited {
                 service,
                 retry_after_secs,
             } => match retry_after_secs {
-                Some(s) => write!(f, "{service}: rate limited, retry after {s}s"),
+                Some(s) => write!(
+                    f,
+                    "{service}: rate limited, retry after {s}s ({})",
+                    humanize_retry_secs(*s)
+                ),
                 None => write!(f, "{service}: rate limited"),
             },
+        }
+    }
+}
+
+/// Человекочитаемая длительность retry-after (#1473, срез В): сырые секунды
+/// остаются машинным контрактом, добавка — чтобы агент видел масштаб отказа
+/// («суточный, не мгновенный») без календарной математики и clock-проводки.
+fn humanize_retry_secs(secs: u64) -> String {
+    let mins = secs / 60;
+    if mins < 60 {
+        format!("≈{mins} мин")
+    } else {
+        let hours = mins / 60;
+        let rest = mins % 60;
+        if rest == 0 {
+            format!("≈{hours} ч")
+        } else {
+            format!("≈{hours} ч {rest} мин")
         }
     }
 }
@@ -87,8 +109,49 @@ impl From<UsecaseError> for ViewError {
 impl std::fmt::Display for ViewError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotFound(what) => write!(f, "не найдено: {what}"),
+            Self::NotFound(what) => write!(f, "not found: {what}"),
             Self::Source(e) => write!(f, "{e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limited_display_carries_human_duration() {
+        let err = UsecaseError::RateLimited {
+            service: "gemini-embeddings".into(),
+            retry_after_secs: Some(73370),
+        };
+        let text = err.to_string();
+        assert!(
+            text.contains("73370s") && text.contains("≈20 ч 22 мин"),
+            "сырые секунды + человекочитаемая длительность, факт: {text}"
+        );
+    }
+
+    #[test]
+    fn rate_limited_display_formats_durations() {
+        let fmt = |secs| {
+            UsecaseError::RateLimited {
+                service: "s".into(),
+                retry_after_secs: Some(secs),
+            }
+            .to_string()
+        };
+        assert!(fmt(30508).contains("≈8 ч 28 мин"), "{}", fmt(30508));
+        assert!(fmt(7200).contains("≈2 ч"), "{}", fmt(7200));
+        assert!(fmt(2700).contains("≈45 мин"), "{}", fmt(2700));
+    }
+
+    #[test]
+    fn rate_limited_without_retry_info_stays_unadorned() {
+        let err = UsecaseError::RateLimited {
+            service: "gemini-embeddings".into(),
+            retry_after_secs: None,
+        };
+        assert_eq!(err.to_string(), "gemini-embeddings: rate limited");
     }
 }

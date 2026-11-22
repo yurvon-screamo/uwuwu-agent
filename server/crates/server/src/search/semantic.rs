@@ -143,10 +143,12 @@ impl GeminiEmbeddings {
         let embs = body
             .get("embeddings")
             .and_then(|v| v.as_array())
-            .ok_or_else(|| UsecaseError::State(format!("{SERVICE}: нет embeddings в ответе")))?;
+            .ok_or_else(|| {
+                UsecaseError::State(format!("{SERVICE}: no embeddings in the response"))
+            })?;
         if embs.len() != texts.len() {
             return Err(UsecaseError::State(format!(
-                "{SERVICE}: ждали {} векторов, получили {}",
+                "{SERVICE}: expected {} vectors, got {}",
                 texts.len(),
                 embs.len()
             )));
@@ -161,17 +163,17 @@ impl GeminiEmbeddings {
                             .filter_map(|x| x.as_f64().map(|f| f as f32))
                             .collect::<Vec<f32>>()
                     })
-                    .ok_or_else(|| UsecaseError::State(format!("{SERVICE}: пустой embedding")))
+                    .ok_or_else(|| UsecaseError::State(format!("{SERVICE}: empty embedding")))
             })
             .collect::<UsecaseResult<Vec<_>>>()?;
         if vecs.iter().any(|v| v.is_empty()) {
-            return Err(UsecaseError::State(format!("{SERVICE}: пустой embedding")));
+            return Err(UsecaseError::State(format!("{SERVICE}: empty embedding")));
         }
         // размерность — единая валидация для обоих путей (docs/query): при
         // оверрайде модели без 1536 отказ будет внятным, а не «batch: …» из Lance
         if let Some(v) = vecs.iter().find(|v| v.len() != EMBED_MODEL_DIMS) {
             return Err(UsecaseError::State(format!(
-                "{SERVICE}: вектор {}-dim вместо {EMBED_MODEL_DIMS}",
+                "{SERVICE}: a {}-dim vector instead of {EMBED_MODEL_DIMS}",
                 v.len()
             )));
         }
@@ -192,7 +194,7 @@ impl Embedder for GeminiEmbeddings {
             .await?
             .into_iter()
             .next()
-            .ok_or_else(|| UsecaseError::State(format!("{SERVICE}: пустой ответ на запрос")))
+            .ok_or_else(|| UsecaseError::State(format!("{SERVICE}: empty response to the request")))
     }
 }
 

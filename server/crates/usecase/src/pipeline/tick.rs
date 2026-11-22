@@ -642,9 +642,9 @@ impl TickUseCase {
                                 .post_comment(
                                     task.number(),
                                     &format!(
-                                        "⚠︎ Спавн-петля: слот `{}` спавнился >2 раз без \
-                                         прогресса статуса ({:?}). Строка переведена в \
-                                         Needs attention — разбор владельца.",
+                                        "⚠︎ Spawn loop: the `{}` slot spawned >2 times without \
+                                         status progress ({:?}). The row moved to \
+                                         Needs attention — owner's triage.",
                                         naming::slot_key(slot),
                                         task.status()
                                     ),
@@ -1358,10 +1358,10 @@ impl TickUseCase {
             .post_comment(
                 task.number(),
                 &format!(
-                    "⚠︎ Сталл-детект: stage-сессия `{}` молчит {} мин при живой \
-                     сессии — агент не завершает статусную транзакцию (проба \
-                     исполнителя: жива; автопингов в раунде: {count}). Строка в \
-                     Needs attention, разбор владельца.",
+                    "⚠︎ Stall detect: the `{}` stage session has been silent for {} min \
+                     with the session alive — the agent is not completing the status \
+                     transaction (executor probe: alive; auto-pings in the round: {count}). \
+                     The row is in Needs attention, owner's triage.",
                     naming::slot_key(slot),
                     silence / 60_000
                 ),
@@ -1399,9 +1399,9 @@ impl TickUseCase {
                 .judge_park(
                     call,
                     &format!(
-                        "⚖︎ Судья: гвард — {} вызовов подряд без смены статуса \
-                         строки (порог {}). Строка в Needs attention без нового \
-                         вызова модели. Разбор владельца.",
+                        "⚖︎ Judge: guard — {} calls in a row without a status change \
+                         (the {} threshold). The row is in Needs attention without \
+                         a new model call. Owner's triage.",
                         call.calls, self.judge_cfg.escalate_after
                     ),
                     out,
@@ -1502,10 +1502,10 @@ impl TickUseCase {
                 .map(str::to_string)
                 .unwrap_or_else(|| "—".into());
             let digest = format!(
-                "⚖︎ Судья: гвард кап-точки — {rounds} подряд request_changes \
-                 (кап {} + порог {}) — паркинг без вызова модели. Раунд не \
-                 назначается, строка в Needs attention, разбор владельца. \
-                 Последняя ревью-сессия: {last}.",
+                "⚖︎ Judge: cap-point guard — {rounds} request_changes in a row \
+                 (the {} cap + the {} threshold) — parking without a model call. \
+                 The round is not assigned, the row is in Needs attention, \
+                 owner's triage. The last review session: {last}.",
                 REVIEW_ROUND_CAP, escalate_after
             );
             let parked = self.judge_round_park(board, task, &digest, out).await;
@@ -1555,10 +1555,10 @@ impl TickUseCase {
                     .map(str::to_string)
                     .unwrap_or_else(|| "—".into());
                 let digest = format!(
-                    "⚖︎ Судья: {rounds} подряд request_changes — вердикт decision-\
-                     модели: цикл не сходится (нужен владелец {:.2}, уверенность \
-                     {:.2}). Раунд не назначается, строка в Needs attention, \
-                     разбор владельца. Последняя ревью-сессия: {last}.",
+                    "⚖︎ Judge: {rounds} request_changes in a row — the decision-model \
+                     verdict: the loop does not converge (owner needed {:.2}, \
+                     confidence {:.2}). The round is not assigned, the row is in \
+                     Needs attention, owner's triage. The last review session: {last}.",
                     verdict.owner_needed, verdict.confidence
                 );
                 // инкременты после set_status (Low раунда 3): счётчики тика —
@@ -1668,10 +1668,10 @@ impl TickUseCase {
             .map(str::to_string)
             .unwrap_or_else(|| "—".into());
         let digest = format!(
-            "⚠︎ Кап ревью-раундов: {next}-й подряд request_changes без approve \
-             (порог {REVIEW_ROUND_CAP}) — раунд {} не назначается, строка в \
-             Needs attention, разбор владельца. Находки и вердикты — в треде \
-             выше; последняя ревью-сессия: {last}.",
+            "⚠︎ Review-round cap: the {next}th request_changes in a row without an approve \
+             (the {REVIEW_ROUND_CAP} threshold) — round {} is not assigned, the row is in \
+             Needs attention, owner's triage. The findings and verdicts — in the thread \
+             above; the last review session: {last}.",
             next + 1
         );
         let parked = self.judge_round_park(board, task, &digest, out).await;
@@ -1730,8 +1730,9 @@ impl TickUseCase {
                 slot,
                 session,
                 &format!(
-                    "⚖︎ Судья конвейера: строка молчала {} мин — продолжай работу. \
-                     Заверши ход статусной транзакцией (uwuwu_task_edit).",
+                    "⚖︎ Pipeline judge: the row has been silent for {} min — keep \
+                     working. Finish the turn with a status transaction \
+                     (uwuwu_task_edit).",
                     silence / 60_000
                 ),
             )
@@ -1760,10 +1761,10 @@ impl TickUseCase {
             .set_status(&board.board, task.number(), target)
             .await?;
         let digest = format!(
-            "⚖︎ Судья: строка перенесена в {} (тишина {} мин; «нужен владелец»: \
-             {:.2}; уверенность {:.2}; вызовов без прогресса: {}). Причина — \
-             вердикт decision-модели по контексту задачи (тело, лента, хвосты \
-             сессий). ADR-106 ревизия #1364.",
+            "⚖︎ Judge: the row moved to {} (silence {} min; owner needed: \
+             {:.2}; confidence {:.2}; calls without progress: {}). The reason — \
+             the decision-model verdict on the task context (body, comment \
+             thread, session tails). ADR-106 revision #1364.",
             naming::status_name(target),
             silence / 60_000,
             verdict.owner_needed,
@@ -1834,8 +1835,8 @@ impl TickUseCase {
             board,
             task.stage_slot().unwrap_or(Slot::Dev),
             session,
-            "⚖︎ Судья конвейера: строка переведена в Needs attention — ход \
-             завершён, работа приостановлена до разбора владельца.",
+            "⚖︎ Pipeline judge: the row moved to Needs attention — the turn is \
+             finished, work is paused until owner's triage.",
         )
         .await?;
         self.state.clear_stall(&board.board, task.number());
@@ -2001,10 +2002,10 @@ impl TickUseCase {
             gw.prompt(
                 session,
                 &format!(
-                    "⏰ Мягкий пинг: ход завершён, статусный перевод не выполнен — \
-                     строка #{} стоит. Заверши транзакцию по контракту хода: \
-                     uwuwu_task_edit {{number: {}, status: <следующая стадия>}} \
-                     или вопрос владельцу комментом + Needs attention.",
+                    "⏰ Soft ping: the turn has finished without the status transition — \
+                     row #{} is stalled. Close the transaction per the turn contract: \
+                     uwuwu_task_edit {{number: {}, status: <next stage>}} \
+                     or ask the owner in a comment + Needs attention.",
                     task.number(),
                     task.number()
                 ),
@@ -2031,10 +2032,10 @@ impl TickUseCase {
             .post_comment(
                 task.number(),
                 &format!(
-                    "⏰ Автопинг сталл-детекта: сессия стадии `{}` молчит {} мин при статусе \
-                     {:?} — ход, похоже, завершён без перевода статуса. Заверши транзакцию: \
-                     переведи статус по канону пайпа (или продолжай работу и доведи её до \
-                     статусного перевода).",
+                    "⏰ Stall auto-ping: the `{}` stage session has been silent for {} min at status \
+                     {:?} — the turn seems to have finished without the status transition. Close \
+                     the transaction: set the status per the pipeline canon (or keep working \
+                     until the status transition is done).",
                     naming::slot_key(slot),
                     silence / 60_000,
                     task.status()

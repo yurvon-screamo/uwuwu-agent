@@ -119,16 +119,16 @@ pub fn replace_md_section(
     }
     if pin != 2 {
         return Err(format!(
-            "секция «{section}» на уровне h{pin} не найдена — append только для h2; \
-             проверь уровень/имя или правь полным task_body"
+            "section «{section}» at h{pin} not found — append is for h2 only; \
+             check the level/name or edit with a full task_body"
         ));
     }
     if content.trim().is_empty() {
         // очистка отсутствующей секции создала бы пустую «## X» в хвосте —
         // исход неожидаем (находка дельта-ревью #1152): громкий отказ
         return Err(format!(
-            "секция «{section}» не найдена — очищать нечего; \
-             проверь имя секции или передай контент"
+            "section «{section}» not found — nothing to clear; \
+             check the section name or pass content"
         ));
     }
     // append: секции не было — заголовок пишется нормализованным (байт-запрос
@@ -156,9 +156,9 @@ fn twin_rejection(
 ) -> String {
     let pin_hint = format!("{} {}", "#".repeat(twin_level), want);
     format!(
-        "секция «{section}» на уровне h{pin} не найдена, но есть тёзка на уровне h{twin_level}: \
-         «{twin_line}»; запроси с пином `{pin_hint}` / правь через содержащую ##-секцию / \
-         полный task_body"
+        "section «{section}» at h{pin} not found, but a namesake exists at h{twin_level}: \
+         «{twin_line}»; request it pinned `{pin_hint}` / edit through the containing ## section / \
+         full task_body"
     )
 }
 
