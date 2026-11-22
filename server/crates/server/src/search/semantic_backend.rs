@@ -465,6 +465,67 @@ impl LanceSemanticBackend {
         self.reindex_doc_chunks(&slug, texts, h).await?;
         Ok(DocSyncOutcome::Reindexed)
     }
+
+    /// Слаги чанков, совпавших с токеном (BM25 по FTS-индексу «текст»).
+    /// Отказ FTS не молчит (#1473): Err пробрасывается в usecase — рендер
+    /// «— недоступен» в секции полнотекста, причина видна в выдаче.
+    async fn token_hits(
+        &self,
+        table: &Table,
+        token: &str,
+        top: usize,
+    ) -> UsecaseResult<std::collections::HashSet<String>> {
+        let q = FullTextSearchQuery::new(token.to_string());
+        let stream = table
+            .query()
+            .full_text_search(q)
+            .limit(top * 3)
+            .execute()
+            .await
+            .map_err(|e| {
+                tracing::warn!(event = "semantic.fts_unavailable", error = %e, "FTS недоступен");
+                err(format!("fts: {e}"))
+            })?;
+        use futures::stream::StreamExt;
+        let mut stream = stream;
+        let mut hits = std::collections::HashSet::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(|e| err(format!("fts stream: {e}")))?;
+            if let Some(col) = batch.column_by_name("slug") {
+                if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
+                    for i in 0..arr.len() {
+                        hits.insert(arr.value(i).to_string());
+                    }
+                }
+            }
+        }
+        Ok(hits)
+    }
+
+    /// Фаза задач синка: дайджесты recent_issues до остатка бюджета тика.
+    async fn sync_issues(
+        &self,
+        budget: usize,
+        changed: usize,
+        known: &HashMap<String, i64>,
+        spend: &mut super::budget::BudgetState,
+    ) -> UsecaseResult<usize> {
+        let Some(issues) = &self.issues else {
+            return Ok(changed);
+        };
+        let mut changed = changed;
+        for digest in issues.recent_issues(400).await? {
+            if changed >= budget {
+                break;
+            }
+            match self.sync_issue_digest(&digest, known, spend).await? {
+                DocSyncOutcome::Reindexed => changed += 1,
+                DocSyncOutcome::BudgetStop => break,
+                DocSyncOutcome::Unchanged => {}
+            }
+        }
+        Ok(changed)
+    }
 }
 
 #[async_trait]
@@ -512,36 +573,7 @@ impl SemanticBackend for LanceSemanticBackend {
         let table = self.chunks().await?;
         let mut per_token: Vec<std::collections::HashSet<String>> = Vec::new();
         for token in tokens {
-            let q = FullTextSearchQuery::new(token.to_string());
-            let stream = match table
-                .query()
-                .full_text_search(q)
-                .limit(top * 3)
-                .execute()
-                .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    // #1473: отказ FTS не молчит — Err пробрасывается в
-                    // usecase (рендер «— недоступен»), причина видна в выдаче
-                    tracing::warn!(event = "semantic.fts_unavailable", error = %e, "FTS недоступен");
-                    return Err(err(format!("fts: {e}")));
-                }
-            };
-            use futures::stream::StreamExt;
-            let mut stream = stream;
-            let mut hits = std::collections::HashSet::new();
-            while let Some(batch) = stream.next().await {
-                let batch = batch.map_err(|e| err(format!("fts stream: {e}")))?;
-                if let Some(col) = batch.column_by_name("slug") {
-                    if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
-                        for i in 0..arr.len() {
-                            hits.insert(arr.value(i).to_string());
-                        }
-                    }
-                }
-            }
-            per_token.push(hits);
+            per_token.push(self.token_hits(&table, token, top).await?);
         }
         // AND-семантика токенов
         let mut it = per_token.into_iter();
@@ -587,18 +619,9 @@ impl SemanticBackend for LanceSemanticBackend {
         }
         // задачи в индекс (юзер-стори: «найти решённое раньше по вики/задачам»):
         // слаг task-N — выдача читается task_get по номеру
-        if let Some(issues) = &self.issues {
-            for digest in issues.recent_issues(400).await? {
-                if changed >= budget {
-                    break;
-                }
-                match self.sync_issue_digest(&digest, &known, &mut spend).await? {
-                    DocSyncOutcome::Reindexed => changed += 1,
-                    DocSyncOutcome::BudgetStop => break,
-                    DocSyncOutcome::Unchanged => {}
-                }
-            }
-        }
+        let changed = self
+            .sync_issues(budget, changed, &known, &mut spend)
+            .await?;
         if changed > 0 {
             tracing::info!(
                 event = "semantic.sync",

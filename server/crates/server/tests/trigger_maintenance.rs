@@ -24,36 +24,22 @@ pub mod search {
 
     #[path = "../../src/search/maintenance.rs"]
     pub mod maintenance;
+
+    #[path = "../search/support.rs"]
+    pub mod support;
 }
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use search::semantic::Embedder;
 use search::semantic_backend::LanceSemanticBackend;
+use search::support::{lance_dir, FixedEmbedder, TempDirGuard};
 use uwuwu_usecase::{AppendDocOutcome, SemanticBackend, UsecaseResult, WikiRepo};
 
 const DOCS: usize = 3;
 const SLUGS: [&str; DOCS] = ["doc/a", "doc/b", "doc/c"];
-
-struct FixedEmbedder;
-
-#[async_trait]
-impl Embedder for FixedEmbedder {
-    async fn embed_docs(&self, docs: &[(String, String)]) -> UsecaseResult<Vec<Vec<f32>>> {
-        Ok(docs
-            .iter()
-            .map(|_| vec![0.0f32; search::semantic::EMBED_MODEL_DIMS])
-            .collect())
-    }
-
-    async fn embed_query(&self, _query: &str) -> UsecaseResult<Vec<f32>> {
-        Ok(vec![0.0f32; search::semantic::EMBED_MODEL_DIMS])
-    }
-}
 
 /// Вики с мутабельным содержимым: churn двигает текст и sha всех доков —
 /// sha-гейт синка пропускает их на реиндекс (прод-чурн «платформа сама
@@ -132,26 +118,6 @@ impl WikiRepo for ChurnWiki {
             created: false,
             lines: 0,
         })
-    }
-}
-
-fn lance_dir(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "uwuwu-trigger-{tag}-{}-{nanos}",
-        std::process::id()
-    ))
-}
-
-/// Чистит папку при любом исходе теста, паника включительно.
-struct TempDirGuard(PathBuf);
-
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
