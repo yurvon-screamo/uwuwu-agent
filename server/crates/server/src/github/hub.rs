@@ -5,6 +5,7 @@
 
 use super::fields::{parse_field_values, Fields, IssueFields};
 use super::pv2::Pv2Rest;
+use super::HTTP_TIMEOUT;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -198,6 +199,7 @@ impl GitHubHub {
             token,
             http: reqwest::Client::builder()
                 .user_agent(concat!("uwuwu-server/", env!("CARGO_PKG_VERSION")))
+                .timeout(HTTP_TIMEOUT)
                 .build()
                 .expect("reqwest client"),
             // 240 c > тик (poll 180 c): снимок живёт через тик — полный
@@ -1437,6 +1439,21 @@ mod goals_json_tests {
     #[test]
     fn empty_array_yields_empty_list() {
         assert!(goals_from_milestones(&[], "uwuwu").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod http_timeout_pin_tests {
+    use super::HTTP_TIMEOUT;
+    use std::time::Duration;
+
+    /// Пин таймаута (#1502): инцидент 22.11 — клиент без таймаута при
+    /// зависшем GitHub-запросе парализовал tick_loop навсегда. Гвард
+    /// против выпила/безмолвного роста: значение обязано быть > 0,
+    /// перекрывать легитимный снапшот (~40 c) и оставаться ниже poll_sec.
+    #[test]
+    fn http_timeout_is_pinned() {
+        assert_eq!(HTTP_TIMEOUT, Duration::from_secs(120));
     }
 }
 
