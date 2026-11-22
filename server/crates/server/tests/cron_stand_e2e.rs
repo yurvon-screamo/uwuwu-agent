@@ -42,7 +42,6 @@ fn bin_exe(name: &str) -> PathBuf {
 }
 
 struct Stand {
-    #[allow(dead_code)]
     dir: PathBuf,
     mock: Child,
     server: Child,
@@ -254,9 +253,17 @@ async fn cron_fire_machine_accounting_without_journal() {
         list.contains("E2E заявитель") && list.contains("E2E исполнитель"),
         "{list}"
     );
+    // Штамп живой по форме «· last fire YYYY-» — год не пинаем (стена часов
+    // умирает ретроактивно), форма JST-штампа — пин машинного учёта.
+    let stamp_at = list
+        .find("· last fire ")
+        .map(|i| &list[i + "· last fire ".len()..]);
+    let stamp = stamp_at.unwrap_or_else(|| panic!("last fire не показан: {list}"));
     assert!(
-        list.contains("· last fire 2026-"),
-        "last fire не показан: {list}"
+        stamp.len() >= 5
+            && stamp.as_bytes()[..4].iter().all(|b| b.is_ascii_digit())
+            && stamp.as_bytes()[4] == b'-',
+        "last fire — не штамп года: {list}"
     );
     assert!(list.contains("fails 0"), "fails не показан: {list}");
     assert!(
