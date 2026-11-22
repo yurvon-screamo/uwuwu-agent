@@ -352,7 +352,7 @@ mod tests {
             workspace: "/w".into(),
             greeting: None,
             manual: "м".into(),
-            lessons: String::new(),
+            lessons: None,
         }
     }
 }

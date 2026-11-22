@@ -67,12 +67,12 @@ pub(crate) fn stop_reason(parsed: Option<&Result<BotSpec, String>>) -> Option<&'
 
 /// Живое представление из спеки (#1424): методичка — композит с уроками
 /// (doc-режим, hash-гейт manual), уроки отдельно (agent-режим, префикс).
-fn live_of(spec: &BotSpec) -> BotLive {
+fn live_of(spec: &BotSpec, lessons: &str) -> BotLive {
     BotLive::with_lessons(
         spec.owner.clone(),
         spec.greeting.clone(),
-        compose_manual(&spec.manual, &spec.lessons),
-        spec.lessons.clone(),
+        compose_manual(&spec.manual, lessons),
+        lessons.to_string(),
     )
 }
 
@@ -144,6 +144,25 @@ impl BotSupervisor {
             .get(slug)
             .map(|r| r.task.is_finished())
             .unwrap_or(false)
+    }
+
+    /// Последние известные уроки бота (#1424, ревью раунд 2): `None`
+    /// спеки — читать не удалось, не равно «носитель опустел» — живое
+    /// представление сохраняет предыдущие уроки, гейт отзора в
+    /// agent-режиме не срабатывает на транзиентном сбое чтения.
+    fn resolve_lessons(
+        &self,
+        running: &HashMap<String, Running>,
+        slug: &str,
+        spec: &BotSpec,
+    ) -> String {
+        match spec.lessons.as_deref() {
+            Some(l) => l.to_string(),
+            None => running
+                .get(slug)
+                .map(|r| r.live.view().lessons)
+                .unwrap_or_default(),
+        }
     }
 
     pub async fn tick(&self) -> UsecaseResult<()> {
@@ -314,18 +333,23 @@ impl BotSupervisor {
                 let bot_slug = format!("bot/{name}");
                 let mut spec = parse_bot_doc(&bot_slug, &md);
                 // Уроки — соседний док персональной папки бота (#1424):
-                // нет дока — пусто (поведение как прежде); отказ чтения —
-                // warn и уроки мимо этого тика, бот не ломается.
+                // Ok(None) — дока нет, носитель честно пуст; Err — читать
+                // не удалось: None (последние известные уроки сохраняются,
+                // ложного отзыва нет); warn и бот не ломается.
                 let lessons_slug = format!("bot/{name}/Уроки");
                 match self.wiki.read_doc(&lessons_slug).await {
                     Ok(Some(raw)) => {
                         if let Ok(s) = spec.as_mut() {
-                            s.lessons = normalize_lessons(&raw);
+                            s.lessons = Some(normalize_lessons(&raw));
                         }
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        if let Ok(s) = spec.as_mut() {
+                            s.lessons = Some(String::new());
+                        }
+                    }
                     Err(e) => tracing::warn!(event = "bot.lessons_read_failed", slug = %bot_slug,
-                        error = %e, "Док уроков не дочитан — уроки не поедут в этом тике"),
+                        error = %e, "Док уроков не дочитан — держим последние известные уроки"),
                 }
                 out.push((bot_slug, spec));
             }
@@ -381,6 +405,9 @@ impl BotSupervisor {
                 running.remove(&slug);
                 continue;
             };
+            // Последние известные уроки — до мутабельного заимствования
+            // entry (resolve_lessons читает running иммутабельно).
+            let lessons = self.resolve_lessons(running, &slug, &spec);
             let entry = running.get_mut(&slug).expect("dead entry");
             let alive_ms = now.saturating_sub(entry.started_ms);
             if !entry.dead_seen {
@@ -403,7 +430,7 @@ impl BotSupervisor {
             }
             tracing::info!(event = "bot.restarted", slug = %slug, fails = entry.fails,
                 "Задача умерла — рестарт");
-            let live = Arc::new(live_of(&spec));
+            let live = Arc::new(live_of(&spec, &lessons));
             let Some(task) = self.spawn_task(&spec, live.clone()) else {
                 // токен пропал из env: запись гасим, warn даст следующий тик
                 running.remove(&slug);
@@ -429,6 +456,9 @@ impl BotSupervisor {
     ) {
         for (slug, parsed) in scanned {
             let Ok(spec) = parsed else { continue };
+            // Последние известные уроки — до мутабельного заимствования
+            // записи (resolve_lessons читает running иммутабельно).
+            let lessons = self.resolve_lessons(running, slug, spec);
             match running.get_mut(slug) {
                 None => {
                     if spec.enabled {
@@ -439,8 +469,8 @@ impl BotSupervisor {
                     let change = entry.live.update(
                         spec.owner.as_deref(),
                         spec.greeting.as_deref(),
-                        &compose_manual(&spec.manual, &spec.lessons),
-                        &spec.lessons,
+                        &compose_manual(&spec.manual, &lessons),
+                        &lessons,
                     );
                     // методичка доезжает только в doc-режиме (agent-режим
                     // несёт её в agents/<name>.md воркспейса) — смена
@@ -495,7 +525,8 @@ impl BotSupervisor {
     /// Пересоздать запись рантайма на свежей спеке (rearm/recreate).
     /// Токен пропал — запись гасится, warn даст следующий тик.
     fn replace_entry(&self, running: &mut HashMap<String, Running>, slug: &str, spec: &BotSpec) {
-        let live = Arc::new(live_of(spec));
+        let lessons = self.resolve_lessons(running, slug, spec);
+        let live = Arc::new(live_of(spec, &lessons));
         let Some(task) = self.spawn_task(spec, live.clone()) else {
             running.remove(slug);
             return;
@@ -515,7 +546,8 @@ impl BotSupervisor {
 
     fn spawn_new(&self, running: &mut HashMap<String, Running>, spec: BotSpec) {
         let slug = spec.slug.clone();
-        let live = Arc::new(live_of(&spec));
+        let lessons = self.resolve_lessons(running, &slug, &spec);
+        let live = Arc::new(live_of(&spec, &lessons));
         let Some(task) = self.spawn_task(&spec, live.clone()) else {
             return; // warn уже в логе (bot.token_missing)
         };

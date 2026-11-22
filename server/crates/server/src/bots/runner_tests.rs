@@ -26,6 +26,8 @@ use super::BotLive;
 #[derive(Default)]
 struct FakeWiki {
     docs: Mutex<HashMap<String, String>>,
+    /// Слаги с эмуляцией отказа чтения (транзиентный сбой вики; ревью #1424).
+    err_docs: Mutex<std::collections::HashSet<String>>,
 }
 
 impl FakeWiki {
@@ -41,6 +43,13 @@ impl FakeWiki {
             .expect("wiki lock")
             .insert(slug.to_string(), md.to_string());
     }
+
+    fn set_err_doc(&self, slug: &str) {
+        self.err_docs
+            .lock()
+            .expect("wiki err lock")
+            .insert(slug.to_string());
+    }
 }
 
 #[async_trait::async_trait]
@@ -49,6 +58,11 @@ impl WikiRepo for FakeWiki {
         Ok(vec![])
     }
     async fn read_doc(&self, slug: &str) -> UsecaseResult<Option<String>> {
+        if self.err_docs.lock().expect("wiki err lock").contains(slug) {
+            return Err(UsecaseError::State(format!(
+                "fake wiki: read refused for {slug}"
+            )));
+        }
         Ok(self.docs.lock().expect("wiki lock").get(slug).cloned())
     }
     async fn list_docs(&self, prefix: &str) -> UsecaseResult<Vec<String>> {
@@ -2941,5 +2955,65 @@ async fn lessons_only_change_logs_lessons_event_not_manual() {
     assert!(
         !rec.iter().any(|l| l.contains("bot.manual_updated")),
         "agent-режим: методичка не доезжает — manual_updated не логируется: {rec:?}"
+    );
+}
+
+/// Ревью раунд 2 (Common): отказ чтения носителя уроков ≠ опустошение —
+/// живое представление держит последние известные уроки, ложного отзыва
+/// в agent-режиме нет, ходы чистые; отказ логируется warn-ом.
+#[tokio::test]
+async fn lessons_read_failure_keeps_last_known_no_revocation() {
+    let wiki = Arc::new(FakeWiki::default());
+    let sessions = FakeSessions::new();
+    let state = Arc::new(FakeState::default());
+    let clock = FakeClock::at(10_000_000);
+    let tg = FakeTg::new(vec![]);
+    wiki.set_doc(
+        DOC_SLUG,
+        "---\ntitle: Проба\nmodel: p/m1\ntoken_env: UWUWU_BOT_TOKEN_L8\n\
+         owner: yurvon\nworkspace: /tmp/opencode\nagent: probe-agent\n---\n\nтело-методичка",
+    );
+    wiki.set_doc(LESSONS_SLUG, "урок один");
+    tg.inject(private_update(1, "yurvon", "привет"));
+    let sup = Arc::new(supervisor(
+        wiki.clone(),
+        sessions.clone(),
+        state.clone(),
+        clock.clone(),
+        tg.clone(),
+        vec![("UWUWU_BOT_TOKEN_L8", "tok")],
+    ));
+    sup.tick().await.unwrap();
+    wait_until(|| state.bot_session(SLUG).is_some(), 2000).await;
+    wait_until(|| !sessions.prompts_snapshot().is_empty(), 2000).await;
+    assert!(
+        sessions.prompts_snapshot()[0].1.contains("урок один"),
+        "уроки доставлены до сбоя"
+    );
+    // транзиентный отказ чтения носителя (вики моргнула)
+    wiki.set_err_doc(LESSONS_SLUG);
+    let (_guard, records) = trap_events();
+    sup.tick().await.unwrap();
+    tg.inject(private_update(2, "yurvon", "после сбоя"));
+    wait_until(|| sessions.prompts_snapshot().len() == 2, 2000).await;
+    let snap = sessions.prompts_snapshot();
+    assert_eq!(
+        snap[1].1, "после сбоя",
+        "отказа чтения нет в промпте — ложный отзыв исключён: {}",
+        snap[1].1
+    );
+    {
+        let rec = records.lock().expect("trap lock");
+        assert_event_logged(&rec, "bot.lessons_read_failed");
+    }
+    // вики ожила: тот же носитель — hash совпадает, ходы остаются чистыми
+    wiki.set_doc(LESSONS_SLUG, "урок один");
+    sup.tick().await.unwrap();
+    tg.inject(private_update(3, "yurvon", "после восстановления"));
+    wait_until(|| sessions.prompts_snapshot().len() == 3, 2000).await;
+    let snap = sessions.prompts_snapshot();
+    assert_eq!(
+        snap[2].1, "после восстановления",
+        "повторной доставки/отзыва нет — носитель не менялся"
     );
 }
