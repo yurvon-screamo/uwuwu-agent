@@ -466,18 +466,20 @@ async fn run(
         wiki: wiki.clone(),
         sessions: sessions.clone(),
         search: search_usecase.clone(),
-        crons: Arc::new(uwuwu_usecase::CronUseCase {
-            wiki: wiki.clone(),
-            sessions: sessions.clone(),
-            clock: clock.clone(),
-            models: spawn_models.clone(),
-            projects: plan
-                .boards
+        crons: Arc::new(uwuwu_usecase::CronUseCase::new(
+            wiki.clone(),
+            sessions.clone(),
+            clock.clone(),
+            spawn_models.clone(),
+            plan.boards
                 .iter()
                 .map(|b| (b.project.clone(), b.checkout.clone()))
                 .collect(),
-            cup: plan.policy.cup,
-        }),
+            plan.policy.cup,
+            state.clone(),
+            // MCP-инстанс учёт читает, сбоев не сигналит
+            None,
+        )),
     });
 
     let http_state = Arc::new(api::AppState {
@@ -490,6 +492,21 @@ async fn run(
         tools: tool_hub,
     });
     let app = api::http_router(http_state).merge(api::mcp_router(mcp_state));
+
+    // ТГ-сигнализация инцидентов и кроновых сбоев (#1281, UC-02): строится
+    // до сайдкаров — крон-сайдкар несёт notify в CronUseCase (#1480).
+    let notify = cfg
+        .tg_notify()
+        // run() возвращает String; префикс «конфиг:» сохраняем из Display
+        // ConfigError (BootError-конверсия — вне скоупа #1281)
+        .map_err(|e| format!("конфиг: {e}"))?
+        .map(|(token, chat)| {
+            (
+                Arc::new(tg::TelegramClient::new(token))
+                    as Arc<dyn uwuwu_usecase::bots::TelegramGateway>,
+                chat,
+            )
+        });
 
     // Сателлиты конвейера: кроны (вики-носитель), триаж черновиков, дример
     let boards_info: Vec<(String, String, String)> = plan
@@ -510,19 +527,22 @@ async fn run(
     {
         // Кроны: один глобальный sidecar — раскладка /cron (#1214):
         // мастера cron/<имя>/README.md несут fm project, связка с
-        // [[project]] (роутинг executor + checkout) — карта из конфига
+        // [[project]] (роутинг executor + checkout) — карта из конфига;
+        // учёт ранов — state-секция crons, сбои — ТГ через [notify] (#1480)
         let projects_map: std::collections::HashMap<String, String> = boards_info
             .iter()
             .map(|(project, _, checkout)| (project.clone(), checkout.clone()))
             .collect();
-        let cron = Arc::new(uwuwu_usecase::CronUseCase {
-            wiki: wiki.clone(),
-            sessions: sessions.clone(),
-            clock: clock.clone(),
-            models: spawn_models.clone(),
-            projects: projects_map,
-            cup: plan.policy.cup,
-        });
+        let cron = Arc::new(uwuwu_usecase::CronUseCase::new(
+            wiki.clone(),
+            sessions.clone(),
+            clock.clone(),
+            spawn_models.clone(),
+            projects_map,
+            plan.policy.cup,
+            state.clone(),
+            notify.clone(),
+        ));
 
         sidecars.push(Sidecar {
             name: "cron".to_string(),
@@ -793,18 +813,6 @@ async fn run(
     }
 
     let http_task = tokio::spawn(serve(cfg.port(), app));
-    let notify = cfg
-        .tg_notify()
-        // run() возвращает String; префикс «конфиг:» сохраняем из Display
-        // ConfigError (BootError-конверсия — вне скоупа #1281)
-        .map_err(|e| format!("конфиг: {e}"))?
-        .map(|(token, chat)| {
-            (
-                Arc::new(tg::TelegramClient::new(token))
-                    as Arc<dyn uwuwu_usecase::bots::TelegramGateway>,
-                chat,
-            )
-        });
     let tick_task = tokio::spawn(tick_loop(TickLoopArgs {
         poll_sec: cfg.poll_sec,
         plan,

@@ -5,7 +5,7 @@
 //! тексты отказов и ответов, чтобы дрейф вернуть нечем. Пробы через живой
 //! диспетчер на MemoryHub — без GitHub, как в tools_tests.rs.
 
-use super::test_support::{blob_usecase, tool_hub};
+use super::test_support::{blob_usecase, tool_hub, StubCronState};
 use super::tools::ToolHub;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -16,6 +16,7 @@ fn hub() -> Arc<ToolHub> {
     let (tools, _memory) = tool_hub(
         Arc::new(crate::mockhub::MemoryHub::from_env()),
         blob_usecase(),
+        Arc::new(StubCronState::default()),
     );
     tools
 }
@@ -260,7 +261,11 @@ async fn docs_write_keeps_fm_from_payload_verbatim() {
 /// операционной недопустима); вход с fm — дословно, от чтения не зависит.
 #[tokio::test]
 async fn docs_write_read_failure_is_loud_without_fm_payload() {
-    let (tools, _) = tool_hub(Arc::new(ReadFailingWiki), blob_usecase());
+    let (tools, _) = tool_hub(
+        Arc::new(ReadFailingWiki),
+        blob_usecase(),
+        Arc::new(StubCronState::default()),
+    );
     let err = call(
         &tools,
         "docs_write",

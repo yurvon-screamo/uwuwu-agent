@@ -1,6 +1,6 @@
 //! Кроны: расписание (value object) и инварианты файра. Чистый домен:
 //! ноль зависимостей, время — epoch ms; грамматика строк носителя и
-//! рендер штампов журнала — юзкейс/инфра (crons.rs, naming).
+//! рендер штампов учёта — юзкейс/инфра (crons.rs, naming).
 
 use crate::agent::AgentSlot;
 /// Мастер крона: вики-док `cron/<имя>/README.md` с валидным расписанием.
@@ -48,7 +48,8 @@ impl Schedule {
     }
 
     /// Настал ли момент файра: `now_ms` против последнего запуска.
-    /// `last_run` — epoch ms прошлой строки журнала (None — не запускался).
+    /// `last_run` — epoch ms последнего файра из машинного учёта демона
+    /// (state, секция `crons`); None — не запускался.
     pub fn is_due(&self, now_ms: u64, last_run: Option<u64>) -> bool {
         let now = now_ms;
         let last = last_run;
