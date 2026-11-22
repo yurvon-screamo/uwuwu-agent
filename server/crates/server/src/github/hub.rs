@@ -1824,16 +1824,29 @@ mod board_status_live_tests {
     /// Строка контрольного каталога: (id, name, color, description).
     type CatalogRow = (String, String, Option<String>, Option<String>);
 
+    /// Нормализация оформления к «отсутствие»: пустая строка носителя
+    /// == null. Обе стороны сверки проходят одну нормализацию — без неё
+    /// pre-сторона Some("") → None, а post-сторона осталась бы Some("")
+    /// (ложный красный, тест-ревью 1).
+    fn norm(s: Option<&str>) -> Option<&str> {
+        s.filter(|s| !s.is_empty())
+    }
+
     /// Лучшее усилие мутации setup/teardown: тест-инфраструктура,
     /// падение teardown — не ложный красный фичи (артефакт уйдёт
-    /// владельцу по маркеру live-e2e-1447).
-    async fn raw_gql(hub: &GitHubHub, query: &str, vars: Value) -> Option<Value> {
-        hub.gql(query, vars).await.ok().map(|mut data| {
-            // один корень data — отдаём его содержимое
-            data.as_object_mut()
-                .map(|m| Value::Object(m.clone()))
-                .unwrap_or(Value::Null)
-        })
+    /// владельцу по маркеру live-e2e-1447). Ошибка носителя возвращается
+    /// текстом — expect в месте вызова кладёт её в панику (диагностика
+    /// setup/teardown, тест-ревью 1), best-effort сохраняют `let _ =`.
+    async fn raw_gql(hub: &GitHubHub, query: &str, vars: Value) -> Result<Value, String> {
+        hub.gql(query, vars)
+            .await
+            .map_err(|e| e.to_string())
+            .map(|mut data| {
+                // один корень data — отдаём его содержимое
+                data.as_object_mut()
+                    .map(|m| Value::Object(m.clone()))
+                    .unwrap_or(Value::Null)
+            })
     }
 
     #[tokio::test]
@@ -2030,13 +2043,13 @@ mod board_status_live_tests {
                 .find(|o| o[&"id"].as_str() == Some(id.as_str()))
                 .expect("чужая опция в каталоге после rename");
             assert_eq!(
-                color.as_deref(),
-                pre[&"color"].as_str().filter(|s| !s.is_empty()),
+                norm(color.as_deref()),
+                norm(pre[&"color"].as_str()),
                 "color опции {name} изменён"
             );
             assert_eq!(
-                description.as_deref(),
-                pre[&"description"].as_str().filter(|s| !s.is_empty()),
+                norm(description.as_deref()),
+                norm(pre[&"description"].as_str()),
                 "description опции {name} изменён"
             );
             let expected_name = if id == &from_option_id {
