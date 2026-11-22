@@ -52,8 +52,8 @@ cargo build -q --bin uwuwu-server --bin mock_opencode
 rm -f "$STATE"
 
 # конфиг стенда с executor-url прогона (дефолтный config.memory.toml не
-# трогаем; серверный порт резолвится env PORT > TOML port_cfg > дефолт —
-# config.rs port(); стенд задаёт его env-ом явно при запуске ниже, #1328)
+# трогаем; TOML-ключ port читается — config.rs: port() = env PORT > TOML
+# port > дефолт, серверный порт по-прежнему задаётся env-ом при запуске ниже)
 sed -e "s|http://127.0.0.1:8099|http://127.0.0.1:$PORT_MOCK|" \
     ops/config.memory.toml > ops/config.memory.e2e.toml
 

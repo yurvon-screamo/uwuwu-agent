@@ -209,7 +209,7 @@ impl WikiRepo for GitHubWiki {
 
     async fn write_doc(&self, slug: &str, content: &str, message: &str) -> UsecaseResult<()> {
         let Some(w) = &self.writer else {
-            return Err(UsecaseError::Board("wiki write не сконфигурирован".into()));
+            return Err(UsecaseError::Board("wiki write is not configured".into()));
         };
         // инвентаризация кэша сбрасывается: состав изменился
         *self.tree_cache.lock().expect("tree lock") = None;
@@ -224,7 +224,7 @@ impl WikiRepo for GitHubWiki {
         message: &str,
     ) -> UsecaseResult<AppendDocOutcome> {
         let Some(w) = &self.writer else {
-            return Err(UsecaseError::Board("wiki write не сконфигурирован".into()));
+            return Err(UsecaseError::Board("wiki write is not configured".into()));
         };
         w.append_line(&format!("docs/{slug}.md"), line, message)
             .await
@@ -275,10 +275,10 @@ mod tests {
         // различимо помечать оба носителя — тихая слепота устранена
         let adr = out
             .iter()
-            .find(|l| l.starts_with("Projects/uwuwu/ADR (неоднозначно:"))
+            .find(|l| l.starts_with("Projects/uwuwu/ADR (ambiguous:"))
             .expect("строка ADR с пометкой коллизии в живом листинге");
         assert!(
-            adr.contains("файл «Projects/uwuwu/ADR.md» + папка «Projects/uwuwu/ADR/»"),
+            adr.contains("file «Projects/uwuwu/ADR.md» + folder «Projects/uwuwu/ADR/»"),
             "оба носителя названы: {adr}"
         );
         // Дети папки без изменений; неколлизионный файл без пометки

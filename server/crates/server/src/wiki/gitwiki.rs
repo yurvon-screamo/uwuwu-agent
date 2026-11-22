@@ -113,7 +113,7 @@ impl GitWikiWriter {
             .unwrap_or_default()
             .to_string();
         if head_sha.is_empty() {
-            return Err(Self::err(format!("нет ref heads/{}", self.branch)));
+            return Err(Self::err(format!("no ref heads/{}", self.branch)));
         }
         let (_, commit) = self
             .call(
@@ -168,7 +168,7 @@ impl GitWikiWriter {
             status.is_success() && resp["object"]["sha"].as_str() == Some(new_sha.as_str());
         if !fast_forward {
             return Err(Self::err(format!(
-                "update_ref {path}: не ff (HTTP {status}) — конкурирующий коммит"
+                "update_ref {path}: not fast-forward (HTTP {status}) — a competing commit"
             )));
         }
         Ok(())

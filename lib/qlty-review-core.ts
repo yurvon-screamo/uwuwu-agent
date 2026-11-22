@@ -53,7 +53,7 @@ export const SARIF_CONTRACT_FIELDS = [
 
 const contractFail = (label: string, what: string): Error =>
   new Error(
-    `${label}: контракт SARIF нарушен — ${what}. Ожидаемые поля: ${SARIF_CONTRACT_FIELDS.join(", ")}. qlty обновился и сменил формат?`,
+    `${label}: the SARIF contract is broken — ${what}. Expected fields: ${SARIF_CONTRACT_FIELDS.join(", ")}. Did qlty update and change its format?`,
   )
 
 interface SarifDocShape {
@@ -78,14 +78,14 @@ export function parseSarif(raw: string, label: string): { findings: QltyFinding[
   try {
     doc = JSON.parse(raw) as SarifDocShape
   } catch {
-    throw new Error(`${label}: вывод не SARIF/JSON (qlty установлен и рабочий?)`)
+    throw new Error(`${label}: output is not SARIF/JSON (is qlty installed and working?)`)
   }
   const run = doc.runs?.[0]
-  if (!run) throw contractFail(label, "нет runs[0]")
+  if (!run) throw contractFail(label, "no runs[0]")
   const version = run.tool?.driver?.semanticVersion
-  if (typeof version !== "string" || version === "") throw contractFail(label, "нет tool.driver.semanticVersion")
+  if (typeof version !== "string" || version === "") throw contractFail(label, "no tool.driver.semanticVersion")
   const results = run.results ?? []
-  if (!Array.isArray(results)) throw contractFail(label, "results не массив")
+  if (!Array.isArray(results)) throw contractFail(label, "results is not an array")
 
   const findings: QltyFinding[] = []
   for (let i = 0; i < results.length; i++) {
@@ -157,7 +157,7 @@ export function applyFilters(
 
 const fmtFinding = (f: QltyFinding): string =>
   f.line === null
-    ? `- [${f.ruleId}] ${f.path} (строка неизвестна) (${f.level}) — ${f.message}`
+    ? `- [${f.ruleId}] ${f.path} (line unknown) (${f.level}) — ${f.message}`
     : `- [${f.ruleId}] ${f.path}:${f.line} (${f.level}) — ${f.message}`
 
 const fmtGroup = (title: string, findings: QltyFinding[]): string => {
@@ -178,12 +178,12 @@ export function renderReport(parts: {
   const head = `**Машинный ревью (qlty v${parts.qltyVersion})** — scope \`${parts.scope}\`${parts.commit ? ` (\`${parts.commit}\`)` : ""} · upstream \`${parts.upstream}\` · ${parts.directory}`
   const notes = parts.notes.length > 0 ? `\n${parts.notes.map((n) => `> ⚠ ${n}`).join("\n")}\n` : ""
   const body =
-    fmtGroup("Delta (qlty check --upstream: находки в изменённых строках)", parts.delta) +
-    fmtGroup("Smells (qlty smells, новые против upstream)", parts.smells)
+    fmtGroup("Delta (qlty check --upstream: findings in changed lines)", parts.delta) +
+    fmtGroup("Smells (qlty smells, new against upstream)", parts.smells)
   const total = parts.delta.length + parts.smells.length
   const verdict =
     total === 0
-      ? "Итог: ✅ новых машинных находок нет."
-      : `Итог: ${parts.delta.length} delta + ${parts.smells.length} smells.`
+      ? "Verdict: ✅ no new machine findings."
+      : `Verdict: ${parts.delta.length} delta + ${parts.smells.length} smells.`
   return `${head}\n${notes}\n${body}\n${verdict}`
 }

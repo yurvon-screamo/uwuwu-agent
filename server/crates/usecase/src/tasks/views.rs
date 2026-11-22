@@ -32,20 +32,20 @@ impl TaskView {
 
     /// Список строк доски проекта (сводка).
     pub async fn list(&self, project: &str) -> Result<Vec<Task>, ViewError> {
-        let board = self
-            .board_of(project)
-            .ok_or_else(|| ViewError::NotFound(format!("проект «{project}» вне конфига")))?;
+        let board = self.board_of(project).ok_or_else(|| {
+            ViewError::NotFound(format!("project «{project}» is not in the config"))
+        })?;
         Ok(self.board.read_board(board).await?)
     }
 
     /// Карточка задачи: агрегат + тело + хвост комментов.
     pub async fn card(&self, project: &str, number: u64) -> Result<IssueView, ViewError> {
-        let board = self
-            .board_of(project)
-            .ok_or_else(|| ViewError::NotFound(format!("проект «{project}» вне конфига")))?;
+        let board = self.board_of(project).ok_or_else(|| {
+            ViewError::NotFound(format!("project «{project}» is not in the config"))
+        })?;
         let view = self.board.read_issue(board, number).await?;
         if view.task.status() == uwuwu_domain::Status::Empty && view.body.is_empty() {
-            return Err(ViewError::NotFound(format!("задача #{number}")));
+            return Err(ViewError::NotFound(format!("task #{number}")));
         }
         Ok(IssueView {
             comments: view
@@ -75,13 +75,13 @@ impl DocsView {
         self.wiki
             .read_doc(&safe)
             .await?
-            .ok_or_else(|| ViewError::NotFound(format!("док «{slug}»")))
+            .ok_or_else(|| ViewError::NotFound(format!("doc «{slug}»")))
     }
 
     /// Пути .md под префиксом. Коллизия носителей (#1385): слаг X существует
     /// и есть дети X/… (в одном каталоге файл X.md и папка X/) — строка X
     /// получает честную пометку обоих носителей (канон «не тихая слепота»);
-    /// якорь пометки « (неоднозначно:» не встречается в слагах, префикс
+    /// якорь пометки « (ambiguous:» не встречается в слагах, префикс
     /// строки остаётся парсибельным.
     pub async fn list(&self, prefix: &str) -> Result<Vec<String>, ViewError> {
         let slugs = self.wiki.list_docs(&sanitize_slug(prefix)).await?;
@@ -104,7 +104,7 @@ impl DocsView {
             .into_iter()
             .map(|s| {
                 if dirs.contains(&s) {
-                    format!("{s} (неоднозначно: файл «{s}.md» + папка «{s}/»)")
+                    format!("{s} (ambiguous: file «{s}.md» + folder «{s}/»)")
                 } else {
                     s
                 }
@@ -130,7 +130,7 @@ impl PersonView {
         self.wiki
             .read_doc(PERSON_SLUG)
             .await?
-            .ok_or_else(|| ViewError::NotFound("персона (PERSON)".into()))
+            .ok_or_else(|| ViewError::NotFound("persona (PERSON)".into()))
     }
 }
 

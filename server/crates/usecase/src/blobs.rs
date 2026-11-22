@@ -71,7 +71,7 @@ impl BlobUseCase {
         match &self.backend {
             BlobBackend::Ready(store) => Ok(store),
             BlobBackend::Missing(names) => Err(UsecaseError::BlobNotConfigured(format!(
-                "задай переменные: {}",
+                "set the variables: {}",
                 names.join(", ")
             ))),
         }
@@ -83,7 +83,7 @@ impl BlobUseCase {
         let store = self.store()?;
         if bytes.len() > BLOB_MAX_BYTES {
             return Err(UsecaseError::BlobTooBig(format!(
-                "{} байт > лимита {} (прецедент UC-06)",
+                "{} bytes over the {} limit (the UC-06 precedent)",
                 bytes.len(),
                 BLOB_MAX_BYTES
             )));
@@ -100,7 +100,7 @@ impl BlobUseCase {
             target.project.trim()
         );
         let key = BlobKey::parse(&raw_key).ok_or_else(|| {
-            UsecaseError::BlobBadKey(format!("дедуп-ключ не прошёл гард: {raw_key}"))
+            UsecaseError::BlobBadKey(format!("the dedup key failed the guard: {raw_key}"))
         })?;
         let content_type = content_type_for(&name);
         store.put(&key, &content_type, bytes).await?;

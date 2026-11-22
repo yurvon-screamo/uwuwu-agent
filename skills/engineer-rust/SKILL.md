@@ -5,7 +5,7 @@ description: Rust expertise - ownership, borrowing, lifetimes, async/await, clip
 
 # Rust Development Standards
 
-> Общие правила (размеры функций/файлов, комментарии, SRP, naming) — в `rules-clean-code`. Здесь только Rust-специфика.
+> General rules (function/file sizes, comments, SRP, naming) — in `rules-clean-code`. Only Rust specifics here.
 
 ## Safety
 
