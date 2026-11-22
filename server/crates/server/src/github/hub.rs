@@ -1565,9 +1565,9 @@ const STATUS_FIELD_QUERY: &str = r#"
   }"#;
 
 const STATUS_RENAME_MUTATION: &str = r#"
-  mutation($project:ID!,$field:ID!,$options:[ProjectV2SingleSelectFieldOptionInput!]){
-    updateProjectV2Field(input:{projectId:$project, fieldId:$field, singleSelectOptions:$options}){
-      field{ ...on ProjectV2SingleSelectField{ id options{ id name color description } } }
+  mutation($field:ID!,$options:[ProjectV2SingleSelectFieldOptionInput!]){
+    updateProjectV2Field(input:{fieldId:$field, singleSelectOptions:$options}){
+      projectV2Field{ ...on ProjectV2SingleSelectField{ id options{ id name color description } } }
     }
   }"#;
 
@@ -1660,32 +1660,38 @@ impl uwuwu_usecase::BoardStatusRepo for GitHubHub {
         new_name: &str,
     ) -> UsecaseResult<Vec<uwuwu_usecase::StatusOption>> {
         // дословный pre-image набор: id/color/description сохранены,
-        // изменено ровно одно имя (набор операцией не конструируется)
+        // изменено ровно одно имя (набор операцией не конструируется).
+        // Живая проба 22.11 (#1447, sandbox): ProjectV2SingleSelectFieldOptionInput
+        // требует color и description (non-null) — поля присутствуют всегда;
+        // пустой description носителя → "", color опций без явного — дефолт GRAY
         let options: Vec<serde_json::Value> = image
             .options
             .iter()
             .map(|o| {
-                let mut v = json!({ "id": o.id, "name": if o.id == option_id { new_name } else { o.name.as_str() } });
-                if let Some(c) = &o.color {
-                    v["color"] = json!(c);
-                }
-                if let Some(d) = &o.description {
-                    v["description"] = json!(d);
-                }
-                v
+                let name = if o.id == option_id {
+                    new_name
+                } else {
+                    o.name.as_str()
+                };
+                json!({
+                    "id": o.id,
+                    "name": name,
+                    "color": o.color.clone().unwrap_or_else(|| "GRAY".into()),
+                    "description": o.description.clone().unwrap_or_default(),
+                })
             })
             .collect();
         let data = self
             .gql(
                 STATUS_RENAME_MUTATION,
                 json!({
-                    "project": image.project_node_id,
                     "field": image.field_node_id,
                     "options": options
                 }),
             )
             .await?;
-        let payload = parse_status_options(&data["updateProjectV2Field"]["field"]["options"]);
+        let payload =
+            parse_status_options(&data["updateProjectV2Field"]["projectV2Field"]["options"]);
         if payload.is_empty() {
             return Err(UsecaseError::Board(
                 "rename: носитель не отдал options в payload мутации (false-success?)".into(),
