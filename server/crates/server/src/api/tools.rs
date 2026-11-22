@@ -202,7 +202,7 @@ pub fn tool_descriptors() -> Value {
         ),
         tool(
             "cron_list",
-            "Cron inventory (masters /cron/<name>/README.md: schedule + journal tail)",
+            "Cron inventory (masters /cron/<name>/README.md: schedule + machine accounting — last fire, fail counter)",
             object(json!({
                 "project": string("filter by project (master fm project); without it — all crons")
             }))
@@ -436,7 +436,7 @@ impl ToolHub {
 
     async fn cron_list(&self, args: &Value) -> Result<Value, String> {
         // Инвентарь /cron (#1214): project — опциональный фильтр по fm,
-        // без него — все кроны
+        // без него — все кроны; учёт ранов — машинный, из state (#1480)
         let filter = arg_str(args, "project");
         let filter = (!filter.is_empty()).then_some(filter.as_str());
         let masters = self
@@ -444,17 +444,22 @@ impl ToolHub {
             .masters(filter)
             .await
             .map_err(|e| e.to_string())?;
-        let out = masters
-            .iter()
-            .map(|m| {
-                format!(
-                    "{} [{}] — `{}`\n",
-                    m.title,
-                    m.project,
-                    uwuwu_usecase::schedule_label(&m.schedule)
-                )
-            })
-            .collect::<String>();
+        let mut out = String::new();
+        for m in &masters {
+            let row = self.crons.state.cron_row(uwuwu_usecase::cron_name(&m.slug));
+            let fire = row
+                .last_fire_ms
+                .map(uwuwu_usecase::jst_stamp)
+                .unwrap_or_else(|| "never".into());
+            out.push_str(&format!(
+                "{} [{}] — `{}` · last fire {} · fails {}\n",
+                m.title,
+                m.project,
+                uwuwu_usecase::schedule_label(&m.schedule),
+                fire,
+                row.fails
+            ));
+        }
         ok_text(if out.is_empty() {
             match filter {
                 Some(p) => format!("no crons for project {p}"),

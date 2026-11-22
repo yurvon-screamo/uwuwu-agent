@@ -83,16 +83,18 @@ pub(crate) fn tool_hub(
         ))),
         search: Arc::new(uwuwu_usecase::SearchUseCase { semantic: None }),
         blobs,
-        crons: Arc::new(uwuwu_usecase::CronUseCase {
+        crons: Arc::new(uwuwu_usecase::CronUseCase::new(
             wiki,
-            sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(Arc::new(
+            Arc::new(uwuwu_usecase::SessionRouter::uniform(Arc::new(
                 StubSessions,
             ))),
-            clock: Arc::new(SystemClock),
-            models: Arc::new(uwuwu_usecase::SpawnModels::canonical()),
-            projects: Default::default(),
-            cup: 7,
-        }),
+            Arc::new(SystemClock),
+            Arc::new(uwuwu_usecase::SpawnModels::canonical()),
+            Default::default(),
+            7,
+            Arc::new(StubCronState),
+            None,
+        )),
     });
     (tools, memory)
 }
@@ -189,6 +191,21 @@ impl uwuwu_usecase::CleanJournalStore for StubJournals {
 
 /// Сессии в пробах не вызываются: гварды армов стреляют до gateway.
 pub(crate) struct StubSessions;
+
+/// Учёт кронов в пробах: пустые ряды, мутации в никуда (кроны в этих
+/// пробах не файрятся).
+#[derive(Default)]
+pub(crate) struct StubCronState;
+
+impl uwuwu_usecase::CronStateStore for StubCronState {
+    fn cron_row(&self, _: &str) -> uwuwu_usecase::CronRow {
+        Default::default()
+    }
+    fn set_cron_row(&self, _: &str, _: uwuwu_usecase::CronRow) {}
+    fn save(&self) -> UsecaseResult<()> {
+        Ok(())
+    }
+}
 
 #[async_trait]
 impl AgentSessionGateway for StubSessions {

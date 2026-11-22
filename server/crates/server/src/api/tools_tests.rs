@@ -4,7 +4,7 @@
 //! квитанция полного task_body. Мок-hub — в памяти, без GitHub.
 
 use super::test_support::{
-    blob_usecase, blob_usecase_missing, tool_hub, StubSessions, StubState, StubWiki,
+    blob_usecase, blob_usecase_missing, tool_hub, StubCronState, StubSessions, StubState, StubWiki,
 };
 use super::tools::{tool_descriptors, ToolHub};
 use crate::clock::SystemClock;
@@ -668,16 +668,18 @@ async fn fast_track_from_draft_and_todo() {
         sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(sessions)),
         search: Arc::new(SearchUseCase { semantic: None }),
         blobs: blob_usecase(),
-        crons: Arc::new(uwuwu_usecase::CronUseCase {
-            wiki: Arc::new(StubWiki),
-            sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(Arc::new(
+        crons: Arc::new(uwuwu_usecase::CronUseCase::new(
+            Arc::new(StubWiki),
+            Arc::new(uwuwu_usecase::SessionRouter::uniform(Arc::new(
                 StubSessions,
             ))),
-            clock: Arc::new(SystemClock),
-            models: Arc::new(uwuwu_usecase::SpawnModels::canonical()),
-            projects: Default::default(),
-            cup: 7,
-        }),
+            Arc::new(SystemClock),
+            Arc::new(uwuwu_usecase::SpawnModels::canonical()),
+            Default::default(),
+            7,
+            Arc::new(StubCronState),
+            None,
+        )),
     });
     call(
         &tools,

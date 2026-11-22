@@ -9,6 +9,9 @@ use uwuwu_domain::{Slot, Status};
 use uwuwu_usecase as naming;
 use uwuwu_usecase::BotStateStore;
 use uwuwu_usecase::Clock;
+use uwuwu_usecase::CronRow;
+use uwuwu_usecase::CronRunTrack;
+use uwuwu_usecase::CronStateStore;
 use uwuwu_usecase::DreamerMark;
 use uwuwu_usecase::TickStateStore;
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
@@ -88,10 +91,64 @@ struct StateFile {
     /// «slug бота» → сессия + offset (раннер ботов, #1150).
     #[serde(default)]
     bots: BTreeMap<String, BotRow>,
+    /// «имя крона» → машинный учёт ранов (#1480, снос журнала):
+    /// last_fire — источник is_due, run — детект тишины UC-02,
+    /// deferred_since — детект пропуска файра, fails — счётчик отказов
+    /// (канон ADR-103 «runtime-факты — в state»).
+    #[serde(default)]
+    crons: BTreeMap<String, CronRowState>,
     /// Реестр серверных постов: node_id → ms поста (self-эхо-фильтр #1204).
     /// Id GitHub глобально уникальны — плоский map без ключа доски.
     #[serde(default)]
     own_comments: BTreeMap<String, u64>,
+}
+
+/// Машинный учёт крона на носителе (срез #1480): SERDE-форма CronRow
+/// (usecase::ports); трек без сессии = краш между записью и спавном.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct CronRowState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_fire_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deferred_since_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run: Option<CronRunState>,
+    #[serde(default)]
+    fails: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CronRunState {
+    session: String,
+    fired_ms: u64,
+}
+
+impl From<&CronRow> for CronRowState {
+    fn from(row: &CronRow) -> Self {
+        Self {
+            last_fire_ms: row.last_fire_ms,
+            deferred_since_ms: row.deferred_since_ms,
+            run: row.run.as_ref().map(|r| CronRunState {
+                session: r.session.clone(),
+                fired_ms: r.fired_ms,
+            }),
+            fails: row.fails,
+        }
+    }
+}
+
+impl From<CronRowState> for CronRow {
+    fn from(s: CronRowState) -> Self {
+        CronRow {
+            last_fire_ms: s.last_fire_ms,
+            deferred_since_ms: s.deferred_since_ms,
+            run: s.run.map(|r| CronRunTrack {
+                session: r.session,
+                fired_ms: r.fired_ms,
+            }),
+            fails: s.fails,
+        }
+    }
 }
 
 /// Переезд носителя ботов (#1214): ключи старой раскладки
@@ -679,6 +736,31 @@ impl BotStateStore for JsonStateStore {
     }
 }
 
+impl CronStateStore for JsonStateStore {
+    fn cron_row(&self, name: &str) -> CronRow {
+        self.state
+            .lock()
+            .expect("state lock")
+            .crons
+            .get(name)
+            .cloned()
+            .map(Into::into)
+            .unwrap_or_default()
+    }
+
+    fn set_cron_row(&self, name: &str, row: CronRow) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .crons
+            .insert(name.to_string(), CronRowState::from(&row));
+    }
+
+    fn save(&self) -> UsecaseResult<()> {
+        self.save_now()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -717,6 +799,20 @@ mod tests {
             // бот: сессия + offset переживают рестарт (секция bots)
             s.set_bot_session("bot/x", Some("ses_abc"));
             s.set_bot_offset("bot/x", 42);
+            // крон: машинный учёт рана переживает рестарт (секция crons, #1480)
+            CronStateStore::set_cron_row(
+                &s,
+                "qa-night",
+                CronRow {
+                    last_fire_ms: Some(1_000),
+                    deferred_since_ms: None,
+                    run: Some(CronRunTrack {
+                        session: "ses_run".into(),
+                        fired_ms: 1_000,
+                    }),
+                    fails: 2,
+                },
+            );
             TickStateStore::save(&s).unwrap();
         }
         let s = store(path.clone());
@@ -727,6 +823,19 @@ mod tests {
             "рестарт восстанавливает сессию бота"
         );
         assert_eq!(s.bot_offset("bot/x"), Some(42));
+        let row = s.cron_row("qa-night");
+        assert_eq!(
+            row.last_fire_ms,
+            Some(1_000),
+            "учёт рана переживает рестарт"
+        );
+        assert_eq!(
+            row.run.map(|r| r.session).as_deref(),
+            Some("ses_run"),
+            "run-трек переживает рестарт"
+        );
+        assert_eq!(row.fails, 2, "счётчик отказов переживает рестарт");
+        assert_eq!(s.cron_row("нет-такого").fails, 0, "нет записи — дефолт");
         std::fs::remove_dir_all(&dir).ok();
     }
 
