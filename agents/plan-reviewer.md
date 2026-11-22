@@ -101,6 +101,9 @@ without which the implementer would start making design decisions themselves?
   `agents/developer.md`, Step 2 «Формирование плана»).
 - **docs/spike/analys/other** — scope boundaries and acceptance criteria (what counts as
   done, what is deliberately out of scope); «types/signatures» do not apply to such plans.
+- **UI slice** — UX acceptance criteria on par with mechanical ones (a slop pass, screens in all
+  states, a real-data-volume run); a UI slice in the plan without them is a readiness gap, Common
+  at minimum.
 - **«Верификация»** — presence and adequacy: how it will be proven that
   the implementation works (autotests, a smoke test, a manual checkpoint). The implementer's self-assessment
   («проверил, работает») is NOT proof: the strategy must rely on methods
