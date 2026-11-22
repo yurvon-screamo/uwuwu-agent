@@ -179,10 +179,14 @@ impl TaskBoardRepo for FakeBoard {
         _p: &str,
         title: &str,
         _body: &str,
+        _kind: Option<&str>,
     ) -> UsecaseResult<u64> {
         let n = self.rows.lock().unwrap().len() as u64 + 100;
         self.log.lock().unwrap().push(format!("create:{title}"));
         Ok(n)
+    }
+    async fn set_issue_type(&self, _n: u64, _kind: &str) -> UsecaseResult<()> {
+        Ok(())
     }
     async fn rename_issue(&self, _n: u64, _t: &str) -> UsecaseResult<()> {
         Ok(())
@@ -1226,6 +1230,49 @@ fn dev_task(n: u64, session: &str) -> Task {
     t
 }
 
+/// Гейтвей с N busy-сессиями union-скана — харнес held_cup-пинов
+/// сайдкаров (#1313): dreamer/analyst/analyst_review решают по busy.
+/// outcome задаёт кандидатность филлеров для дримера (is_fresh_candidate).
+pub(crate) fn gateway_with_busy_sessions(
+    count: usize,
+    outcome: &str,
+) -> Arc<dyn AgentSessionGateway> {
+    let sessions = FakeSessions::new();
+    {
+        let mut extra = sessions.extra.lock().unwrap();
+        for i in 0..count {
+            extra.push(crate::ports::SessionInfo {
+                id: format!("ses_busy_{i}"),
+                agent: String::new(),
+                directory: String::new(),
+                updated_ms: 0,
+                outcome: outcome.to_string(),
+                total_tokens: 100,
+                busy: true,
+            });
+        }
+    }
+    Arc::new(sessions)
+}
+
+/// Доска с заданными строками — харнес контроль-ранов волн.
+pub(crate) fn board_with_rows(rows: Vec<Task>) -> Arc<dyn TaskBoardRepo> {
+    Arc::new(FakeBoard {
+        rows: std::sync::Mutex::new(rows),
+        log: Mutex::default(),
+        comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
+        status_fails: AtomicBool::new(false),
+    })
+}
+
+/// Чистый state тика для сайдкар-пинов.
+pub(crate) fn empty_tick_state() -> Arc<dyn TickStateStore> {
+    Arc::new(MemState(Mutex::default()))
+}
+
 /// Юзкейс будильника: настраиваемые комменты, активность и idle-фаза хода
 /// (сценарии self-эха #1204).
 fn wake_usecase(
@@ -1564,8 +1611,12 @@ impl TaskBoardRepo for CommentBoard {
         _p: &str,
         _title: &str,
         _body: &str,
+        _kind: Option<&str>,
     ) -> UsecaseResult<u64> {
         Ok(1)
+    }
+    async fn set_issue_type(&self, _n: u64, _kind: &str) -> UsecaseResult<()> {
+        Ok(())
     }
     async fn rename_issue(&self, _n: u64, _t: &str) -> UsecaseResult<()> {
         Ok(())
@@ -3817,6 +3868,171 @@ async fn soft_ping_wakes_idle_session_without_transaction() {
         .any(|p| p.contains("Мягкий пинг")));
 }
 
+#[tokio::test]
+async fn soft_ping_held_when_cup_full_then_delivered_on_free_slot() {
+    // #1313: мягкий пинг — запуск хода, тот же LLM-слот, что будильник и
+    // спавн (UC-05 «все новые запуски ходов откладываются»). Кап полон —
+    // доставка держится без mark_stall_ping (ретрай следующим тиком),
+    // на освободившемся слоте уходит.
+    struct BigClock;
+    impl Clock for BigClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            100_000_000
+        }
+    }
+    let mut t = task(64, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dev_64").unwrap(),
+    );
+    t.apply_fields(f);
+    let board = Arc::new(FakeBoard {
+        rows: std::sync::Mutex::new(vec![t]),
+        log: Mutex::default(),
+        comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
+        status_fails: AtomicBool::new(false),
+    });
+    let sess = Arc::new(FakeSessions {
+        // молчание 16 мин, ход завершён (idle)
+        activity_ms: Some(100_000_000 - 16 * 60_000),
+        idle_reply: true,
+        ..FakeSessions::new()
+    });
+    // кап полон: чужая busy-сессия занимает единственный слот
+    sess.extra.lock().unwrap().push(crate::ports::SessionInfo {
+        id: "ses_cap_filler".into(),
+        agent: String::new(),
+        directory: String::new(),
+        updated_ms: 0,
+        outcome: String::new(),
+        total_tokens: 100,
+        busy: true,
+    });
+    let state = Arc::new(MemState(Mutex::default()));
+    let u = TickUseCase {
+        board,
+        sessions: Arc::new(SessionRouter::uniform(sess.clone())),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+            probes: Mutex::default(),
+        }),
+        clock: Arc::new(BigClock),
+        state: state.clone(),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        boot_ms: 0,
+        judge: None,
+        judge_cfg: Default::default(),
+    };
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(out.soft_pings, 0, "кап полон — мягкий пинг не доставляется");
+    assert_eq!(out.soft_pings_deferred, 1, "холд пинга наблюдаем");
+    assert!(
+        !sess
+            .prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.contains("Мягкий пинг")),
+        "промпта нет"
+    );
+    assert!(
+        state.0.lock().unwrap().stalls.is_empty(),
+        "mark_stall_ping при холде не пишется — доставка ретраится"
+    );
+    // слот освободился — пинг уходит следующим тиком
+    sess.extra.lock().unwrap().clear();
+    let out2 = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(out2.soft_pings, 1, "свободный слот — пинг доставлен");
+    assert_eq!(out2.soft_pings_deferred, 0);
+}
+
+/// #1313 (ревью High): доставленный пинг занимает слот в счётчике тика —
+/// две idle-строки со ставшими ходами при капе 1 получают РОВНО ОДИН пинг
+/// за тик (вторая видит инкремент и держится); без инкремента масс-сталл
+/// оверселлит кап (класс общего счётчика #1200/#1244).
+#[tokio::test]
+async fn soft_ping_mass_stall_oversell_is_capped() {
+    struct BigClock;
+    impl Clock for BigClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            100_000_000
+        }
+    }
+    let rows: Vec<Task> = [71, 72]
+        .iter()
+        .map(|n| {
+            let mut t = task(*n, Status::InProgress);
+            let mut f = TaskFields::default();
+            f.set_session(
+                Slot::Dev,
+                uwuwu_domain::SessionRef::parse(&format!("ses_dev_{n}")).unwrap(),
+            );
+            t.apply_fields(f);
+            t
+        })
+        .collect();
+    let board = Arc::new(FakeBoard {
+        rows: std::sync::Mutex::new(rows),
+        log: Mutex::default(),
+        comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
+        status_fails: AtomicBool::new(false),
+    });
+    let sess = Arc::new(FakeSessions {
+        activity_ms: Some(100_000_000 - 16 * 60_000),
+        idle_reply: true,
+        ..FakeSessions::new()
+    });
+    let u = TickUseCase {
+        board,
+        sessions: Arc::new(SessionRouter::uniform(sess.clone())),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+            probes: Mutex::default(),
+        }),
+        clock: Arc::new(BigClock),
+        state: Arc::new(MemState(Mutex::default())),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        boot_ms: 0,
+        judge: None,
+        judge_cfg: Default::default(),
+    };
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(
+        out.soft_pings, 1,
+        "масс-сталл при капе 1: ровно один пинг за тик — инкремент слота виден второй строке"
+    );
+    assert_eq!(
+        out.soft_pings_deferred, 1,
+        "вторая строка держится уже обновлённым счётчиком"
+    );
+    assert_eq!(
+        sess.prompts.lock().unwrap().len(),
+        1,
+        "промпт один — оверселла нет"
+    );
+}
+
 /// Инцидент 18.11 (#1281): рестарт uwuwu-server не должен парковать живые
 /// stage-сессии сталл-детектом. Геометрия прод: persisted count=2 (два
 /// автопинга ДО рестарта, volume /data переживает пересоздание контейнера),
@@ -4050,6 +4266,84 @@ async fn escalation_deferred_when_liveness_probe_unreliable() {
             .iter()
             .any(|l| l.contains("NeedsAttention")),
         "строка не паркуется, пока проба недостоверна"
+    );
+}
+
+/// Пин ADR-101 (#1313): Design-фантом (ход умер, запись сессии жива,
+/// тишина) проходит сталл-детект наравне с In Progress — эскалация
+/// уводит статус из LLM-активных, слот CUP освобождается.
+#[tokio::test]
+async fn design_phantom_stall_escalates_and_frees_cup_slot() {
+    const NOW: u64 = 100_000_000;
+    struct BigClock;
+    impl Clock for BigClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            NOW
+        }
+    }
+    let mut design = task(45, Status::Design);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Design,
+        uwuwu_domain::SessionRef::parse("ses_design_45").unwrap(),
+    );
+    design.apply_fields(f);
+    let board = Arc::new(FakeBoard {
+        rows: std::sync::Mutex::new(vec![design]),
+        log: Mutex::default(),
+        comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
+        status_fails: AtomicBool::new(false),
+    });
+    let sess = Arc::new(FakeSessions {
+        activity_ms: Some(NOW - 25 * 60_000),
+        idle_reply: true,
+        ..Default::default()
+    });
+    // раунд пингов Design-статуса, заработанный текущим процессом
+    let seeded = MemState(Mutex::new(MemStateInner {
+        stalls: vec![
+            (45, Status::Design, NOW - 40 * 60_000),
+            (45, Status::Design, NOW - 35 * 60_000),
+        ],
+        ..Default::default()
+    }));
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sess.clone())),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+            probes: Mutex::default(),
+        }),
+        clock: Arc::new(BigClock),
+        state: Arc::new(seeded),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        boot_ms: NOW - 50 * 60_000,
+        judge: None,
+        judge_cfg: Default::default(),
+    };
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.stall_flagged, 1,
+        "Design-фантом эскалирует — сталл-детект слот-генеричен"
+    );
+    assert!(
+        board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("status#45=NeedsAttention")),
+        "статус ушёл из LLM-активных — слот капа свободен"
     );
 }
 
@@ -5711,8 +6005,12 @@ impl TaskBoardRepo for FakeMultiBoard {
         _p: &str,
         _title: &str,
         _body: &str,
+        _kind: Option<&str>,
     ) -> UsecaseResult<u64> {
         Ok(1)
+    }
+    async fn set_issue_type(&self, _n: u64, _kind: &str) -> UsecaseResult<()> {
+        Ok(())
     }
     async fn rename_issue(&self, _n: u64, _t: &str) -> UsecaseResult<()> {
         Ok(())
@@ -6118,8 +6416,18 @@ impl TaskBoardRepo for CloseBoard {
     async fn read_issue(&self, _: &str, _: u64) -> UsecaseResult<crate::ports::IssueView> {
         Err(crate::error::UsecaseError::Board("мок".into()))
     }
-    async fn create_issue(&self, _: &str, _: &str, _: &str, _: &str) -> UsecaseResult<u64> {
+    async fn create_issue(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+    ) -> UsecaseResult<u64> {
         Ok(1)
+    }
+    async fn set_issue_type(&self, _: u64, _: &str) -> UsecaseResult<()> {
+        Ok(())
     }
     async fn rename_issue(&self, _: u64, _: &str) -> UsecaseResult<()> {
         Ok(())

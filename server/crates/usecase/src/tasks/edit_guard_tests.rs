@@ -101,8 +101,18 @@ impl TaskBoardRepo for StaleBoard {
         Ok(TaskFields::default())
     }
 
-    async fn create_issue(&self, _: &str, _: &str, _: &str, _: &str) -> UsecaseResult<u64> {
+    async fn create_issue(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+    ) -> UsecaseResult<u64> {
         Ok(1)
+    }
+    async fn set_issue_type(&self, _: u64, _: &str) -> UsecaseResult<()> {
+        Ok(())
     }
 
     async fn rename_issue(&self, _: u64, _: &str) -> UsecaseResult<()> {

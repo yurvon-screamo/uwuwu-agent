@@ -21,7 +21,7 @@ pub fn status_name(s: Status) -> &'static str {
         Status::UserReview => "Review",
         Status::Done => "Done",
         Status::NeedsAttention => "Needs attention",
-        Status::Wait => "Вейт",
+        Status::Wait => "Wait",
         Status::Deleted => "Deleted",
         Status::Empty => "",
     }
@@ -44,6 +44,7 @@ pub fn parse_status(raw: &str) -> Status {
         "Review" => Status::UserReview,
         "Done" => Status::Done,
         "Needs attention" => Status::NeedsAttention,
+        "Wait" => Status::Wait,
         "Вейт" => Status::Wait,
         "Deleted" => Status::Deleted,
         _ => Status::Empty,
@@ -78,7 +79,9 @@ pub fn parse_agent(raw: &str) -> Option<Agent> {
     })
 }
 
-/// Каноническое имя типа задачи (поле issue).
+/// Каноническое имя типа задачи (MCP-поверхность: дескрипторы/валидация
+/// create-edit). Носитель — нативный issue Type (#1271), его словарь
+/// резолвит task_type_native_name.
 pub fn task_type_name(t: TaskType) -> &'static str {
     match t {
         TaskType::Bug => "bug",
@@ -90,6 +93,19 @@ pub fn task_type_name(t: TaskType) -> &'static str {
         TaskType::Legacy => "legacy",
         TaskType::Qa => "qa",
         TaskType::Infrastructure => "infrastructure",
+    }
+}
+
+/// Имя типа в нативном словаре issue Type репо-хаба (заведён владельцем
+/// 12.11: дефолты Task/Bug/Feature + остальные канонные 1:1) — запись
+/// create/edit и чтение носителя одним знанием (#1271). Обратный маппинг
+/// — parse_task_type (case-insensitive): «Task» (нативный дефолт),
+/// null и неизвестное имя → None без громкой ошибки.
+pub fn task_type_native_name(t: TaskType) -> &'static str {
+    match t {
+        TaskType::Bug => "Bug",
+        TaskType::Feature => "Feature",
+        t => task_type_name(t),
     }
 }
 
@@ -179,7 +195,8 @@ pub fn schedule_label(s: &Schedule) -> String {
     }
 }
 
-/// Все типы канона (порядок = порядок опций поля «Тип»).
+/// Все типы канона: порядок кормит `type_enum_list()` — перечни enum в
+/// дескрипторах task_create/task_edit и тексты громких отказов (#1271).
 pub const TASK_TYPES: [TaskType; 9] = [
     TaskType::Bug,
     TaskType::Spike,
@@ -235,6 +252,17 @@ mod tests {
     }
 
     #[test]
+    fn status_wait_alias() {
+        // Алиас «Вейт» — мост совместимости переименования: прод-сервер до
+        // деплоя нового бинарника пишет «Вейт», а state.rs парсит last_status
+        // тем же parse_status. Удаление алиаса должно валить этот тест,
+        // а не молча ломать чтение легаси-значений.
+        assert_eq!(status_name(Status::Wait), "Wait");
+        assert_eq!(parse_status("Wait"), Status::Wait);
+        assert_eq!(parse_status("Вейт"), Status::Wait);
+    }
+
+    #[test]
     fn agent_and_type_round_trip() {
         for a in [
             Agent::Developer,
@@ -261,7 +289,17 @@ mod tests {
             TaskType::Infrastructure,
         ] {
             assert_eq!(parse_task_type(task_type_name(t)), Some(t));
+            // круг через нативный словарь issue Type (#1271): записанное
+            // имя читается обратно тем же parse
+            assert_eq!(parse_task_type(task_type_native_name(t)), Some(t));
         }
+        // нативный дефолт Task и нативная капс канона читаются честно:
+        // «Task» — не канонный тип (None), капс гасится lowercase-парсом
+        assert_eq!(parse_task_type("Task"), None);
+        assert_eq!(parse_task_type("Bug"), Some(TaskType::Bug));
+        assert_eq!(task_type_native_name(TaskType::Bug), "Bug");
+        assert_eq!(task_type_native_name(TaskType::Feature), "Feature");
+        assert_eq!(task_type_native_name(TaskType::Spike), "spike");
         // idea/analys выведены: старые значения — неизвестный тип
         assert_eq!(parse_task_type("idea"), None);
         assert_eq!(parse_task_type("analys"), None);

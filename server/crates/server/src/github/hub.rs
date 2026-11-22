@@ -50,7 +50,7 @@ const QUERY: &str = r#"
             pageInfo{ hasNextPage endCursor }
             nodes{
               id
-              content{ __typename ...on Issue{ number title state closedAt } }
+              content{ __typename ...on Issue{ number title state closedAt issueType{ name } } }
               fieldValues(first:30){
                 nodes{ __typename
                   ...on ProjectV2ItemFieldSingleSelectValue{
@@ -725,6 +725,11 @@ fn parse_page(items: &[Value], meta: &mut BoardMeta) -> Vec<Task> {
             task.set_priority(uwuwu_usecase::parse_priority(&v.priority));
             task.set_automerge(v.automerge);
             task.set_direct(v.direct);
+            // тип — нативный issue Type на issue-узле (не ячейка доски;
+            // #1271): null/Task/неизвестное имя → None
+            task.set_kind(uwuwu_usecase::parse_task_type(
+                issue["issueType"]["name"].as_str().unwrap_or_default(),
+            ));
             meta.items
                 .insert(number, item["id"].as_str().unwrap_or_default().to_string());
             Some(task)
@@ -781,10 +786,13 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
     use uwuwu_domain::{Slot, TaskFields, Vcs};
     let s = |v: Option<&String>| v.and_then(|s| uwuwu_domain::SessionRef::parse(s));
     // слоты: dev/review/test; review-поле покрывает оба ревью-слота,
-    // dev-поле — оба слота дев-семьи (Design/Dev единая сессия, канон
-    // сессий #328): иначе Design-строка читается без сессии и тик
-    // бесконечно пытается спавнить дубль (инцидент 15.11/16.11 —
-    // budget-отказы маскировали, budget-50 вскрыл бы спавном дублей)
+    // dev-поле — оба слота дев-семьи (Design/Dev — единая сессия, канон
+    // дев-семьи — usecase/pipeline/tick.rs «едина между этапами и
+    // откатами (требование владельца)», носитель — семейные поля
+    // fields.rs + set_session): иначе Design-строка читается без
+    // сессии и тик бесконечно пытается спавнить дубль (инцидент
+    // 15.11/16.11 — budget-отказы маскировали, budget-50 вскрыл бы
+    // спавном дублей)
     let mut assignments = std::collections::BTreeMap::new();
     for (name, slots) in [
         (
@@ -1062,6 +1070,11 @@ impl TaskBoardRepo for GitHubHub {
             .map(|v| v == "on")
             .unwrap_or(false);
         task.set_direct(direct);
+        // тип — нативный issue Type (верхний уровень GET issue, не
+        // issue_field_values; #1271) — REST-путь MCP честен, как тик-путь
+        task.set_kind(uwuwu_usecase::parse_task_type(
+            issue["type"]["name"].as_str().unwrap_or_default(),
+        ));
         let comments = self.all_comments(number).await?;
         Ok(IssueView {
             task,
@@ -1076,14 +1089,18 @@ impl TaskBoardRepo for GitHubHub {
         project: &str,
         title: &str,
         body: &str,
+        kind_name: Option<&str>,
     ) -> UsecaseResult<u64> {
+        let mut payload =
+            json!({ "title": title, "body": body, "labels": [format!("proj:{project}")] });
+        if let Some(kind) = kind_name {
+            payload["type"] = json!(kind);
+        }
         let (status, resp) = self
             .rest(
                 reqwest::Method::POST,
                 &format!("/repos/{}/issues", self.repo),
-                Some(
-                    json!({ "title": title, "body": body, "labels": [format!("proj:{project}")] }),
-                ),
+                Some(payload),
             )
             .await?;
         if !status.is_success() {
@@ -1092,12 +1109,53 @@ impl TaskBoardRepo for GitHubHub {
                 resp.to_string().chars().take(140).collect::<String>()
             )));
         }
+        // эхо типа (#1271): GitHub отвечает 422 на неизвестное имя, но
+        // «silently dropped» без push-доступа приходит 201 без типа —
+        // тихая потеря носителя ловится здесь, а не чтением агента
+        if let Some(kind) = kind_name {
+            if resp["type"]["name"].as_str() != Some(kind) {
+                return Err(UsecaseError::Board(format!(
+                    "create issue: тип «{kind}» не принят носителем (эхо: {}) — \
+                     словарь issue Type репо или права токена",
+                    resp["type"]["name"].as_str().unwrap_or("null")
+                )));
+            }
+        }
         let number = resp["number"].as_u64().unwrap_or_default();
         if number == 0 {
             return Err(UsecaseError::Board("create issue: нет номера".into()));
         }
         self.add_to_board(board, number).await?;
         Ok(number)
+    }
+
+    async fn set_issue_type(&self, number: u64, kind_name: &str) -> UsecaseResult<()> {
+        let (status, resp) = self
+            .rest(
+                reqwest::Method::PATCH,
+                &format!("/repos/{}/issues/{number}", self.repo),
+                Some(json!({ "type": kind_name })),
+            )
+            .await?;
+        // громкий отказ с телом носителя до сверки эха (#1271): gherr ловит
+        // только 403/429 — 422/5xx дошли бы до эхо-ветки с неверным
+        // диагнозом вместо точной причины GitHub
+        if !status.is_success() {
+            return Err(UsecaseError::Board(format!(
+                "edit #{number}: HTTP {status}: {}",
+                resp.to_string().chars().take(140).collect::<String>()
+            )));
+        }
+        // сверка эха — симметрично create (#1271): тихий дроп без
+        // push-доступа не проходит как успех
+        if resp["type"]["name"].as_str() != Some(kind_name) {
+            return Err(UsecaseError::Board(format!(
+                "edit #{number}: тип «{kind_name}» не принят носителем (эхо: {}) — \
+                 словарь issue Type репо или права токена",
+                resp["type"]["name"].as_str().unwrap_or("null")
+            )));
+        }
+        Ok(())
     }
 
     async fn issue_fields(&self, number: u64) -> UsecaseResult<uwuwu_domain::TaskFields> {
@@ -1566,6 +1624,7 @@ impl uwuwu_usecase::IssueIndexSource for GitHubHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uwuwu_domain::TaskType;
     use uwuwu_domain::{gate, Gate, PeakWindow, Priority, SpawnPolicy, UtcMinute};
 
     #[test]
@@ -2247,6 +2306,34 @@ mod tests {
 
     #[test]
     #[ignore] // живой прогон: GH_TOKEN + сеть к api.github.com (read-only)
+    fn live_read_issue_sees_native_issue_type() {
+        // #1271: REST-путь read_issue обязан нести нативный issue Type —
+        // issue["type"]["name"] → set_kind (fm-вью task_get). Строки
+        // sandbox: #1265 — Feature на носителе, #1175 — native-null хвост.
+        let repo =
+            std::env::var("UWUWU_HUB_REPO").unwrap_or_else(|_| "yurvon-screamo/uwuwu-hub".into());
+        let token = std::env::var("GH_TOKEN").expect("GH_TOKEN");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let hub = GitHubHub::new(repo, token);
+            let view = hub.read_issue("Задачи sandbox", 1265).await.expect("1265");
+            assert_eq!(
+                view.task.kind(),
+                Some(uwuwu_domain::TaskType::Feature),
+                "REST-вью слеп к нативному issue Type у #1265: \
+                 read_issue-парс issue[\"type\"] деградировал (#1271)"
+            );
+            let view = hub.read_issue("Задачи sandbox", 1175).await.expect("1175");
+            assert_eq!(
+                view.task.kind(),
+                None,
+                "native-null хвост #1175 обязан читаться пустым типом без ошибки (#1271)"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore] // живой прогон: GH_TOKEN + сеть к api.github.com (read-only)
     fn live_read_issue_sees_automerge() {
         // БАГ-ПИН ручного прогона #1232 (tester, 17.11): fm-вью task_get
         // показывает automerge: false при Autodone=on на носителе —
@@ -2357,6 +2444,44 @@ mod tests {
             guard_status(Status::ReviewResult, None),
             Status::ReviewResult
         );
+    }
+
+    #[test]
+    fn parse_page_carries_native_issue_type() {
+        // #1271: issueType с issue-узла снапшота доезжает до агрегата;
+        // null (native-null хвост) и нативный дефолт Task — None без ошибки
+        let mut meta = BoardMeta::default();
+        let items = vec![
+            json!({
+                "id": "IT_k1",
+                "content": { "__typename": "Issue", "number": 1, "title": "a",
+                             "state": "open", "issueType": { "name": "Bug" } },
+                "fieldValues": { "nodes": [] }
+            }),
+            json!({
+                "id": "IT_k2",
+                "content": { "__typename": "Issue", "number": 2, "title": "b",
+                             "state": "open", "issueType": { "name": "Refactoring" } },
+                "fieldValues": { "nodes": [] }
+            }),
+            json!({
+                "id": "IT_k3",
+                "content": { "__typename": "Issue", "number": 3, "title": "c",
+                             "state": "open", "issueType": null },
+                "fieldValues": { "nodes": [] }
+            }),
+            json!({
+                "id": "IT_k4",
+                "content": { "__typename": "Issue", "number": 4, "title": "d",
+                             "state": "open", "issueType": { "name": "Task" } },
+                "fieldValues": { "nodes": [] }
+            }),
+        ];
+        let rows = parse_page(&items, &mut meta);
+        assert_eq!(rows[0].kind(), Some(TaskType::Bug));
+        assert_eq!(rows[1].kind(), Some(TaskType::Refactoring));
+        assert_eq!(rows[2].kind(), None, "native-null хвост — пустой тип");
+        assert_eq!(rows[3].kind(), None, "нативный дефолт Task — пустой тип");
     }
 
     #[test]

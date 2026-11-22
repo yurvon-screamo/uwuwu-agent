@@ -1,0 +1,21 @@
+{
+  "opencode_version": "2.3",
+  "probed_at": "2026-11-17",
+  "source": "живая проба #1249 (дельта-раунд 17.11, basic-auth) + пин-семя PR #381",
+  "rule": "пин = дефолтная форма исполнителя; env-ручки-режимы стенда вне контракта",
+  "refresh": "после апгрейда opencode — повторная проба по ранбуку «Проба формы executor-API (пин-файл)»",
+  "message_tail": {
+    "wrapper": "data",
+    "forbidden_time_fields": ["updated"],
+    "assistant_final_time": ["completed", "created", "firstToken", "streamed"],
+    "assistant_streaming_time": ["created", "firstToken", "streamed"],
+    "idle_time": ["created"]
+  },
+  "session_list": {
+    "wrapper": "data",
+    "cursor": true,
+    "item_time": ["busy", "created", "idle", "updated"],
+    "default_session": { "agent_key": "absent", "outcome": "null" },
+    "role_session": { "agent_key": "string" }
+  }
+}

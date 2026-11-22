@@ -80,6 +80,10 @@ struct MockSession {
     /// Хвост строится фазами пробы: стрим → ловушка (шаг finish='tool-calls')
     /// → финал (finish='stop').
     turn_ms: Option<u64>,
+    /// User-сообщения команд (created_ms, текст): канал вердиктов env-gc
+    /// (#1431) — POST /command с name task-env-gc кладёт вердикт-строку,
+    /// wait_user_message конвейера находит её в хвосте.
+    user_messages: Vec<(u64, String)>,
 }
 
 #[derive(Default)]
@@ -101,6 +105,12 @@ struct Store {
     /// Адмиссии нативного компакта (#1221): id сессий по порядку —
     /// наблюдаемость e2e-фазы компакта.
     compacts: Mutex<Vec<String>>,
+    /// Окна фаз turn-хвоста (мс): MOCK_TURN_STREAM_MS / MOCK_TURN_TRAP_MS.
+    /// Дефолты — под поллинг раннера 2с (reply_poll_ms); контракт-тест
+    /// формы (#1254) растягивает окно стрима — проба детерминированно
+    /// попадает в фазу. Форма фаз от окон не зависит (пин #1254).
+    turn_stream_ms: u64,
+    turn_trap_ms: u64,
 }
 
 fn now_ms() -> u64 {
@@ -256,6 +266,8 @@ async fn main() {
     let mcp_token = cfg("MOCK_MCP_TOKEN", "");
     let port: u16 = cfg("MOCK_PORT", "8099").parse().unwrap_or(8099);
     let prompt_404_after: u64 = cfg("MOCK_PROMPT_404_AFTER", "0").parse().unwrap_or(0);
+    let turn_stream_ms: u64 = cfg("MOCK_TURN_STREAM_MS", "1200").parse().unwrap_or(1200);
+    let turn_trap_ms: u64 = cfg("MOCK_TURN_TRAP_MS", "3500").parse().unwrap_or(3500);
 
     let store = Arc::new(Store {
         verdicts: Mutex::new(
@@ -268,6 +280,8 @@ async fn main() {
         lost_directory: Mutex::new(String::new()),
         prompt_404_after,
         prompt_ok: AtomicU64::new(0),
+        turn_stream_ms,
+        turn_trap_ms,
         ..Store::default()
     });
     let verdicts_left = store.verdicts.lock().expect("verdicts").len();
@@ -433,15 +447,35 @@ async fn main() {
         .route(
             "/api/session/{id}/command",
             post({
+                let store = store.clone();
                 let mode = mode.clone();
-                move |Path(id): Path<String>| {
+                move |Path(id): Path<String>, Json(body): Json<Value>| {
+                    let store = store.clone();
                     let mode = mode.clone();
                     async move {
                         if mode == "gate" {
                             return gate_post_reject();
                         }
-                        // bootstrap-команды детерминированы: принимаем, не эмулируя shell
-                        tracing::info!(event = "mock.command", id = %id, "POST /command");
+                        // bootstrap-команды детерминированы: task-env-gc —
+                        // канал вердиктов env-gc (#1431), мок эмулирует
+                        // shell-исход user-сообщением «ENV-GC <row> SWEPT»;
+                        // прочие принимаются без эмуляции shell
+                        let name = body["name"].as_str().unwrap_or_default();
+                        tracing::info!(event = "mock.command", id = %id, name, "POST /command");
+                        if name == "task-env-gc" {
+                            let row = body["text"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .split_whitespace()
+                                .next_back()
+                                .unwrap_or_default()
+                                .to_string();
+                            let mut sessions = store.sessions.lock().expect("store");
+                            if let Some(s) = sessions.get_mut(&id) {
+                                s.user_messages
+                                    .push((now_ms(), format!("ENV-GC {row} SWEPT")));
+                            }
+                        }
                         (StatusCode::OK, Json(json!({}))).into_response()
                     }
                 }
@@ -585,11 +619,17 @@ async fn create_session(
         tokens_in: 0,
         tokens_out: 0,
         busy: false,
-        busy_ms: 0,
+        // дев-ручка стенда (#1313 V4): busy_ms в прошлом — зомби-флаг
+        // (busy > idle старше 30 мин не держит CUP-кап)
+        busy_ms: body["busy_ms_ago"]
+            .as_u64()
+            .map(|ago| now_ms().saturating_sub(ago))
+            .unwrap_or(0),
         idle_ms: 0,
         dead: mode == "dead",
         reply: None,
         turn_ms: None,
+        user_messages: Vec::new(),
     };
     tracing::info!(event = "mock.session_created", id = %id,
         agent = %session.agent, title = %session.title, "POST /session");
@@ -633,7 +673,11 @@ async fn list_sessions(store: Arc<Store>, q: Query<ListQuery>) -> Resp {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n > 0);
     let Some(page_size) = page else {
-        return (StatusCode::OK, Json(Value::Array(list)));
+        // живая форма 2.3 (пин #1254): список всегда обёрнут {data, cursor}
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "data": list, "cursor": { "next": "" } })),
+        );
     };
     // пагинация newest-first не моделируем — стабильный порядок по id:
     // контракт для сервера тот же (страница + cursor.next), iteration
@@ -662,9 +706,10 @@ async fn list_sessions(store: Arc<Store>, q: Query<ListQuery>) -> Resp {
 }
 
 fn session_json(s: &MockSession) -> Value {
-    json!({
+    // живая форма 2.3 (пин #1254): agent-ключ только у role-сессий,
+    // у default отсутствует (не null); outcome null у живых
+    let mut v = json!({
         "id": s.id,
-        "agent": if s.agent.is_empty() { Value::Null } else { json!(s.agent) },
         "title": s.title,
         "location": { "directory": s.directory },
         "time": {
@@ -675,7 +720,11 @@ fn session_json(s: &MockSession) -> Value {
         },
         "outcome": if s.outcome.is_empty() { Value::Null } else { json!(s.outcome) },
         "tokens": { "input": s.tokens_in, "output": s.tokens_out },
-    })
+    });
+    if !s.agent.is_empty() {
+        v["agent"] = json!(s.agent);
+    }
+    v
 }
 
 async fn get_session(store: Arc<Store>, id: String) -> Resp {
@@ -759,15 +808,24 @@ async fn model_catalog(store: Arc<Store>) -> Resp {
     (StatusCode::OK, Json(Value::Array(items)))
 }
 
-/// Стендовая ручка времени: updated_ms -= ms (сатаурирующий вычет).
-/// Дример-сценарии стенда: сессия «уснула» 31+ минут назад без реального
-/// ожидания; revival = свежий prompt + повторный age.
+/// Стендовая ручка времени: все отметки сессии -= ms (сатаурирующий
+/// вычет). Дример-сценарии стенда: сессия «уснула» 31+ минут назад без
+/// реального ожидания; revival = свежий prompt + повторный age.
+/// Форма 2.3 (пин #1254): time.updated в сообщениях нет — активность
+/// хвоста читается по цепочке created-полей, поэтому reply/turn сдвигаются
+/// наравне с updated_ms (контракт ручки «сессия замерла N минут назад»).
 async fn age_session(store: Arc<Store>, id: String, body: Value) -> Resp {
     let ms = body["ms"].as_u64().unwrap_or(0);
     let mut sessions = store.sessions.lock().expect("store");
     match sessions.get_mut(&id) {
         Some(s) => {
             s.updated_ms = s.updated_ms.saturating_sub(ms);
+            if let Some((created, _)) = &mut s.reply {
+                *created = created.saturating_sub(ms);
+            }
+            if let Some(turn) = &mut s.turn_ms {
+                *turn = turn.saturating_sub(ms);
+            }
             let updated = s.updated_ms;
             tracing::info!(event = "mock.session_aged", %id, by_ms = ms, updated,
                 "POST /session/{id}/age");
@@ -841,6 +899,10 @@ async fn prompt(
                 .find(|l| !l.trim().is_empty())
                 .unwrap_or_default();
             s.reply = Some((now_ms(), format!("мок-ответ на: {tail}")));
+            // ход мгновенно завершён — idle ≥ busy (контракт бинаря 2.3.0,
+            // сверено #1231): завершённый plain-ход не держит CUP-кап
+            // (#1313 V5 — иначе dev-сессии висят busy 30 мин до зомби-гарда)
+            s.idle_ms = now_ms();
         }
     }
     drop(sessions);
@@ -1085,17 +1147,24 @@ async fn work_like_agent(
 /// Фазы многосообщного хода (#1209, наблюдённая модель пробы): стрим
 /// (finish=None) → ловушка для старого условия (шаг finish='tool-calls',
 /// is_latest=true — зазор после тула) → финал finish='stop'. Окна —
-/// константы под поллинг раннера 2с (reply_poll_ms).
-fn turn_tail(turn_ms: u64) -> Value {
-    const STREAM_MS: u64 = 1_200;
-    const TRAP_MS: u64 = 3_500;
+/// ручки MOCK_TURN_STREAM_MS / MOCK_TURN_TRAP_MS (дефолты под поллинг
+/// раннера 2с, reply_poll_ms); контракт-тест формы (#1254) растягивает
+/// стрим-окно — проба детерминированно попадает в фазу.
+/// Форма — живой опенкод 2.3 (пин #1254): обёртка {data:[...]}, у
+/// assistant created/firstToken/streamed (финал + completed),
+/// time.updated нет ни у одного события (в т.ч. у user).
+fn turn_tail(turn_ms: u64, stream_ms: u64, trap_ms: u64) -> Value {
     const STEP_TEXT: &str = "промежуточный шаг хода";
     const FINAL_TEXT: &str = "turn final ok";
     let now = now_ms();
     let step1 = json!({
         "type": "assistant",
         "role": "assistant",
-        "time": { "created": turn_ms, "updated": now },
+        "time": {
+            "created": turn_ms,
+            "firstToken": turn_ms + 10,
+            "streamed": turn_ms + 20,
+        },
         "content": [
             { "type": "text", "text": STEP_TEXT },
             { "type": "tool", "state": { "status": "completed" } },
@@ -1103,61 +1172,99 @@ fn turn_tail(turn_ms: u64) -> Value {
     });
     let user = json!({
         "type": "user",
-        "time": { "created": turn_ms - 100, "updated": turn_ms - 100 },
+        "time": { "created": turn_ms - 100 },
     });
-    if now < turn_ms + STREAM_MS {
+    if now < turn_ms + stream_ms {
         // стримится: без finish — не ответ
         let mut msg = step1.clone();
         msg["finish"] = Value::Null;
-        return json!([msg, user]);
+        return json!({ "data": [msg, user] });
     }
-    if now < turn_ms + TRAP_MS {
+    if now < turn_ms + trap_ms {
         // шаг завершён, ход продолжается — ловушка finished+is_latest
         let mut msg = step1.clone();
         msg["finish"] = json!("tool-calls");
-        return json!([msg, user]);
+        return json!({ "data": [msg, user] });
     }
     let final_msg = json!({
         "type": "assistant",
         "role": "assistant",
-        "time": { "created": turn_ms + TRAP_MS, "updated": now },
+        "time": {
+            "created": turn_ms + trap_ms,
+            "firstToken": turn_ms + trap_ms + 10,
+            "streamed": turn_ms + trap_ms + 20,
+            // completed — момент завершения хода, не момент запроса: старение
+            // turn_ms (#1313 V5) уводит активность в прошлое, сталл-тишина копится
+            "completed": (turn_ms + trap_ms).min(now),
+        },
         "finish": "stop",
         "tokens": { "input": 1234, "output": 50, "reasoning": 0,
                     "cache": { "read": 0, "write": 0 } },
         "content": [{ "type": "text", "text": FINAL_TEXT }],
     });
-    json!([final_msg, step1, user])
+    json!({ "data": [final_msg, step1, user] })
 }
 
 async fn message_tail(store: Arc<Store>, id: String) -> Resp {
     let sessions = store.sessions.lock().expect("store");
     match sessions.get(&id) {
         Some(s) if s.turn_ms.is_some() => {
-            let tail = turn_tail(s.turn_ms.expect("turn_ms checked"));
+            let tail = turn_tail(
+                s.turn_ms.expect("turn_ms checked"),
+                store.turn_stream_ms,
+                store.turn_trap_ms,
+            );
             (StatusCode::OK, Json(stamp_activity_age(tail)))
         }
         Some(s) => {
-            // Форма — живой опенкод 2.3.0 (проба #1150): тип в поле `type`,
-            // у ассистента finish/content[].text/time.created; time.updated
-            // держим для last_activity_ms (wakeup-контур)
-            let mut msg = json!({
-                "type": "assistant",
-                "role": "assistant",
-                "time": { "updated": s.updated_ms },
-            });
-            if let Some((created_ms, text)) = &s.reply {
-                msg["finish"] = json!("stop");
-                msg["time"]["created"] = json!(created_ms);
-                msg["time"]["completed"] = json!(created_ms);
-                msg["content"] = json!([{ "type": "text", "text": text }]);
-                // токены поворота (#1221): компакт-проба читает хвост как
-                // занятость окна контекста
-                msg["tokens"] = json!({
-                    "input": s.tokens_in, "output": s.tokens_out, "reasoning": 0,
-                    "cache": { "read": 0, "write": 0 }
-                });
-            }
-            (StatusCode::OK, Json(stamp_activity_age(json!([msg]))))
+            // Форма — живой опенкод 2.3 (пин #1254): хвост обёрнут
+            // {data:[...]}, time.updated нет ни у одного события; ответ
+            // ассистента несёт created/firstToken/streamed/completed,
+            // сессия без ответа открывается idle-событием (только
+            // created — активность хвоста по нему же). User-сообщения
+            // команд (вердикты env-gc, #1431) идут перед ним в desc —
+            // свежайший первым, как order=desc живого API
+            let mut tail: Vec<Value> = s
+                .user_messages
+                .iter()
+                .rev()
+                .map(|(created_ms, text)| {
+                    json!({
+                        "type": "user",
+                        "role": "user",
+                        "time": { "created": created_ms },
+                        "content": [{ "type": "text", "text": text }],
+                    })
+                })
+                .collect();
+            let msg = if let Some((created_ms, text)) = &s.reply {
+                json!({
+                    "type": "assistant",
+                    "role": "assistant",
+                    "time": {
+                        "created": created_ms,
+                        "firstToken": created_ms + 10,
+                        "streamed": created_ms + 20,
+                        "completed": created_ms + 30,
+                    },
+                    "finish": "stop",
+                    "tokens": {
+                        "input": s.tokens_in, "output": s.tokens_out, "reasoning": 0,
+                        "cache": { "read": 0, "write": 0 }
+                    },
+                    "content": [{ "type": "text", "text": text }],
+                })
+            } else {
+                json!({
+                    "type": "idle",
+                    "time": { "created": s.updated_ms },
+                })
+            };
+            tail.push(msg);
+            (
+                StatusCode::OK,
+                Json(stamp_activity_age(json!({ "data": tail }))),
+            )
         }
         None => (StatusCode::NOT_FOUND, Json(json!({ "status": "404" }))),
     }
@@ -1166,22 +1273,30 @@ async fn message_tail(store: Arc<Store>, id: String) -> Resp {
 /// MOCK_ACTIVITY_AGE_MS (стенд судьи #1364): активность насильно старая —
 /// тишина сессии фиксированно глубока, сталл-контур (и судья) срабатывает
 /// в первых тиках стенда. Пост-стамп на ОБА ветвления хвоста (turn-фазы и
-/// idle-реплай): проба активности читает time.updated в первом сообщении,
-/// свежий штамп любого ветвления обнулял бы тишину — silent None
-/// сталл-контура (три красных прогона e2e 14a, 20.11).
+/// idle-реплай): свежий штамп любого ветвления обнулял бы тишину —
+/// silent None сталл-контура (три красных прогона e2e 14a, 20.11).
+/// Форма 2.3 (пин #1254, merge раунда 4): хвост обёрнут {data:[...]},
+/// time.updated в событиях нет — проба активности читает цепочку
+/// completed/streamed/firstToken/created (приоритет пробы), штампуются
+/// все отметки времени каждого сообщения.
 fn stamp_activity_age(mut tail: Value) -> Value {
     let age = cfg("MOCK_ACTIVITY_AGE_MS", "0").parse::<u64>().unwrap_or(0);
     if age == 0 {
         return tail;
     }
     let old = now_ms().saturating_sub(age);
-    if let Some(msgs) = tail.as_array_mut() {
+    // обе формы хвоста: голый массив (turn-ветка исторически) и обёртка
+    // {data:[...]} (пин #1254) — неожиданная форма проходит без штампа
+    let msgs = if tail.is_array() {
+        tail.as_array_mut()
+    } else {
+        tail.get_mut("data").and_then(Value::as_array_mut)
+    };
+    if let Some(msgs) = msgs {
         for m in msgs.iter_mut() {
             if let Some(t) = m.get_mut("time") {
-                t["updated"] = json!(old);
-                t["created"] = json!(old);
-                if t.get("completed").is_some() {
-                    t["completed"] = json!(old);
+                for key in ["updated", "completed", "streamed", "firstToken", "created"] {
+                    t[key] = json!(old);
                 }
             }
         }

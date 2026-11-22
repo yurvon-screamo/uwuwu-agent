@@ -1,6 +1,8 @@
 //! Агрегат Task: строка доски + сессии стадий + переходы статусов.
 //! Чистый домен: ноль зависимостей. Инварианты канона — здесь и в тестах.
 
+use crate::task_type::TaskType;
+
 /// Статусы канона досок uwuwu. Analys/Review Analys — стадия аналитики
 /// (входящий поток, замена триажа #1135). Empty — строка без статуса
 /// (легаси-черновик владельца: конвейер не трогает).
@@ -57,11 +59,11 @@ impl Status {
         if from == to {
             return true; // идемпотентная переустановка
         }
-        // Возврат в Вейт открыт из рабочих/финальных статусов: крон-мастер
-        // после правок тела обязан вернуться в Вейт (файр-гейт пускает только
+        // Возврат в Wait открыт из рабочих/финальных статусов: крон-мастер
+        // после правок тела обязан вернуться в Wait (файр-гейт пускает только
         // из него; унификация кронов с задачами забыла это ребро — мастер
-        // #384 застрял в In Progress, расписание умерло). Из Draft Вейт не
-        // ставится: черновики в Вейт проводит триаж.
+        // #384 застрял в In Progress, расписание умерло). Из Draft Wait не
+        // ставится: черновики в Wait проводит триаж.
         let to_wait = matches!(to, S::Wait)
             && matches!(
                 from,
@@ -394,6 +396,9 @@ pub struct Task {
     /// стадий. По образцу automerge: пишется на носитель явно (create),
     /// читается с колонки доски.
     direct: bool,
+    /// Тип задачи (нативный issue Type — единственный носитель, #1271):
+    /// None — не задан (native-null строки, неизвестное имя, дефолт Task).
+    kind: Option<TaskType>,
     /// Дата закрытия issue (unix ms): None — issue открыт либо носитель
     /// дату не сообщает. Клин холодного ящика (#1293) отбирает
     /// терминальные строки по возрасту закрытия.
@@ -410,6 +415,7 @@ impl Task {
             priority: Priority::Empty,
             automerge: false,
             direct: false,
+            kind: None,
             closed_at: None,
             fields: TaskFields::default(),
         }
@@ -462,6 +468,16 @@ impl Task {
         self.direct
     }
 
+    /// Тип задачи (нативный issue Type, #1271): None — не задан.
+    pub fn kind(&self) -> Option<TaskType> {
+        self.kind
+    }
+
+    /// Запись типа с носителя (parse issue Type) или через edit (#1271).
+    pub fn set_kind(&mut self, kind: Option<TaskType>) {
+        self.kind = kind;
+    }
+
     pub fn branch(&self) -> Option<&BranchName> {
         self.fields.branch()
     }
@@ -496,13 +512,23 @@ impl Task {
     }
 
     /// Кандидат клина холодного ящика (#1293): строка терминальна
-    /// (конвейер закончился) и issue закрыт строго старше `age_days`
+    /// (конвейер закончилась) и issue закрыт строго старше `age_days`
     /// суток. Дата закрытия = доказательство закрытого issue; строка
     /// без даты — пропуск, консервативно.
     pub fn is_sweep_candidate(&self, now_ms: u64, age_days: u32) -> bool {
-        if !self.status.is_terminal() {
-            return false;
-        }
+        self.status.is_terminal() && self.closed_older_than(now_ms, age_days)
+    }
+
+    /// Кандидат env-gc (#1431): терминальная строка, чей env подлежит
+    /// сносу — issue закрыт строго старше `age_days` суток. Тот же
+    /// домен-рулет, что у клина холодного ящика: дата закрытия —
+    /// доказательство, без даты — консервативный пропуск.
+    pub fn is_env_gc_candidate(&self, now_ms: u64, age_days: u32) -> bool {
+        self.status.is_terminal() && self.closed_older_than(now_ms, age_days)
+    }
+
+    /// Issue закрыт строго старше `age_days` суток; без даты — false.
+    fn closed_older_than(&self, now_ms: u64, age_days: u32) -> bool {
         let Some(closed) = self.closed_at else {
             return false;
         };
@@ -918,10 +944,10 @@ mod tests {
     #[test]
     fn wait_return_edges() {
         use Status as S;
-        // Крон-мастер после правок тела обязан вернуться в Вейт (файр-гейт
+        // Крон-мастер после правок тела обязан вернуться в Wait (файр-гейт
         // пускает только из него) — ребро возврата открыто из рабочих и
         // финальных статусов (инцидент #384: мастер застрял в In Progress,
-        // расписание умерло). Из Draft Вейт не ставится — это рука триажа.
+        // расписание умерло). Из Draft Wait не ставится — это рука триажа.
         for from in [
             S::Todo,
             S::Design,
@@ -989,6 +1015,19 @@ mod tests {
         assert_eq!(t.priority(), Priority::High);
     }
 
+    #[test]
+    fn kind_defaults_to_none_and_set_kind_carries() {
+        // #1271: тип — нативный issue Type; fresh-строка без типа (native
+        // null, неизвестное имя, дефолт Task) читается None без ошибки
+        let mut t = task(Status::Analys);
+        assert_eq!(t.kind(), None);
+        t.set_kind(Some(TaskType::Refactoring));
+        assert_eq!(t.kind(), Some(TaskType::Refactoring));
+        // снос значения носителем (PATCH type=null) — легальная мутация
+        t.set_kind(None);
+        assert_eq!(t.kind(), None);
+    }
+
     const DAY_MS: u64 = 86_400_000;
 
     #[test]
@@ -1025,5 +1064,39 @@ mod tests {
         let mut soft = task(Status::Deleted);
         soft.set_closed_at(old);
         assert!(soft.is_sweep_candidate(now, 7));
+    }
+
+    #[test]
+    fn env_gc_candidate_strictly_older_than_threshold() {
+        // Граница боевого порога 2 суток = «строго больше 48 ч» (#1431):
+        // 47 ч — нет, 49 ч — да
+        let now = 1_800_000_000_000;
+        let mut fresh = task(Status::Done);
+        fresh.set_closed_at(now - 47 * 3_600_000);
+        assert!(!fresh.is_env_gc_candidate(now, 2), "47 ч — свежая");
+        let mut mature = task(Status::Done);
+        mature.set_closed_at(now - 49 * 3_600_000);
+        assert!(mature.is_env_gc_candidate(now, 2), "49 ч — кандидат");
+    }
+
+    #[test]
+    fn env_gc_candidate_requires_terminal_status_and_date() {
+        let now = 1_800_000_000_000;
+        let old = now - 10 * 86_400_000;
+        // Активная строка с env — никогда не кандидат (fast-track вернётся
+        // в тот же env), даже при закрытом issue давнем
+        let mut active = task(Status::UserReview);
+        active.set_closed_at(old);
+        assert!(!active.is_env_gc_candidate(now, 2));
+        // Без даты закрытия — консервативный пропуск
+        let deleted = task(Status::Deleted);
+        assert!(!deleted.is_env_gc_candidate(now, 2));
+        // Терминальные с датой — кандидаты
+        let mut done = task(Status::Done);
+        done.set_closed_at(old);
+        assert!(done.is_env_gc_candidate(now, 2));
+        let mut soft = task(Status::Deleted);
+        soft.set_closed_at(old);
+        assert!(soft.is_env_gc_candidate(now, 2));
     }
 }

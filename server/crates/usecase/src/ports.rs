@@ -78,13 +78,23 @@ pub trait TaskBoardRepo: Send + Sync {
     async fn issue_fields(&self, number: u64) -> UsecaseResult<TaskFields>;
     /// Создание issue (лейбл proj:<project>) + строка на доске board
     /// (Analys — create-дефолт #1135; опция ставится по имени колонки).
+    /// kind_name — имя типа в нативном словаре issue Type (task_type_
+    /// native_name; #1271): идёт в теле POST одним вызовом, эхо ответа
+    /// сверяется с запросом — «silently dropped» без push-доступа ловится
+    /// громко на границе носителя. None — тип не ставится (не бывает из
+    /// create-юзкейса: дефолт Feature резолвится выше).
     async fn create_issue(
         &self,
         board: &str,
         project: &str,
         title: &str,
         body: &str,
+        kind_name: Option<&str>,
     ) -> UsecaseResult<u64>;
+    /// Запись нативного типа issue (PATCH issue {"type": имя}; #1271):
+    /// неизвестное имя — HTTP 422 от GitHub (громко через gherr),
+    /// тихий дроп без push-доступа ловится сверкой эха ответа.
+    async fn set_issue_type(&self, number: u64, kind_name: &str) -> UsecaseResult<()>;
     /// Переименование (тайтл уникален — дубль отвергается юзкейсом выше).
     async fn rename_issue(&self, number: u64, title: &str) -> UsecaseResult<()>;
     /// Точечная правка fm-ячеек (branch/pr/priority/…) с сохранением контента.
@@ -274,6 +284,19 @@ pub trait AgentSessionGateway: Send + Sync {
     async fn last_activity_ms(&self, session: &str) -> UsecaseResult<Option<u64>>;
     /// Последний ассистентский ответ сессии (для ботов: ожидание реплая).
     async fn last_assistant_reply(&self, session: &str) -> UsecaseResult<Option<AssistantReply>>;
+    /// Дождаться user-сообщения сессии, содержащего `marker`, не дольше
+    /// `deadline_ms`; вердикты env-gc (#1431): shell-вывод slash-команды
+    /// доезжает user-сообщением bootstrap-сессии. None — дедлайн. Опрос
+    /// с паузами — инфра-забота адаптера (runtime), юзкейс агностичен.
+    /// Дефолт None: фейки без env-gc не должны уметь канал.
+    async fn wait_user_message(
+        &self,
+        _session: &str,
+        _marker: &str,
+        _deadline_ms: u64,
+    ) -> UsecaseResult<Option<String>> {
+        Ok(None)
+    }
     /// Список сессий исполнителя (для дримера: idle-детект).
     async fn list_sessions(&self) -> UsecaseResult<Vec<SessionInfo>>;
     /// Экспорт сессии (сообщения/сводка) — контент для дримера.

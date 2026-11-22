@@ -8,6 +8,10 @@ use uwuwu_domain::ModelRef;
 use uwuwu_usecase::{AgentSessionGateway, AssistantReply, Liveness, SessionInfo, SessionSpec};
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
+/// Пауза опроса user-ленты в wait_user_message (канал вердиктов
+/// env-gc, #1431): редкий опрос не греет API исполнителя.
+const USER_MSG_POLL: Duration = Duration::from_millis(3_000);
+
 pub struct OpencodeClient {
     base: String,
     password: String,
@@ -35,7 +39,7 @@ fn message_activity_ms(msg: &Value) -> Option<u64> {
         .or_else(|| t["created"].as_u64())
 }
 
-/// busy-вердикт сессии по времени (#1231 семантика + #1295 зомби-гард):
+/// busy-вердикт сессии по времени (#1231 семантика + PR #409 зомби-гард):
 /// busy ⟺ busy > idle И флаг свежее 30 минут (оборванный ход оставляет
 /// busy>idle навсегда — крэш/рестарт исполнителя; 12 зомби на redmi
 /// держали глобальный кап при 1 работающей, 18.11).
@@ -77,7 +81,7 @@ fn parse_session_page(
             list.iter()
                 .filter_map(|s| {
                     // busy ⟺ busy > idle (сверено с бинарём 2.3.0, #1231),
-                    // зомби-гард 30 мин (#1295) — см. session_busy.
+                    // зомби-гард 30 мин (PR #409) — см. session_busy.
                     // При апгрейде opencode семантику перепроверить.
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -538,6 +542,29 @@ impl AgentSessionGateway for OpencodeClient {
         }))
     }
 
+    /// Канал вердиктов env-gc (#1431): поллинг user-ленты с паузами —
+    /// токенов не жжёт (bootstrap-реплай агента не участвует), паузы —
+    /// tokio-сны воркера, не блокировка потока.
+    async fn wait_user_message(
+        &self,
+        session: &str,
+        marker: &str,
+        deadline_ms: u64,
+    ) -> UsecaseResult<Option<String>> {
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(text) = self.last_user_message_text(session).await? {
+                if text.contains(marker) {
+                    return Ok(Some(text));
+                }
+            }
+            if started.elapsed().as_millis() as u64 >= deadline_ms {
+                return Ok(None);
+            }
+            tokio::time::sleep(USER_MSG_POLL).await;
+        }
+    }
+
     /// Занятость окна контекста (#1221): токены свежайшего assistant-
     /// поворота против лимита модели из каталога исполнителя. Сбои
     /// хвоста — Err; «не измерить» (нет поворотов / нет лимита) —
@@ -580,6 +607,38 @@ impl AgentSessionGateway for OpencodeClient {
 }
 
 impl OpencodeClient {
+    /// Текст свежайшего user-сообщения сессии (content[].text склеенный);
+    /// None — user-сообщений нет. Форма та же, что у ассистентского
+    /// хвоста (opencode 2.3.0): type «user», content[].text.
+    async fn last_user_message_text(&self, session: &str) -> UsecaseResult<Option<String>> {
+        let (status, resp) = self
+            .call(
+                &format!("/session/{session}/message?limit=5&order=desc"),
+                reqwest::Method::GET,
+                None,
+            )
+            .await?;
+        Self::check(status, &format!("message tail {session}"))?;
+        let Some(msg) = message_array(&resp).and_then(|m| m.iter().find(|m| m["type"] == "user"))
+        else {
+            return Ok(None);
+        };
+        let text: Vec<&str> = msg["content"]
+            .as_array()
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter(|p| p["type"] == "text")
+                    .filter_map(|p| p["text"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if text.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(text.join("\n")))
+    }
+
     /// Лимит окна контекста модели из каталога исполнителя GET /model
     /// (клиент клеит /api — строгий pathname-тест стережёт двойной
     /// префикс, живой урок ADR-082). Кэш per-client: Ok(None)
@@ -732,7 +791,7 @@ mod tests {
 
     #[test]
     fn zombie_busy_flag_expires_after_half_hour() {
-        // #1295: busy-флаг оборванного хода (busy > idle навсегда после
+        // PR #409: busy-флаг оборванного хода (busy > idle навсегда после
         // крэша/рестарта исполнителя) не должен держать кап: ход старше
         // 30 минут без завершения — протух. Свежий busy — держит.
         let now = std::time::SystemTime::now()
@@ -887,7 +946,7 @@ mod tests {
         // #1231: busy ⟺ time.busy > time.idle — ход в полёте (Started
         // пишет time.busy, idle-финал пишет time.idle). outcome — атрибут
         // последнего завершённого хода, живость не выражает.
-        // #1295: плюс зомби-гард — флаг busy свежее 30 мин (фикстуры
+        // PR #409: плюс зомби-гард — флаг busy свежее 30 мин (фикстуры
         // динамические от now: статичные ms протухают по определению).
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

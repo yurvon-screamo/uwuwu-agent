@@ -90,6 +90,9 @@ pub struct TickOutcome {
     pub stall_pings: usize,
     /// Мягких пингов (idle-сессия, прямой промпт — санкция владельца 16.11).
     pub soft_pings: usize,
+    /// Мягких пингов, отложенных CUP-капом (#1313): пинг — запуск хода,
+    /// слот не выдан, mark не пишется — ретрай следующим тиком.
+    pub soft_pings_deferred: usize,
     /// Строк, переведённых в Needs attention сталл-детектом.
     pub stall_flagged: usize,
     /// Строк, снятых с раунда капом ревью-раундов (#1311).
@@ -132,6 +135,22 @@ pub struct TickOutcome {
     pub executors_failed: Vec<String>,
 }
 
+/// Гейт CUP на доставке мягкого пинга (#1313): пинг — запуск хода,
+/// слот выделяется как будильнику/спавну. Бандл «политика + занятость» —
+/// один смысловой вход вердикт-прохода сталл-детекта.
+#[derive(Debug, Clone, Copy)]
+struct CupGate {
+    policy: SpawnPolicy,
+    active_now: usize,
+}
+
+impl CupGate {
+    /// Кап полон — новый ход не выдаётся.
+    fn full(&self) -> bool {
+        self.active_now >= self.policy.cup
+    }
+}
+
 /// Результат прохода сталл-детекта по строке.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StallAct {
@@ -139,6 +158,9 @@ enum StallAct {
     Pinged,
     /// Мягкий пинг: ход завершён (idle), прямой промпт в сессию.
     SoftPinged,
+    /// Мягкий пинг отложен CUP-капом (#1313): пинг — запуск хода, слот
+    /// не выдан, mark не пишется — доставка ретраится следующим тиком.
+    Deferred,
     Flagged,
     /// Недостоверная проба исполнителя: сталл-проход строки отложен —
     /// вердикт о тишине не может быть получен (#1281, срез честности
@@ -492,6 +514,7 @@ impl TickUseCase {
             held_live = out.held_live,
             stall_pings = out.stall_pings,
             soft_pings = out.soft_pings,
+            soft_pings_deferred = out.soft_pings_deferred,
             stall_flagged = out.stall_flagged,
             review_flagged = out.review_flagged,
             session_lost_flagged = out.session_lost_flagged,
@@ -934,14 +957,30 @@ impl TickUseCase {
             Ok(WakeAct::Deferred) => out.wakeups_deferred += 1,
             Ok(WakeAct::Guarded) => out.held_live += 1,
             Ok(WakeAct::GuardedBlind) => out.held_blind += 1,
-            Ok(WakeAct::None) => match self.stall_pass(board, task, out).await {
+            Ok(WakeAct::None) => match self
+                .stall_pass(
+                    board,
+                    task,
+                    CupGate {
+                        policy: plan.policy,
+                        active_now: *active_now,
+                    },
+                    out,
+                )
+                .await
+            {
                 Ok(StallAct::None) => {}
                 Ok(StallAct::Pinged) => out.stall_pings += 1,
                 Ok(StallAct::SoftPinged) => {
                     out.soft_pings += 1;
+                    // доставленный ход занимает слот капа в этом же тике
+                    // (#1231 семантика общих счётчиков: без инкремента K
+                    // idle-строк масс-сталла видят один снапшот и оверселят кап)
+                    *active_now += 1;
                     // мягкий пинг доставлен — доставка в сессию работает (#1288)
                     self.state.clear_lost_session(&board.board, task.number());
                 }
+                Ok(StallAct::Deferred) => out.soft_pings_deferred += 1,
                 Ok(StallAct::Flagged) => out.stall_flagged += 1,
                 Ok(StallAct::ProbeFailed) => out.probe_failed += 1,
                 // обе Err-ветки — путь доставки: классифицированная потеря
@@ -1137,10 +1176,13 @@ impl TickUseCase {
     /// ход завершён без статусного перевода (паттерн #1151/#1135/#384).
     /// Пинг агенту → повтор → Needs attention. Будит через механизм
     /// wakeup (пинг = коммент, следующий тик доставит его сессии).
+    /// Гейт капа нужен доставке пинга: мягкий пинг — запуск хода,
+    /// гейтуется как будильник (#1313).
     async fn stall_pass(
         &self,
         board: &BoardPlan,
         task: &Task,
+        cup: CupGate,
         out: &mut TickOutcome,
     ) -> UsecaseResult<StallAct> {
         let Some(slot) = task.stage_slot() else {
@@ -1190,7 +1232,12 @@ impl TickUseCase {
         // интервал повторных решений — свой ([judge].every_ms; у soft-класса
         // старый интервал 30 мин держал бы повторный вердикт полчаса —
         // вскрыто e2e 14b: wake погасил шум, повторный вызов не наступал).
-        if self.judge_enabled() {
+        // Override строго ПОД судьёй (по judge_stage): стадии вне полномочий
+        // судьи (ReviewTesting #1413) сохраняют каденс старой механики —
+        // override до статус-гарда замедлял бы эскалацию тест-ревью-зависов
+        // вчетверо (2 ч вместо 30 мин; ревью раунд 4, Common-2).
+        let judge_here = self.judge_enabled() && uwuwu_domain::judge_stage(task.status());
+        if judge_here {
             every = self.judge_cfg.every_ms;
         }
         // раунд = статус: смена статуса обнуляет счётчик пингов
@@ -1229,7 +1276,7 @@ impl TickUseCase {
         // Стадии вне матрицы (ReviewTesting #1413 — вердикт тест-ревьювера)
         // остаются на пингах старой механики: вызов судьи там сжёг бы API —
         // любой вердикт гард отклоняет (judge_stage).
-        if self.judge_enabled() && uwuwu_domain::judge_stage(task.status()) {
+        if judge_here {
             let call = JudgeCall {
                 board,
                 task,
@@ -1239,9 +1286,9 @@ impl TickUseCase {
                 calls: count,
                 idle: soft,
             };
-            return self.judge_stall_action(&call, soft, now, out).await;
+            return self.judge_stall_action(&call, soft, now, cup, out).await;
         }
-        self.stall_action(board, task, slot, &session, soft, silence, count, now)
+        self.stall_action(board, task, slot, &session, soft, silence, count, now, cup)
             .await
     }
 
@@ -1259,10 +1306,11 @@ impl TickUseCase {
         silence: u64,
         count: u32,
         now: u64,
+        cup: CupGate,
     ) -> UsecaseResult<StallAct> {
         if count < STALL_MAX_PINGS {
             return self
-                .stall_ping_round(board, task, slot, session, soft, silence, now)
+                .stall_ping_round(board, task, slot, session, soft, silence, now, cup)
                 .await;
         }
         // Проба живости В МОМЕНТ эскалации (#1281, различение причин):
@@ -1341,6 +1389,7 @@ impl TickUseCase {
         call: &JudgeCall<'_>,
         soft: bool,
         now: u64,
+        cup: CupGate,
         out: &mut TickOutcome,
     ) -> UsecaseResult<StallAct> {
         if uwuwu_domain::judge_step(call.calls, self.judge_cfg.escalate_after)
@@ -1360,7 +1409,28 @@ impl TickUseCase {
                 .await;
         }
         let Some(judge) = self.judge.as_ref() else {
-            return Ok(StallAct::None);
+            // Инвариант judge_enabled() (гейт судьи выше) нарушен — порт
+            // отсутствует при включённом контуре. Не глотаем действие
+            // молча: деградация в старую механику сталл-детекта
+            // (ревью раунд 4, Low).
+            tracing::warn!(
+                event = "judge.port_missing",
+                number = call.task.number(),
+                "Порт судьи отсутствует при enabled-гейте — fallback на старую механику"
+            );
+            return self
+                .stall_action(
+                    call.board,
+                    call.task,
+                    call.slot,
+                    call.session,
+                    soft,
+                    call.silence,
+                    call.calls,
+                    now,
+                    cup,
+                )
+                .await;
         };
         let ctx = self
             .judge_context(
@@ -1394,6 +1464,7 @@ impl TickUseCase {
                     call.silence,
                     call.calls,
                     now,
+                    cup,
                 )
                 .await
             }
@@ -1444,7 +1515,18 @@ impl TickUseCase {
             return parked;
         }
         let Some(judge) = self.judge.as_ref() else {
-            return false;
+            // Инвариант judge_enabled() (гейт кап-ветки выше) нарушен —
+            // порт отсутствует при включённом контуре. Не глотаем решение
+            // молча: деградация в старый автопаркинг кап-точки
+            // (ревью раунд 4, Low).
+            tracing::warn!(
+                event = "judge.port_missing",
+                number = task.number(),
+                "Порт судьи отсутствует на кап-точке — fallback на автопаркинг"
+            );
+            return self
+                .review_round_force_park(board, task, out, round_slot, rounds)
+                .await;
         };
         let ctx = self
             .judge_context(board, task, 0, 0, rounds, false, true)
@@ -1503,9 +1585,14 @@ impl TickUseCase {
     }
 
     /// Хореография паркинга кап-точки — единственная копия (ревью раунда
-    /// 2, L): set_status → дайджест → сброс раундов. false — set_status
-    /// отказал: счётчик стоит на капе, ретрай следующим count-переходом
-    /// (раунд N+1 пройдёт — деградация benign).
+    /// 2, L): race-чек → set_status → дайджест → сброс раундов. Race-чек —
+    /// контур судьи (ревью раунд 4, Low): паркинг — тоже set_status,
+    /// стейл-вердикт не перетирает свежую агентскую транзакцию; legacy-путь
+    /// (judge off, автопаркинг) сохраняет прежний безусловный паркинг —
+    /// инвариант «тик бит-в-бит при [judge] off». false — статус строки
+    /// сменился во время вызова ИЛИ set_status отказал: счётчик стоит
+    /// на капе, ретрай следующим count-переходом (раунд N+1 пройдёт —
+    /// деградация benign).
     async fn judge_round_park(
         &self,
         board: &BoardPlan,
@@ -1513,6 +1600,32 @@ impl TickUseCase {
         digest: &str,
         out: &mut TickOutcome,
     ) -> bool {
+        // race-чек (ревью раунд 4, Low): вердикт собирался секунды —
+        // статус строки мог уехать. Отказ пробы трактуется как stale:
+        // мутаций нет, ретрай следующим тиком
+        if self.judge_enabled() {
+            let fresh = match self.board.row_status(&board.board, task.number()).await {
+                Ok(st) => st == Some(task.status()),
+                Err(e) => {
+                    tracing::warn!(
+                        event = "judge.round_park_probe_err",
+                        number = task.number(),
+                        error = %e,
+                        "Race-проба статуса перед кап-паркингом недостоверна — мутаций нет"
+                    );
+                    out.actions_failed += 1;
+                    false
+                }
+            };
+            if !fresh {
+                tracing::info!(
+                    event = "judge.round_park_stale",
+                    number = task.number(),
+                    "Кап-паркинг устарел — статус строки сменился во время вызова"
+                );
+                return false;
+            }
+        }
         if let Err(e) = self
             .board
             .set_status(&board.board, task.number(), Status::NeedsAttention)
@@ -1698,6 +1811,17 @@ impl TickUseCase {
             number = task.number(),
             "Судья: гвард вызовов без прогресса — принудительный паркинг"
         );
+        // race-чек (ревью раунд 4, Low): паркинг — тоже set_status,
+        // гвард не перетирает свежую агентскую транзакцию; stale —
+        // строка ушла сама, гвард-счётчик живёт дальше по носителю
+        if self.board.row_status(&board.board, task.number()).await? != Some(task.status()) {
+            tracing::info!(
+                event = "judge.park_stale",
+                number = task.number(),
+                "Принудительный паркинг устарел — статус строки сменился во время тика"
+            );
+            return Ok(StallAct::None);
+        }
         self.board
             .set_status(&board.board, task.number(), Status::NeedsAttention)
             .await?;
@@ -1843,6 +1967,9 @@ impl TickUseCase {
 
     /// Один раунд пинга: мягкий — прямым промптом в сессию (мгновенное
     /// пробуждение, без обхода через коммент), классический — комментом.
+    /// Мягкий пинг — запуск хода: при полном капе держится без mark
+    /// (доставка ретраится следующим тиком), классический — коммент без
+    /// гейта (ход стартует только гейтованным будильником) (#1313).
     #[allow(clippy::too_many_arguments)]
     async fn stall_ping_round(
         &self,
@@ -1853,8 +1980,19 @@ impl TickUseCase {
         soft: bool,
         silence: u64,
         now: u64,
+        cup: CupGate,
     ) -> UsecaseResult<StallAct> {
         if soft {
+            if cup.full() {
+                tracing::info!(
+                    event = "stall.soft_ping_held_cup",
+                    number = task.number(),
+                    active = cup.active_now,
+                    cap = cup.policy.cup,
+                    "Мягкий пинг отложен: CUP cap — запуск хода ждёт слот"
+                );
+                return Ok(StallAct::Deferred);
+            }
             let gw = self.sessions.project(&board.project);
             // пин агента слота перед ходом (#1300) — как на будильнике
             if let Some(agent) = Agent::of_slot(slot) {

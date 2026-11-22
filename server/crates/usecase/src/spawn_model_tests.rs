@@ -231,8 +231,18 @@ impl TaskBoardRepo for RowsBoard {
     async fn issue_fields(&self, _n: u64) -> UsecaseResult<uwuwu_domain::TaskFields> {
         Ok(Default::default())
     }
-    async fn create_issue(&self, _b: &str, _p: &str, _t: &str, _body: &str) -> UsecaseResult<u64> {
+    async fn create_issue(
+        &self,
+        _b: &str,
+        _p: &str,
+        _t: &str,
+        _body: &str,
+        _kind: Option<&str>,
+    ) -> UsecaseResult<u64> {
         Ok(100)
+    }
+    async fn set_issue_type(&self, _n: u64, _kind: &str) -> UsecaseResult<()> {
+        Ok(())
     }
     async fn rename_issue(&self, _n: u64, _t: &str) -> UsecaseResult<()> {
         Ok(())

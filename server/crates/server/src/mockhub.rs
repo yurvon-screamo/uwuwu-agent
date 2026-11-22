@@ -450,16 +450,38 @@ impl TaskBoardRepo for MemoryHub {
         _project: &str,
         title: &str,
         body: &str,
+        kind_name: Option<&str>,
     ) -> UsecaseResult<u64> {
         self.with_state(|state| {
             let number = state.next_number;
             state.next_number += 1;
-            state
-                .tasks
-                .insert(number, Task::new(number, title.to_string(), Status::Analys));
+            let mut task = Task::new(number, title.to_string(), Status::Analys);
+            // POST с type (#1271): имя «принято» — носитель видит парс
+            task.set_kind(kind_name.and_then(uwuwu_usecase::parse_task_type));
+            state.tasks.insert(number, task);
             state.board_tags.insert(number, board.to_string());
             state.bodies.insert(number, body.to_string());
             Ok(number)
+        })
+    }
+
+    async fn set_issue_type(&self, number: u64, kind_name: &str) -> UsecaseResult<()> {
+        // Fault-режим phantom-записей (#1331): «успех» без записи носителя —
+        // контрольное чтение юзкейса обязано отказывать громко (семантика
+        // семьи: post_comment/rename_issue)
+        if phantom_writes() {
+            return Ok(());
+        }
+        let kind = uwuwu_usecase::parse_task_type(kind_name).ok_or_else(|| {
+            UsecaseError::Board(format!("mockhub: тип «{kind_name}» вне словаря issue Type"))
+        })?;
+        self.with_state(|state| {
+            let task = state
+                .tasks
+                .get_mut(&number)
+                .ok_or_else(|| UsecaseError::Board(format!("mockhub: #{number} нет")))?;
+            task.set_kind(Some(kind));
+            Ok(())
         })
     }
 
@@ -1074,7 +1096,7 @@ mod tests {
     async fn created_row_board_cells_landed_in_read_board() {
         let hub = MemoryHub::with_seed(None);
         let n = hub
-            .create_issue("B", "uwuwu", "строка", "тело")
+            .create_issue("B", "uwuwu", "строка", "тело", Some("Refactoring"))
             .await
             .expect("создание строки");
         hub.set_board_cells("B", n, Some("low"), Some(false), None)
@@ -1086,6 +1108,11 @@ mod tests {
             .find(|t| t.number() == n)
             .expect("строка на доске");
         assert_eq!(t.priority(), uwuwu_domain::Priority::Low);
+        assert_eq!(
+            t.kind(),
+            Some(uwuwu_domain::TaskType::Refactoring),
+            "#1271: тип из POST create виден в read_board стенда"
+        );
         assert!(!t.automerge());
     }
 
