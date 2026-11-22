@@ -402,4 +402,156 @@ mod tests {
         );
         assert!(!p.contains("ход завершён: нет"), "ложный idle не в промпте");
     }
+
+    /// One-shot HTTP-мок границы Decisions API: локальный листенер, один
+    /// ответ — endpoint подставляется полем структуры, env-швы не мутируются
+    /// (параллельные тесты не гоняются за переменные окружения).
+    fn one_shot(status_line: &'static str, body: String) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut sock, _) = listener.accept().unwrap();
+            // запрос читаем до конца заголовков — reqwest ждёт записи ответа
+            // в живой сокет; тело не читаем (ответ не зависит от него)
+            let mut buf = vec![0u8; 16 * 1024];
+            let mut got = 0usize;
+            while got < buf.len() {
+                let n = match sock.read(&mut buf[got..]) {
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                if n == 0 {
+                    break;
+                }
+                got += n;
+                if buf[..got].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let resp = format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes());
+        });
+        format!("http://{addr}/decisions")
+    }
+
+    struct FrozenClock;
+    impl Clock for FrozenClock {
+        fn utc_minute(&self) -> uwuwu_domain::UtcMinute {
+            uwuwu_domain::UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            1_000_000
+        }
+    }
+
+    fn judge_at(endpoint: String) -> GeminiJudge {
+        GeminiJudge {
+            http: reqwest::Client::new(),
+            key: "test".into(),
+            model: MODEL_DEFAULT.into(),
+            endpoint,
+            calls: Arc::new(std::sync::Mutex::new(VecDeque::new())),
+            rpm_limit: 100,
+            clock: Arc::new(FrozenClock),
+        }
+    }
+
+    fn judge_ctx() -> JudgeContext {
+        JudgeContext {
+            board: "uwuwu".into(),
+            number: 42,
+            title: "Т".into(),
+            status: uwuwu_domain::Status::ReviewResult,
+            slot: uwuwu_domain::Slot::ResultReview,
+            silence_min: 40,
+            idle: true,
+            judge_calls_no_progress: 0,
+            review_rounds: 0,
+            branch: Some("work/task-42".into()),
+            pr_url: None,
+            restart_recent_min: None,
+            body: "тело".into(),
+            comments: vec![],
+            now_ms: 10_000_000,
+            cap_point: false,
+            sessions: vec![],
+        }
+    }
+
+    /// Успешный ответ: answers-map (choice + confidence + noul) читается
+    /// структурно — контракт Decisions API (сверен живой пробой 20.11).
+    #[tokio::test]
+    async fn decide_parses_answers_map_verdict() {
+        let body = serde_json::json!({
+            "answers": {
+                "next_status": {
+                    "choice": "Тестирование",
+                    "confidence": 0.8,
+                    "probabilities": {"Тестирование": 0.8}
+                },
+                "owner_needed": {"noul": 0.9}
+            },
+            "usage": {"total_input_tokens": 512}
+        })
+        .to_string();
+        let url = one_shot("HTTP/1.1 200 OK", body);
+        let v = judge_at(url).decide(&judge_ctx()).await.unwrap();
+        assert_eq!(v.status, JudgeStatus::Testing);
+        assert!((v.confidence - 0.8).abs() < 1e-9, "confidence из ответа");
+        assert!((v.owner_needed - 0.9).abs() < 1e-9, "noul из ответа");
+    }
+
+    /// 429 с RetryInfo в теле — структурный RateLimited с задержкой из
+    /// ответа (объединённый парсер с семантикой #1363), не текстовая ошибка.
+    #[tokio::test]
+    async fn decide_429_maps_to_structural_rate_limited() {
+        let body = serde_json::json!({
+            "error": {
+                "code": 429,
+                "message": "quota exceeded",
+                "details": [
+                    {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "26s"}
+                ]
+            }
+        })
+        .to_string();
+        let url = one_shot("HTTP/1.1 429 Too Many Requests", body);
+        let err = judge_at(url).decide(&judge_ctx()).await.unwrap_err();
+        match err {
+            UsecaseError::RateLimited {
+                service,
+                retry_after_secs,
+            } => {
+                assert_eq!(service, "judge");
+                assert_eq!(retry_after_secs, Some(26), "RetryInfo 26s → 26 сек");
+            }
+            other => panic!("ожидался структурный RateLimited, получен: {other:?}"),
+        }
+    }
+
+    /// 429 без RetryInfo в теле — дефолтный бэкофф контура (не паника и
+    /// не текстовый Err: обработчики Err читают задержку из варианта).
+    #[tokio::test]
+    async fn decide_429_without_retry_info_defaults_backoff() {
+        let body = "not a google error body".to_string();
+        let url = one_shot("HTTP/1.1 429 Too Many Requests", body);
+        let err = judge_at(url).decide(&judge_ctx()).await.unwrap_err();
+        match err {
+            UsecaseError::RateLimited {
+                service,
+                retry_after_secs,
+            } => {
+                assert_eq!(service, "judge");
+                assert_eq!(retry_after_secs, Some(RATE_LIMIT_DEFAULT_SECS));
+            }
+            other => panic!("ожидался структурный RateLimited, получен: {other:?}"),
+        }
+    }
 }

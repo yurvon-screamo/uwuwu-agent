@@ -9072,6 +9072,65 @@ async fn judge_verdict_transitions_row_with_race_check_passing() {
     let _ = sessions;
 }
 
+/// Перенос вердиктом не будит старую сессию — архитектура владельца
+/// «перенос = пинг» (C2 плана #1364): адресат промпта — агент прошлой
+/// стадии, контракту новой стадии он не отвечает; спавн новой стадии —
+/// штатный тик, не ветка судьи. Регрессия (возврат промпта в ветку
+/// переноса) = дубль-будж агенту, которого ни один тест не ловил.
+#[tokio::test]
+async fn judge_transition_prompts_nobody_verdict_move_is_the_ping() {
+    const NOW: u64 = 100_000_000;
+    let judge = FakeJudge::says(uwuwu_domain::JudgeStatus::Testing);
+    let cfg = JudgeCfg {
+        enabled: true,
+        ..JudgeCfg::default()
+    };
+    let state = Arc::new(MemState(Mutex::default()));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((44, Status::ReviewResult));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .stalls
+        .push((44, Status::ReviewResult, NOW - 3 * 60 * 60_000));
+    let (u, board, sessions, _) = judge_usecase(
+        vec![judge_row(
+            44,
+            Status::ReviewResult,
+            "ses_rev44",
+            Slot::ResultReview,
+        )],
+        Some(NOW - 90 * 60_000),
+        true,
+        state,
+        (Some(judge), cfg),
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.judge_transitions, 1, "перенос состоялся");
+    assert!(
+        board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l == "status#44=Testing"),
+        "строка перенесена в Тестирование"
+    );
+    assert!(
+        sessions.prompts.lock().unwrap().is_empty(),
+        "перенос не промптит старую сессию — перенос и есть пинг (C2)"
+    );
+    assert!(
+        sessions.spawned.lock().unwrap().is_empty(),
+        "спавн новой стадии делает штатный тик, не ветка судьи"
+    );
+}
+
 #[tokio::test]
 async fn judge_rejects_illegal_verdict_as_hold() {
     // Вердикт Тестирование на Design-строке: прыжок через стадии канона —
