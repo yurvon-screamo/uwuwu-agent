@@ -11,7 +11,8 @@ use lancedb::arrow::arrow_array::{
 };
 use lancedb::arrow::arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lancedb::connection::ConnectBuilder;
-use lancedb::index::scalar::FullTextSearchQuery;
+use lancedb::index::scalar::{FtsIndexBuilder, FullTextSearchQuery};
+use lancedb::index::{Index, IndexType};
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::table::Table;
 use lancedb::Connection;
@@ -140,7 +141,60 @@ impl LanceSemanticBackend {
             embeddings,
         };
         this.ensure_tables().await?;
+        this.ensure_fts_index().await;
         Ok(this)
+    }
+
+    /// FTS-индекс на тексте чанков: без него полнотекст молча пуст —
+    /// ланс не даёт брутфорс-план на колонке без инвертированного индекса
+    /// (корень «мёртвого полнотекста» #1473, квото-независимый). Создаётся
+    /// один раз при открытии; дописанные после индексации строки покрывает
+    /// flat-путь ланса. Отказ создания не роняет открытие: семантика и
+    /// sync живут, полнотекст честно пуст до следующего бута (warn).
+    async fn ensure_fts_index(&self) {
+        let table = match self.chunks().await {
+            Ok(table) => table,
+            Err(e) => {
+                tracing::warn!(
+                    event = "semantic.fts_index_skip",
+                    error = %e,
+                    "FTS-индекс не проверен: таблица чанков недоступна"
+                );
+                return;
+            }
+        };
+        let has_fts = match table.list_indices().await {
+            Ok(indices) => indices
+                .iter()
+                .any(|i| matches!(i.index_type, IndexType::FTS) && i.columns.iter().any(|c| c == "text")),
+            Err(e) => {
+                tracing::warn!(
+                    event = "semantic.fts_index_skip",
+                    error = %e,
+                    "FTS-индекс не проверен: список индексов недоступен"
+                );
+                return;
+            }
+        };
+        if has_fts {
+            return;
+        }
+        if let Err(e) = table
+            .create_index(&["text"], Index::FTS(FtsIndexBuilder::default()))
+            .execute()
+            .await
+        {
+            tracing::warn!(
+                event = "semantic.fts_index_failed",
+                error = %e,
+                "FTS-индекс не создан — полнотекст пуст до следующего бута"
+            );
+            return;
+        }
+        tracing::info!(
+            event = "semantic.fts_index_created",
+            "FTS-индекс создан — полнотекст жив"
+        );
     }
 
     async fn ensure_tables(&self) -> UsecaseResult<()> {
@@ -369,9 +423,10 @@ impl SemanticBackend for LanceSemanticBackend {
             {
                 Ok(s) => s,
                 Err(e) => {
-                    // FTS-индекса может не быть до первого sync — честная пустота
-                    tracing::debug!(event = "semantic.fts_unavailable", error = %e, "FTS недоступен");
-                    return Ok(Vec::new());
+                    // #1473: отказ FTS не молчит — Err пробрасывается в
+                    // usecase (рендер «— недоступен»), причина видна в выдаче
+                    tracing::warn!(event = "semantic.fts_unavailable", error = %e, "FTS недоступен");
+                    return Err(err(format!("fts: {e}")));
                 }
             };
             use futures::stream::StreamExt;

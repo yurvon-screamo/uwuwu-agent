@@ -17,6 +17,8 @@ mod router;
 mod router_tests;
 mod search;
 #[cfg(test)]
+mod search_tests;
+#[cfg(test)]
 mod spawn_model_tests;
 pub mod spawn_models;
 mod tasks;
