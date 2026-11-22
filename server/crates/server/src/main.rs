@@ -27,6 +27,8 @@ mod rename_journal;
 mod s3;
 mod search;
 mod state;
+#[cfg(test)]
+mod task_env_sh_tests;
 mod tg;
 mod wiki;
 

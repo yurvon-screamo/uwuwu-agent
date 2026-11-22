@@ -877,4 +877,101 @@ env_root = "/tmp/env"
         cfg.validate()
             .expect("клин выключен — инвариант не применим");
     }
+
+    // ——— носители кода конвейера (#1333) ———
+
+    /// Живой прод-конфиг (server/config.toml коммитится в репо) — контракт
+    /// носителей #1333: у не-GitHub проектов `repo` остаётся GitHub-каркасом
+    /// (единственный потребитель — PR-слой автомержа prs.probe/merge, код в
+    /// форже), `checkout` = мастер-чекаут кода (cwd bootstrap-сессий).
+    /// Пин данных Т1: откат checkout true-washing на каркасный путь краснеет
+    /// здесь, а не падением спавнов на мёртвом cwd в проде.
+    #[test]
+    fn pipeline_config_carries_code_carrier_contract_1333() {
+        let raw = include_str!("../../../config.toml");
+        let cfg = toml::from_str::<Config>(raw).expect("прод-конфиг валиден");
+        let tw = cfg
+            .project
+            .iter()
+            .find(|p| p.name == "true-washing")
+            .expect("true-washing в прод-конфиге");
+        assert_eq!(
+            tw.checkout, "/home/yurvon/true-wash/detector",
+            "#1333 Т1: checkout true-washing = Forgejo-клон detector, не GitHub-каркас"
+        );
+        for name in ["foilcap", "true-washing"] {
+            let p = cfg.project.iter().find(|p| p.name == name).expect(name);
+            assert!(
+                p.repo.starts_with("yurvon-screamo/"),
+                "repo {name} — GitHub-репо PR-слоя конвейера, не носитель кода: {}",
+                p.repo
+            );
+        }
+        for p in &cfg.project {
+            assert!(!p.checkout.is_empty(), "checkout {} задан", p.name);
+            assert!(!p.env_root.is_empty(), "env_root {} задан", p.name);
+        }
+    }
+
+    /// Живая проба (гвард UWUWU_E2E=1, культура gitea_tests::live_probe_*):
+    /// checkout каждого проекта прод-конфига существует и является живым
+    /// git-чекаутом с origin — источником base для env-ворктри. Ловит класс
+    /// «мёртвого cwd» (#1333: checkout true-washing указывал на удалённый с
+    /// диска каталог — новые true-washing-спавны падали на bootstrap-этапе).
+    /// Красная демонстрация против доТ1-конфига:
+    /// `git show origin/master:server/config.toml > /tmp/cfg.toml &&
+    /// UWUWU_E2E=1 UWUWU_CONFIG_UNDER_TEST=/tmp/cfg.toml cargo test -p
+    /// uwuwu-server live_probe_config_checkouts`
+    #[test]
+    fn live_probe_config_checkouts_are_alive_git_worktrees() {
+        if std::env::var("UWUWU_E2E").as_deref() != Ok("1") {
+            return;
+        }
+        let default_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.toml");
+        let path = std::env::var("UWUWU_CONFIG_UNDER_TEST")
+            .map(std::path::PathBuf::from)
+            .unwrap_or(default_path);
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("конфиг читается ({}): {e}", path.display()));
+        let cfg = toml::from_str::<Config>(&raw).expect("конфиг парсится");
+        assert!(!cfg.project.is_empty(), "в конфиге есть проекты");
+        // Проба живёт на ноде дефолтного экзекьютора: проекты, привязанные к
+        // именованному экзекьютору (пример: 1xgames → redmi за релеем,
+        // checkout — путь той ноды), с этой машины непроверяемы — скип.
+        let default_name = cfg.executor.name.as_str();
+        let local = cfg
+            .project
+            .iter()
+            .filter(|p| p.executor.as_deref().is_none_or(|e| e == default_name));
+        for p in local {
+            let meta = std::fs::metadata(&p.checkout).unwrap_or_else(|e| {
+                panic!(
+                    "checkout {} существует ({}): {e} — спавны проекта мертвы на cwd",
+                    p.name, p.checkout
+                )
+            });
+            assert!(meta.is_dir(), "checkout {} — каталог", p.name);
+            let head = std::process::Command::new("git")
+                .args(["-C", &p.checkout, "rev-parse", "--verify", "HEAD"])
+                .output()
+                .expect("git вызывается");
+            assert!(
+                head.status.success(),
+                "checkout {} — живой git-чекаут (HEAD резолвится): {}",
+                p.name,
+                String::from_utf8_lossy(&head.stderr)
+            );
+            let origin = std::process::Command::new("git")
+                .args(["-C", &p.checkout, "remote", "get-url", "origin"])
+                .output()
+                .expect("git вызывается");
+            assert!(
+                origin.status.success(),
+                "checkout {} несёт origin (base для env-ворктри): {}",
+                p.name,
+                String::from_utf8_lossy(&origin.stderr)
+            );
+        }
+    }
 }
