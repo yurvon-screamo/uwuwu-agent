@@ -210,7 +210,7 @@ impl MemoryHub {
             state.status_options = CANON
                 .iter()
                 .map(|s| {
-                    let name = uwuwu_usecase::status_name(s);
+                    let name = uwuwu_usecase::status_name(*s);
                     (
                         format!("mopt-{}", name.to_lowercase().replace(' ', "-")),
                         name.to_string(),
@@ -716,10 +716,7 @@ impl uwuwu_usecase::BoardStatusRepo for MemoryHub {
         })
     }
 
-    async fn fresh_distribution(
-        &self,
-        board: &str,
-    ) -> UsecaseResult<HashMap<u64, Option<String>>> {
+    async fn fresh_distribution(&self, board: &str) -> UsecaseResult<HashMap<u64, Option<String>>> {
         Ok(uwuwu_usecase::CleanBoardRepo::fresh_index(self, board)
             .await?
             .into_iter()

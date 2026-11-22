@@ -639,8 +639,7 @@ impl ToolHub {
     /// Rename статуса канбана (#1447): строки тула — английские (#1383),
     /// ошибки юзкейса проходят как есть.
     async fn board_status_rename(&self, project: &str, args: &Value) -> Result<Value, String> {
-        let from = str_arg(args, "from")
-            .ok_or("from is required (current option name)")?;
+        let from = str_arg(args, "from").ok_or("from is required (current option name)")?;
         let to = str_arg(args, "to").ok_or("to is required (new option name)")?;
         let report = self
             .status
@@ -1101,7 +1100,7 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "нет инструмента {expected}");
         }
-        assert_eq!(names.len(), 23, "контракт поверхности: {names:?}");
+        assert_eq!(names.len(), 24, "контракт поверхности: {names:?}");
     }
 
     #[test]

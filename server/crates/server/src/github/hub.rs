@@ -1598,6 +1598,7 @@ fn parse_status_options(raw: &serde_json::Value) -> Vec<uwuwu_usecase::StatusOpt
         .unwrap_or_default()
 }
 
+#[async_trait]
 impl uwuwu_usecase::BoardStatusRepo for GitHubHub {
     async fn fresh_field(&self, board: &str) -> UsecaseResult<uwuwu_usecase::StatusFieldImage> {
         let (owner, name) = self
@@ -1642,10 +1643,7 @@ impl uwuwu_usecase::BoardStatusRepo for GitHubHub {
         })
     }
 
-    async fn fresh_distribution(
-        &self,
-        board: &str,
-    ) -> UsecaseResult<HashMap<u64, Option<String>>> {
+    async fn fresh_distribution(&self, board: &str) -> UsecaseResult<HashMap<u64, Option<String>>> {
         Ok(self
             .pv2
             .fresh_index(board)

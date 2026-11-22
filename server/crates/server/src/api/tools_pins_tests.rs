@@ -411,12 +411,21 @@ async fn board_status_rename_happy_reports_journal_and_histogram() {
     )
     .await
     .expect("rename");
-    assert!(answer.contains("Renamed \"Deleted\" → \"Trash\""), "{answer}");
+    assert!(
+        answer.contains("Renamed \"Deleted\" → \"Trash\""),
+        "{answer}"
+    );
     assert!(answer.contains("option id kept: mopt-deleted"), "{answer}");
-    assert!(answer.contains("Pre-image journal: /memory/rename-pre-image.json"), "{answer}");
+    assert!(
+        answer.contains("Pre-image journal: /memory/rename-pre-image.json"),
+        "{answer}"
+    );
     assert!(answer.contains("Histogram before"), "{answer}");
     // не-каноническое имя — warn, не отказ (стоп-краны не заводим)
-    assert!(answer.contains("WARNING: new name \"Trash\" is not a canonical"), "{answer}");
+    assert!(
+        answer.contains("WARNING: new name \"Trash\" is not a canonical"),
+        "{answer}"
+    );
 }
 
 #[tokio::test]
@@ -430,7 +439,10 @@ async fn board_status_rename_unknown_from_is_loud_and_hints_retry() {
     .await
     .expect_err("отказ");
     assert!(err.contains("not found"), "{err}");
-    assert!(err.contains("already renamed"), "подсказка про повтор: {err}");
+    assert!(
+        err.contains("already renamed"),
+        "подсказка про повтор: {err}"
+    );
     assert!(err.contains("pre-image journal"), "{err}");
 }
 

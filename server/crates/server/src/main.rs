@@ -271,7 +271,8 @@ async fn run(
     ));
     // write-ahead pre-image журнал rename статуса (#1447): рядом со state.json
     let rename_preimages = Arc::new(rename_journal::JsonStatusPreImages::load(
-        cfg.state_path(&config_path).with_file_name("rename-pre-image.json"),
+        cfg.state_path(&config_path)
+            .with_file_name("rename-pre-image.json"),
     ));
     let spawn_models = Arc::new(match cfg.executor.models.as_ref() {
         Some(raw) => {
