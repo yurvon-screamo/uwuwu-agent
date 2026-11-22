@@ -3,7 +3,7 @@
 //! Эмбеддинги — Gemini Embedding 2 через Embedder-трейт (#1363).
 //! Инкремент — doc_hash в мета-таблице.
 
-use crate::search::semantic::{chunk_text, Embedder, EMBED_MODEL_DIMS};
+use crate::search::semantic::{chunk_text, Embedder, EMBED_BATCH, EMBED_MODEL_DIMS};
 use async_trait::async_trait;
 use lancedb::arrow::arrow_array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, Int64Array, LargeStringArray,
@@ -42,6 +42,9 @@ pub struct LanceSemanticBackend {
     wiki: Arc<dyn WikiRepo>,
     /// Персист sha-инкремента: /…/semantic_shas.json рядом с Lance-том.
     shas_file: PathBuf,
+    /// Суточный бюджет эмбеддингов синка (#1473): /…/semantic_budget.json
+    /// рядом с Lance-том — резерв дневной квоты Gemini для query-поисков.
+    budget_file: PathBuf,
     /// Задачи для индекса (юзер-стори «по вики/задачам/опыту»); None — стенд.
     issues: Option<Arc<dyn uwuwu_usecase::IssueIndexSource>>,
     db: Connection,
@@ -136,6 +139,7 @@ impl LanceSemanticBackend {
         let this = Self {
             wiki,
             shas_file,
+            budget_file: super::budget::budget_path(&path),
             issues,
             db,
             embeddings,
@@ -303,7 +307,45 @@ impl LanceSemanticBackend {
         (h & 0x7fff_ffff_ffff_ffff) as i64
     }
 
-    async fn reindex_doc(&self, slug: &str, md: &str, h: i64) -> UsecaseResult<usize> {
+    /// Cost реиндекса в запросах к Gemini: тексты режутся батчами по
+    /// EMBED_BATCH в embed_many — ceil(чанков/батч) точно повторяет разбиение.
+    fn embed_request_cost(chunks: usize) -> u64 {
+        chunks.div_ceil(EMBED_BATCH) as u64
+    }
+
+    /// Гард суточного бюджета (L1 #1473): cost учитывается ДО embed-вызова
+    /// без отката при 429 — консервативный перебор безопаснее недобора
+    /// (резерв query-поисков неприкосновенен). False — кап достигнут, синк
+    /// останавливается; отказ персиста не роняет индексацию (недоучёт
+    /// деградирует мягко через честный 429).
+    fn daily_budget_admits(&self, spend: &mut super::budget::BudgetState, chunks: usize) -> bool {
+        let cost = Self::embed_request_cost(chunks);
+        if spend.spent + cost > super::budget::SYNC_DAILY_CAP {
+            tracing::warn!(
+                event = "semantic.daily_budget_exhausted",
+                spent = spend.spent,
+                cap = super::budget::SYNC_DAILY_CAP,
+                "Суточный бюджет эмбеддингов синка исчерпан — до резета (полночь PT) поиски идут на резерве"
+            );
+            return false;
+        }
+        spend.spent += cost;
+        if let Err(e) = super::budget::write_state(&self.budget_file, spend) {
+            tracing::warn!(
+                event = "semantic.budget_persist_failed",
+                error = %e,
+                "Счётчик бюджета не записан — недоучёт расхода до рестарта"
+            );
+        }
+        true
+    }
+
+    async fn reindex_doc_chunks(
+        &self,
+        slug: &str,
+        texts: Vec<String>,
+        h: i64,
+    ) -> UsecaseResult<()> {
         self.chunks()
             .await?
             .delete(slug_pred(slug).as_str())
@@ -314,9 +356,8 @@ impl LanceSemanticBackend {
             .delete(slug_pred(slug).as_str())
             .await
             .map_err(|e| err(format!("del meta {slug}: {e}")))?;
-        let texts = chunk_text(md);
         if texts.is_empty() {
-            return Ok(0);
+            return Ok(());
         }
         // doc-пары (title, text): retrieval-контракт клиента (#1363)
         let docs: Vec<(String, String)> = texts
@@ -364,7 +405,7 @@ impl LanceSemanticBackend {
             .execute()
             .await
             .map_err(|e| err(format!("add meta {slug}: {e}")))?;
-        Ok(1)
+        Ok(())
     }
 }
 
@@ -468,6 +509,8 @@ impl SemanticBackend for LanceSemanticBackend {
             self.wiki.doc_shas().await?.into_iter().collect();
         let known = self.known_hashes().await?;
         let known_shas = self.known_shas();
+        // Суточный бюджет эмбеддингов (#1473): чужой/битый день — счёт с нуля.
+        let mut spend = super::budget::read_state(&self.budget_file);
         let mut changed = 0usize;
         for (slug, sha) in &shas {
             if changed >= budget {
@@ -479,7 +522,11 @@ impl SemanticBackend for LanceSemanticBackend {
             if let Some(md) = self.wiki.read_doc(slug).await? {
                 let h = Self::hash(&md);
                 if known.get(slug).copied() != Some(h) {
-                    self.reindex_doc(slug, &md, h).await?;
+                    let texts = chunk_text(&md);
+                    if !self.daily_budget_admits(&mut spend, texts.len()) {
+                        break;
+                    }
+                    self.reindex_doc_chunks(slug, texts, h).await?;
                     changed += 1;
                 }
                 self.mark_known_sha(slug, sha);
@@ -502,7 +549,11 @@ impl SemanticBackend for LanceSemanticBackend {
                     );
                     let h = Self::hash(&text);
                     if known.get(&slug).copied() != Some(h) {
-                        self.reindex_doc(&slug, &text, h).await?;
+                        let texts = chunk_text(&text);
+                        if !self.daily_budget_admits(&mut spend, texts.len()) {
+                            break;
+                        }
+                        self.reindex_doc_chunks(&slug, texts, h).await?;
                         changed += 1;
                     }
                 }
