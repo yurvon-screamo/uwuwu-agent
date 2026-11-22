@@ -34,11 +34,28 @@
 # Запуск: server/ops/stand/e2e.sh   (из каталога server; cargo build сам)
 # Выход: 0 — ок; 1 — провал с диагнозом. Логи/state/config — mktemp-рандир
 # (печатается в упавших сообщениях). Параллельные прогоны изолированы по
-# рандиру; при занятых дефолтных портах: PORT_MOCK=X PORT_SRV=Y bash e2e.sh
+# рандиру и портам: без оверрайдов порты подбираются свободными
+# (stand_ports.sh, печатаются при старте) — гонка параллельных стендов
+# снята классом (#1304). Ручной оверрайд: PORT_MOCK=X PORT_SRV=Y bash
+# e2e.sh (MOCK2_PORT — второй мок фазы 3) — занятость на зовущем.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."   # server/
-PORT_MOCK="${PORT_MOCK:-8099}"; PORT_SRV="${PORT_SRV:-8090}"
+# stand_ports.sh подключается по пути рантайма ($(dirname "$0")) — статически
+# не следует; сам файл валиден отдельно (SC1091 off на этой строке, #1304)
+# shellcheck disable=SC1091
+source "$(dirname "$0")/stand_ports.sh"
+# Порты: оверрайд задан — как есть; не задан — свободные из пробы-бинда
+# (подбор в переменную: отказ stand_pick_ports роняет прогон здесь —
+# set -e на присваивании; пустые порты дальше не едут). Судейская пара
+# фазы 15 — те же контракты (PORT_JUDGE — мок судьи, PORT_JUDGE_DOWN —
+# намеренно глухой порт пробы fallback; деривация PORT_JUDGE+1 снесена —
+# при параллельном прогоне могла попасть в живой порт соседа)
+ports="$(stand_pick_ports 5)"
+read -r PORT_SRV_D PORT_MOCK_D MOCK2_PORT_D PORT_JUDGE_D PORT_JUDGE_DOWN_D <<<"$ports"
+PORT_MOCK="${PORT_MOCK:-$PORT_MOCK_D}"; PORT_SRV="${PORT_SRV:-$PORT_SRV_D}"
+MOCK2_PORT="${MOCK2_PORT:-$MOCK2_PORT_D}"
+PORT_JUDGE="${PORT_JUDGE:-$PORT_JUDGE_D}"; PORT_JUDGE_DOWN="${PORT_JUDGE_DOWN:-$PORT_JUDGE_DOWN_D}"
 BEARER="${UWUWU_SERVER_BEARER:-stand-e2e-bearer}"
 SEED_N=2046
 # Рандир логов/state: /tmp по умолчанию; UWUWU_STAND_RUN_DIR — оверрайд
@@ -59,6 +76,8 @@ MOCK_PID=""; SRV_PID=""; MOCK2_PID=""; MOCK_JUDGE_PID=""
 
 say()  { printf '\033[1;34m[e2e]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[e2e FAIL]\033[0m %s\n' "$*"; KEEP=1; exit 1; }
+
+say "порты: сервер $PORT_SRV, мок $PORT_MOCK, мок-2 $MOCK2_PORT, судья $PORT_JUDGE (глухой $PORT_JUDGE_DOWN)"
 
 cleanup() { # только СВОИ процессы (pid-scoped): параллельные стенды не трогаем
   for pid in "$SRV_PID" "$MOCK_PID" "$MOCK2_PID" "$MOCK_JUDGE_PID"; do
@@ -170,8 +189,9 @@ wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
 SRV_PID=""; MOCK_PID=""; MOCK2_PID=""
 sleep 1
 rm -f "$STATE"
-MOCK2_PORT=$((PORT_MOCK + 1))   # сессионная изоляция: константа 8098
-                                # сталкивала параллельные стенды на фазе 3
+# MOCK2_PORT — самостоятельный порт второго мока (подбор/оверрайд на верху
+# скрипта): сосед-деривация PORT_MOCK+1 снесена — само соседство было
+# источником столкновений параллельных стендов (#1304)
 LOG_MOCK2="$RUN_DIR/mock2.log"
 LOG_SRV_MULTI="$RUN_DIR/server-multi.log"
 CONFIG_MULTI="$RUN_DIR/config.memory-multi.toml"
@@ -1159,7 +1179,8 @@ V=$(gc_sweep 990005); [ "$V" = "ENV-GC 990005 ABSENT" ] || fail "отсутст�
 say "14c ок: реальный скрипт вернул все вердикты, грязный/чужой/без-repo выжили, повтор ABSENT"
 
 say "фаза 15: судья #1364 — wake без переноса на шуме, паркинг вердиктом, fallback при отказе"
-PORT_JUDGE="${PORT_JUDGE:-$((PORT_MOCK + 4))}"
+# PORT_JUDGE / PORT_JUDGE_DOWN заданы наверху скрипта (подбор/оверрайд):
+# сосед-деривация PORT_MOCK+4 и PORT_JUDGE+1 снесены (#1304, диспозиция #1364)
 JUDGE_SEED=2070
 export MOCK_JUDGE_PORT=$PORT_JUDGE
 MOCK_JUDGE_PORT=$PORT_JUDGE python3 ops/stand/mock_decisions.py >"$RUN_DIR/mock-judge.log" 2>&1 &
@@ -1262,7 +1283,7 @@ UWUWU_SERVER_CONFIG=$CONFIG_JUDGE UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
   UWUWU_SERVER_MODE=live \
   UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
   UWUWU_MOCK_SEED="$JUDGE_SEED2:Design" \
-  GEMINI_API_KEY=stand-test-key UWUWU_JUDGE_URL="http://127.0.0.1:$((PORT_JUDGE + 1))" \
+  GEMINI_API_KEY=stand-test-key UWUWU_JUDGE_URL="http://127.0.0.1:$PORT_JUDGE_DOWN" \
   RUST_LOG=info "$BIN_SRV" >"$LOG_SRV_JUDGE" 2>&1 &
 SRV_PID=$!
 SEEN=0

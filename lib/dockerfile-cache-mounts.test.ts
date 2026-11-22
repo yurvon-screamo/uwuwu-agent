@@ -89,10 +89,13 @@ describe("server/Dockerfile — BuildKit cache mounts (uwuwu#1162)", () => {
 
   test("stage runtime копирует бинарь из слоя (/build/uwuwu-server), не из маунта", () => {
     // Пин парной половины cp-трюка: COPY --from=build /build/target/...
-    // при маунтованном target — регресс к гоче задачи.
+    // при маунтованном target — регресс к гоче задачи. Контракт — про
+    // uwuwu-server, не про количество COPY: #1294 легитимно добавил
+    // вторую копию из build-слоя (thp_off) — пин ловит именно регресс
+    // uwuwu-server к маунту (#1487).
     const copies = insts.filter((inst) => inst.startsWith("COPY --from=build"))
-    expect(copies.length).toBe(1)
-    expect(copies[0]).toContain("/build/uwuwu-server")
-    expect(copies[0]).not.toContain("/build/target/release/")
+    const serverCopy = copies.find((inst) => inst.includes("/build/uwuwu-server"))
+    expect(serverCopy).toBeDefined()
+    expect(serverCopy).not.toContain("/build/target/release/")
   })
 })
