@@ -496,7 +496,8 @@ pub fn parse_master(slug: &str, md: &str) -> Option<CronMaster> {
 }
 
 /// JST-штамп учёта: ISO с зоной (+09:00 — читается обратно). Публично
-/// для cron_list (#1480).
+/// для cron_list (#1480) и fm-гварда docs_write (#1444 — единый формат
+/// датировок корпуса).
 pub fn jst_stamp(ms: u64) -> String {
     let secs = ms / 1000 + 9 * 3600;
     let d = secs / 86400;

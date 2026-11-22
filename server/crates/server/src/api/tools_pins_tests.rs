@@ -50,15 +50,17 @@ async fn docs_append_requires_slug_and_line() {
 
 /// Гард append-семантики docs_append (#1353): дописывание сохраняет
 /// тело существующего дока (fm + контент), строка — в конец; ответ
-/// различает append и создание.
+/// различает append и создание. Сид несёт fm явно (#1444: вход с fm
+/// пишется дословно — append-пин фиксирует append-семантику на fm-доке).
 #[tokio::test]
 async fn docs_append_keeps_body_of_existing_doc() {
     let tools = hub();
     let slug = "Experience/devops/Опыт (srv, #1248)";
+    let seeded = "---\ntitle: Опыт (srv, #1248)\ndate: 2026-11-19\n---\n\nстрока A\n";
     call(
         &tools,
         "docs_write",
-        json!({ "slug": slug, "content": "строка A" }),
+        json!({ "slug": slug, "content": seeded }),
     )
     .await
     .expect("write");
@@ -70,14 +72,14 @@ async fn docs_append_keeps_body_of_existing_doc() {
     .await
     .expect("append");
     assert!(
-        answer.contains("appended to") && answer.contains("lines in the doc: 2"),
+        answer.contains("appended to") && answer.contains("lines in the doc: 7"),
         "ответ append без факта операции: {answer}"
     );
     let stored = call(&tools, "docs_read", json!({ "slug": slug }))
         .await
         .expect("read");
     // append_to нормализует EOF: итог всегда с завершающим переносом
-    assert_eq!(stored, "строка A\nстрока B\n");
+    assert_eq!(stored, format!("{seeded}строка B\n"));
 }
 
 #[tokio::test]
@@ -103,6 +105,223 @@ async fn docs_write_requires_slug_and_content() {
         .await
         .expect_err("отказ");
     assert_eq!(err, "slug and content are required");
+}
+
+// --- fm-гвард docs_write (#1444): шапка вики-дока переживает replace ---
+
+/// Ветка Carried: шапка существующего дока переносится при правке без fm
+/// во входе; date и прочие ключи целы, lastmod освежается, тело — из входа.
+#[tokio::test]
+async fn docs_write_carries_fm_header_of_existing_doc() {
+    let tools = hub();
+    let slug = "Experience/platform/ops-mechanics";
+    let seeded = "---\ntitle: ops-mechanics\ndate: 2026-11-04T22:41:07+09:00\nlastmod: 2026-11-20T20:50:00+09:00\n---\n\n# ops-mechanics\n\nстарое тело\n";
+    call(
+        &tools,
+        "docs_write",
+        json!({ "slug": slug, "content": seeded }),
+    )
+    .await
+    .expect("seed: вход с fm пишется дословно");
+    let answer = call(
+        &tools,
+        "docs_write",
+        json!({ "slug": slug, "content": "# ops-mechanics\n\nновое тело\n" }),
+    )
+    .await
+    .expect("write");
+    assert!(
+        answer.contains("carried over"),
+        "ветка переноса не названа в ответе: {answer}"
+    );
+    let stored = call(&tools, "docs_read", json!({ "slug": slug }))
+        .await
+        .expect("read");
+    assert!(
+        stored.starts_with("---\ntitle: ops-mechanics\n"),
+        "шапка снесена: {stored}"
+    );
+    assert!(
+        stored.contains("date: 2026-11-04T22:41:07+09:00"),
+        "date потерян: {stored}"
+    );
+    assert!(
+        !stored.contains("lastmod: 2026-11-20T20:50"),
+        "lastmod не освежён моментом записи: {stored}"
+    );
+    assert!(
+        stored.contains("lastmod: 2"),
+        "lastmod отсутствует: {stored}"
+    );
+    assert!(
+        stored.contains("новое тело") && !stored.contains("старое тело"),
+        "тело не заменено: {stored}"
+    );
+}
+
+/// Ветка Carried без lastmod в блоке (системный случай C-2: крон-мастера
+/// и бот-доки): ключ дописывается последней строкой блока, операционные
+/// ключи переносится байт-в-байт.
+#[tokio::test]
+async fn docs_write_appends_lastmod_to_fm_block_without_it() {
+    let tools = hub();
+    let slug = "cron/QA-ночной-аудит-кода/README";
+    let seeded = "---\ntitle: QA: ночной аудит\nschedule: 30 1 * * *\nagent: tester\nmigrated-from: '#114'\nproject: uwuwu\n---\n\n## Инструкция\n\nтело\n";
+    call(
+        &tools,
+        "docs_write",
+        json!({ "slug": slug, "content": seeded }),
+    )
+    .await
+    .expect("seed");
+    let answer = call(
+        &tools,
+        "docs_write",
+        json!({ "slug": slug, "content": "## Инструкция\n\nновое тело\n" }),
+    )
+    .await
+    .expect("write");
+    assert!(
+        answer.contains("carried over"),
+        "ветка переноса не названа в ответе: {answer}"
+    );
+    let stored = call(&tools, "docs_read", json!({ "slug": slug }))
+        .await
+        .expect("read");
+    for key in [
+        "title: QA: ночной аудит",
+        "schedule: 30 1 * * *",
+        "agent: tester",
+        "migrated-from: '#114'",
+        "project: uwuwu",
+    ] {
+        assert!(stored.contains(key), "ключ «{key}» потерян: {stored}");
+    }
+    assert!(
+        stored.contains("project: uwuwu\nlastmod: 2"),
+        "lastmod дописан не последней строкой блока: {stored}"
+    );
+}
+
+/// Ветка Created: новый док без шапки получает каноническую; title с «: »
+/// в значении сериализуется в двойных кавычках (C-3, канон ADR #1225).
+#[tokio::test]
+async fn docs_write_creates_canonical_header_with_quoted_title_on_colon() {
+    let tools = hub();
+    let slug = "Projects/uwuwu/ADR/ADR-test-guard: Заголовок решения";
+    let answer = call(
+        &tools,
+        "docs_write",
+        json!({ "slug": slug, "content": "# ADR-test-guard\n\nтекст\n" }),
+    )
+    .await
+    .expect("write");
+    assert!(
+        answer.contains("canonical"),
+        "ветка создания не названа в ответе: {answer}"
+    );
+    let stored = call(&tools, "docs_read", json!({ "slug": slug }))
+        .await
+        .expect("read");
+    assert!(
+        stored.starts_with("---\ntitle: \"ADR-test-guard: Заголовок решения\"\n"),
+        "каноническая шапка без кавычек в title с «: »: {stored}"
+    );
+    assert!(
+        stored.contains("\ndate: 2") && stored.contains("\nlastmod: 2"),
+        "date/lastmod отсутствуют: {stored}"
+    );
+}
+
+/// Ветка Verbatim: вход с собственным fm пишется дословно, байт-в-байт.
+#[tokio::test]
+async fn docs_write_keeps_fm_from_payload_verbatim() {
+    let tools = hub();
+    let slug = "bot/Помощник/README";
+    let payload = "---\ntitle: uwuwu-помощник\nenabled: true\nmodel: zai-coding-plan/glm-5.3-flash\ntoken_env: UWUWU_BOT_TOKEN_HELPER\nowner: yurvon_screamo\n---\n\nметодичка\n";
+    let answer = call(
+        &tools,
+        "docs_write",
+        json!({ "slug": slug, "content": payload }),
+    )
+    .await
+    .expect("write");
+    assert!(
+        answer.contains("verbatim"),
+        "ветка дословной записи не названа в ответе: {answer}"
+    );
+    let stored = call(&tools, "docs_read", json!({ "slug": slug }))
+        .await
+        .expect("read");
+    assert_eq!(stored, payload, "вход с fm искажён");
+}
+
+/// Сбой чтения существующего дока: вход без fm — громкий отказ (гварду
+/// нечего переносить, молчаливая запись канонической шапки поверх
+/// операционной недопустима); вход с fm — дословно, от чтения не зависит.
+#[tokio::test]
+async fn docs_write_read_failure_is_loud_without_fm_payload() {
+    let (tools, _) = tool_hub(
+        Arc::new(ReadFailingWiki),
+        blob_usecase(),
+        Arc::new(StubCronState::default()),
+    );
+    let err = call(
+        &tools,
+        "docs_write",
+        json!({ "slug": "x/y", "content": "тело без шапки\n" }),
+    )
+    .await
+    .expect_err("отказ");
+    assert!(
+        err.contains("fm-guard"),
+        "отказ без вменяемого текста гварда: {err}"
+    );
+    let payload = "---\ntitle: x\n---\n\nтело с шапкой\n";
+    let answer = call(
+        &tools,
+        "docs_write",
+        json!({ "slug": "x/y", "content": payload }),
+    )
+    .await
+    .expect("вход с fm не зависит от сбоя чтения");
+    assert!(answer.contains("verbatim"), "ветка не названа: {answer}");
+}
+
+/// Вики-носитель с мёртвым чтением: write проходит, read рвётся транспортом.
+struct ReadFailingWiki;
+#[async_trait::async_trait]
+impl uwuwu_usecase::WikiRepo for ReadFailingWiki {
+    async fn doc_shas(&self) -> uwuwu_usecase::UsecaseResult<Vec<(String, String)>> {
+        Ok(vec![])
+    }
+    async fn read_doc(&self, slug: &str) -> uwuwu_usecase::UsecaseResult<Option<String>> {
+        Err(uwuwu_usecase::UsecaseError::Board(format!(
+            "wiki transport down: {slug}"
+        )))
+    }
+    async fn list_docs(&self, _prefix: &str) -> uwuwu_usecase::UsecaseResult<Vec<String>> {
+        Ok(vec![])
+    }
+    async fn write_doc(
+        &self,
+        _slug: &str,
+        _content: &str,
+        _message: &str,
+    ) -> uwuwu_usecase::UsecaseResult<()> {
+        Ok(())
+    }
+    async fn append_doc(
+        &self,
+        _slug: &str,
+        _line: &str,
+        _message: &str,
+    ) -> uwuwu_usecase::UsecaseResult<uwuwu_usecase::AppendDocOutcome> {
+        Ok(uwuwu_usecase::AppendDocOutcome {
+            created: false,
+            lines: 0,
+        })
+    }
 }
 
 /// Гвард пустого патча через диспетчер: TaskPatch::is_empty в домене.

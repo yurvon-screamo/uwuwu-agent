@@ -15,11 +15,19 @@
 #     на свободном слоте доставляется.
 #
 # Запуск: server/ops/stand/e2e_cup.sh   (из каталога server; cargo build сам)
-# Порты — 8299/8298 (моки A/B) и 8290 (сервер), #1304/#1328.
+# Порты: оверрайды PORT_MOCK_A/PORT_MOCK_B/PORT_SRV заданы — как есть
+# (занятость на зовущем); не заданы — свободные из пробы-бинда: гонка
+# параллельных прогонов снята классом (#1304; контент #1313 — 22.11)
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."   # server/
-PORT_A="${PORT_MOCK_A:-8299}"; PORT_B="${PORT_MOCK_B:-8298}"; PORT_SRV="${PORT_SRV:-8290}"
+# stand_ports.sh подключается по пути рантайма ($(dirname "$0")) — статически
+# не следует; сам файл валиден отдельно (SC1091 off на этой строке, #1304)
+# shellcheck disable=SC1091
+source "$(dirname "$0")/stand_ports.sh"
+ports="$(stand_pick_ports 3)"
+read -r PORT_A_D PORT_B_D PORT_SRV_D <<<"$ports"
+PORT_A="${PORT_MOCK_A:-$PORT_A_D}"; PORT_B="${PORT_MOCK_B:-$PORT_B_D}"; PORT_SRV="${PORT_SRV:-$PORT_SRV_D}"
 BEARER="${UWUWU_SERVER_BEARER:-stand-e2e-bearer}"
 export GH_TOKEN="${GH_TOKEN:-stand-e2e-dummy}"
 RUN_DIR="${UWUWU_STAND_RUN_DIR:-$(mktemp -d /tmp/uwuwu-stand-cup-XXXXXX)}"
@@ -33,6 +41,8 @@ MARKS=/tmp/opencode/cup_marks.txt
 mark() { echo "$(date -u +%H:%M:%S) $*" >> "$MARKS"; }
 say()  { printf '\033[1;34m[e2e-cup]\033[0m %s\n' "$*"; mark "say: $*"; }
 fail() { printf '\033[1;31m[e2e-cup FAIL]\033[0m %s\n' "$*"; echo "$(date -u +%H:%M:%S) FAIL: $*" >> "$MARKS"; KEEP=1; exit 1; }
+
+say "порты: сервер $PORT_SRV, мок A $PORT_A, мок B $PORT_B"
 # диагностика киллера (#1313): сигналы скрипту — в метки, не смерть
 trap 'mark "SIGNAL caught (TERM/INT/HUP)"' TERM INT HUP
 

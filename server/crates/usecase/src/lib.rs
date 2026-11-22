@@ -7,6 +7,7 @@ pub mod blobs;
 pub mod bots;
 mod crons;
 mod error;
+pub mod fm_guard;
 mod fm_lite;
 pub mod goals;
 mod naming;

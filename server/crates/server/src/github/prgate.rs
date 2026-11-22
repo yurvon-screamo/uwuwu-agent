@@ -1,5 +1,6 @@
 //! PR-шлюз проекта: GitHub REST (пробы/мерж) — реализация PrGateway.
 
+use super::HTTP_TIMEOUT;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use uwuwu_usecase::{PrGateway, PrState};
@@ -55,6 +56,7 @@ impl GhPrGateway {
             token,
             http: reqwest::Client::builder()
                 .user_agent(concat!("uwuwu-server/", env!("CARGO_PKG_VERSION")))
+                .timeout(HTTP_TIMEOUT)
                 .build()
                 .expect("reqwest client"),
         }
