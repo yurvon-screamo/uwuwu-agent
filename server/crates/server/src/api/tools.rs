@@ -5,7 +5,8 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use uwuwu_usecase::{
-    BlobPlace, BlobUseCase, DocsView, PersonView, TaskView, TaskWriteUseCase, TaskWriter,
+    fm_guard, jst_stamp, BlobPlace, BlobUseCase, Clock, DocsView, PersonView, TaskView,
+    TaskWriteUseCase, TaskWriter,
 };
 
 pub struct ToolHub {
@@ -193,7 +194,7 @@ pub fn tool_descriptors() -> Value {
         ),
         tool(
             "docs_write",
-            "Overwrite a wiki doc entirely (ff-only commit; for new experience articles)",
+            "Write doc by slug (full replace); fm header survives: carried over with fresh lastmod, canonical one created when absent, fm in the payload kept verbatim",
             object(json!({
                 "slug": string("doc slug (without docs/ and .md)"),
                 "content": string("full markdown"),
@@ -427,11 +428,38 @@ impl ToolHub {
         require_args(args, &["slug", "content"])?;
         let slug = arg_str(args, "slug");
         let message = message_or(args, format!("write: {slug}"));
+        let incoming = arg_str(args, "content");
+        // fm-гвард (#1444): шапка вики-дока переживает replace. Текущий
+        // док нужен веткам переноса/создания; сбой чтения громко рвёт
+        // запись — кроме входа с собственным fm, той ветке док не нужен.
+        let existing = match self.wiki.read_doc(&slug).await {
+            Ok(doc) => doc,
+            Err(e) => {
+                if fm_guard::split(&incoming).is_none() {
+                    return Err(format!(
+                        "fm-guard needs the current doc, read «{slug}» failed: {e}"
+                    ));
+                }
+                None
+            }
+        };
+        let now = jst_stamp(crate::clock::SystemClock.now_ms());
+        let (content, verdict) = fm_guard::guard(existing.as_deref(), &incoming, &slug, &now);
         self.wiki
-            .write_doc(&slug, &arg_str(args, "content"), &message)
+            .write_doc(&slug, &content, &message)
             .await
             .map_err(|e| e.to_string())?;
-        ok_text(format!("doc «{slug}» written"))
+        ok_text(match verdict {
+            fm_guard::FmGuard::Verbatim => {
+                format!("doc «{slug}» written — fm header from payload kept verbatim")
+            }
+            fm_guard::FmGuard::Carried => {
+                format!("doc «{slug}» written — fm header carried over, lastmod refreshed")
+            }
+            fm_guard::FmGuard::Created => {
+                format!("doc «{slug}» written — canonical fm header created (title/date/lastmod)")
+            }
+        })
     }
 
     async fn cron_list(&self, args: &Value) -> Result<Value, String> {
