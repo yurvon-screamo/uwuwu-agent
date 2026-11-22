@@ -1548,6 +1548,169 @@ impl uwuwu_usecase::CleanBoardRepo for GitHubHub {
     }
 }
 
+/// GraphQL-носитель каталога Status-поля и rename-мутации (#1447):
+/// REST ProjectsV2 полей не мутирует (List/Add/Get — docs.github.com
+/// 22.11), живой прецедент GraphQL-Pv2 мимо ADR-113 — archive_row.
+/// Контракт формы options — живая проба sandbox-доски (срез 2 #1447).
+const STATUS_FIELD_QUERY: &str = r#"
+  query($owner:String!,$name:String!,$board:String!){
+    rateLimit{ remaining resetAt }
+    repository(owner:$owner,name:$name){
+      projectsV2(first:20,query:$board){
+        nodes{ id title
+          field(name:"Status"){ ...on ProjectV2SingleSelectField{ id options{ id name color description } } }
+        }
+      }
+    }
+  }"#;
+
+const STATUS_RENAME_MUTATION: &str = r#"
+  mutation($project:ID!,$field:ID!,$options:[ProjectV2SingleSelectFieldOptionInput!]){
+    updateProjectV2Field(input:{projectId:$project, fieldId:$field, singleSelectOptions:$options}){
+      field{ ...on ProjectV2SingleSelectField{ id options{ id name color description } } }
+    }
+  }"#;
+
+/// Опции из gql-ответа (id/name обязательны; color/description —
+/// непустые строки, пустые → None: носитель отдаёт "").
+fn parse_status_options(raw: &serde_json::Value) -> Vec<uwuwu_usecase::StatusOption> {
+    raw.as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|o| {
+                    let id = o["id"].as_str()?;
+                    let name = o["name"].as_str()?;
+                    if id.is_empty() || name.is_empty() {
+                        return None;
+                    }
+                    let s = |v: &serde_json::Value| {
+                        v.as_str().map(str::to_string).filter(|x| !x.is_empty())
+                    };
+                    Some(uwuwu_usecase::StatusOption {
+                        id: id.to_string(),
+                        name: name.to_string(),
+                        color: s(&o["color"]),
+                        description: s(&o["description"]),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+impl uwuwu_usecase::BoardStatusRepo for GitHubHub {
+    async fn fresh_field(&self, board: &str) -> UsecaseResult<uwuwu_usecase::StatusFieldImage> {
+        let (owner, name) = self
+            .repo
+            .split_once('/')
+            .ok_or_else(|| UsecaseError::Board(format!("repo: {}", self.repo)))?;
+        let data = self
+            .gql(
+                STATUS_FIELD_QUERY,
+                json!({ "owner": owner, "name": name, "board": board }),
+            )
+            .await?;
+        let project = data["repository"]["projectsV2"]["nodes"]
+            .as_array()
+            .and_then(|nodes| nodes.iter().find(|p| p["title"] == board))
+            .ok_or_else(|| {
+                UsecaseError::Board(format!("проект «{board}» в projectsV2 {owner} не найден"))
+            })?;
+        let project_node_id = project["id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| UsecaseError::Board(format!("доска «{board}»: проект без node id")))?
+            .to_string();
+        let field = &project["field"];
+        let field_node_id = field["id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                UsecaseError::Board(format!("доска «{board}»: Status-поле без node id"))
+            })?
+            .to_string();
+        let options = parse_status_options(&field["options"]);
+        if options.is_empty() {
+            return Err(UsecaseError::Board(format!(
+                "доска «{board}»: Status-поле без опций"
+            )));
+        }
+        Ok(uwuwu_usecase::StatusFieldImage {
+            project_node_id,
+            field_node_id,
+            options,
+        })
+    }
+
+    async fn fresh_distribution(
+        &self,
+        board: &str,
+    ) -> UsecaseResult<HashMap<u64, Option<String>>> {
+        Ok(self
+            .pv2
+            .fresh_index(board)
+            .await?
+            .into_iter()
+            .map(|(number, item)| (number, item.status))
+            .collect())
+    }
+
+    async fn rename(
+        &self,
+        image: &uwuwu_usecase::StatusFieldImage,
+        option_id: &str,
+        new_name: &str,
+    ) -> UsecaseResult<Vec<uwuwu_usecase::StatusOption>> {
+        // дословный pre-image набор: id/color/description сохранены,
+        // изменено ровно одно имя (набор операцией не конструируется)
+        let options: Vec<serde_json::Value> = image
+            .options
+            .iter()
+            .map(|o| {
+                let mut v = json!({ "id": o.id, "name": if o.id == option_id { new_name } else { o.name.as_str() } });
+                if let Some(c) = &o.color {
+                    v["color"] = json!(c);
+                }
+                if let Some(d) = &o.description {
+                    v["description"] = json!(d);
+                }
+                v
+            })
+            .collect();
+        let data = self
+            .gql(
+                STATUS_RENAME_MUTATION,
+                json!({
+                    "project": image.project_node_id,
+                    "field": image.field_node_id,
+                    "options": options
+                }),
+            )
+            .await?;
+        let payload = parse_status_options(&data["updateProjectV2Field"]["field"]["options"]);
+        if payload.is_empty() {
+            return Err(UsecaseError::Board(
+                "rename: носитель не отдал options в payload мутации (false-success?)".into(),
+            ));
+        }
+        Ok(payload)
+    }
+
+    async fn verify_catalog(&self, board: &str) -> UsecaseResult<Vec<(String, String)>> {
+        // мета перечитана после invalidate_meta — носитель, не кеш
+        let meta = self.pv2.meta(board).await?;
+        Ok(meta
+            .options
+            .iter()
+            .map(|(name, id)| (id.clone(), name.clone()))
+            .collect())
+    }
+
+    fn invalidate_meta(&self, board: &str) {
+        self.pv2.invalidate_meta(board);
+    }
+}
+
 impl GitHubHub {
     /// Поля задачи (нативные): лениво для строк-кандидатов тика.
     #[allow(dead_code)] // точка входа ленивых чтений тика (срез анти-шторма подключит)

@@ -397,3 +397,91 @@ async fn task_edit_descriptor_carries_wait_canon() {
     assert!(status.contains("/Wait"), "канон в описании тула: {status}");
     assert!(!status.contains("Вейт"), "старое имя не в контракте тула");
 }
+
+/// Пины rename статуса канбана (#1447): happy-path на MemoryHub-носителе
+/// (строка Done не задета — распределение живо), отказы до мутации —
+/// точные тексты (агент по ним различает ветки повтора/коллизии/no-op).
+#[tokio::test]
+async fn board_status_rename_happy_reports_journal_and_histogram() {
+    let tools = hub();
+    let answer = call(
+        &tools,
+        "board_status_rename",
+        json!({ "from": "Deleted", "to": "Trash" }),
+    )
+    .await
+    .expect("rename");
+    assert!(answer.contains("Renamed \"Deleted\" → \"Trash\""), "{answer}");
+    assert!(answer.contains("option id kept: mopt-deleted"), "{answer}");
+    assert!(answer.contains("Pre-image journal: /memory/rename-pre-image.json"), "{answer}");
+    assert!(answer.contains("Histogram before"), "{answer}");
+    // не-каноническое имя — warn, не отказ (стоп-краны не заводим)
+    assert!(answer.contains("WARNING: new name \"Trash\" is not a canonical"), "{answer}");
+}
+
+#[tokio::test]
+async fn board_status_rename_unknown_from_is_loud_and_hints_retry() {
+    let tools = hub();
+    let err = call(
+        &tools,
+        "board_status_rename",
+        json!({ "from": "Несуществующий", "to": "Trash" }),
+    )
+    .await
+    .expect_err("отказ");
+    assert!(err.contains("not found"), "{err}");
+    assert!(err.contains("already renamed"), "подсказка про повтор: {err}");
+    assert!(err.contains("pre-image journal"), "{err}");
+}
+
+#[tokio::test]
+async fn board_status_rename_to_equals_from_refuses() {
+    let tools = hub();
+    let err = call(
+        &tools,
+        "board_status_rename",
+        json!({ "from": "Draft", "to": "Draft" }),
+    )
+    .await
+    .expect_err("отказ");
+    assert!(err.contains("no-op"), "{err}");
+}
+
+#[tokio::test]
+async fn board_status_rename_collision_refuses() {
+    let tools = hub();
+    let err = call(
+        &tools,
+        "board_status_rename",
+        json!({ "from": "Draft", "to": "Done" }),
+    )
+    .await
+    .expect_err("отказ");
+    assert!(err.contains("collision"), "{err}");
+}
+
+#[tokio::test]
+async fn board_status_rename_missing_args_keep_exact_text() {
+    let tools = hub();
+    let err = call(&tools, "board_status_rename", json!({}))
+        .await
+        .expect_err("отказ");
+    assert_eq!(err, "from is required (current option name)");
+    let err = call(&tools, "board_status_rename", json!({ "from": "Draft" }))
+        .await
+        .expect_err("отказ");
+    assert_eq!(err, "to is required (new option name)");
+}
+
+#[tokio::test]
+async fn board_status_rename_project_outside_config_refuses() {
+    let tools = hub();
+    let err = call(
+        &tools,
+        "board_status_rename",
+        json!({ "from": "Draft", "to": "Trash", "project": "origa" }),
+    )
+    .await
+    .expect_err("отказ");
+    assert!(err.contains("not in config"), "{err}");
+}
