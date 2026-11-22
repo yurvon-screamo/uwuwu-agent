@@ -1618,7 +1618,7 @@ async fn task_type_native_carrier_roundtrip_on_mcp_surface() {
     )
     .await
     .expect_err("мусорный тип отвергнут");
-    assert!(err.contains("неизвестный тип"), "{err}");
+    assert!(err.contains("unknown type"), "{err}");
     let rows = memory.read_board("Задачи uwuwu").await.unwrap();
     let row = rows.iter().find(|t| t.number() == number).unwrap();
     assert_eq!(row.kind(), Some(uwuwu_domain::TaskType::Docs));

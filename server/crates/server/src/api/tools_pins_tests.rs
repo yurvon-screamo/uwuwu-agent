@@ -222,7 +222,7 @@ async fn task_create_rejects_unknown_type_with_canonical_list() {
     .expect_err("отказ");
     assert_eq!(
         err,
-        "unknown type «супер»: bug|spike|docs|feature|refactoring|legacy|qa|infrastructure|other"
+        "unknown type «супер»: bug|spike|docs|other|feature|refactoring|legacy|qa|infrastructure"
     );
 }
 

@@ -117,6 +117,9 @@ pub struct TaskPatch {
     pub title: Option<String>,
     /// Автомерж on/off (#1232): до-пометка старых строк, выключение.
     pub automerge: Option<bool>,
+    /// Тип задачи (#1271): нативный issue Type, PATCH {"type": имя}.
+    /// None — не трогать (снос значения патчем не предусмотрен).
+    pub kind: Option<TaskType>,
 }
 
 impl TaskPatch {
@@ -131,6 +134,7 @@ impl TaskPatch {
                 priority: None,
                 title: None,
                 automerge: None,
+                kind: None,
             }
         )
     }
@@ -265,16 +269,14 @@ impl TaskWriter for TaskWriteUseCase {
                 project,
                 spec.title.trim(),
                 &render_create_body(&spec),
+                Some(naming::task_type_native_name(
+                    spec.kind.unwrap_or(uwuwu_domain::TaskType::Feature),
+                )),
             )
             .await?;
-        // тип — нативное поле issue (fm снесён); Тип в снапшоте не живёт
-        let kind = spec.kind.unwrap_or(uwuwu_domain::TaskType::Feature);
-        self.fields
-            .store(
-                number,
-                &[("Тип", Some(naming::task_type_name(kind).to_string()))],
-            )
-            .await?;
+        // тип уехал в теле POST create (нативный issue Type, #1271):
+        // атомарно, дрейф между issue и полем невозможен; тихий дроп
+        // без push-доступа ловит сверка эха на границе носителя
         // Приоритет/Automerge/Direct — ячейки снапшота доски: единая точка
         // записи board-адаптера с кеш-гигиеной (#1258; add_to_board
         // инвалидирует ДО записи полей — окно кеша без полей закрывается
@@ -458,6 +460,15 @@ impl TaskWriter for TaskWriteUseCase {
             want_priority = patch.priority.clone();
             want_automerge = patch.automerge;
         }
+        // тип — нативный issue Type (#1271): PATCH {"type": имя}, мимо
+        // снапшота доски; контрольное чтение ниже сверяет парс носителя
+        let mut want_kind: Option<uwuwu_domain::TaskType> = None;
+        if let Some(kind) = patch.kind {
+            self.board
+                .set_issue_type(number, naming::task_type_native_name(kind))
+                .await?;
+            want_kind = Some(kind);
+        }
         self.verify_edit_delivery(
             &board,
             number,
@@ -467,6 +478,7 @@ impl TaskWriter for TaskWriteUseCase {
                 pr: want_pr,
                 priority: want_priority,
                 automerge: want_automerge,
+                kind: want_kind,
             },
         )
         .await
@@ -765,6 +777,7 @@ struct EditExpectations {
     pr: Option<String>,
     priority: Option<String>,
     automerge: Option<bool>,
+    kind: Option<TaskType>,
 }
 
 impl EditExpectations {
@@ -775,9 +788,10 @@ impl EditExpectations {
                 &self.branch,
                 &self.pr,
                 &self.priority,
-                self.automerge
+                self.automerge,
+                self.kind,
             ),
-            (None, None, None, None, None)
+            (None, None, None, None, None, None)
         )
     }
 
@@ -807,6 +821,9 @@ impl EditExpectations {
         if let Some(a) = self.automerge {
             if view.task.automerge() != a {
                 out.push("automerge");
+            }
+            if self.kind.is_some_and(|k| view.task.kind() != Some(k)) {
+                out.push("type");
             }
         }
         out
@@ -1136,8 +1153,12 @@ mod tests {
             _project: &str,
             _title: &str,
             _body: &str,
+            _kind_name: Option<&str>,
         ) -> UsecaseResult<u64> {
             Ok(1)
+        }
+        async fn set_issue_type(&self, _n: u64, _kind_name: &str) -> UsecaseResult<()> {
+            Ok(())
         }
         async fn rename_issue(&self, _n: u64, t: &str) -> UsecaseResult<()> {
             if !self.phantom {

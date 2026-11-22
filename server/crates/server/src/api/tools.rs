@@ -81,7 +81,7 @@ pub fn tool_descriptors() -> Value {
                 "title": string("title (unique on the board)"),
                 "project": string("project; default uwuwu"),
                 "body": string("markdown body (problem statement…)"),
-                "type": string("bug|spike|docs|other|feature|refactoring|legacy|qa|infrastructure"),
+                "type": string(&type_enum_list()),
                 "priority": string("high|medium|low; default medium"),
                 "automerge": json!({"type":"boolean","description":"automerge: merge the PR on entering Review, the row stays in Review; default true (direct — false)"}),
                 "direct": json!({"type":"boolean","description":"direct task (#1357): row goes straight to In Progress, the agent finalizes to Review itself bypassing factory stages. Only on the owner's direct order — verbatim quote of the order in the body; default false"})
@@ -306,10 +306,11 @@ impl ToolHub {
         let mut out = String::new();
         for t in rows {
             out.push_str(&format!(
-                "{:>6}  {:<14} {:<7} {}\n",
+                "{:>6}  {:<14} {:<7} {:<15} {}\n",
                 t.number(),
                 uwuwu_usecase::status_name(t.status()),
                 format!("{:?}", t.priority()).to_lowercase(),
+                t.kind().map(uwuwu_usecase::task_type_name).unwrap_or(""),
                 t.title()
             ));
         }
@@ -320,7 +321,7 @@ impl ToolHub {
         let number = need_number(args)?;
         let view = self.tasks.card(project, number).await.map_err(view_err)?;
         let mut out = format!(
-            "#{} {} — {}\n\n--- fm ---\nbranch: {}\npr: {}\nautomerge: {}\ndirect: {}\nbody_hash: {}\n\n",
+            "#{} {} — {}\n\n--- fm ---\nbranch: {}\npr: {}\nautomerge: {}\ndirect: {}\ntype: {}\nbody_hash: {}\n\n",
             view.task.number(),
             view.task.title(),
             uwuwu_usecase::status_name(view.task.status()),
@@ -328,6 +329,12 @@ impl ToolHub {
             view.task.pr().map(|u| u.as_str()).unwrap_or("—"),
             view.task.automerge(),
             view.task.direct(),
+            // канонное имя (словарь MCP-поверхности); None — «—» как
+            // branch/pr (native-null хвост, дефолт Task; #1271)
+            view.task
+                .kind()
+                .map(uwuwu_usecase::task_type_name)
+                .unwrap_or("—"),
             uwuwu_usecase::body_hash(&view.body),
         );
         out.push_str(&view.body);
@@ -472,12 +479,7 @@ impl ToolHub {
     }
 
     async fn task_create(&self, project: &str, args: &Value) -> Result<Value, String> {
-        let raw_kind = arg_str(args, "type");
-        if !raw_kind.is_empty() && uwuwu_usecase::parse_task_type(&raw_kind).is_none() {
-            return Err(format!(
-                "unknown type «{raw_kind}»: bug|spike|docs|feature|refactoring|legacy|qa|infrastructure|other"
-            ));
-        }
+        let kind = parse_type_arg(&arg_str(args, "type"))?;
         let direct = args
             .get("direct")
             .and_then(|v| v.as_bool())
@@ -501,7 +503,7 @@ impl ToolHub {
         let spec = uwuwu_usecase::NewTask {
             title: arg_str(args, "title"),
             body_md: arg_str(args, "body"),
-            kind: uwuwu_usecase::parse_task_type(&raw_kind),
+            kind,
             priority: arg_str(args, "priority"),
             automerge,
             direct,
@@ -520,8 +522,10 @@ impl ToolHub {
 
     async fn task_edit(&self, project: &str, args: &Value) -> Result<Value, String> {
         let number = need_number(args)?;
+        let kind = parse_type_arg(&arg_str(args, "type"))?;
         let patch = uwuwu_usecase::TaskPatch {
             status: str_arg(args, "status").map(|s| uwuwu_usecase::parse_status(&s)),
+            kind,
             branch: str_arg(args, "branch"),
             pr: str_arg(args, "pr"),
             priority: str_arg(args, "priority"),
@@ -696,6 +700,27 @@ impl ToolHub {
 
 fn view_err(e: uwuwu_usecase::ViewError) -> String {
     e.to_string()
+}
+
+/// Перечень типов канона для дескрипторов и текстов отказов: один
+/// источник с валидацией (пин enum-паритета — зеркало #1298).
+fn type_enum_list() -> String {
+    uwuwu_usecase::TASK_TYPES
+        .iter()
+        .map(|t| uwuwu_usecase::task_type_name(*t))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// Разбор аргумента `type` (create/edit, #1271): пусто — None, мусор —
+/// громкий отказ с канонным перечнем до мутаций доски.
+fn parse_type_arg(raw: &str) -> Result<Option<uwuwu_domain::TaskType>, String> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    uwuwu_usecase::parse_task_type(raw)
+        .map(Some)
+        .ok_or_else(|| format!("unknown type «{raw}»: {}", type_enum_list()))
 }
 
 /// Значение строкового аргумента: отсутствующий или не-строковый — пустая строка.

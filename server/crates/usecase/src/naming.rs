@@ -103,6 +103,19 @@ pub fn task_type_name(t: TaskType) -> &'static str {
 
 /// Парсинг типа; None — неизвестное имя (idea/analys выведены #1135:
 /// старые значения читаются как пустой тип, без громких ошибок).
+/// Имя типа в нативном словаре issue Type репо-хаба (заведён владельцем
+/// 12.11: дефолты Task/Bug/Feature + остальные канонные 1:1) — запись
+/// create/edit и чтение носителя одним знанием (#1271). Обратный маппинг
+/// — parse_task_type (case-insensitive): «Task» (нативный дефолт),
+/// null и неизвестное имя → None без громкой ошибки.
+pub fn task_type_native_name(t: TaskType) -> &'static str {
+    match t {
+        TaskType::Bug => "Bug",
+        TaskType::Feature => "Feature",
+        t => task_type_name(t),
+    }
+}
+
 pub fn parse_task_type(raw: &str) -> Option<TaskType> {
     Some(match raw.trim().to_lowercase().as_str() {
         "bug" => TaskType::Bug,
