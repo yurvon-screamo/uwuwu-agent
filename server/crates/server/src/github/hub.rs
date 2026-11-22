@@ -2027,6 +2027,58 @@ mod tests {
         });
     }
 
+    /// #1437 живая проба (tester): честная квитанция статусной записи
+    /// против реального носителя. МУТАЦИОННАЯ, идемпотентная — пишет
+    /// ТО ЖЕ значение статуса, что носитель уже несёт (базлайн не
+    /// искажается, восстановления не требуется); носитель — sandbox
+    /// #1265 (носитель живых проб #1232/#1258). Контракт: PATCH
+    /// применился → квитанция Confirmed с raw-именем носителя +
+    /// fresh_row_status (тот же gql_issue_status — путь идемпотентного
+    /// гарда) видит записанный статус. Красный на момент пробы 22.11:
+    /// gql_issue_status разворачивает envelope дважды (gql() уже
+    /// возвращает body["data"], функция читает data["data"]) — все
+    /// verify-риды дают Ok(None) → Mismatch → громкий отказ ПРИМЕНЁННОЙ
+    /// записи и «строка не на доске» из гарда.
+    #[test]
+    #[ignore] // живой прогон: GH_TOKEN + сеть к api.github.com; МУТАЦИЯ — идемпотентная запись своего же значения
+    fn live_set_status_honest_receipt_on_real_carrier() {
+        let repo =
+            std::env::var("UWUWU_HUB_REPO").unwrap_or_else(|_| "yurvon-screamo/uwuwu-hub".into());
+        let token = std::env::var("GH_TOKEN").expect("GH_TOKEN");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let board = "Задачи sandbox";
+            let n = 1265u64;
+            let hub = GitHubHub::new(repo.clone(), token.clone());
+            let rows = hub.read_board(board).await.expect("read_board базлайн");
+            let row = rows
+                .iter()
+                .find(|t| t.number() == n)
+                .expect("#1265 на доске sandbox");
+            let base = row.status();
+            // идемпотентная проба: запись значения, которое носитель уже несёт
+            let delivery = hub
+                .set_status(board, n, base)
+                .await
+                .expect("применённая запись → честная квитанция Confirmed (#1437)");
+            let uwuwu_usecase::StatusDelivery::Confirmed { actual } = delivery else {
+                panic!("квитанция без доказательства применения: {delivery:?}");
+            };
+            assert_eq!(
+                uwuwu_usecase::parse_status(&actual),
+                base,
+                "raw-имя носителя совпало с записанным: {actual}"
+            );
+            // тот же путь чтения (gql_issue_status) в идемпотентном гарде
+            let fresh = hub
+                .fresh_row_status(board, n)
+                .await
+                .expect("свежее чтение носителя отвечает")
+                .expect("строка #1265 на доске по свежему GraphQL-риду");
+            assert_eq!(fresh, base, "fresh_row_status видит записанный статус");
+        });
+    }
+
     #[test]
     fn is_rate_limited_matches_only_owned_tag_not_github_texts() {
         // Permission-отказ: Display содержит «не rate limit» — старый
