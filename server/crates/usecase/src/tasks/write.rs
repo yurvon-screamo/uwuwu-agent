@@ -822,9 +822,9 @@ impl EditExpectations {
             if view.task.automerge() != a {
                 out.push("automerge");
             }
-            if self.kind.is_some_and(|k| view.task.kind() != Some(k)) {
-                out.push("type");
-            }
+        }
+        if self.kind.is_some_and(|k| view.task.kind() != Some(k)) {
+            out.push("type");
         }
         out
     }

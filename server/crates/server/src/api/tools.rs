@@ -89,7 +89,7 @@ pub fn tool_descriptors() -> Value {
         ),
         tool(
             "task_edit",
-            "Edit task cells: status/branch/PR/priority/title",
+            "Edit task cells: status/branch/PR/priority/title/type",
             object(json!({
                 "number": integer("task number"),
                 "project": string("project; default uwuwu"),
@@ -98,6 +98,7 @@ pub fn tool_descriptors() -> Value {
                 "pr": string("PR URL"),
                 "priority": string("high|medium|low"),
                 "title": string("new title"),
+                "type": string(&(type_enum_list() + "; empty — leave untouched")),
                 "automerge": json!({"type":"boolean","description":"automerge on/off (back-tagging old rows)"})
             }))
         ),
