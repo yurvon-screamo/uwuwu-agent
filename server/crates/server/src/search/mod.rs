@@ -7,8 +7,6 @@ mod maintenance;
 mod semantic;
 mod semantic_backend;
 
-pub use budget::SYNC_DAILY_CAP;
-
 pub use semantic::{
     Embedder, GeminiEmbeddings, EMBED_MODEL, RATE_LIMIT_CAP_SECS, RATE_LIMIT_DEFAULT_SECS,
 };

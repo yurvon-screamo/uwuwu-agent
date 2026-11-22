@@ -110,7 +110,10 @@ async fn seeded_backend() -> (LanceSemanticBackend, TempDirGuard) {
     let guard = TempDirGuard(lance_dir());
     let dir = guard.0.clone();
     let wiki = Arc::new(FakeWiki {
-        docs: HashMap::from([(SLUG.to_string(), (DOC_MD.to_string(), "sha-1473".to_string()))]),
+        docs: HashMap::from([(
+            SLUG.to_string(),
+            (DOC_MD.to_string(), "sha-1473".to_string()),
+        )]),
     });
     let embeddings: Arc<dyn Embedder> = Arc::new(FixedEmbedder);
     let backend = LanceSemanticBackend::open(dir, wiki, None, embeddings)
@@ -140,11 +143,7 @@ async fn fts_finds_seeded_doc_before_breakage() {
 
     let cyrillic = backend.fulltext(&["монолита".to_string()], 5).await;
     assert!(
-        cyrillic
-            .as_ref()
-            .expect("fts ok")
-            .iter()
-            .any(|s| s == SLUG),
+        cyrillic.as_ref().expect("fts ok").iter().any(|s| s == SLUG),
         "simple-токенизатор индекса покрывает кириллицу, факт: {cyrillic:?}"
     );
 }

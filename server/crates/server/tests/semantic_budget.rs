@@ -88,8 +88,7 @@ impl CountingEmbedder {
 impl Embedder for CountingEmbedder {
     async fn embed_docs(&self, docs: &[(String, String)]) -> UsecaseResult<Vec<Vec<f32>>> {
         self.doc_calls.fetch_add(1, Ordering::SeqCst);
-        self.texts_total
-            .fetch_add(docs.len(), Ordering::SeqCst);
+        self.texts_total.fetch_add(docs.len(), Ordering::SeqCst);
         Ok(docs
             .iter()
             .map(|_| vec![0.0f32; EMBED_MODEL_DIMS])
@@ -126,8 +125,7 @@ const SMALL_MD: &str = "# Док\n\nКомпактный абзац — один
 /// (два batchEmbedContents-вызова по 38 текстов).
 fn heavy_md() -> String {
     let paragraph = "а".repeat(1300);
-    std::iter::repeat(paragraph)
-        .take(50)
+    std::iter::repeat_n(paragraph, 50)
         .collect::<Vec<_>>()
         .join("\n\n")
 }
@@ -135,8 +133,14 @@ fn heavy_md() -> String {
 fn wiki_with_three_docs() -> FakeWiki {
     FakeWiki {
         docs: HashMap::from([
-            ("Experience/a".to_string(), (SMALL_MD.to_string(), "sha-a".into())),
-            ("Experience/b".to_string(), (SMALL_MD.to_string(), "sha-b".into())),
+            (
+                "Experience/a".to_string(),
+                (SMALL_MD.to_string(), "sha-a".into()),
+            ),
+            (
+                "Experience/b".to_string(),
+                (SMALL_MD.to_string(), "sha-b".into()),
+            ),
             (
                 "Experience/heavy".to_string(),
                 (heavy_md(), "sha-heavy".into()),
@@ -192,7 +196,10 @@ async fn sync_spends_are_accounted_in_budget_file() {
     let state = search::budget::read_state(&budget_path(&dir.0));
     assert_eq!(state.day, budget_day_now());
     // 2 малых дока по 1 запросу + тяжёлый (50 чанков) = ceil(50/38) = 2 → 4.
-    assert_eq!(state.spent, 4, "cost = ceil(чанков/EMBED_BATCH), факт: {state:?}");
+    assert_eq!(
+        state.spent, 4,
+        "cost = ceil(чанков/EMBED_BATCH), факт: {state:?}"
+    );
 
     // Повторный sync без изменений не тратит бюджет.
     let second = backend.sync_index(19).await.expect("resync ok");

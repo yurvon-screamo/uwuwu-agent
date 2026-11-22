@@ -12,6 +12,10 @@
 
 pub mod search {
     #[allow(dead_code)]
+    #[path = "../../src/search/budget.rs"]
+    pub mod budget;
+
+    #[allow(dead_code)]
     #[path = "../../src/search/semantic.rs"]
     pub mod semantic;
 

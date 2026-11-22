@@ -168,9 +168,9 @@ impl LanceSemanticBackend {
             }
         };
         let has_fts = match table.list_indices().await {
-            Ok(indices) => indices
-                .iter()
-                .any(|i| matches!(i.index_type, IndexType::FTS) && i.columns.iter().any(|c| c == "text")),
+            Ok(indices) => indices.iter().any(|i| {
+                matches!(i.index_type, IndexType::FTS) && i.columns.iter().any(|c| c == "text")
+            }),
             Err(e) => {
                 tracing::warn!(
                     event = "semantic.fts_index_skip",
