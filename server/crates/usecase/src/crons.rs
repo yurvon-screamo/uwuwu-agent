@@ -1159,6 +1159,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settlement_holds_crash_track_without_session() {
+        // Crash-семантика файра (#1480): state-запись до спавна, краш
+        // между записью и спавном оставляет трек без сессии. Сеттлмент
+        // не судит вслепую (ветка пустой сессии), тишина-детект закроет
+        // эпизод по порогу — свежий crash-трек не отказ и не рефайр.
+        let now = 1_000_000_000_000u64;
+        let (u, state) = cron_uc_scan(vec![sess("ses_1", "succeeded", false)], now);
+        state.set_cron_row("тест", run_track("", now - 60_000, now - 60_000));
+        u.tick().await.unwrap();
+        let row = state.row("тест");
+        assert!(row.run.is_some(), "crash-трек без сессии не сеттлится");
+        assert_eq!(row.fails, 0, "ложной тревоги нет");
+    }
+
+    #[tokio::test]
+    async fn silence_closes_crash_track_over_threshold() {
+        // Реалистичный crash-таймлайн (#1480): файр умер между записью
+        // state и спавном (last_fire = fired_ms = момент краша). Через
+        // порог тишины эпизод закрывается отказом (UC-02), интервал к
+        // этому моменту снова due — тот же тик перезапускает ран
+        // (восстановление без ручного вмешательства).
+        let now = 1_000_000_000_000u64;
+        let (u, state) = cron_uc_scan(vec![sess("ses_1", "succeeded", false)], now);
+        state.set_cron_row(
+            "тест",
+            run_track("", now - RUN_SILENCE_MS - 1, now - RUN_SILENCE_MS - 1),
+        );
+        u.tick().await.unwrap();
+        let row = state.row("тест");
+        assert_eq!(row.fails, 1, "тишина закрыла crash-эпизод отказом");
+        assert_eq!(
+            row.last_fire_ms,
+            Some(now),
+            "интервал снова due — тот же тик перезапустил ран"
+        );
+        assert!(row.run.is_some(), "новый ран живёт в треке");
+    }
+
+    #[tokio::test]
     async fn silence_over_threshold_signals_and_closes() {
         // Тишина рана (UC-02): файр был, завершения нет > 6 ч → отказ +
         // эпизод закрыт. Сессия busy — сеттлмент держит, тишина закрывает;
