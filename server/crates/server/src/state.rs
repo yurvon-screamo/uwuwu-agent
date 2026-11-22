@@ -42,6 +42,10 @@ struct BotRow {
     offset: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     manual_hash: Option<u64>,
+    /// Hash уроков, доставленных префиксом (agent-режим #1424): None —
+    /// не доставлены/сброс (компакт/recreate); персиста переживает рестарт.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lessons_hash: Option<u64>,
     /// Метка последней адмиссии нативного компакта (ms; None — не было):
     /// коулдаун автокомпакта переживает рестарт сервера (#1221, ADR-082).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -639,6 +643,27 @@ impl BotStateStore for JsonStateStore {
             // пустой строке нечего забывать — Some завёл бы сироту
             None if hash.is_some() => {
                 guard.bots.entry(slug.to_string()).or_default().manual_hash = hash;
+            }
+            None => {}
+        }
+    }
+
+    fn bot_lessons_hash(&self, slug: &str) -> Option<u64> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .bots
+            .get(slug)
+            .and_then(|b| b.lessons_hash)
+    }
+
+    fn set_bot_lessons_hash(&self, slug: &str, hash: Option<u64>) {
+        let mut guard = self.state.lock().expect("state lock");
+        match guard.bots.get_mut(slug) {
+            Some(row) => row.lessons_hash = hash,
+            // пустой строке нечего забывать — Some завёл бы сироту
+            None if hash.is_some() => {
+                guard.bots.entry(slug.to_string()).or_default().lessons_hash = hash;
             }
             None => {}
         }

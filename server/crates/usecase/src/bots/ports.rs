@@ -112,6 +112,14 @@ pub trait BotStateStore: Send + Sync {
     /// бутстрап; recreate теряет сессию целиком).
     fn bot_manual_hash(&self, slug: &str) -> Option<u64>;
     fn set_bot_manual_hash(&self, slug: &str, hash: Option<u64>);
+    /// Hash уроков, доставленных в сессию префиксом (agent-режим, #1424):
+    /// расхождение = носитель уроков изменился → следующий промпт понесёт
+    /// уроки снова (один раз), дальше — чистый текст. Some — записать,
+    /// None — забыть: сброс = «уроков в живой сессии нет» — дозаправка
+    /// следующим промптом (компакт суммаризует префикс; recreate теряет
+    /// сессию целиком).
+    fn bot_lessons_hash(&self, slug: &str) -> Option<u64>;
+    fn set_bot_lessons_hash(&self, slug: &str, hash: Option<u64>);
     /// Метка последней адмиссии компакта (#1221): 0 — не было; коулдаун
     /// матрицы вердикта переживает рестарт сервера (персиста в state).
     fn bot_compact_ms(&self, slug: &str) -> u64;

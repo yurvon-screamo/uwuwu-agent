@@ -15,6 +15,8 @@ pub use supervisor::BotSupervisor;
 
 /// Живое (горячее) представление бота: метаданные и методичка читаются
 /// раннером с каждого сообщения — правка дока доезжает без рестарта.
+/// `manual` — композит методички с уроками (doc-режим, #1424), `lessons` —
+/// носитель уроков отдельно (agent-режим, префикс при смене).
 pub(crate) struct BotLive {
     inner: std::sync::RwLock<BotLiveView>,
 }
@@ -24,15 +26,29 @@ pub(crate) struct BotLiveView {
     pub owner: Option<String>,
     pub greeting: Option<String>,
     pub manual: String,
+    pub lessons: String,
 }
 
 impl BotLive {
+    /// Без уроков — регресс-гейт #1424: дока `Уроки` нет, поведение как прежде.
     pub(crate) fn new(owner: Option<String>, greeting: Option<String>, manual: String) -> Self {
+        Self::with_lessons(owner, greeting, manual, String::new())
+    }
+
+    /// Полная форма (#1424): `manual` — композит методички с уроками
+    /// (doc-режим), `lessons` — носитель уроков (agent-режим, префикс).
+    pub(crate) fn with_lessons(
+        owner: Option<String>,
+        greeting: Option<String>,
+        manual: String,
+        lessons: String,
+    ) -> Self {
         Self {
             inner: std::sync::RwLock::new(BotLiveView {
                 owner,
                 greeting,
                 manual,
+                lessons,
             }),
         }
     }
@@ -42,12 +58,19 @@ impl BotLive {
     }
 
     /// Обновить из свежего дока; true — методичка изменилась (лог).
-    pub(crate) fn update(&self, owner: Option<&str>, greeting: Option<&str>, manual: &str) -> bool {
+    pub(crate) fn update(
+        &self,
+        owner: Option<&str>,
+        greeting: Option<&str>,
+        manual: &str,
+        lessons: &str,
+    ) -> bool {
         let mut guard = self.inner.write().expect("bot live lock");
         let changed = guard.manual != manual;
         guard.owner = owner.map(String::from);
         guard.greeting = greeting.map(String::from);
         guard.manual = manual.to_string();
+        guard.lessons = lessons.to_string();
         changed
     }
 }

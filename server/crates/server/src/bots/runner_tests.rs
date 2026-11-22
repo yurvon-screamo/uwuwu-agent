@@ -463,8 +463,15 @@ impl AgentSessionGateway for FakeSessions {
     }
 }
 
-/// slug → (session, offset) — пара состояния бота.
-type BotRow = (Option<String>, Option<u64>, Option<u64>, Option<u64>);
+/// slug → (session, offset, manual_hash, lessons_hash, compact_ms) —
+/// состояние бота.
+type BotRow = (
+    Option<String>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+);
 
 #[derive(Default)]
 struct FakeState {
@@ -510,18 +517,30 @@ impl BotStateStore for FakeState {
         let e = rows.entry(slug.to_string()).or_default();
         e.2 = hash;
     }
-    fn bot_compact_ms(&self, slug: &str) -> u64 {
+    fn bot_lessons_hash(&self, slug: &str) -> Option<u64> {
         self.rows
             .lock()
             .expect("state lock")
             .get(slug)
             .and_then(|r| r.3)
+    }
+    fn set_bot_lessons_hash(&self, slug: &str, hash: Option<u64>) {
+        let mut rows = self.rows.lock().expect("state lock");
+        let e = rows.entry(slug.to_string()).or_default();
+        e.3 = hash;
+    }
+    fn bot_compact_ms(&self, slug: &str) -> u64 {
+        self.rows
+            .lock()
+            .expect("state lock")
+            .get(slug)
+            .and_then(|r| r.4)
             .unwrap_or(0)
     }
     fn set_bot_compact_ms(&self, slug: &str, ms: u64) {
         let mut rows = self.rows.lock().expect("state lock");
         let e = rows.entry(slug.to_string()).or_default();
-        e.3 = Some(ms);
+        e.4 = Some(ms);
     }
     fn save(&self) -> UsecaseResult<()> {
         if self.fail_save.load(Ordering::SeqCst) {
@@ -2581,4 +2600,236 @@ async fn bot_turn_delivered_while_session_busy_cap_ignored() {
         ok,
         "ход бота доставлен при занятой сессии — исключение живо"
     );
+}
+
+// ---------- уроки бота (#1424) ----------
+
+const LESSONS_SLUG: &str = "bot/проба/Уроки";
+
+/// doc-режим: уроки едут в композите методички через hash-гейт — бутстрап
+/// несёт методичку с блоком уроков, ночной append доезжает одним
+/// сообщением, дальше чистый текст; нет дока — текст дозаправки прежний.
+#[tokio::test]
+async fn doc_mode_lessons_ride_in_manual_composite() {
+    let wiki = Arc::new(FakeWiki::default());
+    let sessions = FakeSessions::new();
+    let state = Arc::new(FakeState::default());
+    let clock = FakeClock::at(10_000_000);
+    let tg = FakeTg::new(vec![]);
+    wiki.set_doc(DOC_SLUG, &doc_md("p/m1", "UWUWU_BOT_TOKEN_L1", "методичка"));
+    wiki.set_doc(LESSONS_SLUG, "урок один");
+    let sup = supervisor(
+        wiki.clone(),
+        sessions.clone(),
+        state.clone(),
+        clock.clone(),
+        tg.clone(),
+        vec![("UWUWU_BOT_TOKEN_L1", "tok")],
+    );
+    sup.tick().await.unwrap();
+    tg.inject(private_update(1, "yurvon", "вопрос один"));
+    wait_until(|| !sessions.prompts_snapshot().is_empty(), 2000).await;
+    let snap1 = sessions.prompts_snapshot();
+    let first = &snap1[0].1;
+    assert!(
+        first.contains("## Уроки (выучено автоматически"),
+        "блок уроков в композите: {first}"
+    );
+    assert!(first.contains("урок один"), "текст урока в композите");
+    // второй ход — чистый текст (hash-гейт композита)
+    tg.inject(private_update(2, "yurvon", "вопрос два"));
+    wait_until(|| sessions.prompts_snapshot().len() == 2, 2000).await;
+    let snap2 = sessions.prompts_snapshot();
+    assert!(
+        !snap2[1].1.contains("урок один"),
+        "повторной доставки уроков нет: {}",
+        snap2[1].1
+    );
+    // ночной append уроков → композит меняется → дозаправка одним сообщением
+    wiki.set_doc(LESSONS_SLUG, "урок один\nурок два");
+    sup.tick().await.unwrap();
+    tg.inject(private_update(3, "yurvon", "вопрос три"));
+    wait_until(|| sessions.prompts_snapshot().len() == 3, 2000).await;
+    let snap3 = sessions.prompts_snapshot();
+    let third = &snap3[2].1;
+    assert!(third.contains("урок два"), "свежие уроки доезжают: {third}");
+    assert!(
+        third.contains("методичка"),
+        "композит несёт методичку целиком"
+    );
+    // и снова чисто
+    tg.inject(private_update(4, "yurvon", "вопрос четыре"));
+    wait_until(|| sessions.prompts_snapshot().len() == 4, 2000).await;
+    let snap4 = sessions.prompts_snapshot();
+    assert!(!snap4[3].1.contains("урок"));
+}
+
+/// agent-режим: уроки — префикс одним сообщением при смене носителя
+/// (lessons-hash в state), дальше чистый текст.
+#[tokio::test]
+async fn agent_mode_lessons_prefix_rides_once_on_change() {
+    let sessions = FakeSessions::new();
+    let state = Arc::new(FakeState::default());
+    let live = BotLive::with_lessons(
+        Some("yurvon".into()),
+        None,
+        "тело-дока-игнорируется".into(),
+        "урок один".into(),
+    );
+    let mut d = deps(FakeTg::new(vec![]), sessions.clone(), state, 50, 5, live);
+    d.structural.agent = Some("marketing".into());
+    // ход 1: префикс с уроками
+    let u1 = private_update(1, "yurvon", "вопрос один");
+    process_message(&d, u1.message.as_ref().unwrap())
+        .await
+        .unwrap();
+    let snap1 = sessions.prompts_snapshot();
+    let p1 = snap1
+        .iter()
+        .find(|(_, p)| p.contains("вопрос один"))
+        .map(|(_, p)| p.as_str())
+        .expect("первый промпт есть");
+    assert!(p1.starts_with("New bot lessons"), "уроки-префикс: {p1}");
+    assert!(p1.contains("урок один"));
+    // ход 2 — чистый текст
+    let u2 = private_update(2, "yurvon", "вопрос два");
+    process_message(&d, u2.message.as_ref().unwrap())
+        .await
+        .unwrap();
+    let snap2 = sessions.prompts_snapshot();
+    let p2 = snap2
+        .iter()
+        .find(|(_, p)| p.contains("вопрос два"))
+        .map(|(_, p)| p.as_str())
+        .expect("второй промпт есть");
+    assert_eq!(p2, "вопрос два", "повторного префикса нет");
+    // смена носителя уроков → дозаправка одним сообщением
+    d.live.update(
+        Some("yurvon"),
+        None,
+        "тело-дока-игнорируется",
+        "урок один\nурок два",
+    );
+    let u3 = private_update(3, "yurvon", "вопрос три");
+    process_message(&d, u3.message.as_ref().unwrap())
+        .await
+        .unwrap();
+    let snap3 = sessions.prompts_snapshot();
+    let p3 = snap3
+        .iter()
+        .find(|(_, p)| p.contains("вопрос три"))
+        .map(|(_, p)| p.as_str())
+        .expect("третий промпт есть");
+    assert!(p3.contains("урок два"), "свежие уроки доезжают: {p3}");
+}
+
+/// agent-режим без уроков — промпты чистые всегда (регресс-гейт #1424:
+/// дока `Уроки` нет, поведение как прежде).
+#[tokio::test]
+async fn agent_mode_empty_lessons_never_prefix() {
+    let sessions = FakeSessions::new();
+    let state = Arc::new(FakeState::default());
+    let live = BotLive::new(Some("yurvon".into()), None, "т".into());
+    let mut d = deps(FakeTg::new(vec![]), sessions.clone(), state, 50, 5, live);
+    d.structural.agent = Some("marketing".into());
+    for id in 1..=2u64 {
+        let u = private_update(id, "yurvon", &format!("вопрос {id}"));
+        process_message(&d, u.message.as_ref().unwrap())
+            .await
+            .unwrap();
+    }
+    for (_, p) in sessions.prompts_snapshot() {
+        assert!(
+            !p.starts_with("New bot lessons"),
+            "пустые уроки не префиксуют: {p}"
+        );
+    }
+}
+
+/// agent-режим: компакт суммаризует префикс уроков — сброс lessons-hash
+/// дозаправляет уроки следующим промптом (методичка по-прежнему не едет).
+#[tokio::test]
+async fn compact_agent_mode_rearms_lessons_prefix() {
+    let wiki = Arc::new(FakeWiki::default());
+    let sessions = FakeSessions::new();
+    let state = Arc::new(FakeState::default());
+    let clock = FakeClock::at(10_000_000);
+    let tg = FakeTg::new(vec![]);
+    wiki.set_doc(
+        DOC_SLUG,
+        "---\ntitle: Проба\nmodel: p/m1\ntoken_env: UWUWU_BOT_TOKEN_L4\n\
+         owner: yurvon\nworkspace: /tmp/opencode\nagent: probe-agent\n---\n\nтело-методичка",
+    );
+    wiki.set_doc(LESSONS_SLUG, "урок один");
+    tg.inject(private_update(1, "yurvon", "привет"));
+    let mut sup = supervisor(
+        wiki.clone(),
+        sessions.clone(),
+        state.clone(),
+        clock.clone(),
+        tg.clone(),
+        vec![("UWUWU_BOT_TOKEN_L4", "tok")],
+    );
+    sup.compact = Some(compact_policy(300_000, 40.0, 60_000));
+    let sup = Arc::new(sup);
+    sup.tick().await.unwrap();
+    wait_until(|| state.bot_session(SLUG).is_some(), 2000).await;
+    let session = state.bot_session(SLUG).unwrap();
+    wait_until(|| !sessions.prompts_snapshot().is_empty(), 2000).await;
+    assert!(
+        sessions.prompts_snapshot()[0].1.contains("урок один"),
+        "уроки-префикс в первом ходе"
+    );
+    sessions.set_activity(&session, Some(clock.now_ms() - 400_000));
+    sessions.set_usage(&session, Some(50.0));
+    sup.tick().await.unwrap();
+    assert_eq!(sessions.compacts_snapshot(), vec![session.clone()]);
+    // после компакта уроки дозаправляются префиксом (история суммаризована)
+    tg.inject(private_update(2, "yurvon", "второе"));
+    wait_until(|| sessions.prompts_snapshot().len() == 2, 2000).await;
+    assert!(
+        sessions.prompts_snapshot()[1]
+            .1
+            .starts_with("New bot lessons"),
+        "компакт сбросил lessons-hash — уроки доезжают: {}",
+        sessions.prompts_snapshot()[1].1
+    );
+    assert!(
+        !sessions.prompts_snapshot()[1].1.contains("The bot manual"),
+        "методичка в agent-режиме не едет"
+    );
+}
+
+/// Скан-обогащение (#1424): соседний док уроков дочитывается (fm в нём
+/// срезается), соседние доки папки бота не ломают диф жизненного цикла.
+#[tokio::test]
+async fn scan_enriches_spec_with_sibling_lessons() {
+    let wiki = Arc::new(FakeWiki::default());
+    let sessions = FakeSessions::new();
+    let state = Arc::new(FakeState::default());
+    let clock = FakeClock::at(10_000_000);
+    let tg = FakeTg::new(vec![]);
+    wiki.set_doc(DOC_SLUG, &doc_md("p/m1", "UWUWU_BOT_TOKEN_L5", "методичка"));
+    wiki.set_doc(LESSONS_SLUG, "---\ntitle: Уроки\n---\n\nурок с fm");
+    wiki.set_doc("bot/проба/Заметки", "не README — мимо спеки");
+    let sup = Arc::new(supervisor(
+        wiki.clone(),
+        sessions.clone(),
+        state.clone(),
+        clock.clone(),
+        tg.clone(),
+        vec![("UWUWU_BOT_TOKEN_L5", "tok")],
+    ));
+    sup.tick().await.unwrap();
+    assert!(sup.is_running(SLUG), "соседние доки не ломают подъём бота");
+    tg.inject(private_update(1, "yurvon", "вопрос"));
+    wait_until(|| !sessions.prompts_snapshot().is_empty(), 2000).await;
+    let snap = sessions.prompts_snapshot();
+    let p = &snap[0].1;
+    assert!(p.contains("урок с fm"), "урок в композите: {p}");
+    assert!(
+        !p.contains("title: Уроки"),
+        "fm носителя уроков срезан: {p}"
+    );
+    assert!(!p.contains("не README — мимо спеки"));
 }

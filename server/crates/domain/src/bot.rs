@@ -37,6 +37,11 @@ pub struct BotSpec {
     pub agent: Option<String>,
     /// Тело дока — методичка; в agent-режиме игнорируется.
     pub manual: String,
+    /// Соседний док `bot/<имя>/Уроки` — носитель уроков бота (#1424).
+    /// Не из fm: супервизор дочитывает при скане и обогащает спеку;
+    /// пусто — дока нет (поведение как прежде). В doc-режиме едет в
+    /// композите методички, в agent-режиме — префиксом при смене.
+    pub lessons: String,
 }
 
 impl BotSpec {
@@ -88,6 +93,7 @@ mod tests {
             workspace: workspace.into(),
             greeting: None,
             manual: "методичка".into(),
+            lessons: String::new(),
         }
     }
 
