@@ -355,7 +355,9 @@ fn parse_iso_ms(stamp: &str) -> Option<u64> {
 }
 
 /// JST-штамп журнала: ISO с зоной (+09:00 — читается обратно).
-fn jst_stamp(ms: u64) -> String {
+/// Реэкспортируется в корень крейта: единый формат датировок корпуса
+/// (fm-гвард docs_write #1444 штампует lastmod тем же форматом).
+pub fn jst_stamp(ms: u64) -> String {
     let secs = ms / 1000 + 9 * 3600;
     let d = secs / 86400;
     let (y, mo, da) = civil_from_days(d as i64);

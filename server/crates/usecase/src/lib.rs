@@ -7,6 +7,7 @@ pub mod blobs;
 pub mod bots;
 mod crons;
 mod error;
+pub mod fm_guard;
 mod fm_lite;
 pub mod goals;
 mod naming;
@@ -30,7 +31,7 @@ pub use bots::{
     build_prompt, chunk_reply, classify_message, parse_bot_doc, plan_action, BotStateStore,
     TelegramGateway, TgMessage, TgUpdate,
 };
-pub use crons::{parse_schedule_text, CronUseCase, FireOutcome, CRON_DIR};
+pub use crons::{jst_stamp, parse_schedule_text, CronUseCase, FireOutcome, CRON_DIR};
 pub use error::{UsecaseError, UsecaseResult, ViewError};
 pub use goals::{gist_of, Goal, GoalsRepo, GoalsView};
 pub use naming::{
