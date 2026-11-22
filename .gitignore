@@ -65,3 +65,6 @@ tools/*.npz
 /wt/
 
 server/target/
+
+# рантайм-артефакт e2e-стендов (memory-конфиг поднимает semantic-индекс в ops/) — #1424 ревью Low 4
+server/ops/lancedb/

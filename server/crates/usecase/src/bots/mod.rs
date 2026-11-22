@@ -12,7 +12,10 @@ mod spec;
 
 pub use assets::normalize_asset_name;
 pub use compact::{compact_verdict, CompactFacts, CompactPolicy, CompactVerdict};
-pub use flow::{build_prompt, chunk_reply, classify_message, plan_action};
+pub use flow::{
+    build_lessons_prompt, build_lessons_revoked_prompt, build_prompt, chunk_reply,
+    classify_message, compose_manual, normalize_lessons, plan_action,
+};
 pub use ports::{
     BotAssetStore, BotStateStore, Incoming, MediaKind, TelegramGateway, TgMedia, TgMessage,
     TgUpdate,

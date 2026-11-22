@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use uwuwu_domain::{BotAction, BotSpec, ModelRef};
 use uwuwu_usecase::bots::{
-    compact_verdict, parse_bot_doc, plan_action, BotAssetStore, BotStateStore, CompactFacts,
-    CompactPolicy, TelegramGateway,
+    compact_verdict, compose_manual, normalize_lessons, parse_bot_doc, plan_action, BotAssetStore,
+    BotStateStore, CompactFacts, CompactPolicy, TelegramGateway,
 };
 use uwuwu_usecase::{
     AgentSessionGateway, Clock, Liveness, TickStateStore, UsecaseResult, WikiRepo,
@@ -63,6 +63,17 @@ pub(crate) fn stop_reason(parsed: Option<&Result<BotSpec, String>>) -> Option<&'
         Some(Ok(b)) if !b.enabled => Some("enabled:false"),
         Some(Ok(_)) => None,
     }
+}
+
+/// Живое представление из спеки (#1424): методичка — композит с уроками
+/// (doc-режим, hash-гейт manual), уроки отдельно (agent-режим, префикс).
+fn live_of(spec: &BotSpec, lessons: &str) -> BotLive {
+    BotLive::with_lessons(
+        spec.owner.clone(),
+        spec.greeting.clone(),
+        compose_manual(&spec.manual, lessons),
+        lessons.to_string(),
+    )
 }
 
 pub struct BotSupervisor {
@@ -133,6 +144,25 @@ impl BotSupervisor {
             .get(slug)
             .map(|r| r.task.is_finished())
             .unwrap_or(false)
+    }
+
+    /// Последние известные уроки бота (#1424, ревью раунд 2): `None`
+    /// спеки — читать не удалось, не равно «носитель опустел» — живое
+    /// представление сохраняет предыдущие уроки, гейт отзыва в
+    /// agent-режиме не срабатывает на транзиентном сбое чтения.
+    fn resolve_lessons(
+        &self,
+        running: &HashMap<String, Running>,
+        slug: &str,
+        spec: &BotSpec,
+    ) -> String {
+        match spec.lessons.as_deref() {
+            Some(l) => l.to_string(),
+            None => running
+                .get(slug)
+                .map(|r| r.live.view().lessons)
+                .unwrap_or_default(),
+        }
     }
 
     pub async fn tick(&self) -> UsecaseResult<()> {
@@ -256,14 +286,22 @@ impl BotSupervisor {
             match self.sessions.compact_session(&session).await {
                 Ok(()) => {
                     // doc-режим: бутстрап-методичка ушла в суммаризацию —
-                    // дозаправка следующим промптом (сброс hash);
-                    // agent-режим компактом не задевается (методичка —
-                    // системный контекст agents/<name>.md)
+                    // дозаправка следующим промптом (сброс hash; уроки едут
+                    // в композите — покрываются тем же сбросом);
+                    // agent-режим: уроки ехали префиксом в историю — сброс
+                    // lessons-hash дозаправит их (#1424); методичка в
+                    // agents/<name>.md компактом не задевается.
                     if spec.agent.is_none() {
                         self.state.set_bot_manual_hash(&slug, None);
                         if let Err(e) = self.state.save() {
                             tracing::warn!(event = "bot.state_save_failed", slug = %slug,
                                 error = %e, "Сброс manual-hash не персистится — методичка не дозаправится");
+                        }
+                    } else {
+                        self.state.set_bot_lessons_hash(&slug, None);
+                        if let Err(e) = self.state.save() {
+                            tracing::warn!(event = "bot.state_save_failed", slug = %slug,
+                                error = %e, "Сброс lessons-hash не персистится — уроки не дозаправятся");
                         }
                     }
                     tracing::info!(event = "bot.compacted", slug = %slug,
@@ -293,7 +331,26 @@ impl BotSupervisor {
             }
             if let Some(md) = self.wiki.read_doc(&slug).await? {
                 let bot_slug = format!("bot/{name}");
-                let spec = parse_bot_doc(&bot_slug, &md);
+                let mut spec = parse_bot_doc(&bot_slug, &md);
+                // Уроки — соседний док персональной папки бота (#1424):
+                // Ok(None) — дока нет, носитель честно пуст; Err — читать
+                // не удалось: None (последние известные уроки сохраняются,
+                // ложного отзыва нет); warn и бот не ломается.
+                let lessons_slug = format!("bot/{name}/Уроки");
+                match self.wiki.read_doc(&lessons_slug).await {
+                    Ok(Some(raw)) => {
+                        if let Ok(s) = spec.as_mut() {
+                            s.lessons = Some(normalize_lessons(&raw));
+                        }
+                    }
+                    Ok(None) => {
+                        if let Ok(s) = spec.as_mut() {
+                            s.lessons = Some(String::new());
+                        }
+                    }
+                    Err(e) => tracing::warn!(event = "bot.lessons_read_failed", slug = %bot_slug,
+                        error = %e, "Док уроков не дочитан — держим последние известные уроки"),
+                }
                 out.push((bot_slug, spec));
             }
         }
@@ -348,6 +405,9 @@ impl BotSupervisor {
                 running.remove(&slug);
                 continue;
             };
+            // Последние известные уроки — до мутабельного заимствования
+            // entry (resolve_lessons читает running иммутабельно).
+            let lessons = self.resolve_lessons(running, &slug, &spec);
             let entry = running.get_mut(&slug).expect("dead entry");
             let alive_ms = now.saturating_sub(entry.started_ms);
             if !entry.dead_seen {
@@ -370,11 +430,7 @@ impl BotSupervisor {
             }
             tracing::info!(event = "bot.restarted", slug = %slug, fails = entry.fails,
                 "Задача умерла — рестарт");
-            let live = Arc::new(BotLive::new(
-                spec.owner.clone(),
-                spec.greeting.clone(),
-                spec.manual.clone(),
-            ));
+            let live = Arc::new(live_of(&spec, &lessons));
             let Some(task) = self.spawn_task(&spec, live.clone()) else {
                 // токен пропал из env: запись гасим, warn даст следующий тик
                 running.remove(&slug);
@@ -400,6 +456,9 @@ impl BotSupervisor {
     ) {
         for (slug, parsed) in scanned {
             let Ok(spec) = parsed else { continue };
+            // Последние известные уроки — до мутабельного заимствования
+            // записи (resolve_lessons читает running иммутабельно).
+            let lessons = self.resolve_lessons(running, slug, spec);
             match running.get_mut(slug) {
                 None => {
                     if spec.enabled {
@@ -407,13 +466,23 @@ impl BotSupervisor {
                     }
                 }
                 Some(entry) => {
-                    if entry.live.update(
+                    let change = entry.live.update(
                         spec.owner.as_deref(),
                         spec.greeting.as_deref(),
-                        &spec.manual,
-                    ) {
+                        &compose_manual(&spec.manual, &lessons),
+                        &lessons,
+                    );
+                    // методичка доезжает только в doc-режиме (agent-режим
+                    // несёт её в agents/<name>.md воркспейса) — смена
+                    // композита от уроков или тела дока в agent-режиме
+                    // мимо сессии, лог не врёт (ревью Low 2)
+                    if change.manual && spec.agent.is_none() {
                         tracing::info!(event = "bot.manual_updated", slug = %slug,
                             "Методичка обновлена — доедет с ближайшим сообщением");
+                    }
+                    if change.lessons {
+                        tracing::info!(event = "bot.lessons_updated", slug = %slug,
+                            "Уроки обновлены — доедут с ближайшим ходом (doc: композит, agent: префикс/отзыв)");
                     }
                     match plan_action(&entry.spec, spec) {
                         // Stop здесь недостижим: apply_stops в этом же тике
@@ -426,8 +495,11 @@ impl BotSupervisor {
                             // Методичка вшита в старую сессию (doc-режим) —
                             // свежая её не получит: сброс hash = дозаправка
                             // первым же промптом (#1221, тот же инвариант,
-                            // что у компакта).
+                            // что у компакта). Уроки (agent-режим) ехали
+                            // префиксом в историю старой сессии — сброс
+                            // lessons-hash дозаправит их тоже (#1424).
                             self.state.set_bot_manual_hash(slug, None);
+                            self.state.set_bot_lessons_hash(slug, None);
                             if let Err(e) = self.state.save() {
                                 tracing::warn!(event = "bot.state_save_failed", slug = %slug, error = %e,
                                     "Сброс сессии не персистится — рестарт реанимирует старую сессию без новой model/workspace");
@@ -453,11 +525,8 @@ impl BotSupervisor {
     /// Пересоздать запись рантайма на свежей спеке (rearm/recreate).
     /// Токен пропал — запись гасится, warn даст следующий тик.
     fn replace_entry(&self, running: &mut HashMap<String, Running>, slug: &str, spec: &BotSpec) {
-        let live = Arc::new(BotLive::new(
-            spec.owner.clone(),
-            spec.greeting.clone(),
-            spec.manual.clone(),
-        ));
+        let lessons = self.resolve_lessons(running, slug, spec);
+        let live = Arc::new(live_of(spec, &lessons));
         let Some(task) = self.spawn_task(spec, live.clone()) else {
             running.remove(slug);
             return;
@@ -477,11 +546,8 @@ impl BotSupervisor {
 
     fn spawn_new(&self, running: &mut HashMap<String, Running>, spec: BotSpec) {
         let slug = spec.slug.clone();
-        let live = Arc::new(BotLive::new(
-            spec.owner.clone(),
-            spec.greeting.clone(),
-            spec.manual.clone(),
-        ));
+        let lessons = self.resolve_lessons(running, &slug, &spec);
+        let live = Arc::new(live_of(&spec, &lessons));
         let Some(task) = self.spawn_task(&spec, live.clone()) else {
             return; // warn уже в логе (bot.token_missing)
         };

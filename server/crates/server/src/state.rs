@@ -45,6 +45,10 @@ struct BotRow {
     offset: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     manual_hash: Option<u64>,
+    /// Hash уроков, доставленных префиксом (agent-режим #1424): None —
+    /// не доставлены/сброс (компакт/recreate); персиста переживает рестарт.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lessons_hash: Option<u64>,
     /// Метка последней адмиссии нативного компакта (ms; None — не было):
     /// коулдаун автокомпакта переживает рестарт сервера (#1221, ADR-082).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -701,6 +705,27 @@ impl BotStateStore for JsonStateStore {
         }
     }
 
+    fn bot_lessons_hash(&self, slug: &str) -> Option<u64> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .bots
+            .get(slug)
+            .and_then(|b| b.lessons_hash)
+    }
+
+    fn set_bot_lessons_hash(&self, slug: &str, hash: Option<u64>) {
+        let mut guard = self.state.lock().expect("state lock");
+        match guard.bots.get_mut(slug) {
+            Some(row) => row.lessons_hash = hash,
+            // пустой строке нечего забывать — Some завёл бы сироту
+            None if hash.is_some() => {
+                guard.bots.entry(slug.to_string()).or_default().lessons_hash = hash;
+            }
+            None => {}
+        }
+    }
+
     fn bot_compact_ms(&self, slug: &str) -> u64 {
         self.state
             .lock()
@@ -1145,6 +1170,52 @@ mod tests {
         let s = store(path);
         assert_eq!(s.review_rounds("B", 5001), 7, "свежий ключ жив");
         assert_eq!(s.review_rounds("B", 1), 0, "старейший ключ срезан капом");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bot_lessons_hash_round_trip_and_orphan_reset() {
+        // #1424 (тестер): lessons-hash (agent-режим) переживает рестарт;
+        // Some(0) — «носитель опустел, уроки отозваны» — не схлопывается
+        // в None (иначе следующий ход ложно доставит уроки снова);
+        // сброс None на несуществующей строке не заводит сироту-строку.
+        let dir = std::env::temp_dir().join(format!("uwuwu-state-lessons-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        {
+            let s = store(path.clone());
+            assert_eq!(
+                s.bot_lessons_hash("bot/a"),
+                None,
+                "старый state без поля — уроков нет"
+            );
+            s.set_bot_lessons_hash("bot/a", Some(0)); // отзыв: hash пустого носителя
+            s.set_bot_lessons_hash("bot/b", Some(77));
+            TickStateStore::save(&s).unwrap();
+        }
+        let s = store(path.clone());
+        assert_eq!(
+            s.bot_lessons_hash("bot/a"),
+            Some(0),
+            "Some(0) переживает рестарт и не читается как None"
+        );
+        assert_eq!(s.bot_lessons_hash("bot/b"), Some(77));
+        s.set_bot_lessons_hash("bot/ghost", None);
+        TickStateStore::save(&s).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let bots = json.get("bots").expect("секция bots");
+        assert!(
+            bots.get("bot/ghost").is_none(),
+            "сброс None на несуществующей строке не заводит сироту: {bots}"
+        );
+        assert!(
+            bots.get("bot/a")
+                .expect("строка a жива")
+                .get("lessons_hash")
+                .is_some(),
+            "lessons_hash сериализуется в state.json"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
