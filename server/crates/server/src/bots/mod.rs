@@ -13,6 +13,15 @@ mod supervisor;
 pub use asset_store::{GitAssetStore, MemoryAssetStore};
 pub use supervisor::BotSupervisor;
 
+/// Дифференцированный итог hot-обновления (#1424, ревью Low 2):
+/// методичка и уроки меняются разными механизмами доставки — логи
+/// раздельные.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct BotLiveChange {
+    pub manual: bool,
+    pub lessons: bool,
+}
+
 /// Живое (горячее) представление бота: метаданные и методичка читаются
 /// раннером с каждого сообщения — правка дока доезжает без рестарта.
 /// `manual` — композит методички с уроками (doc-режим, #1424), `lessons` —
@@ -57,20 +66,24 @@ impl BotLive {
         self.inner.read().expect("bot live lock").clone()
     }
 
-    /// Обновить из свежего дока; true — методичка изменилась (лог).
+    /// Обновить из свежего дока; дифференцированный итог — методичка и
+    /// уроки доставляются разными механизмами (#1424).
     pub(crate) fn update(
         &self,
         owner: Option<&str>,
         greeting: Option<&str>,
         manual: &str,
         lessons: &str,
-    ) -> bool {
+    ) -> BotLiveChange {
         let mut guard = self.inner.write().expect("bot live lock");
-        let changed = guard.manual != manual;
+        let change = BotLiveChange {
+            manual: guard.manual != manual,
+            lessons: guard.lessons != lessons,
+        };
         guard.owner = owner.map(String::from);
         guard.greeting = greeting.map(String::from);
         guard.manual = manual.to_string();
         guard.lessons = lessons.to_string();
-        changed
+        change
     }
 }

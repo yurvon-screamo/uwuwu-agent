@@ -436,14 +436,23 @@ impl BotSupervisor {
                     }
                 }
                 Some(entry) => {
-                    if entry.live.update(
+                    let change = entry.live.update(
                         spec.owner.as_deref(),
                         spec.greeting.as_deref(),
                         &compose_manual(&spec.manual, &spec.lessons),
                         &spec.lessons,
-                    ) {
+                    );
+                    // методичка доезжает только в doc-режиме (agent-режим
+                    // несёт её в agents/<name>.md воркспейса) — смена
+                    // композита от уроков или тела дока в agent-режиме
+                    // мимо сессии, лог не врёт (ревью Low 2)
+                    if change.manual && spec.agent.is_none() {
                         tracing::info!(event = "bot.manual_updated", slug = %slug,
                             "Методичка обновлена — доедет с ближайшим сообщением");
+                    }
+                    if change.lessons {
+                        tracing::info!(event = "bot.lessons_updated", slug = %slug,
+                            "Уроки обновлены — доедут с ближайшим ходом (doc: композит, agent: префикс/отзыв)");
                     }
                     match plan_action(&entry.spec, spec) {
                         // Stop здесь недостижим: apply_stops в этом же тике

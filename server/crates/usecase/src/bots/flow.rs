@@ -75,6 +75,16 @@ pub fn build_lessons_prompt(lessons: &str, text: &str) -> String {
     )
 }
 
+/// Промпт отзыва уроков (agent-режим, #1424): носитель опустел
+/// (компактизация/поглощение методичкой/отзыв) — ранние копии уроков
+/// в истории сессии устарели и исполнению не подлежат.
+pub fn build_lessons_revoked_prompt(text: &str) -> String {
+    format!(
+        "The bot lessons carrier is now empty: earlier lesson copies in the \
+         session history are stale and must not be followed.\n\n## User message\n\n{text}"
+    )
+}
+
 /// Нормализация носителя уроков (#1424): fm-шапка (если появилась) —
 /// долой, обрамление — трим. Конвенция — body-only док; strip защитен.
 pub fn normalize_lessons(raw: &str) -> String {
@@ -246,6 +256,15 @@ mod tests {
         let p = build_lessons_prompt("урок один", "вопрос");
         assert!(p.starts_with("New bot lessons"));
         assert!(p.contains("урок один"));
+        assert!(p.ends_with("вопрос"));
+    }
+
+    /// #1424 (ревью Common 1): промпт отзыва — носитель опустел, ранние
+    /// копии уроков в истории объявлены устаревшими.
+    #[test]
+    fn lessons_revoked_prompt_suppresses_history() {
+        let p = build_lessons_revoked_prompt("вопрос");
+        assert!(p.starts_with("The bot lessons carrier is now empty"));
         assert!(p.ends_with("вопрос"));
     }
 

@@ -2833,3 +2833,113 @@ async fn scan_enriches_spec_with_sibling_lessons() {
     );
     assert!(!p.contains("не README — мимо спеки"));
 }
+
+/// agent-режим, отзыв уроков (ревью Common 1): носитель опустел после
+/// доставки — бот узнаёт об отзыве одним сообщением, дальше чисто;
+/// бот без уроков от рождения не получает промптов вовсе.
+#[tokio::test]
+async fn agent_mode_lessons_revocation_rides_once() {
+    let sessions = FakeSessions::new();
+    let state = Arc::new(FakeState::default());
+    let live = BotLive::with_lessons(Some("yurvon".into()), None, "т".into(), "урок один".into());
+    let mut d = deps(FakeTg::new(vec![]), sessions.clone(), state, 50, 5, live);
+    d.structural.agent = Some("marketing".into());
+    // ход 1: уроки доставлены
+    let u1 = private_update(1, "yurvon", "вопрос один");
+    process_message(&d, u1.message.as_ref().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        sessions
+            .prompts_snapshot()
+            .iter()
+            .any(|(_, p)| p.contains("урок один")),
+        "уроки доставлены до отзыва"
+    );
+    // носитель опустел (компактизация/поглощение методичкой/отзыв)
+    d.live.update(Some("yurvon"), None, "т", "");
+    let u2 = private_update(2, "yurvon", "вопрос два");
+    process_message(&d, u2.message.as_ref().unwrap())
+        .await
+        .unwrap();
+    let snap2 = sessions.prompts_snapshot();
+    let p2 = snap2
+        .iter()
+        .find(|(_, p)| p.contains("вопрос два"))
+        .map(|(_, p)| p.as_str())
+        .expect("промпт отзыва есть");
+    assert!(
+        p2.starts_with("The bot lessons carrier is now empty"),
+        "отзыв доезжает: {p2}"
+    );
+    // ход 3 — чистый текст
+    let u3 = private_update(3, "yurvon", "вопрос три");
+    process_message(&d, u3.message.as_ref().unwrap())
+        .await
+        .unwrap();
+    let snap3 = sessions.prompts_snapshot();
+    let p3 = snap3
+        .iter()
+        .find(|(_, p)| p.contains("вопрос три"))
+        .map(|(_, p)| p.as_str())
+        .expect("третий промпт есть");
+    assert_eq!(p3, "вопрос три", "повторного отзыва нет");
+    // регресс-гейт: бот без уроков от рождения — чистый промпт
+    let live = BotLive::new(Some("yurvon".into()), None, "т".into());
+    let mut d2 = deps(
+        FakeTg::new(vec![]),
+        sessions.clone(),
+        Arc::new(FakeState::default()),
+        50,
+        5,
+        live,
+    );
+    d2.structural.agent = Some("marketing".into());
+    let u4 = private_update(4, "yurvon", "чистый вопрос");
+    process_message(&d2, u4.message.as_ref().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        sessions
+            .prompts_snapshot()
+            .iter()
+            .any(|(_, p)| p == "чистый вопрос"),
+        "уроков не было — никакого урочного промпта"
+    );
+}
+
+/// Ревью Low 2: смена одних уроков в agent-режиме логируется
+/// lessons_updated; manual_updated («методичка доедет») не логируется —
+/// методичка в agent-режиме до сессии не доезжает.
+#[tokio::test]
+async fn lessons_only_change_logs_lessons_event_not_manual() {
+    let wiki = Arc::new(FakeWiki::default());
+    let sessions = FakeSessions::new();
+    let state = Arc::new(FakeState::default());
+    let clock = FakeClock::at(10_000_000);
+    let tg = FakeTg::new(vec![]);
+    wiki.set_doc(
+        DOC_SLUG,
+        "---\ntitle: Проба\nmodel: p/m1\ntoken_env: UWUWU_BOT_TOKEN_L6\n\
+         owner: yurvon\nworkspace: /tmp/opencode\nagent: probe-agent\n---\n\nтело-методичка",
+    );
+    wiki.set_doc(LESSONS_SLUG, "урок один");
+    let sup = Arc::new(supervisor(
+        wiki.clone(),
+        sessions.clone(),
+        state.clone(),
+        clock.clone(),
+        tg.clone(),
+        vec![("UWUWU_BOT_TOKEN_L6", "tok")],
+    ));
+    sup.tick().await.unwrap(); // спавн — hot-путь не ходит
+    let (_guard, records) = trap_events();
+    wiki.set_doc(LESSONS_SLUG, "урок один\nурок два");
+    sup.tick().await.unwrap(); // hot-путь: только уроки
+    let rec = records.lock().expect("trap lock");
+    assert_event_logged(&rec, "bot.lessons_updated");
+    assert!(
+        !rec.iter().any(|l| l.contains("bot.manual_updated")),
+        "agent-режим: методичка не доезжает — manual_updated не логируется: {rec:?}"
+    );
+}
