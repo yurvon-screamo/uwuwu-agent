@@ -8,108 +8,26 @@
 //! зеркалом tests/search/mod.rs (паттерн mock_route_coverage).
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::search::semantic::{Embedder, EMBED_MODEL_DIMS};
 use crate::search::semantic_backend::LanceSemanticBackend;
-use async_trait::async_trait;
 use lancedb::arrow::arrow_array::{
     FixedSizeListArray, Float32Array, Int32Array, Int64Array, LargeStringArray, RecordBatch,
 };
 use lancedb::arrow::arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lancedb::connection::ConnectBuilder;
-use uwuwu_usecase::{AppendDocOutcome, SemanticBackend, UsecaseResult, WikiRepo};
+use uwuwu_usecase::{SemanticBackend, WikiRepo};
 
 const LEGACY_DIM: i32 = 1024; // qwen3-embedding:0.6b — прежний маршрут
 const SLUG: &str = "Experience/platform/Лимиты Gemini Embedding";
 const DOC_MD: &str =
     "# Лимиты\n\nFree tier: RPD 1000, ресет — полночь Pacific. 429 несёт RetryInfo.";
 
-// ——— фикстуры (паттерн semantic_slug_escape) ———
+// ——— фикстуры: общий бойлерплейк в super::support (паттерн semantic_slug_escape) ———
 
-struct FakeWiki {
-    docs: HashMap<String, (String, String)>,
-}
-
-#[async_trait]
-impl WikiRepo for FakeWiki {
-    async fn read_doc(&self, slug: &str) -> UsecaseResult<Option<String>> {
-        Ok(self.docs.get(slug).map(|(md, _)| md.clone()))
-    }
-
-    async fn list_docs(&self, prefix: &str) -> UsecaseResult<Vec<String>> {
-        Ok(self
-            .docs
-            .keys()
-            .filter(|slug| slug.starts_with(prefix))
-            .cloned()
-            .collect())
-    }
-
-    async fn doc_shas(&self) -> UsecaseResult<Vec<(String, String)>> {
-        Ok(self
-            .docs
-            .iter()
-            .map(|(slug, (_, sha))| (slug.clone(), sha.clone()))
-            .collect())
-    }
-
-    async fn write_doc(&self, _slug: &str, _content: &str, _message: &str) -> UsecaseResult<()> {
-        Ok(())
-    }
-
-    async fn append_doc(
-        &self,
-        _slug: &str,
-        _line: &str,
-        _message: &str,
-    ) -> UsecaseResult<AppendDocOutcome> {
-        Ok(AppendDocOutcome {
-            created: false,
-            lines: 0,
-        })
-    }
-}
-
-/// Фиксированный мок-эмбеддер 1536 (штатный приём пина #1392): эмбеддинги —
-/// внешний unmanaged-dep, здесь важна размерность, не содержимое векторов.
-struct FixedEmbedder;
-
-#[async_trait]
-impl Embedder for FixedEmbedder {
-    async fn embed_docs(&self, docs: &[(String, String)]) -> UsecaseResult<Vec<Vec<f32>>> {
-        Ok(docs
-            .iter()
-            .map(|_| vec![0.0f32; EMBED_MODEL_DIMS])
-            .collect())
-    }
-
-    async fn embed_query(&self, _query: &str) -> UsecaseResult<Vec<f32>> {
-        Ok(vec![0.0f32; EMBED_MODEL_DIMS])
-    }
-}
-
-fn lance_dir(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "uwuwu-dimguard-{tag}-{}-{nanos}",
-        std::process::id()
-    ))
-}
-
-/// Чистит папку при любом исходе теста, паника включительно.
-struct TempDirGuard(PathBuf);
-
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+use super::support::{lance_dir, FakeWiki, FixedEmbedder, TempDirGuard};
 
 fn legacy_schema(dim: i32) -> Arc<ArrowSchema> {
     Arc::new(ArrowSchema::new(vec![

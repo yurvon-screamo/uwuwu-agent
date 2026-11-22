@@ -8,14 +8,12 @@
 mod search;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use async_trait::async_trait;
-use search::semantic::{Embedder, EMBED_MODEL_DIMS};
+use search::semantic::Embedder;
 use search::semantic_backend::LanceSemanticBackend;
-use uwuwu_usecase::{AppendDocOutcome, SemanticBackend, UsecaseResult, WikiRepo};
+use search::support::{lance_dir, FakeWiki, FixedEmbedder, TempDirGuard};
+use uwuwu_usecase::SemanticBackend;
 
 /// Слаг с обоими классами кавычек: апостроф рвёт одинарный SQL-литерал,
 /// двойная кавычка — контроль (в одинарном литерале она безопасна).
@@ -23,94 +21,9 @@ const QUOTED_SLUG: &str = "Experience/platform/Фабрика uwuwu: хвост�
 const DOC_MD: &str =
     "# Пин #1392\n\nТекст дока с amend'а и \"кавычками\" — чанки перезаливаются после delete.";
 
-struct FakeWiki {
-    docs: HashMap<String, (String, String)>,
-}
-
-#[async_trait]
-impl WikiRepo for FakeWiki {
-    async fn read_doc(&self, slug: &str) -> UsecaseResult<Option<String>> {
-        Ok(self.docs.get(slug).map(|(md, _)| md.clone()))
-    }
-
-    async fn list_docs(&self, prefix: &str) -> UsecaseResult<Vec<String>> {
-        Ok(self
-            .docs
-            .keys()
-            .filter(|slug| slug.starts_with(prefix))
-            .cloned()
-            .collect())
-    }
-
-    async fn doc_shas(&self) -> UsecaseResult<Vec<(String, String)>> {
-        Ok(self
-            .docs
-            .iter()
-            .map(|(slug, (_, sha))| (slug.clone(), sha.clone()))
-            .collect())
-    }
-
-    async fn write_doc(&self, _slug: &str, _content: &str, _message: &str) -> UsecaseResult<()> {
-        Ok(())
-    }
-
-    async fn append_doc(
-        &self,
-        _slug: &str,
-        _line: &str,
-        _message: &str,
-    ) -> UsecaseResult<AppendDocOutcome> {
-        Ok(AppendDocOutcome {
-            created: false,
-            lines: 0,
-        })
-    }
-}
-
-/// Фиксированный мок-эмбеддер: нулевые векторы нужной размерности. Трейт
-/// `Embedder` (#1363) — эмбеддинги внешний unmanaged-dep, мок трейта —
-/// штатный приём тестов; ADR-110 не задет — её скоуп GitHub-транспорты.
-struct FixedEmbedder;
-
-#[async_trait]
-impl Embedder for FixedEmbedder {
-    async fn embed_docs(&self, docs: &[(String, String)]) -> UsecaseResult<Vec<Vec<f32>>> {
-        Ok(docs
-            .iter()
-            .map(|_| vec![0.0f32; EMBED_MODEL_DIMS])
-            .collect())
-    }
-
-    async fn embed_query(&self, _query: &str) -> UsecaseResult<Vec<f32>> {
-        Ok(vec![0.0f32; EMBED_MODEL_DIMS])
-    }
-}
-
-/// Lance-том в уникальной временной папке (без новой dev-dep tempfile).
-fn lance_dir() -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "uwuwu-semantic-1392-{}-{nanos}",
-        std::process::id()
-    ))
-}
-
-/// Lance-том в уникальной временной папке (без новой dev-dep tempfile).
-/// Guard чистит папку при любом исходе теста, паника включительно —
-/// падающие прогоны не копят мусор в /tmp (замечание ревью #1392).
-struct TempDirGuard(PathBuf);
-
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
+/// Гейт-фикстура: бекенд с доком-кавычкой, временный том под гардом уборки.
 async fn backend_with_quoted_doc() -> (LanceSemanticBackend, TempDirGuard) {
-    let guard = TempDirGuard(lance_dir());
+    let guard = TempDirGuard(lance_dir("1392"));
     let dir = guard.0.clone();
     let wiki = Arc::new(FakeWiki {
         docs: HashMap::from([(
