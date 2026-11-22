@@ -1,60 +1,60 @@
 ---
 name: visual-diagrams
-description: Диаграммы и визуальные объяснения — mermaid и статичные SVG/HTML в uwuwu (hub: issues рендерят mermaid нативно, docs/*.md в uwuwu-hub рендерят HTML/SVG файлом, JS не исполняется нигде). Использовать когда нужна схема/визуализация — по запросу юзера, при неясности текста, для архитектурных выводов.
+description: Diagrams and visual explanations — mermaid and static SVG/HTML in uwuwu (hub: issues render mermaid natively, docs/*.md in uwuwu-hub render HTML/SVG as a file, JS is not executed anywhere). Use when a diagram/visualization is needed — on user request, when the text is unclear, for architecture conclusions.
 ---
 
 # Visual Diagrams
 
-Форма следует содержанию. Это не «кубики со стрелками», а полная выразительность веба внутри дока uwuwu.
+Form follows content. This is not «boxes with arrows» — it is the full expressiveness of the web inside a uwuwu doc.
 
-## Как писать
+## How to write
 
-- **Нод-графы (архитектуры, конвейеры, связи)** → статичный **SVG/inline-HTML** (dagre-раскладка руками или визуальный редактор; JS-движки не исполняются нигде в контуре)
-- Текстовые блок-схемы/сиквенсы → **mermaid** (инлайн; GitHub рендерит mermaid-фенсы в issues нативно)
-- Возьми `assets/template-vesper.html` (тема для плоского HTML) — палитра + типографика, макет и фигуры свои под содержание
-- Без JS/CDN/анимаций: GitHub санитизирует html — script не исполняется, интерактив не закладывай
-- Куда вставлять: в **тело issue** — mermaid-фенс или картинка (asset → raw-URL); в **вики-док** (docs/*.md в uwuwu-hub) — HTML/SVG-блок рендерится нативно при просмотре файла
+- **Node graphs (architectures, pipelines, links)** → static **SVG/inline-HTML** (a dagre layout by hand or a visual editor; JS engines are not executed anywhere in the contour)
+- Text flowcharts/sequences → **mermaid** (inline; GitHub renders mermaid fences in issues natively)
+- Take `assets/template-vesper.html` (the theme for flat HTML) — the palette + typography; the layout and shapes are your own, driven by the content
+- No JS/CDN/animations: GitHub sanitizes html — script is not executed, do not build in interactivity
+- Where to insert: into the **issue body** — a mermaid fence or a picture (asset → raw URL); into a **wiki doc** (docs/*.md in uwuwu-hub) — an HTML/SVG block renders natively when viewing the file
 
-## Два слоя визуала (онтология выбора)
+## Two layers of visuals (the ontology of choice)
 
-Выбор движка = вопрос «какой слой», не «какая библиотека»:
+The engine choice = the question «which layer», not «which library»:
 
-1. **Визуал в моменте** — объяснить конкретную вещь сейчас: сиквенс в теле задачи, механизм в статье опыта, инцидент в ранбуке. Движки: mermaid (сиквенсы/флоу), статичный SVG/inline-HTML (нод-графы, вики-доки), голый Vesper-HTML (таймлайны/кастом, вики-доки). Не обновляется никогда — устарела вместе с контекстом, так и задумано; порог создания минимальный.
-2. **Модель проекта (C4)** — каноническое описание структуры, живёт годами: элемент, связь, deployment-уровень. Только LikeC4: док «Модель (LikeC4)» в папке проекта (источник истины), в Стек-доке — визуализация + линк на модель. Обновление: правка DSL → `likec4 validate`; рендер вью — PNG-экспорт (см. LikeC4-секцию). Стабильные id элементов = линки между вью и доками.
+1. **A visual for the moment** — explain a specific thing now: a sequence in a task body, a mechanism in an experience article, an incident in a runbook. Engines: mermaid (sequences/flows), static SVG/inline-HTML (node graphs, wiki docs), bare Vesper HTML (timelines/custom, wiki docs). Never updated — goes stale together with its context, by design; the creation threshold is minimal.
+2. **The project model (C4)** — the canonical description of structure, lives for years: element, link, deployment level. Only LikeC4: the «Модель (LikeC4)» doc in the project folder (the source of truth), in the Stack doc — a visualization + a link to the model. Updating: a DSL edit → `likec4 validate`; the view render — PNG export (see the LikeC4 section). Stable element ids = links between views and docs.
 
-Cytoscape-эмбеды афин-эпохи в Стек-доках мертвы с миграции 04.11 (JS не исполняется) — при ревизии доков заменяются статичным SVG или визуализацией по LikeC4-канону (прецедент: true-washing); новые cytoscape-диаграммы не создавать.
+Cytoscape embeds of the affinity era in Stack docs are dead since the 04.11 migration (JS is not executed) — on doc revision they are replaced with static SVG or a visualization per the LikeC4 canon (precedent: true-washing); do not create new cytoscape diagrams.
 
-## LikeC4: модель-как-код в вики (канон жив, интерактив-вью мёртв, PNG-рендер жив)
+## LikeC4: model-as-code in the wiki (the canon is alive, the interactive view is dead, PNG render is alive)
 
-Когда архитектура = **модель** (стабильные id элементов, несколько связанных вью, deployment-уровень, статические линки) — не разовая диаграмма. DSL-исходники живут **в вики** (docs/ репо uwuwu-hub).
+When architecture = **a model** (stable element ids, several linked views, a deployment level, static links) — not a one-off diagram. DSL sources live **in the wiki** (docs/ of the uwuwu-hub repo).
 
-- **Хранение (канон)**: док `Модель (LikeC4)` в папке проекта; исходники — фенсами ` ```c4 ` (specification/model/views/deployment отдельными секциями). В Стек-доке — визуализация + линк на модель-док. Запрет — на ручные копии и второй источник правки: DSL правят только в вики. Сгенерированный из модели срез (односторонний sync в репу, руками не правится) — не второй источник, а штатный паттерн (ADR-013 true-washing).
-- **LikeC4 CLI** (live-check 08.11.2026): `bun add -g likec4@1.60.0` работает без браузера — `likec4 validate` и `likec4 format` (проба на модели true-washing: validate валидирует 4 файла, format правит форматирование). Процедура: экспортируй модель-док (MCP `uwuwu_docs_read`), вырежи c4-фенсы в `*.c4`-файлы папки, прогони `likec4 validate`. DSL = источник истины архитектуры.
-- **Интерактив-вью мёртв**: webcomponent (`<likec4-view>` + wc.mjs, React внутри) требует JS — html GitHub не исполняет; интерактив LikeC4 (навигация по вью, element-details) недоступен. Старый конвейер `tools/likec4_refresh.py` удалён purge-коммитом d63cdc4. Существующие likec4-эмбеды (Стек-док true-washing) — мёртвые с миграции 04.11.
-- **PNG-экспорт жив** (live-check 09.11.2026, спайк 20261108104457-6wsptcd): в папке `*.c4` — `env -u OPENROUTER_API_KEY likec4 export png --dark -o png-out`; playwright (прямая dep likec4) стартует chromium из `~/.cache/ms-playwright`, проба на модели true-washing — 4 вью → 4 валидных PNG за ~40с (dark, до 7028px по ширине). **Триггер тихого провала — AI-ключи в env** (`OPENROUTER_API_KEY`, а также OPENAI/ANTHROPIC/GEMINI/OLLAMA_HOST/MINIMAX): активируется AI-фича preview-сервера → likec4 требует `@tanstack/ai`, не резолвящийся от cwd (голая папка без node_modules) → «Package manager not detected» → `exit(1)` без PNG и без внятной ошибки про playwright. В env без этих ключей — `env -u` не нужен. Диагноз и процедура — опыт-док `cli/LikeC4 CLI & DSL Authoring` (секция «Экспорт PNG»); PNG вставляется в док/задачу как asset-файл.
-- **Практика сейчас**: визуализация в Стек-доке — статичный SVG/inline-HTML по мотивам DSL (см. «Как писать»), вставка — html в docs/*.md (рендер файлом) или картинка в issue; модель-док — источник истины, синхронизация вью руками.
-- Ссылки: ADR-052 uwuwu (html-вставки), опыт-док «AFFiNE embed_html: живые HTML-диаграммы в контуре вики».
+- **Storage (canon)**: the «Модель (LikeC4)» doc in the project folder; sources — ` ```c4 ` fences (specification/model/views/deployment as separate sections). In the Stack doc — a visualization + a link to the model doc. The ban — on manual copies and a second source of edits: the DSL is edited only in the wiki. A slice generated from the model (a one-way sync into the repo, not hand-edited) — not a second source but the standard pattern (ADR-013 true-washing).
+- **LikeC4 CLI** (live-check 08.11.2026): `bun add -g likec4@1.60.0` works without a browser — `likec4 validate` and `likec4 format` (a probe on the true-washing model: validate validates 4 files, format fixes formatting). The procedure: export the model doc (MCP `uwuwu_docs_read`), cut the c4 fences into `*.c4` files of the folder, run `likec4 validate`. The DSL is the source of truth of the architecture.
+- **The interactive view is dead**: the webcomponent (`<likec4-view>` + wc.mjs, React inside) requires JS — GitHub html does not execute it; LikeC4 interactivity (view navigation, element-details) is unavailable. The old `tools/likec4_refresh.py` pipeline was removed by purge commit d63cdc4. Existing likec4 embeds (the true-washing Stack doc) — dead since the 04.11 migration.
+- **PNG export is alive** (live-check 09.11.2026, spike 20261108104457-6wsptcd): in the `*.c4` folder — `env -u OPENROUTER_API_KEY likec4 export png --dark -o png-out`; playwright (a direct dep of likec4) starts chromium from `~/.cache/ms-playwright`, a probe on the true-washing model — 4 views → 4 valid PNGs in ~40s (dark, up to 7028px wide). **The silent-failure trigger — AI keys in env** (`OPENROUTER_API_KEY`, plus OPENAI/ANTHROPIC/GEMINI/OLLAMA_HOST/MINIMAX): the preview server's AI feature activates → likec4 requires `@tanstack/ai`, unresolvable from cwd (a bare folder without node_modules) → «Package manager not detected» → `exit(1)` with no PNGs and no clear error about playwright. In an env without these keys — `env -u` is not needed. Diagnosis and procedure — the experience doc `cli/LikeC4 CLI & DSL Authoring` (the «Экспорт PNG» section); the PNG is inserted into a doc/task as an asset file.
+- **Practice now**: the visualization in the Stack doc — static SVG/inline-HTML after the DSL (see «How to write»), insertion — html into docs/*.md (rendered as a file) or a picture in an issue; the model doc — the source of truth, view sync by hand.
+- Links: ADR-052 uwuwu (html embeds), the experience doc «AFFiNE embed_html: живые HTML-диаграммы в контуре вики».
 
-## Возможности (hub, live-check 11.2026)
+## Capabilities (hub, live-check 11.2026)
 
-- **docs/*.md uwuwu-hub**: GitHub рендерит md-файлы с inline-HTML/SVG/`<div>`-макетами (санитизация: без script)
-- **тела issues**: mermaid — нативно; inline-HTML санитизируется жёстче (стили режутся) — диаграммы в issues через mermaid или картинку
-- **JS не исполняется нигде** — диаграммы статичные; анимации/степперы/CDN (unpkg/jsdelivr) — не работают, не закладывай
+- **docs/*.md uwuwu-hub**: GitHub renders md files with inline-HTML/SVG/`<div>` layouts (sanitization: no script)
+- **issue bodies**: mermaid — natively; inline-HTML is sanitized harder (styles are cut) — diagrams in issues via mermaid or a picture
+- **JS is not executed anywhere** — diagrams are static; animations/steppers/CDN (unpkg/jsdelivr) — do not work, do not build them in
 
-## Домашняя палитра — Vesper (uwuwu у нас в тёмной теме)
+## The home palette — Vesper (uwuwu runs dark)
 
-| Роль | Hex |
+| Role | Hex |
 |---|---|
-| фон | `#101010` |
-| панель | `#181818` / `#1E1E1E` |
-| линии | `#2E2E2E` / `#505050` |
-| текст | `#FFFFFF` · приглушённый `#A0A0A0` · тусклый `#7E7E7E` |
-| персик (главный акцент) | `#FFC799` |
-| мята | `#99FFE4` |
-| лаванда | `#ACA1CF` |
-| роза | `#F5A191` |
-| золото | `#FFCFA8` |
+| background | `#101010` |
+| panel | `#181818` / `#1E1E1E` |
+| lines | `#2E2E2E` / `#505050` |
+| text | `#FFFFFF` · muted `#A0A0A0` · dim `#7E7E7E` |
+| peach (the main accent) | `#FFC799` |
+| mint | `#99FFE4` |
+| lavender | `#ACA1CF` |
+| rose | `#F5A191` |
+| gold | `#FFCFA8` |
 
-Палитра — дом по умолчанию; конкретный контент может требовать своего.
+The palette is the home default; specific content may require its own.
 
-## Правила выживания (единственные ограничения)
+## Survival rules (the only constraints)

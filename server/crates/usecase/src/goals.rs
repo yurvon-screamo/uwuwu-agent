@@ -66,14 +66,14 @@ impl GoalsView {
     pub async fn list(&self, project: &str) -> Result<String, ViewError> {
         if !self.projects.iter().any(|p| p == project) {
             return Err(ViewError::NotFound(format!(
-                "проект «{project}» вне конфига конвейера"
+                "project «{project}» is not in the pipeline config"
             )));
         }
         let goals = self.repo.open_goals(project).await?;
         if goals.is_empty() {
             return Ok(format!(
-                "цели проекта не заведены (носитель: milestones hub-репо; \
-                 ведёт владелец в UI: {})",
+                "no goals set for the project (the carrier: hub-repo milestones; \
+                 maintained by the owner in the UI: {})",
                 self.carrier_url
             ));
         }

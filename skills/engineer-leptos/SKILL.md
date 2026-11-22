@@ -5,7 +5,7 @@ description: Apply these rules when developing with Leptos (Rust + WASM framewor
 
 # Leptos Development Guide
 
-> Rust-базу (safety, ownership, Result/Option, crates, **size limits**, workflow) — в `engineer-rust`. Общие правила (комментарии) — в `rules-clean-code`. Здесь только Leptos-специфика.
+> The Rust base (safety, ownership, Result/Option, crates, **size limits**, workflow) — in `engineer-rust`. General rules (comments) — in `rules-clean-code`. Only Leptos specifics here.
 
 ## Philosophy
 

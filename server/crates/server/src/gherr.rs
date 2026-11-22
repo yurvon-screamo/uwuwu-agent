@@ -29,20 +29,20 @@ impl fmt::Display for GhFail {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Core { reset_epoch } => {
-                write!(f, "GitHub rate limit (core): квота исчерпана")?;
+                write!(f, "GitHub rate limit (core): the quota is exhausted")?;
                 if let Some(epoch) = reset_epoch {
                     let now = chrono::Utc::now();
                     write!(f, ", reset {}", format_reset(*epoch, now))?;
                 }
-                write!(f, " — подожди или отложи ход")
+                write!(f, " — wait or defer the turn")
             }
             Self::Secondary { retry_after_secs } => write!(
                 f,
-                "GitHub rate limit (secondary): Retry-After {retry_after_secs}s — бэкофф, не бей повторами"
+                "GitHub rate limit (secondary): Retry-After {retry_after_secs}s — back off, do not hammer retries"
             ),
             Self::Permission => write!(
                 f,
-                "HTTP 403 (не rate limit): проверь GH_TOKEN/права токена"
+                "HTTP 403 (not rate limit): check GH_TOKEN / the token's permissions"
             ),
         }
     }
@@ -105,7 +105,7 @@ pub fn format_reset(reset_epoch: i64, now: chrono::DateTime<chrono::Utc>) -> Str
     };
     let wait_min = (reset - now).num_minutes().max(0);
     format!(
-        "{} UTC (через ~{wait_min} мин)",
+        "{} UTC (in ~{wait_min} min)",
         reset.format("%Y-%m-%d %H:%M")
     )
 }

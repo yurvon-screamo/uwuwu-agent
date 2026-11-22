@@ -43,16 +43,16 @@ pub enum UsecaseError {
 impl fmt::Display for UsecaseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Board(m) => write!(f, "доска: {m}"),
-            Self::Session(m) => write!(f, "сессия: {m}"),
+            Self::Board(m) => write!(f, "board: {m}"),
+            Self::Session(m) => write!(f, "session: {m}"),
             Self::Pr(m) => write!(f, "pr: {m}"),
-            Self::State(m) => write!(f, "состояние: {m}"),
+            Self::State(m) => write!(f, "state: {m}"),
             Self::Telegram(m) => write!(f, "telegram: {m}"),
             Self::TelegramTooBig(m) => write!(f, "telegram too big: {m}"),
-            Self::SessionNotFound(m) => write!(f, "сессия не найдена (dead-session): {m}"),
+            Self::SessionNotFound(m) => write!(f, "session not found (dead-session): {m}"),
             Self::Blob(m) => write!(f, "blob: {m}"),
             Self::BlobTooBig(m) => write!(f, "blob too big: {m}"),
-            Self::BlobNotConfigured(m) => write!(f, "blob не сконфигурирован: {m}"),
+            Self::BlobNotConfigured(m) => write!(f, "blob is not configured: {m}"),
             Self::BlobBadKey(m) => write!(f, "blob bad key: {m}"),
             Self::RateLimited {
                 service,
@@ -109,7 +109,7 @@ impl From<UsecaseError> for ViewError {
 impl std::fmt::Display for ViewError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotFound(what) => write!(f, "не найдено: {what}"),
+            Self::NotFound(what) => write!(f, "not found: {what}"),
             Self::Source(e) => write!(f, "{e}"),
         }
     }

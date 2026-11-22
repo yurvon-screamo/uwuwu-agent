@@ -153,7 +153,7 @@ export default Plugin.define({
         log(`judge ${sessionID}: пустой ответ — цель остаётся активной, без пинка`)
         await ctx.session.synthetic({
           sessionID,
-          text: "[goal-mode] ⚠️ судья не дал вердикта — цель остаётся активной. Проверка повторится после следующего шага.",
+          text: "[goal-mode] ⚠️ the judge gave no verdict — the goal stays active. The check will repeat after the next step.",
         })
         return
       }
@@ -172,13 +172,13 @@ export default Plugin.define({
         await persist()
         await ctx.session.synthetic({
           sessionID,
-          text: `[goal-mode] ⛔ судья: цель недостижима — ${v.detail}. Цель снята.`,
+          text: `[goal-mode] ⛔ judge: the goal is unachievable — ${v.detail}. The goal is withdrawn.`,
         })
         return
       }
       await ctx.session.synthetic({
         sessionID,
-        text: `⚖️ GOAL-судья: цель «${goal.text}» ещё НЕ достигнута. ${v.detail}\nПользователь ушёл — действуй полностью самостоятельно. Не отчитывайся словами — доноси до результата. Не забудь код-ревью перед завершением.`,
+        text: `⚖️ GOAL judge: the goal «${goal.text}» is NOT achieved yet. ${v.detail}\nThe user has left — act fully autonomously. Do not report in words — drive to the result. Do not forget the code review before finishing.`,
       })
     }
 

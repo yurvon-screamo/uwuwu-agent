@@ -5,7 +5,7 @@ description: C# and .NET expertise - async programming, LINQ, DI, generics, Span
 
 # C# / .NET Expertise
 
-> Общие правила (размеры, комментарии, SRP, naming) — в `rules-clean-code`. Здесь только C#-специфика.
+> General rules (sizes, comments, SRP, naming) — in `rules-clean-code`. Only C# specifics here.
 
 ## Safety and Typing
 

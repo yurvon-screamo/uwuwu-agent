@@ -37,7 +37,7 @@ ADRs capture the reasoning behind significant technical decisions. They're the h
 
 Store ADRs in `docs/decisions/` named `ADR-<name>` (human-readable slug: lowercase kebab-case, starts with a letter, 2–5 words):
 
-> **uwuwu-проекты (репо с контуром uwuwu)**: ADR живут не в репо, а в вики проекта (`Projects/<proj>/ADR`), и ведёт их дример пост-фактум — решения фиксируй в теле задачи, дример разложит по ADR. Путь `docs/decisions/` — для generic-проектов без вики-канона.
+> **uwuwu projects (repos with the uwuwu contour)**: ADRs live not in the repo but in the project wiki (`Projects/<proj>/ADR`), and the dreamer maintains them post-factum — record decisions in the task body, the dreamer will lay them out into ADRs. The `docs/decisions/` path is for generic projects without a wiki canon.
 
 ```markdown
 # ADR-use-postgresql: Use PostgreSQL for primary database

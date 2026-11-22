@@ -27,6 +27,10 @@ pub struct AnalystReviewUseCase {
     pub cup: usize,
 }
 
+/// Дословный маркер волны ревью аналитики — контракт мок-стенда
+/// (mock_opencode::stage_action_of_prompt); правка промпта через него.
+pub const ANALYST_REVIEW_WAVE_MARKER: &str = "Analytics review (project {project})";
+
 impl AnalystReviewUseCase {
     /// Один проход: по каждой доске — не больше одного спавна за тик.
     /// Цикл-гвард ревью-контура (R2-C2): спавны ревьювера при неизменном
@@ -192,9 +196,9 @@ impl AnalystReviewUseCase {
             .post_comment(
                 task.number(),
                 &format!(
-                    "⚠︎ Цикл-гвард ревью аналитики: {repeats} спавнов ревьювера без прогресса \
-                     статуса (строка ждёт в Review Analys). Строка переведена в \
-                     Needs attention — разбор владельца."
+                    "⚠︎ Analytics review loop guard: {repeats} reviewer spawns without status \
+                     progress (the row waits in Review Analys). The row moved to \
+                     Needs attention — owner's triage."
                 ),
             )
             .await
@@ -205,23 +209,24 @@ impl AnalystReviewUseCase {
 }
 
 fn analyst_review_prompt(project: &str, rows: &[&Task]) -> String {
+    let marker = ANALYST_REVIEW_WAVE_MARKER.replace("{project}", project);
     let mut list = String::new();
     for t in rows {
         list.push_str(&format!("- #{} «{}»\n", t.number(), t.title()));
     }
     format!(
-        "Ревью аналитики (проект {project}) — строки в Review Analys, волна целиком:\n\n{list}\n\
-         Действуй по методичке репо agents/analyst-reviewer. По каждой строке:\n\
-         1. uwuwu_task_get {{number}} — проработанное тело; сверяй с источниками заявки\n\
-            (Design Spec/README/ADR/цитаты владельца): каждое требование имеет источник,\n\
-            сочинённое = request_changes.\n\
-         2. Оптики: sourcing; форма/дедуп (тайтл-конкретика, тело по TASK-TEMPLATE-костяку\n\
-            типа); соразмерность (спайк не задавлен рамками фичи); readiness (постановку\n\
-            можно брать в работу).\n\
-         3. Вердикты: approve → uwuwu_task_edit {{number, status: \"Todo\"}};\n\
-            request_changes → uwuwu_task_edit {{number, status: \"Analys\"}} + замечания комментами\n\
-            (цикл-гвард считает круги); реальная проблема → Needs attention.\n\
-         Отчёт — по одному комменту на строку (вердикт + причина кратко); никаких\n\
-         отдельных сводных постов по волне сверх этих комментов."
+        "{marker} — rows in Review Analys, the whole wave:\n\n{list}\n\
+         Act per the repo methodology agents/analyst-reviewer. For each row:\n\
+         1. uwuwu_task_get {{number}} — the reworked body; verify against the request sources\n\
+            (Design Spec/README/ADRs/owner quotes): every requirement has a source;\n\
+            invented = request_changes.\n\
+         2. Optics: sourcing; form/dedup (title specificity, body per the type's TASK-TEMPLATE\n\
+            skeleton); proportionality (a spike not crushed by feature frames); readiness (the\n\
+            statement can be taken into work).\n\
+         3. Verdicts: approve → uwuwu_task_edit {{number, status: \"Todo\"}};\n\
+            request_changes → uwuwu_task_edit {{number, status: \"Analys\"}} + remarks in comments\n\
+            (the round guard counts the rounds); a real problem → Needs attention.\n\
+         The report — one comment per row (verdict + brief reason); no\n\
+         separate wave summary posts beyond those comments."
     )
 }

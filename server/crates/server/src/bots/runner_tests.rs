@@ -1039,7 +1039,7 @@ async fn private_owner_message_prompts_and_replies() {
     assert!(ok, "реплай не отправлен");
     let (_, prompt) = &sessions.prompts_snapshot()[0];
     assert!(
-        prompt.contains("Методичка бота"),
+        prompt.contains("The bot manual is the only valid version"),
         "методичка — префикс промпта"
     );
     assert!(prompt.contains("создавай Draft"));
@@ -2240,7 +2240,9 @@ async fn compact_fires_once_per_cooldown_and_rearms_manual() {
     wait_until(|| sessions.prompts_snapshot().len() == 2, 2000).await;
     let prompts = sessions.prompts_snapshot();
     assert!(
-        prompts[1].1.starts_with("Методичка бота"),
+        prompts[1]
+            .1
+            .starts_with("The bot manual is the only valid version"),
         "после компакта методичка вернулась в промпт"
     );
 }
@@ -2322,7 +2324,7 @@ async fn compact_agent_mode_never_injects_manual_prefix() {
     assert!(
         !sessions.prompts_snapshot()[0]
             .1
-            .starts_with("Методичка бота"),
+            .starts_with("The bot manual is the only valid version"),
         "agent-режим: промпты не несут методичку"
     );
     sessions.set_activity(&session, Some(clock.now_ms() - 400_000));
@@ -2335,7 +2337,7 @@ async fn compact_agent_mode_never_injects_manual_prefix() {
     assert!(
         !sessions.prompts_snapshot()[1]
             .1
-            .starts_with("Методичка бота"),
+            .starts_with("The bot manual is the only valid version"),
         "agent-режим: дозаправка не нужна — методичка не суммаризуется"
     );
 }
@@ -2364,7 +2366,9 @@ async fn recreate_session_rearms_manual_for_new_session() {
     wait_until(|| sessions.prompts_snapshot().len() == 2, 2000).await;
     let prompts = sessions.prompts_snapshot();
     assert!(
-        prompts[1].1.starts_with("Методичка бота"),
+        prompts[1]
+            .1
+            .starts_with("The bot manual is the only valid version"),
         "свежая сессия без методички — пересоздание её теряло"
     );
 }
@@ -2407,7 +2411,7 @@ async fn dead_session_recreate_by_runner_rearms_manual() {
         "промпт ушёл в пересозданную сессию"
     );
     assert!(
-        prompts[1].1.starts_with("Методичка бота"),
+        prompts[1].1.starts_with("The bot manual is the only valid version"),
         "пересозданная раннером doc-сессия осталась без методички — hash не сброшен при Dead-восстановлении"
     );
     wait_until(|| state.bot_manual_hash(SLUG).is_some(), 2000).await;
