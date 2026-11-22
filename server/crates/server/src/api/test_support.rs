@@ -71,6 +71,12 @@ pub(crate) fn tool_hub(
             boards: vec![("uwuwu".to_string(), "Задачи uwuwu".to_string())],
             clock: Arc::new(SystemClock),
         }),
+        status: Arc::new(uwuwu_usecase::BoardStatusRenameUseCase {
+            repo: memory.clone() as Arc<dyn uwuwu_usecase::BoardStatusRepo>,
+            journal: Arc::new(StubPreImages),
+            boards: vec![("uwuwu".to_string(), "Задачи uwuwu".to_string())],
+            clock: Arc::new(SystemClock),
+        }),
         wiki: wiki.clone(),
         sessions: Arc::new(uwuwu_usecase::SessionRouter::uniform(Arc::new(
             StubSessions,
@@ -117,6 +123,19 @@ impl WikiRepo for StubWiki {
 /// не проверяется (юзкейс-пины clean.rs покрывают контракт журнала).
 pub(crate) struct StubJournals {
     entries: std::sync::Mutex<std::collections::BTreeMap<String, uwuwu_usecase::CleanJournal>>,
+}
+
+/// Pre-image журнал rename (#1447) в армах диспетчера: память на время
+/// пробы (персистентность покрывает пин rename_journal).
+pub(crate) struct StubPreImages;
+
+impl uwuwu_usecase::StatusPreImageStore for StubPreImages {
+    fn put(&self, _image: &uwuwu_usecase::StatusPreImage) -> UsecaseResult<()> {
+        Ok(())
+    }
+    fn path_hint(&self) -> String {
+        "/memory/rename-pre-image.json".into()
+    }
 }
 
 impl Default for StubJournals {

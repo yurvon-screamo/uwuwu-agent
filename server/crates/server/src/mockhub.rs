@@ -33,6 +33,9 @@ struct HubState {
     /// number → снос item'а (батч-чистка #1158): строка снята с доски
     /// (undo-журнал сервера возвращает — restore_row)
     removed: HashMap<u64, bool>,
+    /// Каталог Status-опций стенда (rename #1447): (fake id, имя);
+    /// канон-набор засеивается при первом обращении.
+    status_options: Vec<(String, String)>,
     counter: u64,
     /// Слэг → markdown (вики стенда; seed UWUWU_MOCK_DOCS — JSON-карта).
     docs: HashMap<String, String>,
@@ -184,6 +187,37 @@ impl MemoryHub {
     }
 
     fn ensure_seed(&self, state: &mut HubState) {
+        // каталог Status-опций стенда (rename #1447): канон-набор доски —
+        // засев независим от строк (доска без сидов тоже.renameable)
+        if state.status_options.is_empty() {
+            const CANON: &[Status] = &[
+                Status::Draft,
+                Status::Analys,
+                Status::ReviewAnalys,
+                Status::Todo,
+                Status::Design,
+                Status::ReviewPlan,
+                Status::InProgress,
+                Status::ReviewResult,
+                Status::Testing,
+                Status::ReviewTesting,
+                Status::UserReview,
+                Status::Done,
+                Status::NeedsAttention,
+                Status::Wait,
+                Status::Deleted,
+            ];
+            state.status_options = CANON
+                .iter()
+                .map(|s| {
+                    let name = uwuwu_usecase::status_name(*s);
+                    (
+                        format!("mopt-{}", name.to_lowercase().replace(' ', "-")),
+                        name.to_string(),
+                    )
+                })
+                .collect();
+        }
         if !state.tasks.is_empty() {
             return;
         }
@@ -676,6 +710,82 @@ impl uwuwu_usecase::CleanBoardRepo for MemoryHub {
             Ok(number)
         })
     }
+}
+
+/// Носитель rename-операции (#1447) на стенде: каталог опций в состоянии,
+/// распределение строк — как fresh_index (Raw-имя статуса строки).
+#[async_trait]
+impl uwuwu_usecase::BoardStatusRepo for MemoryHub {
+    async fn fresh_field(&self, _board: &str) -> UsecaseResult<uwuwu_usecase::StatusFieldImage> {
+        self.with_state(|state| {
+            self.ensure_seed(state);
+            Ok(uwuwu_usecase::StatusFieldImage {
+                field_node_id: "mfield".into(),
+                options: state
+                    .status_options
+                    .iter()
+                    .map(|(id, name)| uwuwu_usecase::StatusOption {
+                        id: id.clone(),
+                        name: name.clone(),
+                        color: None,
+                        description: None,
+                    })
+                    .collect(),
+            })
+        })
+    }
+
+    async fn fresh_distribution(&self, board: &str) -> UsecaseResult<HashMap<u64, Option<String>>> {
+        Ok(uwuwu_usecase::CleanBoardRepo::fresh_index(self, board)
+            .await?
+            .into_iter()
+            .map(|(number, binding)| (number, binding.status_raw))
+            .collect())
+    }
+
+    async fn rename(
+        &self,
+        image: &uwuwu_usecase::StatusFieldImage,
+        option_id: &str,
+        new_name: &str,
+    ) -> UsecaseResult<Vec<uwuwu_usecase::StatusOption>> {
+        self.with_state(|state| {
+            self.ensure_seed(state);
+            let exists = state.status_options.iter().any(|(id, _)| id == option_id)
+                && image.options.iter().any(|o| o.id == option_id);
+            if !exists {
+                return Err(UsecaseError::Board(format!(
+                    "rename: опция {option_id} не найдена в каталоге стенда"
+                )));
+            }
+            for o in state.status_options.iter_mut() {
+                if o.0 == option_id {
+                    o.1 = new_name.to_string();
+                }
+            }
+            Ok(image
+                .options
+                .iter()
+                .map(|o| uwuwu_usecase::StatusOption {
+                    name: if o.id == option_id {
+                        new_name.to_string()
+                    } else {
+                        o.name.clone()
+                    },
+                    ..o.clone()
+                })
+                .collect())
+        })
+    }
+
+    async fn verify_catalog(&self, _board: &str) -> UsecaseResult<Vec<(String, String)>> {
+        self.with_state(|state| {
+            self.ensure_seed(state);
+            Ok(state.status_options.clone())
+        })
+    }
+
+    fn invalidate_meta(&self, _board: &str) {}
 }
 
 #[async_trait]
