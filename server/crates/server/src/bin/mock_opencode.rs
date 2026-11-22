@@ -1230,7 +1230,7 @@ async fn message_tail(store: Arc<Store>, id: String) -> Resp {
                 store.turn_stream_ms,
                 store.turn_trap_ms,
             );
-            (StatusCode::OK, Json(tail))
+            (StatusCode::OK, Json(stamp_activity_age(tail)))
         }
         Some(s) => {
             // Форма — живой опенкод 2.3 (пин #1254): хвост обёрнут
@@ -1277,10 +1277,47 @@ async fn message_tail(store: Arc<Store>, id: String) -> Resp {
                 })
             };
             tail.push(msg);
-            (StatusCode::OK, Json(json!({ "data": tail })))
+            (
+                StatusCode::OK,
+                Json(stamp_activity_age(json!({ "data": tail }))),
+            )
         }
         None => (StatusCode::NOT_FOUND, Json(json!({ "status": "404" }))),
     }
+}
+
+/// MOCK_ACTIVITY_AGE_MS (стенд судьи #1364): активность насильно старая —
+/// тишина сессии фиксированно глубока, сталл-контур (и судья) срабатывает
+/// в первых тиках стенда. Пост-стамп на ОБА ветвления хвоста (turn-фазы и
+/// idle-реплай): свежий штамп любого ветвления обнулял бы тишину —
+/// silent None сталл-контура (три красных прогона e2e 14a, 20.11).
+/// Форма 2.3 (пин #1254, merge раунда 4): хвост обёрнут {data:[...]},
+/// time.updated в событиях нет — проба активности читает цепочку
+/// completed/streamed/firstToken/created (приоритет пробы), штампуются
+/// все отметки времени каждого сообщения.
+fn stamp_activity_age(mut tail: Value) -> Value {
+    let age = cfg("MOCK_ACTIVITY_AGE_MS", "0").parse::<u64>().unwrap_or(0);
+    if age == 0 {
+        return tail;
+    }
+    let old = now_ms().saturating_sub(age);
+    // обе формы хвоста: голый массив (turn-ветка исторически) и обёртка
+    // {data:[...]} (пин #1254) — неожиданная форма проходит без штампа
+    let msgs = if tail.is_array() {
+        tail.as_array_mut()
+    } else {
+        tail.get_mut("data").and_then(Value::as_array_mut)
+    };
+    if let Some(msgs) = msgs {
+        for m in msgs.iter_mut() {
+            if let Some(t) = m.get_mut("time") {
+                for key in ["updated", "completed", "streamed", "firstToken", "created"] {
+                    t[key] = json!(old);
+                }
+            }
+        }
+    }
+    tail
 }
 
 async fn export(store: Arc<Store>, id: String) -> Resp {

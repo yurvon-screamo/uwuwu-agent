@@ -404,6 +404,94 @@ pub trait Clock: Send + Sync {
     fn sleep_ms(&self, _ms: u64) {}
 }
 
+/// Конфиг судьи `[judge]` (#1364): значения — из конфига сервера, дефолты —
+/// канон плана. `enabled` — opt-in (дефолт off): контур включается решением
+/// владельца на деплое.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JudgeCfg {
+    pub enabled: bool,
+    /// Интервал повторных вызовов судьи на одной тишине (ms).
+    pub every_ms: u64,
+    /// Гвард сверху судьи: вызовов без смены статуса строки до
+    /// принудительного паркинга (слово владельца «порог 3»).
+    pub escalate_after: u32,
+    /// Хвост ленты: комментов в контексте.
+    pub comments_tail: usize,
+    /// Трим одного коммента (символы, char-safe).
+    pub comment_max_chars: usize,
+    /// Трим тела задачи (символы) — тела регулярно 10–40k (ревью C3).
+    pub body_max_chars: usize,
+    /// Трим одного ассистентского ответа в хвосте сессии (символы).
+    pub msg_max_chars: usize,
+}
+
+impl Default for JudgeCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            every_ms: 2 * 60 * 60_000,
+            escalate_after: 3,
+            comments_tail: 4,
+            comment_max_chars: 1500,
+            body_max_chars: 6000,
+            msg_max_chars: 800,
+        }
+    }
+}
+
+/// Хвост сессии слота в контексте судьи: последний ассистентский ответ
+/// (трим `msg_max_chars`) + признак завершённого хода.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JudgeSessionTail {
+    pub slot: Slot,
+    pub text: String,
+    pub finished: bool,
+}
+
+/// Контекст судьи (#1364): всё, что тик знает о строке. Тело и лента —
+/// носитель задачи (не вердикты агентов); хвосты сессий — состояние
+/// исполнителя. Тримы — квотная дисциплина (ревью C3: тела 10–40k).
+#[derive(Debug, Clone, PartialEq)]
+pub struct JudgeContext {
+    pub board: String,
+    pub number: u64,
+    pub title: String,
+    pub status: Status,
+    pub slot: Slot,
+    /// Тишина stage-сессии (мин) и признак завершённого хода.
+    pub silence_min: u64,
+    pub idle: bool,
+    /// Вызовов судьи без смены статуса строки (гвард сверху).
+    pub judge_calls_no_progress: u32,
+    /// Подряд request_changes ревью-контура (кап-контекст).
+    pub review_rounds: u32,
+    pub branch: Option<String>,
+    pub pr_url: Option<String>,
+    /// Сервер перезапущен N мин назад: структурный сигнал масс-аномалий
+    /// сталл-класса #1281 (каунтеры из-под рестарта).
+    pub restart_recent_min: Option<u64>,
+    /// Тело задачи (трим `body_max_chars`).
+    pub body: String,
+    /// Хвост ленты (от новых к старым): (создан ms, тело тримнутое).
+    pub comments: Vec<(u64, String)>,
+    /// Хвосты сессий слотов с назначениями.
+    pub sessions: Vec<JudgeSessionTail>,
+    /// Эпоха сборки контекста: возраст ленты в промпте (ревью L2).
+    pub now_ms: u64,
+    /// Точка капа ревью-раундов: тишина/idle не меряются (сталл-гейт не
+    /// звучал) — промпт не сообщает ложное «тишина 0 мин, ход завершён»
+    /// (ревью раунда 2, L).
+    pub cap_point: bool,
+}
+
+/// Судья — decision-модель статусных решений (#1364). Err — отказ вызова
+/// (сбой сети / 429 / локальный лимит полосы): тик падает в старую
+/// механику — судья улучшение, не зависимость.
+#[async_trait]
+pub trait DecisionJudge: Send + Sync {
+    async fn decide(&self, ctx: &JudgeContext) -> UsecaseResult<uwuwu_domain::JudgeVerdict>;
+}
+
 /// Нативные поля issue (сессии/ветка/PR/приоритет/тип): fm-зеркало снесено.
 #[async_trait]
 pub trait IssueFieldStore: Send + Sync {

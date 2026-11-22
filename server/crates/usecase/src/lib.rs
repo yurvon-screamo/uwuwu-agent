@@ -49,9 +49,10 @@ pub use pipeline::{
     ANALYST_WAVE_MARKER, STAGE_PROMPTS,
 };
 pub use ports::{
-    AgentSessionGateway, AppendDocOutcome, AssistantReply, Clock, CommentRef, DreamerMark,
-    FmMutator, IssueDigest, IssueFieldStore, IssueIndexSource, IssueView, Liveness, PrGateway,
-    PrState, SessionInfo, SessionSpec, StatusDelivery, TaskBoardRepo, TickStateStore, WikiRepo,
+    AgentSessionGateway, AppendDocOutcome, AssistantReply, Clock, CommentRef, DecisionJudge,
+    DreamerMark, FmMutator, IssueDigest, IssueFieldStore, IssueIndexSource, IssueView, JudgeCfg,
+    JudgeContext, JudgeSessionTail, Liveness, PrGateway, PrState, SessionInfo, SessionSpec,
+    StatusDelivery, TaskBoardRepo, TickStateStore, WikiRepo,
 };
 pub use router::SessionRouter;
 pub use search::{sync_allowed, SearchHit, SearchUseCase, SemanticBackend};
