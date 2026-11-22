@@ -16,6 +16,15 @@
 #   3. mock.started строго после успешного бинда с фактическим портом:
 #      занятый порт → RC≠0 и «started» в логе НЕТ (маскировка «up + паника»
 #      не вернулась); свободный → строка есть, requested_port == port.
+#   4. Судейская пара фазы 15 (e2e.sh) на контракте портов, не на
+#      деривации (#1304, диспозиция #1364): дефолтный путь порт-блока
+#      даёт 5 различных портов, PORT_JUDGE/PORT_JUDGE_DOWN живут
+#      независимыми переменными (регресс-форма мастера a1e33159 —
+#      PORT_JUDGE="${PORT_JUDGE:-$((PORT_MOCK + 4))}" без присваивания
+#      PORT_JUDGE_DOWN — громко умирает под set -u: переменной нет);
+#      оверрайды уважаются как есть.
+#      Красная сторона проверена деградат-копией e2e.sh с линиями
+#      a1e33159 (см. раунд-отчёт тестирования 23.11).
 #
 # Запуск: bash server/ops/stand/tests/stand_tests.sh   (cargo build мока сам)
 # Выход: 0 — все пробы зелёные; 1 — есть провалы (список в stdout).
@@ -55,6 +64,15 @@ if [ -n "$P1" ] && [ -n "$P2" ] && [ -n "$P3" ] && [ "$P1" != "$P2" ] && [ "$P2"
   ok "stand_pick_ports 3 → 3 различных свободных порта ($P1 $P2 $P3)"
 else
   bad "stand_pick_ports 3 → '$ports' (ожидались 3 различных положительных)"
+fi
+
+ports="$(stand_pick_ports 5)"
+read -r J1 J2 J3 J4 J5 <<<"$ports"
+if [ "$(printf '%s\n' "$J1" "$J2" "$J3" "$J4" "$J5" | sort -u | wc -l)" = 5 ] \
+   && [ "$J1" -gt 0 ] && [ "$J2" -gt 0 ] && [ "$J3" -gt 0 ] && [ "$J4" -gt 0 ] && [ "$J5" -gt 0 ]; then
+  ok "stand_pick_ports 5 → 5 различных свободных портов ($J1 $J2 $J3 $J4 $J5)"
+else
+  bad "stand_pick_ports 5 → '$ports' (ожидались 5 различных положительных)"
 fi
 
 if ( PATH="$SHIM" stand_pick_ports 1 ) 2>/dev/null; then
@@ -134,5 +152,44 @@ else
 fi
 kill "$MOCK_PID" 2>/dev/null
 kill "$OCC_PID" 2>/dev/null
+
+# ---- 4. судейская пара фазы 15: порт-блок e2e.sh на контракте -------------
+# Порт-блок e2e.sh (подбор + присваивания до PORT_JUDGE_DOWN включительно)
+# исполняется в песочнице как есть — поведение, не строки:
+#   4a. дефолтный путь (без оверрайдов): все 5 переменных живы и различны —
+#       судейская пара кормится подбором; регресс-форма мастера a1e33159
+#       (PORT_JUDGE деривацией, PORT_JUDGE_DOWN нет) умирает под set -u на
+#       первом обращении к PORT_JUDGE_DOWN — громко, до процессов.
+#   4b. оверрайды PORT_JUDGE/PORT_JUDGE_DOWN (как и три старых) берутся
+#       как есть — подбор их не перетирает.
+PORT_BLOCK="$(awk '/^ports="\$\(stand_pick_ports/{f=1} f{print} /^PORT_JUDGE="/{exit}' "$STAND_DIR/e2e.sh")"
+
+run_port_block() { # env-оверрайды зовущего проходят в подшеллку как есть
+  (
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$STAND_DIR/stand_ports.sh"
+    eval "$PORT_BLOCK"
+    # shellcheck disable=SC2153 # переменные присваивает eval порт-блока — shellcheck не видит
+    alls="$PORT_SRV $PORT_MOCK $MOCK2_PORT $PORT_JUDGE $PORT_JUDGE_DOWN"
+    # shellcheck disable=SC2086 # $alls режется на 5 портов намеренно (sort -u построчно)
+    [ "$(printf '%s\n' $alls | sort -u | wc -l)" = 5 ] \
+      && [ "$PORT_SRV" -gt 0 ] && [ "$PORT_JUDGE_DOWN" -gt 0 ] \
+      && echo "$alls"
+  )
+}
+
+if run_port_block; then
+  ok "e2e.sh порт-блок (дефолт): 5 переменных живы и различны — судейская пара на подборе"
+else
+  bad "e2e.sh порт-блок (дефолт): судейская пара не сошлась из подбора (см. вывод выше)"
+fi
+
+if out5="$(PORT_SRV=18101 PORT_MOCK=18102 MOCK2_PORT=18103 PORT_JUDGE=18104 PORT_JUDGE_DOWN=18105 run_port_block 2>&1)" \
+   && [ "$out5" = "18101 18102 18103 18104 18105" ]; then
+  ok "e2e.sh порт-блок: все 5 оверрайдов взяты как есть ($out5)"
+else
+  bad "e2e.sh порт-блок: оверрайды не уважены (вышло: '$(PORT_SRV=18101 PORT_MOCK=18102 MOCK2_PORT=18103 PORT_JUDGE=18104 PORT_JUDGE_DOWN=18105 run_port_block 2>&1 | tail -1)')"
+fi
 
 finish
