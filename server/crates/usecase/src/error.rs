@@ -58,9 +58,31 @@ impl fmt::Display for UsecaseError {
                 service,
                 retry_after_secs,
             } => match retry_after_secs {
-                Some(s) => write!(f, "{service}: rate limited, retry after {s}s"),
+                Some(s) => write!(
+                    f,
+                    "{service}: rate limited, retry after {s}s ({})",
+                    humanize_retry_secs(*s)
+                ),
                 None => write!(f, "{service}: rate limited"),
             },
+        }
+    }
+}
+
+/// Человекочитаемая длительность retry-after (#1473, срез В): сырые секунды
+/// остаются машинным контрактом, добавка — чтобы агент видел масштаб отказа
+/// («суточный, не мгновенный») без календарной математики и clock-проводки.
+fn humanize_retry_secs(secs: u64) -> String {
+    let mins = secs / 60;
+    if mins < 60 {
+        format!("≈{mins} мин")
+    } else {
+        let hours = mins / 60;
+        let rest = mins % 60;
+        if rest == 0 {
+            format!("≈{hours} ч")
+        } else {
+            format!("≈{hours} ч {rest} мин")
         }
     }
 }
@@ -90,5 +112,46 @@ impl std::fmt::Display for ViewError {
             Self::NotFound(what) => write!(f, "не найдено: {what}"),
             Self::Source(e) => write!(f, "{e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limited_display_carries_human_duration() {
+        let err = UsecaseError::RateLimited {
+            service: "gemini-embeddings".into(),
+            retry_after_secs: Some(73370),
+        };
+        let text = err.to_string();
+        assert!(
+            text.contains("73370s") && text.contains("≈20 ч 22 мин"),
+            "сырые секунды + человекочитаемая длительность, факт: {text}"
+        );
+    }
+
+    #[test]
+    fn rate_limited_display_formats_durations() {
+        let fmt = |secs| {
+            UsecaseError::RateLimited {
+                service: "s".into(),
+                retry_after_secs: Some(secs),
+            }
+            .to_string()
+        };
+        assert!(fmt(30508).contains("≈8 ч 28 мин"), "{}", fmt(30508));
+        assert!(fmt(7200).contains("≈2 ч"), "{}", fmt(7200));
+        assert!(fmt(2700).contains("≈45 мин"), "{}", fmt(2700));
+    }
+
+    #[test]
+    fn rate_limited_without_retry_info_stays_unadorned() {
+        let err = UsecaseError::RateLimited {
+            service: "gemini-embeddings".into(),
+            retry_after_secs: None,
+        };
+        assert_eq!(err.to_string(), "gemini-embeddings: rate limited");
     }
 }
