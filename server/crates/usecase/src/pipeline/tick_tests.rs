@@ -8864,6 +8864,31 @@ impl DecisionJudge for FakeJudge {
     }
 }
 
+/// Судья с hook'ом — хореография внутри decide(): симуляция агентской
+/// транзакции, завершившейся за время сбора контекста и вызова модели
+/// (окно race-чека паркингов, ревью раунда 4 Low).
+struct HookJudge {
+    hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    verdict: uwuwu_domain::JudgeStatus,
+}
+
+#[async_trait]
+impl DecisionJudge for HookJudge {
+    async fn decide(
+        &self,
+        _ctx: &crate::ports::JudgeContext,
+    ) -> UsecaseResult<uwuwu_domain::JudgeVerdict> {
+        if let Some(h) = self.hook.lock().unwrap().as_ref() {
+            h();
+        }
+        Ok(uwuwu_domain::JudgeVerdict {
+            status: self.verdict,
+            owner_needed: 0.9,
+            confidence: 0.7,
+        })
+    }
+}
+
 /// Юзкейс с судьёй: rows на доске, judge-конфиг включён, тишина сессии
 /// управляется activity_ms (ms), idle-фаза — idle_reply.
 fn judge_usecase(
@@ -9378,6 +9403,73 @@ async fn judge_cap_guard_forces_park_without_model_call() {
     assert!(
         sessions.prompts.lock().unwrap().is_empty(),
         "осиротевшая ревью-сессия не будится (ревью C3)"
+    );
+}
+
+#[tokio::test]
+async fn judge_cap_park_stale_race_check_aborts_mutations() {
+    // Race-чек кап-паркинга (ревью раунда 4, Low): агентская транзакция
+    // сменила статус строки за время контекста+вызова — вердикт-паркинг
+    // не перетирает свежий переход: мутаций нет, счётчики паркинга не
+    // насчитываются, раунды не сброшены (ретрай следующим count-переходом).
+    let judge = Arc::new(HookJudge {
+        hook: Mutex::new(None),
+        verdict: uwuwu_domain::JudgeStatus::NeedsAttention,
+    });
+    let cfg = JudgeCfg {
+        enabled: true,
+        ..JudgeCfg::default()
+    };
+    let state = Arc::new(MemState(Mutex::default()));
+    // кап-точка: тик видит смену ReviewResult → InProgress при раундах 3
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((46, Status::ReviewResult));
+    state.0.lock().unwrap().review_rounds.push((46, 3));
+    let (u, board, sessions, state) = judge_usecase(
+        vec![judge_row(46, Status::InProgress, "ses_dev", Slot::Dev)],
+        Some(100_000_000), // активность свежая — сталл-контур молчит
+        true,
+        state,
+        (Some(judge.clone() as Arc<dyn DecisionJudge>), cfg),
+    );
+    // внутри decide(): статус строки уехал (агент успел перевести в Design)
+    let board2 = Arc::clone(&board);
+    *judge.hook.lock().unwrap() = Some(Box::new(move || {
+        let mut rows = board2.rows.lock().unwrap();
+        for t in rows.iter_mut() {
+            if t.number() == 46 {
+                *t = judge_row(46, Status::Design, "ses_dev", Slot::Dev);
+            }
+        }
+    }));
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.judge_calls, 1, "вызов судьи состоялся");
+    assert_eq!(
+        out.judge_transitions, 0,
+        "паркинг не состоялся — race-чек поймал stale"
+    );
+    assert_eq!(out.judge_forced, 0);
+    let log = board.log.lock().unwrap();
+    assert!(
+        !log.iter().any(|l| l.starts_with("status#46=")),
+        "статус не перетёрт: {log:?}"
+    );
+    assert!(
+        !log.iter().any(|l| l.starts_with("comment#46=")),
+        "дайджест паркинга не доставлен"
+    );
+    assert_eq!(
+        state.0.lock().unwrap().review_rounds.first().map(|r| r.1),
+        Some(4),
+        "счётчик стоит на капе: инкремент count-перехода сохранён, сброс — только у состоявшегося паркинга"
+    );
+    assert!(
+        sessions.prompts.lock().unwrap().is_empty(),
+        "промптов при stale нет"
     );
 }
 
