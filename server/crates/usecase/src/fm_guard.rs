@@ -204,4 +204,27 @@ mod tests {
             "{out}"
         );
     }
+
+    #[test]
+    fn carry_keeps_raw_block_byte_for_byte_except_lastmod() {
+        // контракт «сырой блок»: комментарии, пустые строки, пробелы в
+        // значениях и порядок ключей выживают — перенос не parse-rebuild
+        let fm = "title: x\n# служебный комментарий\n\nquoted: 'одинарные'\nspaced:   значение\nlastmod: 2026-01-01T00:00:00+09:00";
+        let out = carry(fm, "# тело\n", "N");
+        assert_eq!(
+            out,
+            "---\ntitle: x\n# служебный комментарий\n\nquoted: 'одинарные'\nspaced:   значение\nlastmod: N\n---\n\n# тело\n"
+        );
+    }
+
+    #[test]
+    fn canonical_escapes_quote_and_backslash_in_title() {
+        // кавычка/бэкслеш в значении — экранирование YAML double-quoted
+        // скаляра: сериализация разбирается обратно в исходный хвост слага
+        let out = canonical("a/b\"c\\d: x", "# тело\n", "N");
+        assert!(
+            out.starts_with("---\ntitle: \"b\\\"c\\\\d: x\"\ndate: N\nlastmod: N\n---\n"),
+            "{out}"
+        );
+    }
 }
