@@ -259,9 +259,10 @@ jobs:
           FMT: ${{ needs.fmt.result }}
           RUST: ${{ needs.rust.result }}
           PLUGINS: ${{ needs.plugins.result }}
+          STAND_SHELL: ${{ needs.stand-shell.result }}
           QLTY: ${{ needs.qlty.result }}
         run: |
-          for name in CHANGES FMT RUST PLUGINS QLTY; do
+          for name in CHANGES FMT RUST PLUGINS STAND_SHELL QLTY; do
             r="${!name}"
             case "$r" in
               success|skipped) ;;
