@@ -473,7 +473,10 @@ async fn main() {
                         // bootstrap-команды детерминированы: task-env-gc —
                         // канал вердиктов env-gc (#1431), мок эмулирует
                         // shell-исход user-сообщением «ENV-GC <row> SWEPT»;
-                        // прочие принимаются без эмуляции shell
+                        // прочие принимаются без эмуляции shell. row — из
+                        // $1 args (первый токен): резолв шаблона opencode
+                        // подставляет в $1 только args[0] (bug #1506 —
+                        // бывший next_back маскировал чужой args-контракт)
                         let name = body["name"].as_str().unwrap_or_default();
                         tracing::info!(event = "mock.command", id = %id, name, "POST /command");
                         if name == "task-env-gc" {
@@ -481,7 +484,7 @@ async fn main() {
                                 .as_str()
                                 .unwrap_or_default()
                                 .split_whitespace()
-                                .next_back()
+                                .next()
                                 .unwrap_or_default()
                                 .to_string();
                             let mut sessions = store.sessions.lock().expect("store");

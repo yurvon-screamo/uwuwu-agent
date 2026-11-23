@@ -24,7 +24,13 @@ struct FakeGcSessions {
     created: Mutex<Vec<String>>,
     deleted: Mutex<Vec<String>>,
     commands: Mutex<Vec<String>>,
-    /// row → вердикт-глагол; «*» — дефолт на любой row.
+    /// $1 последней команды — первый токен args (резолв шаблона opencode:
+    /// argsRegex сплитит arguments по пробелам, позиционный $1 = args[0]).
+    /// Вердикт в ленте вычисляется по $1, не по маркеру сервера — так
+    /// юниты ловят расхождение args-контракта (bug #1506: args
+    /// «sweep <row>» делали $1 = "sweep", вердикт уходил с чужим row).
+    arg1: Mutex<String>,
+    /// Ключ → вердикт-глагол; ключ матчится к $1 args; «*» — дефолт.
     verdicts: Mutex<HashMap<String, String>>,
 }
 
@@ -66,6 +72,11 @@ impl AgentSessionGateway for FakeGcSessions {
     }
     async fn run_command(&self, _s: &str, _n: &str, args: &str) -> UsecaseResult<()> {
         self.commands.lock().unwrap().push(args.into());
+        *self.arg1.lock().unwrap() = args
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string();
         Ok(())
     }
     async fn liveness(&self, _s: &str) -> Liveness {
@@ -84,15 +95,18 @@ impl AgentSessionGateway for FakeGcSessions {
     async fn wait_user_message(
         &self,
         _s: &str,
-        marker: &str,
+        _marker: &str,
         _deadline_ms: u64,
     ) -> UsecaseResult<Option<String>> {
-        // маркер «ENV-GC <row>» → вердикт-глагол из карты
-        let row = marker.split_whitespace().nth(1).unwrap_or("*");
+        // Лента содержит вердикт, отрезолвленный opencode'ом по $1 args
+        // (вывод shell-блока шаблона); маркер сервера сюда не входит.
+        // Пустая карта — None (путь дедлайна).
+        let row = self.arg1.lock().unwrap().clone();
         let map = self.verdicts.lock().unwrap();
         Ok(map
-            .get(row)
+            .get(&row)
             .or_else(|| map.get("*"))
+            .filter(|_| !row.is_empty())
             .map(|v| format!("ENV-GC {row} {v}")))
     }
     async fn last_activity_ms(&self, _s: &str) -> UsecaseResult<Option<u64>> {
@@ -295,7 +309,7 @@ async fn mature_done_row_dispatches_sweep_and_is_swept() {
     verdict_default(&gw, "SWEPT");
     let tasks = [done_closed(1431, THREE_DAYS, NOW)];
     let out = run(&tasks, &gw, &FakeBoard::all_done(), NOW, false).await;
-    assert_eq!(gw.commands.lock().unwrap().as_slice(), ["sweep 1431"]);
+    assert_eq!(gw.commands.lock().unwrap().as_slice(), ["1431"]);
     assert_eq!(out.swept, 1);
     assert_eq!(out.dispatched, 1);
     assert_eq!(
@@ -421,7 +435,7 @@ async fn oldest_candidates_are_dispatched_first() {
     run(&tasks, &gw, &FakeBoard::all_done(), NOW, false).await;
     assert_eq!(
         gw.commands.lock().unwrap().as_slice(),
-        ["sweep 1433", "sweep 1432"],
+        ["1433", "1432"],
         "старейшие первыми (путь клина)"
     );
 }
@@ -507,4 +521,30 @@ async fn status_probe_failure_skips_the_row_fail_safe() {
     assert_eq!(out.failed, 1);
     assert_eq!(out.dispatched, 0);
     assert!(gw.commands.lock().unwrap().is_empty());
+}
+
+// ---------- пин контракта «шаблон ↔ args» (#1506) ----------
+
+/// Реальные шаблоны slash-команд. include_str! мёртвым путём —
+/// compile-error, не тишина (канон mock_route_coverage).
+const TASK_ENV_GC_TEMPLATE: &str = include_str!("../../../../../commands/task-env-gc.md");
+const TASK_ENV_TEMPLATE: &str = include_str!("../../../../../commands/task-env.md");
+
+/// Фейк выше эмулирует резолв opencode ($1 = первый токен args, слово
+/// sweep литерально в шаблоне), но ни один юнит не читает реальный файл
+/// шаблона — его правка мимо args-контракта (слово выкинуто, $1
+/// подвинут) прошла бы все тесты и сломала канал вердиктов тем же
+/// классом бага #1506, только на стороне шаблона.
+#[test]
+fn sweep_template_carries_subcommand_literally_and_row_via_arg1() {
+    // shell-блок: скрипт получает sweep литералом, row — $1 (первый
+    // токен args); контракт единый с эталонным task-env (args = row)
+    assert!(
+        TASK_ENV_GC_TEMPLATE.contains("task-env-gc.sh sweep $1"),
+        "шаблон task-env-gc обязан нести «sweep $1»: подкоманда литерально в шаблоне, args = row (#1506)"
+    );
+    assert!(
+        TASK_ENV_TEMPLATE.contains("task-env.sh $1"),
+        "эталонный контракт task-env: args = row, без подкоманды в args"
+    );
 }
