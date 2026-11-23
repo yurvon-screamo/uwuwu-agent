@@ -80,6 +80,25 @@ pub struct NotifyCfg {
     pub tg_chat_id: i64,
 }
 
+/// Проба квоты подписки провайдера моделей (#1477): гейт лимитной тишины
+/// сталл-детекта. Секция отсутствует — off (safe default). Привязка к
+/// провайдеру — только конфигом (требование владельца 24.11.2026:
+/// «запаковать за трейты») — ядро конвейера видит трейт QuotaProbe.
+#[derive(Debug, Clone, Deserialize)]
+pub struct QuotaCfg {
+    /// База лимит-эндпоинта (без хвостового слэша).
+    pub base_url: String,
+    /// Путь лимит-эндпоинта.
+    #[serde(default = "default_quota_path")]
+    pub path: String,
+    /// Имя env-переменной с ключом провайдера (секрет — env, не конфиг).
+    pub api_key_env: String,
+}
+
+fn default_quota_path() -> String {
+    "/api/monitor/usage/quota/limit".into()
+}
+
 /// Автокомпакт вечных сессий ботов (#1221, ADR-082): нативный compact
 /// по idle-политике в тике супервизора. Секция отсутствует — механика
 /// off (safe default, откат = снять секцию); провенанс дефолтов:
@@ -164,6 +183,9 @@ pub struct Config {
     /// Судья конвейера (#1364); нет секции — off (opt-in владельца).
     #[serde(default)]
     pub judge: Option<JudgeToml>,
+    /// Проба квоты подписки провайдера (#1477); нет секции — off.
+    #[serde(default)]
+    pub quota: Option<QuotaCfg>,
 }
 
 /// Секция `[judge]` (#1364): порты вызовов и тримы контекста. Ключ —

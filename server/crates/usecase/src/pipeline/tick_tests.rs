@@ -5,7 +5,7 @@ use crate::error::{UsecaseError, UsecaseResult};
 use crate::pipeline::tick::{BoardPlan, Mode, TickPlan, TickUseCase, PROBE_DEGRADE_MIN_ROWS};
 use crate::ports::{
     AgentSessionGateway, Clock, CommentRef, DecisionJudge, DreamerMark, JudgeCfg, Liveness,
-    PrGateway, PrState, SessionSpec, TaskBoardRepo, TickStateStore,
+    PrGateway, PrState, QuotaProbe, SessionSpec, TaskBoardRepo, TickStateStore,
 };
 use crate::router::SessionRouter;
 use async_trait::async_trait;
@@ -894,6 +894,7 @@ fn usecase_with_state(
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     (u, board, sessions, prs)
 }
@@ -948,6 +949,7 @@ fn fixture_usecase(
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     (u, board, sessions, prs)
 }
@@ -999,6 +1001,7 @@ fn usecase_with_sessions(
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     (u, board, sessions, prs)
 }
@@ -1061,6 +1064,7 @@ fn routed_usecase(
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     }
 }
 
@@ -1334,6 +1338,7 @@ fn wake_usecase(
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     (u, sessions, state)
 }
@@ -1772,6 +1777,7 @@ async fn dev_spawn_pins_the_developer_agent() {
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.spawns_done, 1);
@@ -2891,6 +2897,7 @@ async fn mixed_health_cup_counts_only_reachable_busy() {
             boot_ms: 0,
             judge: None,
             judge_cfg: Default::default(),
+            quota: None,
         }
     };
     let out = build().run(&plan(Mode::Live, 7)).await.unwrap();
@@ -2951,6 +2958,7 @@ async fn foreign_executor_failure_does_not_blind_project_guard() {
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
@@ -3118,6 +3126,7 @@ async fn wakeup_held_when_cup_full() {
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
     assert!(
@@ -3191,6 +3200,7 @@ async fn wakeup_delivery_occupies_cup_slot() {
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
     assert_eq!(
@@ -3511,6 +3521,7 @@ async fn undelivered_comment_is_not_marked_seen() {
             boot_ms: 0,
             judge: None,
             judge_cfg: Default::default(),
+            quota: None,
         };
         (uc, board, sess, prs)
     };
@@ -3582,6 +3593,7 @@ async fn undelivered_comment_is_not_marked_seen() {
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     let out = u2.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.wakeups, 1, "коммент доставлен после завершения хода");
@@ -3664,6 +3676,7 @@ async fn multi_comment_tail_delivered_together() {
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.wakeups, 1);
@@ -3733,6 +3746,7 @@ async fn inflight_comment_delivered_after_agent_reply() {
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.wakeups, 1, "in-flight коммент доставлен после ответа");
@@ -3805,6 +3819,7 @@ async fn busy_session_not_pinged_early() {
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
@@ -3871,6 +3886,7 @@ async fn soft_ping_wakes_idle_session_without_transaction() {
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.soft_pings, 1, "мягкий пинг ушёл в сессию");
@@ -3947,6 +3963,7 @@ async fn soft_ping_held_when_cup_full_then_delivered_on_free_slot() {
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
     assert_eq!(out.soft_pings, 0, "кап полон — мягкий пинг не доставляется");
@@ -4030,6 +4047,7 @@ async fn soft_ping_mass_stall_oversell_is_capped() {
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
     assert_eq!(
@@ -4107,6 +4125,7 @@ async fn restored_counters_from_previous_process_do_not_escalate_on_first_tick()
         boot_ms: NOW,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
@@ -4182,6 +4201,7 @@ async fn counters_earned_by_current_process_still_escalate() {
         boot_ms: NOW - 50 * 60_000,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
@@ -4265,6 +4285,7 @@ async fn escalation_deferred_when_liveness_probe_unreliable() {
         boot_ms: NOW - 50 * 60_000,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
@@ -4344,6 +4365,7 @@ async fn design_phantom_stall_escalates_and_frees_cup_slot() {
         boot_ms: NOW - 50 * 60_000,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
@@ -4409,6 +4431,7 @@ async fn probe_failure_records_outcome_without_escalation_or_counters() {
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.probe_failed, 1, "недостоверная проба видна в outcome");
@@ -4429,6 +4452,273 @@ async fn probe_failure_records_outcome_without_escalation_or_counters() {
             .iter()
             .any(|l| l.contains("status#64=NeedsAttention")),
         "строка не паркуется по недостоверной пробе"
+    );
+}
+
+/// Фейк пробы квоты (#1477): состояние переключается тестом — Exhausted /
+/// Ok / Err (сцена спада окна = самовозобновление).
+struct FakeQuota(std::sync::Mutex<FakeQuotaState>);
+#[derive(Clone, Copy)]
+enum FakeQuotaState {
+    Exhausted,
+    Ok,
+    Err,
+}
+#[async_trait::async_trait]
+impl QuotaProbe for FakeQuota {
+    async fn probe(&self) -> UsecaseResult<crate::ports::QuotaSnapshot> {
+        match *self.0.lock().unwrap() {
+            FakeQuotaState::Exhausted => Ok(crate::ports::QuotaSnapshot {
+                exhausted: true,
+                window_pct: Some(100),
+                reset_at_ms: None,
+            }),
+            FakeQuotaState::Ok => Ok(crate::ports::QuotaSnapshot {
+                exhausted: false,
+                window_pct: Some(53),
+                reset_at_ms: None,
+            }),
+            FakeQuotaState::Err => Err(UsecaseError::Session("quota probe (мок)".into())),
+        }
+    }
+}
+
+/// Сталл-сцена с пробой квоты: In Progress-строка с дев-сессией в глубокой
+/// тишине и раундом пингов, заработанным текущим процессом.
+fn quota_stall_usecase(
+    board: Arc<FakeBoard>,
+    sess: Arc<FakeSessions>,
+    state: Arc<MemState>,
+    quota: Option<Arc<dyn QuotaProbe>>,
+) -> TickUseCase {
+    const NOW: u64 = 100_000_000;
+    struct BigClock;
+    impl Clock for BigClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            NOW
+        }
+    }
+    TickUseCase {
+        board,
+        sessions: Arc::new(SessionRouter::uniform(sess)),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+            probes: Mutex::default(),
+        }),
+        clock: Arc::new(BigClock),
+        state,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        boot_ms: NOW - 50 * 60_000,
+        judge: None,
+        judge_cfg: Default::default(),
+        quota,
+    }
+}
+
+fn quota_stall_fixture(
+    quota: Option<Arc<dyn QuotaProbe>>,
+) -> (Arc<FakeBoard>, Arc<MemState>, TickUseCase) {
+    const NOW: u64 = 100_000_000;
+    let board = Arc::new(FakeBoard {
+        rows: std::sync::Mutex::new(vec![dev_task(64, "ses_dev_64")]),
+        log: Mutex::default(),
+        comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
+        status_fails: AtomicBool::new(false),
+    });
+    let sess = Arc::new(FakeSessions {
+        activity_ms: Some(NOW - 25 * 60_000),
+        idle_reply: true,
+        ..FakeSessions::new()
+    });
+    // раунд пингов текущего процесса: сталл-точка достигнута
+    let state = Arc::new(MemState(Mutex::new(MemStateInner {
+        stalls: vec![
+            (64, Status::InProgress, NOW - 40 * 60_000),
+            (64, Status::InProgress, NOW - 35 * 60_000),
+        ],
+        ..Default::default()
+    })));
+    let u = quota_stall_usecase(board.clone(), sess, state.clone(), quota);
+    (board, state, u)
+}
+
+/// Лимитный гейт (#1477): окно исчерпано — тишина классифицирована как
+/// лимитная: ни пингов, ни эскалации, ни записи каунтеров раунда.
+#[tokio::test]
+async fn limit_exhaustion_holds_row_without_pings_escalation_or_counters() {
+    let (board, state, u) = quota_stall_fixture(Some(Arc::new(FakeQuota(std::sync::Mutex::new(
+        FakeQuotaState::Exhausted,
+    )))));
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.limit_paused, 1, "лимитная пауза видна в outcome");
+    assert_eq!(out.stall_flagged, 0, "эскалации по лимитной тишине нет");
+    assert_eq!(out.stall_pings, 0, "коммент-пинг на паузе не отправляется");
+    assert_eq!(out.soft_pings, 0, "мягкий пинг на паузе не отправляется");
+    assert_eq!(
+        state.0.lock().unwrap().stalls.len(),
+        2,
+        "каунтеры раунда не растут — пост-резетный пинг не задержан"
+    );
+    assert!(
+        !board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("status#64=NeedsAttention")),
+        "строка не паркуется: лимитная тишина не сбой сессии"
+    );
+}
+
+/// Окно живо (проба ok) — старая механика без изменений: раунд
+/// исчерпан, эскалация как раньше.
+#[tokio::test]
+async fn quota_probe_ok_keeps_old_mechanics() {
+    let (board, _state, u) = quota_stall_fixture(Some(Arc::new(FakeQuota(std::sync::Mutex::new(
+        FakeQuotaState::Ok,
+    )))));
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.limit_paused, 0, "исчерпания нет — паузы нет");
+    assert_eq!(
+        out.stall_flagged, 1,
+        "раунд исчерпан, сессия жива — эскалация по старой механике"
+    );
+    assert!(
+        board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("status#64=NeedsAttention")),
+        "парковка обычного сталла не заблокирована гейтом"
+    );
+}
+
+/// Err пробы квоты — старая механика немедленно: отказ вспомогательной
+/// пробы не парализует эскалацию сталл-детекта.
+#[tokio::test]
+async fn quota_probe_err_keeps_old_mechanics() {
+    let (_board, _state, u) = quota_stall_fixture(Some(Arc::new(FakeQuota(
+        std::sync::Mutex::new(FakeQuotaState::Err),
+    ))));
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.limit_paused, 0, "Err пробы — паузы нет");
+    assert_eq!(
+        out.stall_flagged, 1,
+        "эскалация живёт при недоступной пробе квоты"
+    );
+}
+
+/// Самовозобновление (#1477): спад процента между тиками — строка снимает
+/// паузу и получает обычный мягкий пинг (idle-ход завершён без транзакции).
+/// Гейт не пишет каунтеры — пост-резетный (пост-спадный) пинг не задержан.
+#[tokio::test]
+async fn limit_pause_releases_when_window_drains() {
+    let quota = Arc::new(FakeQuota(std::sync::Mutex::new(FakeQuotaState::Exhausted)));
+    let (_board, state, u) = quota_stall_fixture(Some(quota.clone()));
+    // чистый state: раунд пингов не начат — пауза держит строку ДО первого
+    // пинга, а не после исчерпания раунда
+    state.0.lock().unwrap().stalls.clear();
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.limit_paused, 1,
+        "первый тик: окно исчерпано — строка на паузе"
+    );
+    assert_eq!(
+        out.soft_pings, 0,
+        "пауза до пинга: мягкий пинг не сжигается в лимитном окне"
+    );
+    assert!(
+        state.0.lock().unwrap().stalls.is_empty(),
+        "пауза не пишет каунтеры — раунд не начат"
+    );
+    *quota.0.lock().unwrap() = FakeQuotaState::Ok;
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.limit_paused, 0, "спад процента — пауза не продлевается");
+    assert_eq!(
+        out.soft_pings, 1,
+        "самовозобновление: обычный мягкий пинг после спада"
+    );
+}
+
+/// Гейт стоит ДО судьи (#1477): лимитная тишина не сжигает вызов
+/// decision-модели на вердикт, который всё равно был бы эскалацией.
+#[tokio::test]
+async fn limit_pause_skips_judge_call() {
+    const NOW: u64 = 100_000_000;
+    struct FreezeClock;
+    impl Clock for FreezeClock {
+        fn utc_minute(&self) -> UtcMinute {
+            UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            NOW
+        }
+    }
+    let board = Arc::new(FakeBoard {
+        rows: std::sync::Mutex::new(vec![judge_row(
+            64,
+            Status::InProgress,
+            "ses_dev_64",
+            Slot::Dev,
+        )]),
+        log: Mutex::default(),
+        comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
+        status_fails: AtomicBool::new(false),
+    });
+    let sess = Arc::new(FakeSessions {
+        activity_ms: Some(NOW - 70 * 60_000),
+        idle_reply: false,
+        ..FakeSessions::new()
+    });
+    let judge = FakeJudge::says(uwuwu_domain::JudgeStatus::NeedsAttention);
+    let state = Arc::new(MemState(Mutex::default()));
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sess)),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+            probes: Mutex::default(),
+        }),
+        clock: Arc::new(FreezeClock),
+        state,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        boot_ms: NOW - 50 * 60_000,
+        judge: Some(judge.clone()),
+        judge_cfg: Default::default(),
+        quota: Some(Arc::new(FakeQuota(std::sync::Mutex::new(
+            FakeQuotaState::Exhausted,
+        )))),
+    };
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.limit_paused, 1,
+        "лимитная пауза сработала на judge-стадии"
+    );
+    assert_eq!(
+        out.judge_calls, 0,
+        "гейт до судьи: вызов decision-модели не сжигается"
+    );
+    assert!(
+        judge.calls.lock().unwrap().is_empty(),
+        "судья не видел лимитной тишины"
     );
 }
 
@@ -4489,6 +4779,7 @@ async fn probe_failure_isolated_per_row_other_rows_processed() {
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
@@ -4566,6 +4857,7 @@ async fn probe_degradation_strip_reaches_threshold_signal() {
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
@@ -4739,6 +5031,7 @@ async fn idle_sessions_do_not_hold_cup() {
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
@@ -6730,6 +7023,7 @@ fn tick_with_clock(
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     (u, board, sessions, prs)
 }
@@ -6929,6 +7223,7 @@ async fn enrichment_failure_skips_row() {
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.enrich_skipped, 1, "строка пропущена, не решена");
@@ -6970,6 +7265,7 @@ async fn orphan_deleted_when_set_session_fails() {
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.actions_failed, 1, "отказ записи ячейки виден");
@@ -7337,6 +7633,7 @@ async fn round_stale_reset_gives_true_fresh_round_two_pings_before_escalation() 
         boot_ms: BOOT,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     // тик 1 (сразу после рестарта): раунд чужой — сброс + свежий пинг
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
@@ -7784,6 +8081,7 @@ async fn cup_preempt_wave_does_not_escalate_victim_loop() {
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     live_busy(&sessions, "ses_a");
     live_busy(&sessions, "ses_x");
@@ -8054,6 +8352,7 @@ async fn executor_failure_lands_in_outcome_by_name() {
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
@@ -8106,6 +8405,7 @@ async fn named_executor_failure_is_isolated_from_healthy_peer() {
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     let out = u.run(&routed_plan(Mode::Live)).await.unwrap();
     assert_eq!(
@@ -8133,6 +8433,7 @@ fn multi_board_usecase(board: Arc<FakeMultiBoard>) -> TickUseCase {
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     }
 }
 
@@ -8339,6 +8640,7 @@ fn lost_usecase(
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
+        quota: None,
     };
     (u, board, sessions)
 }
@@ -9153,6 +9455,7 @@ fn judge_usecase(
         boot_ms: 0,
         judge,
         judge_cfg: cfg,
+        quota: None,
     };
     (u, board, sessions, state)
 }

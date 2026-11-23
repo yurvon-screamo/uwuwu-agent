@@ -23,6 +23,9 @@ mod github;
 mod judge;
 mod mockhub;
 mod prgate;
+mod quota;
+#[cfg(test)]
+mod quota_tests;
 mod rename_journal;
 mod s3;
 mod search;
@@ -41,6 +44,7 @@ use uwuwu_usecase::{
     Clock as _, ExecutorLoudness, IncidentLoudness, TickOutcome, TickUseCase,
     EXECUTOR_UNAVAILABLE_COOLDOWN_MS, EXECUTOR_UNAVAILABLE_THRESHOLD,
     EXECUTOR_UNAVAILABLE_WINDOW_MS, INCIDENT_COOLDOWN_MS, INCIDENT_THRESHOLD, INCIDENT_WINDOW_MS,
+    LIMIT_SIGNAL_COOLDOWN_MS, LIMIT_SIGNAL_THRESHOLD,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -319,6 +323,21 @@ async fn run(
         }
         _ => (None, uwuwu_usecase::JudgeCfg::default()),
     };
+    // Проба квоты подписки провайдера (#1477): opt-in владельца ([quota]).
+    // Секция без ключа-env — громкий старт-отказ (прецедент [notify]:
+    // включённая секция молча без ключа — «док врёт»).
+    let quota: Option<Arc<dyn uwuwu_usecase::QuotaProbe>> = match cfg.quota.as_ref() {
+        Some(q) => {
+            let probe = quota::quota_probe_from_cfg(q).map_err(|e| e.to_string())?;
+            tracing::info!(
+                event = "quota.enabled",
+                base_url = %q.base_url,
+                "Проба квоты включена: лимитная тишина сталл-детекта без эскалации"
+            );
+            Some(probe)
+        }
+        None => None,
+    };
     let usecase = Arc::new(TickUseCase {
         board: board.clone(),
         sessions: sessions.clone(),
@@ -329,6 +348,7 @@ async fn run(
         boot_ms: clock.now_ms(),
         judge,
         judge_cfg,
+        quota,
     });
 
     let shared: Arc<std::sync::RwLock<TickOutcome>> = Arc::default();
@@ -1051,6 +1071,44 @@ async fn incident_signal(
     }
 }
 
+/// Сигнал лимитного окна (#1477): паузы — не инцидент сбоя, а норма
+/// контура; владельцу нужен факт начала окна — один ТГ на окно
+/// (threshold 1, cooldown 6 ч ≥ окна). [notify] не настроен — громкий лог.
+async fn limit_pause_signal(
+    notify: &Option<(Arc<dyn uwuwu_usecase::bots::TelegramGateway>, i64)>,
+    loudness: &mut IncidentLoudness,
+    now_ms: u64,
+    rows_paused: usize,
+) {
+    if !loudness.register(now_ms) {
+        return;
+    }
+    let text = format!(
+        "⏳ uwuwu: GLM 5h-лимит — {rows_paused} строк на лимитной паузе \
+         (сталл-детект держит без эскалаций, конвейер продолжит сам \
+         после спада процента). Разбор — не нужен."
+    );
+    match notify {
+        Some((tg, chat)) => match tg.send_message(*chat, &text).await {
+            Ok(()) => tracing::warn!(
+                event = "quota.limit_signal",
+                rows = rows_paused,
+                "Лимитный сигнал владельцу отправлен"
+            ),
+            Err(e) => tracing::error!(
+                event = "quota.limit_signal_failed",
+                error = %e,
+                "Лимитный сигнал не отправлен"
+            ),
+        },
+        None => tracing::warn!(
+            event = "quota.limit_unnotified",
+            rows = rows_paused,
+            "Лимитное окно: [notify] не настроен — сигнала нет"
+        ),
+    }
+}
+
 /// Транспортная деградация executor'а (#1312): отказы union-скана за
 /// скользящее окно — один ТГ-сигнал владельцу per-executor через тот же
 /// инцидент-контур #1281. [notify] не настроен — громкий лог.
@@ -1166,6 +1224,14 @@ async fn tick_loop(args: TickLoopArgs) {
     // ADR-107.
     let mut preempt_loudness =
         IncidentLoudness::new(INCIDENT_THRESHOLD, INCIDENT_WINDOW_MS, INCIDENT_COOLDOWN_MS);
+    // Громкость лимитного окна (#1477): threshold 1 + cooldown ≥ окна —
+    // один сигнал на окно исчерпания подписки; окно неперсистентно —
+    // философия ADR-107.
+    let mut limit_loudness = IncidentLoudness::new(
+        LIMIT_SIGNAL_THRESHOLD,
+        INCIDENT_WINDOW_MS,
+        LIMIT_SIGNAL_COOLDOWN_MS,
+    );
     loop {
         let started = std::time::Instant::now();
         match usecase.run(&plan).await {
@@ -1182,6 +1248,15 @@ async fn tick_loop(args: TickLoopArgs) {
                         &mut executor_incidents,
                         executor,
                         clock.now_ms(),
+                    )
+                    .await;
+                }
+                if outcome.limit_paused > 0 {
+                    limit_pause_signal(
+                        &notify,
+                        &mut limit_loudness,
+                        clock.now_ms(),
+                        outcome.limit_paused,
                     )
                     .await;
                 }
