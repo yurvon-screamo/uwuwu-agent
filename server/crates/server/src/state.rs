@@ -206,10 +206,25 @@ pub struct JsonStateStore {
 
 impl JsonStateStore {
     pub fn load(path: PathBuf, clock: Arc<dyn Clock>) -> Self {
-        let mut state: StateFile = match std::fs::read_to_string(&path) {
+        // Чтение в bytes: невалидный UTF-8 доходит до парсера и ловится
+        // как коррупция (громко + улика), а не тихим InvalidData чтения.
+        let mut state: StateFile = match std::fs::read(&path) {
             // Файла нет — первый старт: тихо.
-            Err(_) => StateFile::default(),
-            Ok(raw) => match serde_json::from_str(&raw) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => StateFile::default(),
+            // Иная ошибка чтения (права, сбой тома) — громко: тихий сброс
+            // учёта кронов невидим оператору (#1517). Улика — попыткой
+            // rename: ему нужны права на каталог, не на чтение файла.
+            Err(e) => {
+                tracing::error!(
+                    event = "state.load_unreadable",
+                    path = %path.display(),
+                    error = %e,
+                    "state.json не читается — старт с пустым state, улика сохраняется rename'ом (сброс учёта кронов даёт масс-догон)"
+                );
+                preserve_corrupt_state(&path, clock.now_ms());
+                StateFile::default()
+            }
+            Ok(raw) => match serde_json::from_slice(&raw) {
                 Ok(state) => state,
                 // Битый файл — громко: тихий сброс = класс масс-догона
                 // кронов (#1517, пустые last_fire по всем кронам). Улика
@@ -268,7 +283,12 @@ impl JsonStateStore {
     }
 
     /// Атомарная запись файла (единая точка: оба трейта — делегаты).
+    /// save_lock захватывается до снапшота: сериализация и запись под
+    /// одним замком — порядок файлов = порядок вызовов save (иначе
+    /// писатель со старым снапшотом, захватив лок позже, перезаписал бы
+    /// более свежий файл).
     fn save_now(&self) -> UsecaseResult<()> {
+        let _writer = self.save_lock.lock().expect("save lock");
         {
             let mut guard = self.state.lock().expect("state lock");
             if guard.spawns.len() > 5000 {
@@ -316,10 +336,11 @@ impl JsonStateStore {
             std::fs::create_dir_all(dir)
                 .map_err(|e| UsecaseError::State(format!("mkdir {}: {e}", dir.display())))?;
         }
-        // Один писатель файла в момент записи (см. save_lock) + fsync tmp
-        // перед rename: битый state на следующем старте — тихий сброс
-        // учёта кронов (класс масс-догона, #1517).
-        let _writer = self.save_lock.lock().expect("save lock");
+        // fsync tmp перед rename + fsync каталога после: без сброса
+        // каталога rename может не дожить до диска при падении хоста
+        // (процессный рестарт безопасен — содержимое tmp уже на диске).
+        // Битый state на следующем старте — тихий сброс учёта кронов
+        // (класс масс-догона, #1517).
         let tmp = self.path.with_extension("tmp");
         let mut file = std::fs::File::create(&tmp)
             .map_err(|e| UsecaseError::State(format!("create {}: {e}", tmp.display())))?;
@@ -329,6 +350,11 @@ impl JsonStateStore {
             .map_err(|e| UsecaseError::State(format!("sync {}: {e}", tmp.display())))?;
         std::fs::rename(&tmp, &self.path)
             .map_err(|e| UsecaseError::State(format!("rename {}: {e}", self.path.display())))?;
+        if let Some(dir) = self.path.parent() {
+            if let Ok(d) = std::fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
         Ok(())
     }
 }
@@ -1316,6 +1342,24 @@ mod tests {
         TickStateStore::save(&s).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         serde_json::from_str::<serde_json::Value>(&raw).expect("файл снова валиден");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn binary_garbage_state_is_loud_corruption_not_quiet_start() {
+        // #1517 (ревью Common): невалидный UTF-8 — реалистичный режим
+        // порчи (усечённая запись/сбой тома); чтение в bytes доходит до
+        // парсера → громкая коррупция + улика, не тихий пустой старт.
+        let dir = std::env::temp_dir().join(format!("uwuwu-binary-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(&path, [0xFF, 0xFE, 0x00, 0xC3, 0x28, 0x7B]).unwrap();
+        let s = store_at(path.clone(), 9_000);
+        assert_eq!(CronStateStore::cron_row(&s, "x"), CronRow::default());
+        assert!(
+            dir.join("state.json.corrupt-9").exists(),
+            "бинарный мусор сохранён уликой"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
