@@ -39,29 +39,43 @@ pub struct GitHubHub {
     last_rate_limit: std::sync::RwLock<Option<(u64, String)>>,
 }
 
-const QUERY: &str = r#"
-  query($owner:String!,$name:String!,$board:String!,$after:String){
-    rateLimit{ remaining resetAt }
+/// Доски хаба — id и тайтлы, без строк: первый шаг снимка. Доска
+/// резолвится по точному тайтлу на нашей стороне.
+const PROJECTS_QUERY: &str = r#"
+  query($owner:String!,$name:String!){
     repository(owner:$owner, name:$name){
-      projectsV2(first:20, query:$board){
-        nodes{
-          id title
-          field(name:"Status"){ ...on ProjectV2SingleSelectField{ id options{ id name } } }
-          items(first:100, after:$after){
-            pageInfo{ hasNextPage endCursor }
-            nodes{
-              id
-              content{ __typename ...on Issue{ number title state closedAt issueType{ name } } }
-              fieldValues(first:30){
-                nodes{ __typename
-                  ...on ProjectV2ItemFieldSingleSelectValue{
-                    name field{ ...on ProjectV2FieldCommon{ name } }
-                  }
-                  ...on ProjectV2ItemIssueFieldValue{
-                    field{ ...on ProjectV2FieldCommon{ name } }
-                    issueFieldValue{ __typename
-                      ...on IssueFieldSingleSelectValue{ name } }
-                  }
+      projectsV2(first:50){
+        nodes{ id title }
+      }
+    }
+  }"#;
+
+/// Одна страница строк одной доски — по id проекта. Инцидент 23.11: снимок
+/// шёл одним документом через `projectsV2(query:$board)`, а GitHub матчит
+/// проекты нестрого — по слову «Задачи» шли все открытые доски, `items`
+/// умножался на их число, документ переставал укладываться в лимит шлюза
+/// (около 10 с) и получал `502 Bad Gateway` на всех проектах разом.
+const BOARD_ITEMS_QUERY: &str = r#"
+  query($id:ID!,$first:Int!,$after:String){
+    rateLimit{ remaining resetAt }
+    node(id:$id){
+      ... on ProjectV2{
+        title
+        field(name:"Status"){ ...on ProjectV2SingleSelectField{ id options{ id name } } }
+        items(first:$first, after:$after){
+          pageInfo{ hasNextPage endCursor }
+          nodes{
+            id
+            content{ __typename ...on Issue{ number title state closedAt issueType{ name } } }
+            fieldValues(first:30){
+              nodes{ __typename
+                ...on ProjectV2ItemFieldSingleSelectValue{
+                  name field{ ...on ProjectV2FieldCommon{ name } }
+                }
+                ...on ProjectV2ItemIssueFieldValue{
+                  field{ ...on ProjectV2FieldCommon{ name } }
+                  issueFieldValue{ __typename
+                    ...on IssueFieldSingleSelectValue{ name } }
                 }
               }
             }
@@ -71,11 +85,18 @@ const QUERY: &str = r#"
     }
   }"#;
 
-const MAX_PAGES: usize = 10;
+/// Строк на страницу снимка. Страница держится в секундах — запас к
+/// лимиту шлюза на случай замедления бэкенда GitHub (замер 23.11:
+/// 100 строк — 2–3 с, шлюз обрывал документ на 10 с).
+const PAGE_SIZE: usize = 50;
+/// Потолок страниц на снимок — гард бесконечной пагинации. Вместе с
+/// PAGE_SIZE держит прежний потолок строк доски.
+const MAX_PAGES: usize = 20;
 
 /// TTL-кеш значений по ключу (#1243): цена обращения к GitHub GraphQL
-/// высока (полный снимок доски — сотни поинтов), а данные между тиками
-/// меняются редко. `now` прокидывается для тестируемости.
+/// высока (полный снимок доски — страница за страницей, без кеша доходило
+/// до 40 с), а данные между тиками меняются редко. `now` прокидывается
+/// для тестируемости.
 pub(crate) struct TtlCache<T> {
     ttl: std::time::Duration,
     cells: std::sync::RwLock<std::collections::HashMap<String, (std::time::Instant, Arc<T>)>>,
@@ -357,8 +378,18 @@ impl GitHubHub {
         if let Some(hit) = self.snap_cache.get(board, now) {
             return Ok(hit);
         }
+        let started = std::time::Instant::now();
         let fetched = self.snapshot_fetch(board).await?;
-        // бюджетная наблюдаемость: remaining несёт каждый снимок (QUERY)
+        // наблюдаемость пути снимка: тренд времени страницы против лимита
+        // шлюза GitHub (23.11: отказ стал постоянным незаметно — #1502)
+        tracing::info!(
+            event = "board.snapshot_fetched",
+            board = %board,
+            rows = fetched.0.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Снимок доски прочитан"
+        );
+        // бюджетная наблюдаемость: remaining несёт каждая страница строк
         if let Some(rl) = self.last_rate_limit.read().expect("rl lock").as_ref() {
             let remaining = rl.0;
             if remaining < 300 {
@@ -374,71 +405,27 @@ impl GitHubHub {
         Ok(arc)
     }
 
-    /// Полное чтение доски пагинацией (мимо кеша).
+    /// Полное чтение доски (мимо кеша): документы — через gql_retrying
+    /// (#1330), бюджетная наблюдаемость — с каждой страницы строк.
     async fn snapshot_fetch(&self, board: &str) -> UsecaseResult<(Vec<Task>, BoardMeta)> {
-        let (owner, name) = self.repo.split_once('/').ok_or_else(|| {
-            UsecaseError::Board(format!("repo in the owner/name form: {}", self.repo))
-        })?;
-        let mut meta = BoardMeta::default();
-        let mut rows: Vec<Task> = Vec::new();
-        let mut cursor: Option<String> = None;
-        for _ in 0..MAX_PAGES {
-            let data = self
-                .gql_retrying(
-                    QUERY,
-                    json!({ "owner": owner, "name": name, "board": board, "after": cursor }),
-                )
-                .await?;
-            // бюджет с каждого снимка (QUERY несёт rateLimit) — #1243
-            if let Some(rl) = data.get("rateLimit") {
-                if let Some(remaining) = rl["remaining"].as_u64() {
-                    let reset_at = rl["resetAt"].as_str().unwrap_or_default().to_string();
-                    *self.last_rate_limit.write().expect("rl lock") = Some((remaining, reset_at));
-                }
-            }
-            let nodes = data["repository"]["projectsV2"]["nodes"]
-                .as_array()
-                .ok_or_else(|| UsecaseError::Board("projectsV2.nodes is not an array".into()))?;
-            let project = nodes
-                .iter()
-                .find(|p| p["title"].as_str() == Some(board))
-                .ok_or_else(|| {
-                    UsecaseError::Board(format!(
-                        "board «{board}» not found among {} boards",
-                        nodes.len()
-                    ))
-                })?;
-            if meta.project_id.is_empty() {
-                meta.project_id = project["id"].as_str().unwrap_or_default().to_string();
-                meta.status_field_id = project["field"]["id"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string();
-                if let Some(options) = project["field"]["options"].as_array() {
-                    for o in options {
-                        if let (Some(id), Some(n)) = (o["id"].as_str(), o["name"].as_str()) {
-                            meta.options.insert(n.to_string(), id.to_string());
-                        }
-                    }
-                }
-                if meta.project_id.is_empty() {
-                    return Err(UsecaseError::Board(format!(
-                        "board «{board}»: no project id"
-                    )));
-                }
-            }
-            let items = &project["items"];
-            if let Some(page) = items["nodes"].as_array() {
-                rows.extend(parse_page(page, &mut meta));
-            }
-            if items["pageInfo"]["hasNextPage"].as_bool() != Some(true) {
-                return Ok((rows, meta));
-            }
-            cursor = items["pageInfo"]["endCursor"].as_str().map(String::from);
+        read_board_pages(&self.repo, board, |query, variables| async move {
+            let data = self.gql_retrying(query, variables).await?;
+            self.note_rate_limit(&data);
+            Ok(data)
+        })
+        .await
+    }
+
+    /// Бюджетная наблюдаемость: remaining/resetAt несёт каждая страница
+    /// строк (BOARD_ITEMS_QUERY) — контекст бэкоффа и гайд `gql.budget_low`.
+    fn note_rate_limit(&self, data: &Value) {
+        if let Some(remaining) = data["rateLimit"]["remaining"].as_u64() {
+            let reset_at = data["rateLimit"]["resetAt"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            *self.last_rate_limit.write().expect("rl lock") = Some((remaining, reset_at));
         }
-        Err(UsecaseError::Board(format!(
-            "board «{board}» exceeded the {MAX_PAGES} pages — the guard"
-        )))
     }
 
     /// Статус строки на доске (по номеру issue, через projectItems).
@@ -691,6 +678,93 @@ impl GitHubHub {
         out.sort_by_key(|c| c.created_ms);
         Ok(out)
     }
+}
+
+/// Точный резолв доски по тайтлу среди досок хаба: GitHub ищет проекты
+/// нестрого, совпадение по слову — не совпадение по имени.
+fn board_id(nodes: &[Value], board: &str) -> UsecaseResult<String> {
+    nodes
+        .iter()
+        .find(|p| p["title"].as_str() == Some(board))
+        .and_then(|p| p["id"].as_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            UsecaseError::Board(format!(
+                "board «{board}» not found among {} boards",
+                nodes.len()
+            ))
+        })
+}
+
+/// Мета статусного поля доски (id поля + каталог опций) — из узла
+/// проекта, один раз на снимок.
+fn read_status_field(project: &Value, meta: &mut BoardMeta) {
+    meta.status_field_id = project["field"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    if let Some(options) = project["field"]["options"].as_array() {
+        for o in options {
+            if let (Some(id), Some(n)) = (o["id"].as_str(), o["name"].as_str()) {
+                meta.options.insert(n.to_string(), id.to_string());
+            }
+        }
+    }
+}
+
+/// Снимок доски по документам `gql`: список досок → точный тайтл →
+/// страницы строк по id проекта. Курсор передаётся дословно, стоп — на
+/// странице без `hasNextPage`; транспортные ретраи — за замыканием.
+async fn read_board_pages<F, Fut>(
+    repo: &str,
+    board: &str,
+    mut gql: F,
+) -> UsecaseResult<(Vec<Task>, BoardMeta)>
+where
+    F: FnMut(&'static str, Value) -> Fut,
+    Fut: std::future::Future<Output = UsecaseResult<Value>>,
+{
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or_else(|| UsecaseError::Board(format!("repo in the owner/name form: {repo}")))?;
+    let projects = gql(PROJECTS_QUERY, json!({ "owner": owner, "name": name })).await?;
+    let nodes = projects["repository"]["projectsV2"]["nodes"]
+        .as_array()
+        .ok_or_else(|| UsecaseError::Board("projectsV2.nodes is not an array".into()))?;
+    let mut meta = BoardMeta {
+        project_id: board_id(nodes, board)?,
+        ..BoardMeta::default()
+    };
+    let mut rows = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        let data = gql(
+            BOARD_ITEMS_QUERY,
+            json!({ "id": meta.project_id, "first": PAGE_SIZE, "after": cursor }),
+        )
+        .await?;
+        let project = &data["node"];
+        if project["items"].is_null() {
+            return Err(UsecaseError::Board(format!(
+                "board «{board}»: project not readable by id"
+            )));
+        }
+        if meta.status_field_id.is_empty() {
+            read_status_field(project, &mut meta);
+        }
+        let items = &project["items"];
+        if let Some(page) = items["nodes"].as_array() {
+            rows.extend(parse_page(page, &mut meta));
+        }
+        if items["pageInfo"]["hasNextPage"].as_bool() != Some(true) {
+            return Ok((rows, meta));
+        }
+        cursor = items["pageInfo"]["endCursor"].as_str().map(String::from);
+    }
+    Err(UsecaseError::Board(format!(
+        "board «{board}» exceeded the {MAX_PAGES} pages — the guard"
+    )))
 }
 
 /// Гард-резолюция статуса строки (#1403): закрытый issue терминален
@@ -3208,3 +3282,10 @@ mod vcs_mapping_tests {
         assert!(f.branch().is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "hub_snapshot_stand.rs"]
+mod snapshot_stand;
+#[cfg(test)]
+#[path = "hub_snapshot_tests.rs"]
+mod snapshot_tests;
