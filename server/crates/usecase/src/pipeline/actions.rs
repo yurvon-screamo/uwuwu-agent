@@ -4,7 +4,8 @@
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
 use crate::pipeline::tick::{
-    BoardPlan, RowContext, SpawnHold, TickPlan, TickUseCase, SESSION_LOST_ESCALATE_AFTER,
+    BoardPlan, RowContext, SpawnHold, TickOutcome, TickPlan, TickUseCase,
+    SESSION_LOST_ESCALATE_AFTER,
 };
 use crate::ports::{CommentRef, Liveness, SessionSpec};
 use crate::router::Gateway;
@@ -620,10 +621,16 @@ impl TickUseCase {
     /// automerge_ready не прощупывает безветочные ячейки — Vcs::Local и
     /// Artifact, #1155 — и PR-ячейки с URL не PR-формы: wiki/issues/blob
     /// с фабричной веткой, #1286 — мержить нечего, строка ждёт владельца).
-    /// Возвращает true — PR смержен этим вызовом (счётчик тика).
-    pub async fn automerge(&self, board: &BoardPlan, task: &Task) -> UsecaseResult<bool> {
+    /// Возвращает true — PR смержен этим вызовом (счётчик тика);
+    /// семантические bounce инкрементят out.automerge_bounced (#1519).
+    pub async fn automerge(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        out: &mut TickOutcome,
+    ) -> UsecaseResult<bool> {
         use crate::ports::PrState;
-        let state = self
+        let probe = self
             .prs
             .probe(
                 &board.repo,
@@ -631,7 +638,7 @@ impl TickUseCase {
                 task.branch().map(|b| b.as_str()),
             )
             .await?;
-        if state == PrState::Pending {
+        if probe.state == PrState::Pending {
             tracing::info!(
                 event = "automerge.pending",
                 number = task.number(),
@@ -639,7 +646,7 @@ impl TickUseCase {
             );
             return Ok(false);
         }
-        match state {
+        match probe.state {
             PrState::Pending => unreachable!("pending обработан выше"),
             // Уже влит (вручную или раньше): no-op — merge-API не зовётся,
             // строка остаётся в Review и ждёт владельца (инцидент #1151/#1162:
@@ -662,31 +669,69 @@ impl TickUseCase {
             }
             PrState::Missing => {
                 self.bounce(board, task, "branch set, PR not found").await?;
+                out.automerge_bounced += 1;
                 Ok(false)
             }
             PrState::Closed => {
                 self.bounce(board, task, "PR closed without a merge")
                     .await?;
+                out.automerge_bounced += 1;
                 Ok(false)
             }
             PrState::Open {
                 mergeable: false, ..
             } => {
                 self.bounce(board, task, "PR conflicts with master").await?;
+                out.automerge_bounced += 1;
                 Ok(false)
             }
             PrState::Open {
                 ci_green: false, ..
             } => {
                 self.bounce(board, task, "PR has red CI").await?;
+                out.automerge_bounced += 1;
                 Ok(false)
             }
             PrState::Open {
                 mergeable: true,
                 ci_green: true,
             } => {
-                let pr = task.pr().map(|u| u.as_str()).unwrap_or_default();
-                match self.prs.merge(&board.repo, pr).await {
+                // Дозаполнение canonical PR-ячейки (#1519): вердикт о
+                // конкретном PR есть, ячейка пуста или несёт протухший URL —
+                // пишем резолв до мержа; отказ записи — bounce (канон
+                // UC-01, авторемонт без мержа); мерж по
+                // probe-верифицированному URL — мержится ровно то, что
+                // прощупано.
+                let url = match probe.url.as_deref() {
+                    Some(u) => u,
+                    None => {
+                        tracing::warn!(
+                            event = "automerge.no_pr_url",
+                            number = task.number(),
+                            "Automerge: зелёный Open без конкретного PR — bounce"
+                        );
+                        self.bounce(board, task, "branch set, PR not found").await?;
+                        out.automerge_bounced += 1;
+                        return Ok(false);
+                    }
+                };
+                if task.pr().map(|u| u.as_str()) != Some(url) {
+                    match self.board.set_pr(&board.board, task.number(), url).await {
+                        Ok(()) => tracing::info!(
+                            event = "automerge.pr_cell_filled",
+                            number = task.number(),
+                            url,
+                            "Automerge: canonical PR-ячейка дозаполнена резолвом (#1519)"
+                        ),
+                        Err(e) => {
+                            self.bounce(board, task, &format!("PR cell fill failed: {e}"))
+                                .await?;
+                            out.automerge_bounced += 1;
+                            return Ok(false);
+                        }
+                    }
+                }
+                match self.prs.merge(&board.repo, url).await {
                     Ok(()) => {
                         // мерж без закрытия: строка остаётся в Review —
                         // финализация (Done) всегда за владельцем (#1232)
@@ -700,6 +745,7 @@ impl TickUseCase {
                     Err(e) => {
                         self.bounce(board, task, &format!("merge failed: {e}"))
                             .await?;
+                        out.automerge_bounced += 1;
                         Ok(false)
                     }
                 }

@@ -372,6 +372,20 @@ impl TaskBoardRepo for MemoryHub {
         })
     }
 
+    async fn set_pr(&self, _board: &str, number: u64, pr_url: &str) -> UsecaseResult<()> {
+        let url = uwuwu_domain::PrUrl::parse(pr_url)
+            .ok_or_else(|| UsecaseError::Board(format!("PR «{pr_url}» is not an http(s) URL")))?;
+        self.with_state(|state| {
+            state
+                .fields
+                .entry(number)
+                .or_default()
+                .open_pr(url)
+                .map_err(|e| UsecaseError::Board(e.to_string()))?;
+            Ok(())
+        })
+    }
+
     async fn set_board_cells(
         &self,
         _board: &str,

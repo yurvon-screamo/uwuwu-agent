@@ -7,7 +7,7 @@ use crate::github::HTTP_TIMEOUT;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use uwuwu_usecase::{PrGateway, PrState, UsecaseError, UsecaseResult};
+use uwuwu_usecase::{PrGateway, PrProbe, PrState, UsecaseError, UsecaseResult};
 
 /// host/owner/repo/number из URL PR Gitea-семейства:
 /// `<scheme>://<host>/{owner}/{repo}/pulls/{number}`. Строгая форма:
@@ -120,12 +120,18 @@ impl PrGateway for GiteaPrGateway {
         _project_repo: &str,
         pr_url: Option<&str>,
         _branch: Option<&str>,
-    ) -> UsecaseResult<PrState> {
+    ) -> UsecaseResult<PrProbe> {
+        // url — конкретная цель вердикта: ячейка, если она распарсилась
+        // (веточной пробы у Gitea нет); None — Missing без цели.
+        let url = pr_url.filter(|u| !u.is_empty()).map(str::to_string);
         let Some((host, owner, repo, number)) = pr_url
             .filter(|u| !u.is_empty())
             .and_then(parse_gitea_pr_url)
         else {
-            return Ok(PrState::Missing);
+            return Ok(PrProbe {
+                state: PrState::Missing,
+                url: None,
+            });
         };
         let Some(token) = self.tokens.get(&host) else {
             tracing::info!(
@@ -134,7 +140,10 @@ impl PrGateway for GiteaPrGateway {
                 number,
                 "Gitea-инстанс без записи в GITEA_TOKENS — Foreign, строка ждёт владельца"
             );
-            return Ok(PrState::Foreign);
+            return Ok(PrProbe {
+                state: PrState::Foreign,
+                url,
+            });
         };
         let (status, body) = self
             .get(
@@ -145,7 +154,10 @@ impl PrGateway for GiteaPrGateway {
             .await?;
         match status {
             200..=299 => match body {
-                Some(body) => Ok(classify_pr(&body)),
+                Some(body) => Ok(PrProbe {
+                    state: classify_pr(&body),
+                    url,
+                }),
                 None => {
                     tracing::warn!(
                         event = "gitea.not_json",
@@ -153,21 +165,27 @@ impl PrGateway for GiteaPrGateway {
                         number,
                         "Gitea отдал success без JSON — Foreign"
                     );
-                    Ok(PrState::Foreign)
+                    Ok(PrProbe {
+                        state: PrState::Foreign,
+                        url,
+                    })
                 }
             },
             // JSON-404 — PR нет (ветка есть, bounce «PR не найден» честен);
             // plain-text 404 — роута нет, инстанс API-нечитаем → Foreign
-            404 => Ok(if body.is_some() {
-                PrState::Missing
-            } else {
-                tracing::warn!(
-                    event = "gitea.no_route",
-                    host = %host,
-                    number,
-                    "Gitea 404 без JSON (роута нет) — Foreign"
-                );
-                PrState::Foreign
+            404 => Ok(PrProbe {
+                state: if body.is_some() {
+                    PrState::Missing
+                } else {
+                    tracing::warn!(
+                        event = "gitea.no_route",
+                        host = %host,
+                        number,
+                        "Gitea 404 без JSON (роута нет) — Foreign"
+                    );
+                    PrState::Foreign
+                },
+                url,
             }),
             401 | 403 => {
                 tracing::warn!(
@@ -177,7 +195,10 @@ impl PrGateway for GiteaPrGateway {
                     status,
                     "Gitea отклонил токен — Foreign"
                 );
-                Ok(PrState::Foreign)
+                Ok(PrProbe {
+                    state: PrState::Foreign,
+                    url,
+                })
             }
             500..=599 => {
                 tracing::warn!(
@@ -187,7 +208,10 @@ impl PrGateway for GiteaPrGateway {
                     status,
                     "Gitea-инстанс отвечает 5xx — Foreign"
                 );
-                Ok(PrState::Foreign)
+                Ok(PrProbe {
+                    state: PrState::Foreign,
+                    url,
+                })
             }
             _ => {
                 tracing::warn!(
@@ -197,7 +221,10 @@ impl PrGateway for GiteaPrGateway {
                     status,
                     "Gitea-ответ не разобран — Foreign"
                 );
-                Ok(PrState::Foreign)
+                Ok(PrProbe {
+                    state: PrState::Foreign,
+                    url,
+                })
             }
         }
     }

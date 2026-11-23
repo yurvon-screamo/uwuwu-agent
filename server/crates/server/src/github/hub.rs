@@ -967,6 +967,14 @@ impl TaskBoardRepo for GitHubHub {
         Ok(())
     }
 
+    async fn set_pr(&self, board: &str, number: u64, pr_url: &str) -> UsecaseResult<()> {
+        self.fields
+            .store(number, &[("PR", Some(pr_url.to_string()))])
+            .await?;
+        self.invalidate_snapshot(board);
+        Ok(())
+    }
+
     async fn set_board_cells(
         &self,
         board: &str,

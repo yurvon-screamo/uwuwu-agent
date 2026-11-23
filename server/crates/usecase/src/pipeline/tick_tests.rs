@@ -5,7 +5,7 @@ use crate::error::{UsecaseError, UsecaseResult};
 use crate::pipeline::tick::{BoardPlan, Mode, TickPlan, TickUseCase, PROBE_DEGRADE_MIN_ROWS};
 use crate::ports::{
     AgentSessionGateway, Clock, CommentRef, DecisionJudge, DreamerMark, JudgeCfg, Liveness,
-    PrGateway, PrState, SessionSpec, TaskBoardRepo, TickStateStore,
+    PrGateway, PrProbe, PrState, SessionSpec, TaskBoardRepo, TickStateStore,
 };
 use crate::router::SessionRouter;
 use async_trait::async_trait;
@@ -28,6 +28,9 @@ struct FakeBoard {
     fields_fails: bool,
     /// Отказ set_session (записи ячейки) — сирота-зачистка (#1163).
     set_session_fails: bool,
+    /// Отказ set_pr (дозаполнения canonical PR-ячейки) — bounce без
+    /// мержа (#1519).
+    set_pr_fails: AtomicBool,
     /// Отказ clear_session (снятия ячейки) — краш-окно гашения (#1412).
     clear_session_fails: AtomicBool,
     /// Отказ set_status (эскалационный ретрай: счётчик стоит на капе —
@@ -76,6 +79,13 @@ impl TaskBoardRepo for FakeBoard {
             .lock()
             .unwrap()
             .push(format!("branch#{n}={}", branch.as_str()));
+        Ok(())
+    }
+    async fn set_pr(&self, _b: &str, n: u64, pr_url: &str) -> UsecaseResult<()> {
+        if self.set_pr_fails.load(Ordering::Relaxed) {
+            return Err(UsecaseError::Session("set_pr недоступен (мок)".into()));
+        }
+        self.log.lock().unwrap().push(format!("pr#{n}={pr_url}"));
         Ok(())
     }
     async fn set_board_cells(
@@ -488,13 +498,20 @@ struct FakePrs {
     merges: Mutex<Vec<String>>,
     /// URL-аргументы probe — фикс «артефакт доезжает до gateway» (#1155)
     probes: Mutex<Vec<Option<String>>>,
+    /// URL, который вердикт называет своей целью (#1519): None по умолчанию
+    /// — зелёный Open без цели честно bounce-ит «no PR URL»; тесты
+    /// веточной пробы ставят его после сборки фикстуры.
+    url: Mutex<Option<String>>,
 }
 
 #[async_trait]
 impl PrGateway for FakePrs {
-    async fn probe(&self, _r: &str, u: Option<&str>, _b: Option<&str>) -> UsecaseResult<PrState> {
+    async fn probe(&self, _r: &str, u: Option<&str>, _b: Option<&str>) -> UsecaseResult<PrProbe> {
         self.probes.lock().unwrap().push(u.map(str::to_string));
-        Ok(self.state)
+        Ok(PrProbe {
+            state: self.state,
+            url: self.url.lock().unwrap().clone(),
+        })
     }
     async fn merge(&self, _r: &str, pr: &str) -> UsecaseResult<()> {
         self.merges.lock().unwrap().push(pr.into());
@@ -868,6 +885,7 @@ fn usecase_with_state(
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -876,6 +894,7 @@ fn usecase_with_state(
         state: pr,
         merges: Mutex::default(),
         probes: Mutex::default(),
+        url: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -922,6 +941,7 @@ fn fixture_usecase(
         comments,
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -930,6 +950,7 @@ fn fixture_usecase(
         state: PrState::Missing,
         merges: Mutex::default(),
         probes: Mutex::default(),
+        url: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -973,6 +994,7 @@ fn usecase_with_sessions(
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -981,6 +1003,7 @@ fn usecase_with_sessions(
         state: pr,
         merges: Mutex::default(),
         probes: Mutex::default(),
+        url: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -1031,6 +1054,7 @@ fn routed_usecase(
             comments,
             fields_fails: false,
             set_session_fails: false,
+            set_pr_fails: AtomicBool::new(false),
             clear_session_fails: AtomicBool::new(false),
             status_fails: AtomicBool::new(false),
         }),
@@ -1047,6 +1071,7 @@ fn routed_usecase(
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         }),
         clock,
         state: Arc::new(MemState(Mutex::default())),
@@ -1263,6 +1288,7 @@ pub(crate) fn board_with_rows(rows: Vec<Task>) -> Arc<dyn TaskBoardRepo> {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     })
@@ -1288,6 +1314,7 @@ fn wake_usecase(
         comments,
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -1320,6 +1347,7 @@ fn wake_usecase(
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         }),
         clock: Arc::new(FixedClock),
         state: state.clone(),
@@ -1576,6 +1604,9 @@ impl TaskBoardRepo for CommentBoard {
     async fn set_branch(&self, _b: &str, _n: u64, _branch: &BranchName) -> UsecaseResult<()> {
         Ok(())
     }
+    async fn set_pr(&self, _b: &str, _n: u64, _pr_url: &str) -> UsecaseResult<()> {
+        Ok(())
+    }
     async fn clear_session(&self, _b: &str, _n: u64, _slot: Slot) -> UsecaseResult<()> {
         Ok(())
     }
@@ -1731,6 +1762,7 @@ async fn dev_spawn_pins_the_developer_agent() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -1751,6 +1783,7 @@ async fn dev_spawn_pins_the_developer_agent() {
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         }),
         clock: Arc::new(FixedClock),
         state: Arc::new(MemState(Mutex::default())),
@@ -1895,7 +1928,11 @@ async fn automerge_red_ci_bounces_to_in_progress() {
             ci_green: false,
         },
     );
-    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.automerge_bounced, 1,
+        "bounce — наблюдаемый исход (#1519)"
+    );
     let log = board.log.lock().unwrap();
     assert!(
         log.iter().any(|l| l.contains("status#4=InProgress")),
@@ -1921,15 +1958,113 @@ async fn automerge_green_merges_row_stays_review() {
             ci_green: true,
         },
     );
+    *prs.url.lock().unwrap() = Some("https://github.com/a/c/pull/5".into());
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(prs.merges.lock().unwrap().len(), 1);
     assert_eq!(out.automerged, 1);
+    assert_eq!(out.automerge_bounced, 0, "мерж — не bounce");
     let log = board.log.lock().unwrap();
     assert!(
         !log.iter().any(|l| l.contains("status#5")),
         "статус не трогается (остаётся Review): {log:?}"
     );
     assert!(!log.iter().any(|l| l.contains("close#5")));
+}
+
+#[tokio::test]
+async fn automerge_fills_empty_pr_cell_from_probe_before_merge() {
+    // #1519 (дефект 2, скорректированная премиса): пустая canonical
+    // PR-ячейка + PR найден веточной пробой — демон дозаполняет ячейку
+    // резолвом ДО мержа и мержит по probe-верифицированному URL; прежнее
+    // поведение — merge("") → bounce «PR-URL не парсится» (мусорный
+    // авторемонт с раундтрипом)
+    let mut t = task(77, Status::UserReview);
+    carrier(&mut t, 77, false);
+    let (u, board, _, prs) = usecase(
+        vec![t],
+        PrState::Open {
+            mergeable: true,
+            ci_green: true,
+        },
+    );
+    *prs.url.lock().unwrap() = Some("https://github.com/a/c/pull/77".into());
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.automerged, 1, "мерж состоялся");
+    assert_eq!(out.automerge_bounced, 0, "дозаполнение — не bounce");
+    assert_eq!(
+        prs.merges.lock().unwrap().as_slice(),
+        ["https://github.com/a/c/pull/77"],
+        "мерж по probe-верифицированному URL, не по пустой ячейке"
+    );
+    let log = board.log.lock().unwrap();
+    assert!(
+        log.iter()
+            .any(|l| l.contains("pr#77=https://github.com/a/c/pull/77")),
+        "canonical ячейка дозаполнена резолвом: {log:?}"
+    );
+    assert!(
+        !log.iter().any(|l| l.contains("status#77")),
+        "строка остаётся в Review: {log:?}"
+    );
+}
+
+#[tokio::test]
+async fn automerge_repairs_stale_pr_cell_from_probe() {
+    // #1519: протухшая ячейка (URL не резолвится) + живой PR по ветке —
+    // ячейка отремонтирована резолвом, мерж по нему же
+    let mut t = task(78, Status::UserReview);
+    carrier(&mut t, 78, true); // ячейка: https://github.com/a/c/pull/78
+    let (u, board, _, prs) = usecase(
+        vec![t],
+        PrState::Open {
+            mergeable: true,
+            ci_green: true,
+        },
+    );
+    *prs.url.lock().unwrap() = Some("https://github.com/a/c/pull/99".into());
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.automerged, 1);
+    assert_eq!(
+        prs.merges.lock().unwrap().as_slice(),
+        ["https://github.com/a/c/pull/99"],
+        "мерж по резолву, не по протухшей ячейке"
+    );
+    let log = board.log.lock().unwrap();
+    assert!(
+        log.iter()
+            .any(|l| l.contains("pr#78=https://github.com/a/c/pull/99")),
+        "протухшая ячейка отремонтирована: {log:?}"
+    );
+}
+
+#[tokio::test]
+async fn automerge_cell_fill_failure_bounces_without_merge() {
+    // #1519: отказ записи ячейки — bounce (канон UC-01), мержа нет
+    let mut t = task(79, Status::UserReview);
+    carrier(&mut t, 79, false);
+    let (u, board, _, prs) = usecase(
+        vec![t],
+        PrState::Open {
+            mergeable: true,
+            ci_green: true,
+        },
+    );
+    *prs.url.lock().unwrap() = Some("https://github.com/a/c/pull/79".into());
+    board
+        .set_pr_fails
+        .store(true, std::sync::atomic::Ordering::Relaxed); // мок-отказ записи canonical PR-ячейки
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.automerged, 0, "мержа без ячейки нет");
+    assert_eq!(out.automerge_bounced, 1, "отказ дозаполнения — bounce");
+    assert!(
+        prs.merges.lock().unwrap().is_empty(),
+        "merge-API не зовётся"
+    );
+    let log = board.log.lock().unwrap();
+    assert!(
+        log.iter().any(|l| l.contains("status#79=InProgress")),
+        "bounce в In Progress: {log:?}"
+    );
 }
 
 #[tokio::test]
@@ -1943,7 +2078,11 @@ async fn automerge_conflict_bounces_to_in_progress() {
             ci_green: true,
         },
     );
-    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.automerge_bounced, 1,
+        "bounce — наблюдаемый исход (#1519)"
+    );
     let log = board.log.lock().unwrap();
     assert!(
         log.iter().any(|l| l.contains("status#8=InProgress")),
@@ -1956,7 +2095,11 @@ async fn automerge_missing_pr_with_branch_bounces() {
     let mut t = task(6, Status::UserReview);
     carrier(&mut t, 6, false);
     let (u, board, _, _) = usecase(vec![t], PrState::Missing);
-    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.automerge_bounced, 1,
+        "bounce — наблюдаемый исход (#1519)"
+    );
     let log = board.log.lock().unwrap();
     assert!(
         log.iter().any(|l| l.contains("status#6=InProgress")),
@@ -2859,6 +3002,7 @@ async fn mixed_health_cup_counts_only_reachable_busy() {
             comments: Vec::default(),
             fields_fails: false,
             set_session_fails: false,
+            set_pr_fails: AtomicBool::new(false),
             clear_session_fails: AtomicBool::new(false),
             status_fails: AtomicBool::new(false),
         });
@@ -2866,6 +3010,7 @@ async fn mixed_health_cup_counts_only_reachable_busy() {
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         });
         TickUseCase {
             board: board.clone(),
@@ -2918,6 +3063,7 @@ async fn foreign_executor_failure_does_not_blind_project_guard() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -2926,6 +3072,7 @@ async fn foreign_executor_failure_does_not_blind_project_guard() {
         state: PrState::Missing,
         merges: Mutex::default(),
         probes: Mutex::default(),
+        url: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -3066,6 +3213,7 @@ async fn wakeup_held_when_cup_full() {
         }],
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -3093,6 +3241,7 @@ async fn wakeup_held_when_cup_full() {
         state: PrState::Missing,
         merges: Mutex::default(),
         probes: Mutex::default(),
+        url: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -3142,6 +3291,7 @@ async fn wakeup_delivery_occupies_cup_slot() {
         }],
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -3166,6 +3316,7 @@ async fn wakeup_delivery_occupies_cup_slot() {
         state: PrState::Missing,
         merges: Mutex::default(),
         probes: Mutex::default(),
+        url: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -3452,6 +3603,7 @@ async fn undelivered_comment_is_not_marked_seen() {
             log: Mutex::default(),
             fields_fails: false,
             set_session_fails: false,
+            set_pr_fails: AtomicBool::new(false),
             clear_session_fails: AtomicBool::new(false),
             status_fails: AtomicBool::new(false),
             comments: vec![CommentRef {
@@ -3486,6 +3638,7 @@ async fn undelivered_comment_is_not_marked_seen() {
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         });
         let uc = TickUseCase {
             board: board.clone(),
@@ -3524,6 +3677,7 @@ async fn undelivered_comment_is_not_marked_seen() {
         log: Mutex::default(),
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
         comments: vec![CommentRef {
@@ -3561,6 +3715,7 @@ async fn undelivered_comment_is_not_marked_seen() {
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         }),
         clock: Arc::new(FixedClock),
         state,
@@ -3594,6 +3749,7 @@ async fn multi_comment_tail_delivered_together() {
         log: Mutex::default(),
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
         comments: vec![
@@ -3643,6 +3799,7 @@ async fn multi_comment_tail_delivered_together() {
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         }),
         clock: Arc::new(FixedClock),
         state: state.clone(),
@@ -3686,6 +3843,7 @@ async fn inflight_comment_delivered_after_agent_reply() {
         log: Mutex::default(),
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
         comments: vec![CommentRef {
@@ -3712,6 +3870,7 @@ async fn inflight_comment_delivered_after_agent_reply() {
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         }),
         clock: Arc::new(FixedClock),
         state,
@@ -3760,6 +3919,7 @@ async fn busy_session_not_pinged_early() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -3784,6 +3944,7 @@ async fn busy_session_not_pinged_early() {
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         }),
         clock: Arc::new(BigClock),
         state: Arc::new(MemState(Mutex::default())),
@@ -3830,6 +3991,7 @@ async fn soft_ping_wakes_idle_session_without_transaction() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -3850,6 +4012,7 @@ async fn soft_ping_wakes_idle_session_without_transaction() {
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         }),
         clock: Arc::new(BigClock),
         state: Arc::new(MemState(Mutex::default())),
@@ -3899,6 +4062,7 @@ async fn soft_ping_held_when_cup_full_then_delivered_on_free_slot() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -3926,6 +4090,7 @@ async fn soft_ping_held_when_cup_full_then_delivered_on_free_slot() {
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         }),
         clock: Arc::new(BigClock),
         state: state.clone(),
@@ -3994,6 +4159,7 @@ async fn soft_ping_mass_stall_oversell_is_capped() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -4009,6 +4175,7 @@ async fn soft_ping_mass_stall_oversell_is_capped() {
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         }),
         clock: Arc::new(BigClock),
         state: Arc::new(MemState(Mutex::default())),
@@ -4061,6 +4228,7 @@ async fn restored_counters_from_previous_process_do_not_escalate_on_first_tick()
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -4086,6 +4254,7 @@ async fn restored_counters_from_previous_process_do_not_escalate_on_first_tick()
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         }),
         clock: Arc::new(BigClock),
         state: Arc::new(seeded),
@@ -4138,6 +4307,7 @@ async fn counters_earned_by_current_process_still_escalate() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -4161,6 +4331,7 @@ async fn counters_earned_by_current_process_still_escalate() {
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         }),
         clock: Arc::new(BigClock),
         state: Arc::new(seeded),
@@ -4219,6 +4390,7 @@ async fn escalation_deferred_when_liveness_probe_unreliable() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -4244,6 +4416,7 @@ async fn escalation_deferred_when_liveness_probe_unreliable() {
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         }),
         clock: Arc::new(BigClock),
         state: Arc::new(seeded),
@@ -4300,6 +4473,7 @@ async fn design_phantom_stall_escalates_and_frees_cup_slot() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -4323,6 +4497,7 @@ async fn design_phantom_stall_escalates_and_frees_cup_slot() {
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         }),
         clock: Arc::new(BigClock),
         state: Arc::new(seeded),
@@ -4371,6 +4546,7 @@ async fn probe_failure_records_outcome_without_escalation_or_counters() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -4388,6 +4564,7 @@ async fn probe_failure_records_outcome_without_escalation_or_counters() {
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         }),
         clock: Arc::new(BigClock),
         state: state.clone(),
@@ -4446,6 +4623,7 @@ async fn probe_failure_isolated_per_row_other_rows_processed() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -4468,6 +4646,7 @@ async fn probe_failure_isolated_per_row_other_rows_processed() {
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         }),
         clock: Arc::new(BigClock),
         state: Arc::new(MemState(Mutex::default())),
@@ -4525,6 +4704,7 @@ async fn probe_degradation_strip_reaches_threshold_signal() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -4545,6 +4725,7 @@ async fn probe_degradation_strip_reaches_threshold_signal() {
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         }),
         clock: Arc::new(BigClock),
         state: Arc::new(MemState(Mutex::default())),
@@ -4693,6 +4874,7 @@ async fn idle_sessions_do_not_hold_cup() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -4714,6 +4896,7 @@ async fn idle_sessions_do_not_hold_cup() {
         state: PrState::Missing,
         merges: Mutex::default(),
         probes: Mutex::default(),
+        url: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -4857,6 +5040,7 @@ async fn analyst_multiboard_no_oversell_within_tick() {
         comments: vec![],
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -4903,6 +5087,7 @@ macro_rules! sidecar_uc_with_cup {
                 comments: vec![],
                 fields_fails: false,
                 set_session_fails: false,
+                set_pr_fails: AtomicBool::new(false),
                 clear_session_fails: AtomicBool::new(false),
                 status_fails: AtomicBool::new(false),
             });
@@ -5594,6 +5779,7 @@ async fn analyst_verdictless_waves_do_not_burn_cycles() {
         comments: vec![],
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -5710,6 +5896,7 @@ async fn analyst_three_real_rounds_escalate_with_honest_message() {
             comments: vec![],
             fields_fails: false,
             set_session_fails: false,
+            set_pr_fails: AtomicBool::new(false),
             clear_session_fails: AtomicBool::new(false),
             status_fails: AtomicBool::new(false),
         })
@@ -5981,6 +6168,9 @@ impl TaskBoardRepo for FakeMultiBoard {
         Ok(())
     }
     async fn set_branch(&self, _: &str, _: u64, _: &uwuwu_domain::BranchName) -> UsecaseResult<()> {
+        Ok(())
+    }
+    async fn set_pr(&self, _: &str, _: u64, _: &str) -> UsecaseResult<()> {
         Ok(())
     }
     async fn set_board_cells(
@@ -6412,6 +6602,9 @@ impl TaskBoardRepo for CloseBoard {
     async fn set_branch(&self, _: &str, _: u64, _: &uwuwu_domain::BranchName) -> UsecaseResult<()> {
         Ok(())
     }
+    async fn set_pr(&self, _: &str, _: u64, _: &str) -> UsecaseResult<()> {
+        Ok(())
+    }
     async fn set_board_cells(
         &self,
         _b: &str,
@@ -6683,6 +6876,7 @@ fn tick_with_clock(
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -6691,6 +6885,7 @@ fn tick_with_clock(
         state: PrState::Missing,
         merges: Mutex::default(),
         probes: Mutex::default(),
+        url: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -6883,6 +7078,7 @@ async fn enrichment_failure_skips_row() {
         comments: Vec::default(),
         fields_fails: true,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -6894,6 +7090,7 @@ async fn enrichment_failure_skips_row() {
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         }),
         clock: Arc::new(FixedClock),
         state: Arc::new(MemState(Mutex::default())),
@@ -6924,6 +7121,7 @@ async fn orphan_deleted_when_set_session_fails() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: true,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -6935,6 +7133,7 @@ async fn orphan_deleted_when_set_session_fails() {
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         }),
         clock: Arc::new(FixedClock),
         state: Arc::new(MemState(Mutex::default())),
@@ -7278,6 +7477,7 @@ async fn round_stale_reset_gives_true_fresh_round_two_pings_before_escalation() 
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -7302,6 +7502,7 @@ async fn round_stale_reset_gives_true_fresh_round_two_pings_before_escalation() 
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         }),
         clock: Arc::new(SettableClock(now.clone())),
         state: Arc::new(seeded),
@@ -7737,6 +7938,7 @@ async fn cup_preempt_wave_does_not_escalate_victim_loop() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -7749,6 +7951,7 @@ async fn cup_preempt_wave_does_not_escalate_victim_loop() {
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         }),
         clock: clock.clone(),
         state: Arc::new(MemState(Mutex::default())),
@@ -8005,6 +8208,7 @@ async fn executor_failure_lands_in_outcome_by_name() {
         comments: Vec::default(),
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -8019,6 +8223,7 @@ async fn executor_failure_lands_in_outcome_by_name() {
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         }),
         clock: Arc::new(FixedClock),
         state: Arc::new(MemState(Mutex::default())),
@@ -8052,6 +8257,7 @@ async fn named_executor_failure_is_isolated_from_healthy_peer() {
             comments: Vec::default(),
             fields_fails: false,
             set_session_fails: false,
+            set_pr_fails: AtomicBool::new(false),
             clear_session_fails: AtomicBool::new(false),
             status_fails: AtomicBool::new(false),
         }),
@@ -8071,6 +8277,7 @@ async fn named_executor_failure_is_isolated_from_healthy_peer() {
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         }),
         clock: Arc::new(FixedClock),
         state: Arc::new(MemState(Mutex::default())),
@@ -8098,6 +8305,7 @@ fn multi_board_usecase(board: Arc<FakeMultiBoard>) -> TickUseCase {
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         }),
         clock: Arc::new(FixedClock),
         state: Arc::new(MemState(Mutex::default())),
@@ -8292,6 +8500,7 @@ fn lost_usecase(
         comments,
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -8300,6 +8509,7 @@ fn lost_usecase(
         state: PrState::Missing,
         merges: Mutex::default(),
         probes: Mutex::default(),
+        url: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -9086,6 +9296,7 @@ fn judge_usecase(
         comments: Vec::new(),
         fields_fails: false,
         set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
@@ -9118,6 +9329,7 @@ fn judge_usecase(
             state: PrState::Missing,
             merges: Mutex::default(),
             probes: Mutex::default(),
+            url: Mutex::default(),
         }),
         clock: Arc::new(FreezeClock),
         state: state.clone(),

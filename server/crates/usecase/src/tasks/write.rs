@@ -1119,6 +1119,9 @@ mod tests {
             }
             Ok(())
         }
+        async fn set_pr(&self, _b: &str, _n: u64, _pr_url: &str) -> UsecaseResult<()> {
+            Ok(())
+        }
         async fn post_comment(&self, n: u64, body: &str) -> UsecaseResult<String> {
             // фантом возвращает стандартный id без записи носителя:
             // нестандартный (пустой) ответ — отдельная fail-open ветка

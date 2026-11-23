@@ -62,6 +62,9 @@ impl TaskBoardRepo for StaleBoard {
     async fn set_branch(&self, _: &str, _: u64, _: &BranchName) -> UsecaseResult<()> {
         Ok(())
     }
+    async fn set_pr(&self, _: &str, _: u64, _: &str) -> UsecaseResult<()> {
+        Ok(())
+    }
     async fn set_board_cells(
         &self,
         _b: &str,

@@ -3,7 +3,7 @@
 use super::HTTP_TIMEOUT;
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use uwuwu_usecase::{PrGateway, PrState};
+use uwuwu_usecase::{PrGateway, PrProbe, PrState};
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 pub struct GhPrGateway {
@@ -142,7 +142,11 @@ impl GhPrGateway {
         }))
     }
 
-    async fn probe_by_branch(&self, repo: &str, branch: &str) -> UsecaseResult<Option<PrState>> {
+    async fn probe_by_branch(
+        &self,
+        repo: &str,
+        branch: &str,
+    ) -> UsecaseResult<Option<(u64, PrState)>> {
         let (owner, name) = repo
             .split_once('/')
             .ok_or_else(|| UsecaseError::Pr(format!("repo в форме owner/name: {repo}")))?;
@@ -161,7 +165,7 @@ impl GhPrGateway {
             .and_then(|l| l.first())
             .and_then(|p| p["number"].as_u64());
         match number {
-            Some(n) => self.probe_pull(owner, name, n).await,
+            Some(n) => Ok(self.probe_pull(owner, name, n).await?.map(|s| (n, s))),
             None => Ok(None),
         }
     }
@@ -174,20 +178,29 @@ impl PrGateway for GhPrGateway {
         project_repo: &str,
         pr_url: Option<&str>,
         branch: Option<&str>,
-    ) -> UsecaseResult<PrState> {
+    ) -> UsecaseResult<PrProbe> {
         if let Some(url) = pr_url.filter(|u| !u.is_empty()) {
             if let Some((owner, repo, number)) = parse_pr_url(url) {
                 if let Some(state) = self.probe_pull(&owner, &repo, number).await? {
-                    return Ok(state);
+                    return Ok(PrProbe {
+                        state,
+                        url: Some(url.to_string()),
+                    });
                 }
             }
         }
         if let Some(branch) = branch.filter(|b| !b.is_empty()) {
-            if let Some(state) = self.probe_by_branch(project_repo, branch).await? {
-                return Ok(state);
+            if let Some((number, state)) = self.probe_by_branch(project_repo, branch).await? {
+                return Ok(PrProbe {
+                    state,
+                    url: Some(format!("https://github.com/{project_repo}/pull/{number}")),
+                });
             }
         }
-        Ok(PrState::Missing)
+        Ok(PrProbe {
+            state: PrState::Missing,
+            url: None,
+        })
     }
 
     async fn merge(&self, project_repo: &str, pr_url: &str) -> UsecaseResult<()> {
