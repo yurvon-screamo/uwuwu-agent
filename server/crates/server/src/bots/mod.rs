@@ -39,7 +39,10 @@ pub(crate) struct BotLiveView {
 }
 
 impl BotLive {
-    /// Без уроков — регресс-гейт #1424: дока `Уроки` нет, поведение как прежде.
+    /// Без уроков — регресс-гейт #1424: дока `Уроки` нет, поведение как
+    /// прежде. Носитель тестовых ранов runner_tests — боевой путь всегда
+    /// с уроками (`with_lessons`).
+    #[cfg(test)]
     pub(crate) fn new(owner: Option<String>, greeting: Option<String>, manual: String) -> Self {
         Self::with_lessons(owner, greeting, manual, String::new())
     }
