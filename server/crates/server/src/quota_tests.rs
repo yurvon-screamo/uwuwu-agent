@@ -1,11 +1,13 @@
 //! Тесты пробы квоты (#1477): парс живой формы (фикстура — паттерн
 //! executor_form_pin), граница исчерпания, честный Err на дрейф формы,
-//! кэш (один зовн на окно, Err тоже кэшуется), off-конфиг.
+//! кэш (один вызов на окно кэша, Err тоже кэшуется, истечение TTL),
+//! таймаут HTTP-вызова, off-конфиг.
 
 use crate::config::QuotaCfg;
-use crate::quota::{parse_quota_response, CachedQuotaProbe};
+use crate::quota::{parse_quota_response, CachedQuotaProbe, ZaiQuotaProbe};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use uwuwu_usecase::{QuotaProbe, QuotaSnapshot, UsecaseError, UsecaseResult};
 
 fn fixture() -> serde_json::Value {
@@ -54,6 +56,21 @@ fn missing_5h_window_is_loud_err_not_silent_ok() {
     assert!(
         parse_quota_response(&json).is_err(),
         "5h-окно исчезло из ответа (дрейф формы / другой план) — Err, гейт отдаёт старую механику"
+    );
+}
+
+#[test]
+fn percentage_missing_or_non_numeric_is_err() {
+    let mut json = fixture();
+    json["data"]["limits"][1]["percentage"] = serde_json::json!(null);
+    assert!(
+        parse_quota_response(&json).is_err(),
+        "percentage отсутствует — Err: единственное поле гейта не маскируется «окно живо»"
+    );
+    json["data"]["limits"][1]["percentage"] = serde_json::json!("53");
+    assert!(
+        parse_quota_response(&json).is_err(),
+        "percentage строкой — Err (дрейф типа)"
     );
 }
 
@@ -121,6 +138,62 @@ async fn cache_caches_err_to_not_storm_the_gate() {
     );
 }
 
+/// Истечение TTL (#1477, ревью L3): именно на нём держится
+/// самовозобновление — кэш обязан отпускать снимок по старении.
+#[tokio::test]
+async fn cache_expires_after_ttl_and_refetches() {
+    let inner = Arc::new(CountingProbe {
+        calls: AtomicUsize::new(0),
+        result: Ok(snapshot(false)),
+    });
+    let cached = CachedQuotaProbe::with_ttl(inner.clone(), Duration::from_millis(30));
+    let _ = cached.probe().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let _ = cached.probe().await.unwrap();
+    assert_eq!(
+        inner.calls.load(Ordering::Relaxed),
+        2,
+        "снимок устарел — проба зовётся заново (спад процента виден гейту)"
+    );
+}
+
+/// Таймаут HTTP-вызова (ревью High-1): медленный эндпоинт — Err за
+/// ограниченное время, тик не висит (прецедент judge.rs).
+#[tokio::test]
+async fn slow_endpoint_times_out_as_err() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        // сервер-медлитель: принимает соединения, ответа не шлёт
+        for stream in listener.incoming() {
+            let mut s = match stream {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf);
+            std::thread::sleep(Duration::from_secs(5));
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}");
+        }
+    });
+    let probe = ZaiQuotaProbe::with_call_timeout(
+        format!("http://{addr}/api/monitor/usage/quota/limit"),
+        "key".into(),
+        Duration::from_millis(200),
+    );
+    let started = std::time::Instant::now();
+    let err = probe.probe().await.expect_err("медлитель — Err");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "проба вернулась по таймауту, а не по ответу сервера"
+    );
+    assert!(
+        err.to_string().contains("quota probe transport"),
+        "таймаут идёт по ветке Err (гейт отдаёт старую механику): {err}"
+    );
+}
+
 #[test]
 fn cfg_section_parses_with_default_path() {
     let cfg: QuotaCfg = serde_json::from_value(serde_json::json!({
@@ -151,4 +224,22 @@ async fn missing_key_env_is_loud_startup_err() {
         err.to_string().contains("UWUWU_QUOTA_TEST_MISSING_KEY"),
         "секция включена, ключа нет — стартовый отказ с именем env, не тихий off"
     );
+}
+
+/// Живой прогон собранного адаптера (ревью L9; клейм «команда → вывод»):
+/// #[ignore] — зовётся только вручную с env UWUWU_ZAI_API_KEY (ключ
+/// провайдера в CI нет). Неисчерпанного состояния достаточно: транспорт,
+/// auth, парс. Форма исчерпанного окна фиксируется при первом окне.
+#[tokio::test]
+#[ignore = "живой эндпоинт: требует env UWUWU_ZAI_API_KEY"]
+async fn live_probe_real_endpoint() {
+    let key = std::env::var("UWUWU_ZAI_API_KEY").expect("env UWUWU_ZAI_API_KEY");
+    let probe = ZaiQuotaProbe::new("https://api.z.ai/api/monitor/usage/quota/limit".into(), key);
+    let snap = probe.probe().await.expect("живой вызов — Ok");
+    println!(
+        "live snapshot: exhausted={} pct={:?} reset={:?}",
+        snap.exhausted, snap.window_pct, snap.reset_at_ms
+    );
+    assert!(!snap.exhausted, "текущее окно живо — проба не врёт");
+    assert!(snap.window_pct.is_some(), "процент от провайдера получен");
 }

@@ -4456,18 +4456,32 @@ async fn probe_failure_records_outcome_without_escalation_or_counters() {
 }
 
 /// Фейк пробы квоты (#1477): состояние переключается тестом — Exhausted /
-/// Ok / Err (сцена спада окна = самовозобновление).
-struct FakeQuota(std::sync::Mutex<FakeQuotaState>);
+/// Ok / Err (сцена спада окна = самовозобновление); счётчик вызовов
+/// пинит «проба — только на сталл-решении».
+struct FakeQuota {
+    state: std::sync::Mutex<FakeQuotaState>,
+    calls: std::sync::atomic::AtomicUsize,
+}
 #[derive(Clone, Copy)]
 enum FakeQuotaState {
     Exhausted,
     Ok,
     Err,
 }
+impl FakeQuota {
+    fn new(state: FakeQuotaState) -> Self {
+        Self {
+            state: std::sync::Mutex::new(state),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
 #[async_trait::async_trait]
 impl QuotaProbe for FakeQuota {
     async fn probe(&self) -> UsecaseResult<crate::ports::QuotaSnapshot> {
-        match *self.0.lock().unwrap() {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match *self.state.lock().unwrap() {
             FakeQuotaState::Exhausted => Ok(crate::ports::QuotaSnapshot {
                 exhausted: true,
                 window_pct: Some(100),
@@ -4556,9 +4570,8 @@ fn quota_stall_fixture(
 /// лимитная: ни пингов, ни эскалации, ни записи каунтеров раунда.
 #[tokio::test]
 async fn limit_exhaustion_holds_row_without_pings_escalation_or_counters() {
-    let (board, state, u) = quota_stall_fixture(Some(Arc::new(FakeQuota(std::sync::Mutex::new(
-        FakeQuotaState::Exhausted,
-    )))));
+    let (board, state, u) =
+        quota_stall_fixture(Some(Arc::new(FakeQuota::new(FakeQuotaState::Exhausted))));
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.limit_paused, 1, "лимитная пауза видна в outcome");
     assert_eq!(out.stall_flagged, 0, "эскалации по лимитной тишине нет");
@@ -4584,9 +4597,8 @@ async fn limit_exhaustion_holds_row_without_pings_escalation_or_counters() {
 /// исчерпан, эскалация как раньше.
 #[tokio::test]
 async fn quota_probe_ok_keeps_old_mechanics() {
-    let (board, _state, u) = quota_stall_fixture(Some(Arc::new(FakeQuota(std::sync::Mutex::new(
-        FakeQuotaState::Ok,
-    )))));
+    let (board, _state, u) =
+        quota_stall_fixture(Some(Arc::new(FakeQuota::new(FakeQuotaState::Ok))));
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.limit_paused, 0, "исчерпания нет — паузы нет");
     assert_eq!(
@@ -4608,9 +4620,8 @@ async fn quota_probe_ok_keeps_old_mechanics() {
 /// пробы не парализует эскалацию сталл-детекта.
 #[tokio::test]
 async fn quota_probe_err_keeps_old_mechanics() {
-    let (_board, _state, u) = quota_stall_fixture(Some(Arc::new(FakeQuota(
-        std::sync::Mutex::new(FakeQuotaState::Err),
-    ))));
+    let (_board, _state, u) =
+        quota_stall_fixture(Some(Arc::new(FakeQuota::new(FakeQuotaState::Err))));
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.limit_paused, 0, "Err пробы — паузы нет");
     assert_eq!(
@@ -4624,7 +4635,7 @@ async fn quota_probe_err_keeps_old_mechanics() {
 /// Гейт не пишет каунтеры — пост-резетный (пост-спадный) пинг не задержан.
 #[tokio::test]
 async fn limit_pause_releases_when_window_drains() {
-    let quota = Arc::new(FakeQuota(std::sync::Mutex::new(FakeQuotaState::Exhausted)));
+    let quota = Arc::new(FakeQuota::new(FakeQuotaState::Exhausted));
     let (_board, state, u) = quota_stall_fixture(Some(quota.clone()));
     // чистый state: раунд пингов не начат — пауза держит строку ДО первого
     // пинга, а не после исчерпания раунда
@@ -4642,7 +4653,7 @@ async fn limit_pause_releases_when_window_drains() {
         state.0.lock().unwrap().stalls.is_empty(),
         "пауза не пишет каунтеры — раунд не начат"
     );
-    *quota.0.lock().unwrap() = FakeQuotaState::Ok;
+    *quota.state.lock().unwrap() = FakeQuotaState::Ok;
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.limit_paused, 0, "спад процента — пауза не продлевается");
     assert_eq!(
@@ -4651,7 +4662,7 @@ async fn limit_pause_releases_when_window_drains() {
     );
 }
 
-/// Гейт стоит ДО судьи (#1477): лимитная тишина не сжигает вызов
+/// Гейт до судьи (#1477): лимитная тишина не сжигает вызов
 /// decision-модели на вердикт, который всё равно был бы эскалацией.
 #[tokio::test]
 async fn limit_pause_skips_judge_call() {
@@ -4703,9 +4714,7 @@ async fn limit_pause_skips_judge_call() {
         boot_ms: NOW - 50 * 60_000,
         judge: Some(judge.clone()),
         judge_cfg: Default::default(),
-        quota: Some(Arc::new(FakeQuota(std::sync::Mutex::new(
-            FakeQuotaState::Exhausted,
-        )))),
+        quota: Some(Arc::new(FakeQuota::new(FakeQuotaState::Exhausted))),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
@@ -4720,6 +4729,41 @@ async fn limit_pause_skips_judge_call() {
         judge.calls.lock().unwrap().is_empty(),
         "судья не видел лимитной тишины"
     );
+}
+
+/// Проба квоты — только на сталл-решении (#1477, ревью L3): свежая
+/// строка (тишина ниже гейтов) не дёргает пробу вовсе.
+#[tokio::test]
+async fn limit_probe_runs_only_at_stall_decision() {
+    let board = Arc::new(FakeBoard {
+        rows: std::sync::Mutex::new(vec![dev_task(64, "ses_dev_64")]),
+        log: Mutex::default(),
+        comments: Vec::default(),
+        fields_fails: false,
+        set_session_fails: false,
+        clear_session_fails: AtomicBool::new(false),
+        status_fails: AtomicBool::new(false),
+    });
+    let sess = Arc::new(FakeSessions {
+        // активность 5 минут назад — ниже мягкого гейта тишины
+        activity_ms: Some(95_000_000),
+        idle_reply: true,
+        ..FakeSessions::new()
+    });
+    let quota = Arc::new(FakeQuota::new(FakeQuotaState::Ok));
+    let u = quota_stall_usecase(
+        board,
+        sess,
+        Arc::new(MemState(Mutex::default())),
+        Some(quota.clone()),
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        quota.calls.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "свежая строка не доходит до сталл-решения — проба не зовётся"
+    );
+    assert_eq!(out.limit_paused, 0);
 }
 
 /// Изоляция построчная (#1281): массовый отказ пробы не глушит обработку

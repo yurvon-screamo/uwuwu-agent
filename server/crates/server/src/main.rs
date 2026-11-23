@@ -44,8 +44,15 @@ use uwuwu_usecase::{
     Clock as _, ExecutorLoudness, IncidentLoudness, TickOutcome, TickUseCase,
     EXECUTOR_UNAVAILABLE_COOLDOWN_MS, EXECUTOR_UNAVAILABLE_THRESHOLD,
     EXECUTOR_UNAVAILABLE_WINDOW_MS, INCIDENT_COOLDOWN_MS, INCIDENT_THRESHOLD, INCIDENT_WINDOW_MS,
-    LIMIT_SIGNAL_COOLDOWN_MS, LIMIT_SIGNAL_THRESHOLD,
 };
+
+/// Сигнал лимитного окна (#1477): пауза — норма контура, владельцу нужен
+/// факт начала окна. Threshold 1 — один строковый факт достаточен;
+/// cooldown ≥ самого длинного окна подписки (~5 ч) — один сигнал на окно
+/// (L2 ревью плана). Провайдер-специфичное окно живёт на уровне
+/// композиции, не в ядре (привязка не жёсткая — требование владельца).
+const LIMIT_SIGNAL_THRESHOLD: usize = 1;
+const LIMIT_SIGNAL_COOLDOWN_MS: u64 = 6 * 60 * 60_000;
 
 #[derive(Debug, thiserror::Error)]
 enum BootError {
@@ -1084,8 +1091,8 @@ async fn limit_pause_signal(
         return;
     }
     let text = format!(
-        "⏳ uwuwu: GLM 5h-лимит — {rows_paused} строк на лимитной паузе \
-         (сталл-детект держит без эскалаций, конвейер продолжит сам \
+        "⏳ uwuwu: лимит квоты провайдера моделей — {rows_paused} строк на лимитной \
+         паузе (сталл-детект держит без эскалаций, конвейер продолжит сам \
          после спада процента). Разбор — не нужен."
     );
     match notify {

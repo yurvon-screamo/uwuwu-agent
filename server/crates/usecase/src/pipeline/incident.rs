@@ -14,13 +14,6 @@ pub const INCIDENT_WINDOW_MS: u64 = 60 * 60_000;
 /// Анти-повтор: повторный сигнал не раньше, чем через cooldown.
 pub const INCIDENT_COOLDOWN_MS: u64 = 60 * 60_000;
 
-/// Лимитная пауза (#1477): сигнал о начале окна исчерпания подписки.
-/// Порог 1 — один строковый факт достаточен (пауза — не инцидент сбоя,
-/// а норма контура, владельцу нужен факт начала окна); cooldown ≥ самого
-/// длинного окна (~5 ч) — один сигнал на лимитное окно (L2 ревью плана).
-pub const LIMIT_SIGNAL_THRESHOLD: usize = 1;
-pub const LIMIT_SIGNAL_COOLDOWN_MS: u64 = 6 * 60 * 60_000;
-
 /// Счётчик скользящего окна сталл-эскалаций. Чистая политика без
 /// носителя и сети: вызывающий регистрирует эскалации и по true отправляет
 /// сигнал в свой канал.
@@ -120,33 +113,6 @@ mod tests {
         assert!(
             l.register(61 * MIN),
             "новая волна эскалаций после cooldown сигналит снова"
-        );
-    }
-
-    /// Лимитное окно (#1477): threshold 1 + cooldown ≥ окна — один сигнал
-    /// на окно исчерпания подписки (L2 ревью плана).
-    #[test]
-    fn limit_window_signals_once_per_cooldown() {
-        let mut l = IncidentLoudness::new(
-            LIMIT_SIGNAL_THRESHOLD,
-            INCIDENT_WINDOW_MS,
-            LIMIT_SIGNAL_COOLDOWN_MS,
-        );
-        assert!(
-            l.register(0),
-            "threshold 1: первая лимитная пауза окно сигналит"
-        );
-        assert!(
-            !l.register(2 * MIN),
-            "повторные паузы в окне сигнал не дублируют"
-        );
-        assert!(
-            !l.register(LIMIT_SIGNAL_COOLDOWN_MS - MIN),
-            "до истечения cooldown повторного сигнала нет"
-        );
-        assert!(
-            l.register(LIMIT_SIGNAL_COOLDOWN_MS + MIN),
-            "новое окно после cooldown сигналит снова (ночь за ночью)"
         );
     }
 }

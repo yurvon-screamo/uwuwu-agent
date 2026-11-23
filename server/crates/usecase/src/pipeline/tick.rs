@@ -560,6 +560,7 @@ impl TickUseCase {
             soft_pings = out.soft_pings,
             soft_pings_deferred = out.soft_pings_deferred,
             stall_flagged = out.stall_flagged,
+            limit_paused = out.limit_paused,
             review_flagged = out.review_flagged,
             session_lost_flagged = out.session_lost_flagged,
             observed = out.observed,
@@ -1360,11 +1361,19 @@ impl TickUseCase {
     ) -> Option<StallAct> {
         match quota.probe().await {
             Ok(snapshot) if snapshot.exhausted => {
-                tracing::warn!(
+                // пауза — норма контура (#1477): info, как stall.soft_pinged,
+                // а не уровень эскалации; атрибуты — значениями, не Debug
+                tracing::info!(
                     event = "stall.limit_paused",
                     number = task.number(),
-                    window_pct = ?snapshot.window_pct,
-                    reset_at = ?snapshot.reset_at_ms,
+                    window_pct = snapshot
+                        .window_pct
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "none".into()),
+                    reset_at_ms = snapshot
+                        .reset_at_ms
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "none".into()),
                     "Лимитная тишина: окно подписки исчерпано — строка на паузе \
                      без эскалации, продолжит после спада процента"
                 );

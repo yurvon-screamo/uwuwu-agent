@@ -48,10 +48,9 @@ pub use pipeline::{
     executor::ExecutorLoudness, executor::EXECUTOR_UNAVAILABLE_COOLDOWN_MS,
     executor::EXECUTOR_UNAVAILABLE_THRESHOLD, executor::EXECUTOR_UNAVAILABLE_WINDOW_MS,
     incident::IncidentLoudness, incident::INCIDENT_COOLDOWN_MS, incident::INCIDENT_THRESHOLD,
-    incident::INCIDENT_WINDOW_MS, incident::LIMIT_SIGNAL_COOLDOWN_MS,
-    incident::LIMIT_SIGNAL_THRESHOLD, AnalystBoard, AnalystReviewUseCase, AnalystUseCase,
-    BoardPlan, DreamerUseCase, Mode, TickOutcome, TickPlan, TickUseCase,
-    ANALYST_REVIEW_WAVE_MARKER, ANALYST_WAVE_MARKER, STAGE_PROMPTS,
+    incident::INCIDENT_WINDOW_MS, AnalystBoard, AnalystReviewUseCase, AnalystUseCase, BoardPlan,
+    DreamerUseCase, Mode, TickOutcome, TickPlan, TickUseCase, ANALYST_REVIEW_WAVE_MARKER,
+    ANALYST_WAVE_MARKER, STAGE_PROMPTS,
 };
 pub use ports::{
     AgentSessionGateway, AppendDocOutcome, AssistantReply, Clock, CommentRef, CronRow,
