@@ -63,6 +63,19 @@ pub struct FireOutcome {
     pub session: String,
 }
 
+/// Факт файра с якорем первой встречи (#1517): max(last_fire, anchor).
+/// Once живёт на голом last_fire — его None доживает до планового
+/// момента (якорь в формулу Once не входит).
+fn effective_last(row: &CronRow, once_kind: bool) -> Option<u64> {
+    if once_kind {
+        return row.last_fire_ms;
+    }
+    match (row.last_fire_ms, row.anchor_ms) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 impl CronUseCase {
     /// Каноническая сборка: анти-повтор сигналов — IncidentLoudness
     /// «порог 1 + cooldown» (один ТГ на эпизод сбоя крона, ин-мемори —
@@ -149,7 +162,19 @@ impl CronUseCase {
                     row.run = Some(run);
                 }
             }
-            let due = master.schedule.is_due(now, row.last_fire_ms);
+            // Якорь первой встречи (#1517): факта файра и якоря нет —
+            // якорим и не файрим этот тик. None не файрит: крон ждёт
+            // ближайшей плановой минуты — потеря state (битый файл/сброс
+            // тома) больше не даёт масс-догона прошлых минут. Once —
+            // исключение: его None должен дожить до планового момента.
+            let once_kind = matches!(master.schedule.kind(), ScheduleKind::Once { .. });
+            let effective = effective_last(&row, once_kind);
+            if effective.is_none() && !once_kind {
+                row.anchor_ms = Some(now);
+                self.state.set_cron_row(&name, row);
+                continue;
+            }
+            let due = master.schedule.is_due(now, effective);
             // 3. Пропущенный файр: due держится, файр отложен > порога.
             if due {
                 match row.deferred_since_ms {
@@ -761,6 +786,34 @@ mod tests {
         }
     }
 
+    /// Настраиваемые часы: якорная семантика требует движения времени
+    /// между тиками (якорь → плановая минута).
+    struct SettableClock(std::sync::Mutex<u64>);
+    impl SettableClock {
+        fn at(ms: u64) -> Arc<Self> {
+            Arc::new(Self(std::sync::Mutex::new(ms)))
+        }
+        fn set(&self, ms: u64) {
+            *self.0.lock().unwrap() = ms;
+        }
+    }
+    impl Clock for SettableClock {
+        fn utc_minute(&self) -> uwuwu_domain::UtcMinute {
+            uwuwu_domain::UtcMinute {
+                minute_of_day: 100,
+                weekday: 3,
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    /// Epoch ms из UTC-полей (минуты JST-окна считаются тестами явно).
+    fn epoch_ms(day: i64, hour: i64, minute: i64, extra_ms: i64) -> u64 {
+        ((day * 86400 + hour * 3600 + minute * 60) * 1000 + extra_ms) as u64
+    }
+
     /// Фиксированные часы (тишина/отложение: пороги от произвольного now).
     struct FixedClock(u64);
     impl Clock for FixedClock {
@@ -931,13 +984,19 @@ mod tests {
         // файр откладывается, state-запись файра (last_fire/run-трек) НЕ
         // пишется — ран не считается состоявшимся, расписание перезапустит
         // файр. Метка отложения пишется — детект пропуска файра (#1480).
+        // Первая встреча (#1517): тик якорит, файр — на следующем интервале.
         let wiki = master_wiki();
         let sessions = Arc::new(MemSessions {
             busy: 1.into(),
             spawned: Mutex::default(),
             fail_create: false.into(),
         });
-        let (u, state) = cron_uc(wiki, sessions.clone(), 1);
+        let clock = SettableClock::at(epoch_ms(20780, 1, 0, 0));
+        let state = MemCronState::new();
+        let u = cron_uc_clock(wiki, sessions.clone(), 1, clock.clone(), state.clone());
+        let fired = u.tick().await.unwrap();
+        assert!(fired.is_empty(), "первая встреча — якорь, не файр");
+        clock.set(epoch_ms(20780, 1, 5, 0)); // +5 минут — интервал 5m due
         let fired = u.tick().await.unwrap();
         assert!(fired.is_empty(), "файр при полном капе отложен");
         assert!(sessions.spawned.lock().unwrap().is_empty(), "спавна нет");
@@ -977,7 +1036,8 @@ mod tests {
     async fn cron_fire_partial_degradation_fires() {
         // Смешанное здоровье (ревью #1450): один исполнитель отказной,
         // живой отвечает — файр идёт, busy считается по живому union.
-        // Спавн уходит живому исполнителю (дефолт роутера).
+        // Спавн уходит живому исполнителю (дефолт роутера). Первая
+        // встреча якорится (#1517), файр — на следующем интервале.
         let wiki = master_wiki();
         let live_mem = Arc::new(MemSessions {
             busy: 0.into(),
@@ -986,6 +1046,8 @@ mod tests {
         });
         let live: crate::router::Gateway = live_mem.clone();
         let failing: crate::router::Gateway = Arc::new(FailingSessions);
+        let clock = SettableClock::at(epoch_ms(20780, 1, 0, 0));
+        let state = MemCronState::new();
         let u = CronUseCase::new(
             wiki,
             Arc::new(SessionRouter::new(
@@ -994,13 +1056,15 @@ mod tests {
                 vec![("redmi".into(), failing)],
                 std::collections::HashMap::new(),
             )),
-            Arc::new(TicksClock),
+            clock.clone(),
             Arc::new(crate::spawn_models::SpawnModels::canonical()),
             std::collections::HashMap::from([("uwuwu".to_string(), "/tmp/checkout".to_string())]),
             7,
-            MemCronState::new(),
+            state.clone(),
             None,
         );
+        u.tick().await.unwrap();
+        clock.set(epoch_ms(20780, 1, 5, 0)); // +5 минут — интервал 5m due
         let fired = u.tick().await.unwrap();
         assert_eq!(
             fired.len(),
@@ -1017,22 +1081,136 @@ mod tests {
     #[tokio::test]
     async fn cron_fire_passes_with_free_slot() {
         // Свободный слот: файр состоявшийся — state-запись (last_fire +
-        // run-трек с сессией) + спавн.
+        // run-трек с сессией) + спавн. Первая встреча якорится (#1517),
+        // файр — на следующем интервале.
         let wiki = master_wiki();
         let sessions = Arc::new(MemSessions {
             busy: 0.into(),
             spawned: Mutex::default(),
             fail_create: false.into(),
         });
-        let (u, state) = cron_uc(wiki, sessions.clone(), 1);
+        let clock = SettableClock::at(epoch_ms(20780, 1, 0, 0));
+        let state = MemCronState::new();
+        let u = cron_uc_clock(wiki, sessions.clone(), 1, clock.clone(), state.clone());
+        let fired = u.tick().await.unwrap();
+        assert!(fired.is_empty(), "первая встреча — якорь");
+        clock.set(epoch_ms(20780, 1, 5, 0)); // +5 минут — интервал 5m due
         let fired = u.tick().await.unwrap();
         assert_eq!(fired.len(), 1, "файр при свободном слоте");
         assert_eq!(sessions.spawned.lock().unwrap().len(), 1);
         let row = state.row("тест");
-        assert_eq!(row.last_fire_ms, Some(2000), "факт файра в state");
+        assert_eq!(
+            row.last_fire_ms,
+            Some(epoch_ms(20780, 1, 5, 0)),
+            "факт файра в state"
+        );
         let track = row.run.expect("run-трек заведён");
         assert_eq!(track.session, "ses_1", "сессия рана в учёте");
         assert!(state.saves() > 0, "save был");
+    }
+
+    /// CronUseCase поверх настраиваемых часов и готового state (тесты
+    /// якорной семантики: потеря state, первая встреча крона).
+    fn cron_uc_clock(
+        wiki: Arc<MemWiki>,
+        sessions: Arc<MemSessions>,
+        cup: usize,
+        clock: Arc<SettableClock>,
+        state: Arc<MemCronState>,
+    ) -> CronUseCase {
+        CronUseCase::new(
+            wiki,
+            Arc::new(SessionRouter::uniform(sessions)),
+            clock,
+            Arc::new(crate::spawn_models::SpawnModels::canonical()),
+            std::collections::HashMap::from([("uwuwu".to_string(), "/tmp/checkout".to_string())]),
+            cup,
+            state,
+            None,
+        )
+    }
+
+    fn two_cron_masters() -> Arc<MemWiki> {
+        Arc::new(MemWiki(Mutex::new(std::collections::HashMap::from([
+            (
+                "cron/sentry/README".into(),
+                "---\ntitle: Sentry\nschedule: 0 5 * * *\nproject: uwuwu\n---\nТело".into(),
+            ),
+            (
+                "cron/qa/README".into(),
+                "---\ntitle: QA\nschedule: 30 1 * * *\nproject: uwuwu\n---\nТело".into(),
+            ),
+        ]))))
+    }
+
+    #[tokio::test]
+    async fn state_loss_anchors_instead_of_mass_catchup() {
+        // R2 (#1517, Д2): потеря state (битый файл/сброс) — пустой сторе.
+        // Ни одного файра: кроны якорятся и ждут своих плановых минут.
+        // Прежнее поведение — масс-догон прошлых плановых минут разом
+        // (всплеск пяти кронов 23.11 05:37–05:41).
+        let sessions = Arc::new(MemSessions {
+            busy: 0.into(),
+            spawned: Mutex::default(),
+            fail_create: false.into(),
+        });
+        let clock = SettableClock::at(epoch_ms(20780, 1, 0, 0)); // 23.11 10:00 JST
+        let lost = MemCronState::new();
+        let u = cron_uc_clock(
+            two_cron_masters(),
+            sessions.clone(),
+            7,
+            clock.clone(),
+            lost.clone(),
+        );
+        let fired = u.tick().await.unwrap();
+        assert!(fired.is_empty(), "потеря state — догона нет");
+        assert!(sessions.spawned.lock().unwrap().is_empty(), "спавнов нет");
+        assert_eq!(lost.row("sentry").last_fire_ms, None, "факта файра нет");
+        assert_eq!(
+            lost.row("sentry").anchor_ms,
+            Some(epoch_ms(20780, 1, 0, 0)),
+            "якорь первой встречи записан"
+        );
+        assert_eq!(lost.row("qa").anchor_ms, Some(epoch_ms(20780, 1, 0, 0)));
+    }
+
+    #[tokio::test]
+    async fn new_cron_anchors_then_fires_next_scheduled_minute() {
+        // R3 (#1517): крон без факта (первая встреча после деплоя/завода)
+        // не файрит «сразу» — якорится и файрит ближайшую плановую минуту.
+        let wiki = Arc::new(MemWiki(Mutex::new(std::collections::HashMap::from([(
+            "cron/daily/README".into(),
+            "---\ntitle: Daily\nschedule: 01:30\nproject: uwuwu\n---\nТело".into(),
+        )]))));
+        let sessions = Arc::new(MemSessions {
+            busy: 0.into(),
+            spawned: Mutex::default(),
+            fail_create: false.into(),
+        });
+        let clock = SettableClock::at(epoch_ms(20780, 5, 0, 0)); // 23.11 14:00 JST
+        let state = MemCronState::new();
+        let u = cron_uc_clock(wiki, sessions.clone(), 7, clock.clone(), state.clone());
+        let fired = u.tick().await.unwrap();
+        assert!(fired.is_empty(), "первая встреча — файра нет");
+        assert!(
+            sessions.spawned.lock().unwrap().is_empty(),
+            "спавна при якоре нет"
+        );
+        assert_eq!(state.row("daily").anchor_ms, Some(epoch_ms(20780, 5, 0, 0)));
+        // Ближайшая плановая минута: 24.11 01:31 JST — файр
+        clock.set(epoch_ms(20780, 16, 31, 0));
+        let fired = u.tick().await.unwrap();
+        assert_eq!(fired.len(), 1, "файр в плановую минуту после якоря");
+        assert_eq!(
+            state.row("daily").last_fire_ms,
+            Some(epoch_ms(20780, 16, 31, 0))
+        );
+        assert_eq!(
+            state.row("daily").anchor_ms,
+            Some(epoch_ms(20780, 5, 0, 0)),
+            "якорь остаётся, погашен фактом"
+        );
     }
 
     /// CronUseCase поверх готового роутера и фиксированных часов (тесты
@@ -1071,6 +1249,7 @@ mod tests {
     fn run_track(session: &str, fired_ms: u64, last_fire_ms: u64) -> CronRow {
         CronRow {
             last_fire_ms: Some(last_fire_ms),
+            anchor_ms: None,
             deferred_since_ms: None,
             run: Some(CronRunTrack {
                 session: session.into(),
@@ -1230,8 +1409,9 @@ mod tests {
 
     #[tokio::test]
     async fn missed_fire_over_threshold_signals() {
-        // Пропущенный файр: due держится (CUP полон), отложение > 6 ч →
-        // отказ; метка эпизода сбрасывается, state-запись файра не пишется.
+        // Пропущенный файр: крон с якорем (факт первой встречи) держится
+        // due (CUP полон), отложение > 6 ч → отказ; метка эпизода
+        // сбрасывается, state-запись файра не пишется.
         let now = 1_000_000_000_000u64;
         let sessions: crate::router::Gateway = Arc::new(MemSessions {
             busy: 1.into(),
@@ -1243,6 +1423,7 @@ mod tests {
             "тест",
             CronRow {
                 last_fire_ms: None,
+                anchor_ms: Some(now - RUN_SILENCE_MS - 60_000),
                 deferred_since_ms: Some(now - RUN_SILENCE_MS - 1),
                 run: None,
                 fails: 0,
@@ -1265,6 +1446,17 @@ mod tests {
             fail_create: false.into(),
         });
         let (u, state) = cron_uc_router(SessionRouter::uniform(sessions), now, 1);
+        // Якорь 5 минут назад: интервал 5m — файр due, CUP полон держит.
+        state.set_cron_row(
+            "тест",
+            CronRow {
+                last_fire_ms: None,
+                anchor_ms: Some(now - 300_000),
+                deferred_since_ms: None,
+                run: None,
+                fails: 0,
+            },
+        );
         let fired = u.tick().await.unwrap();
         assert!(fired.is_empty());
         let row = state.row("тест");
@@ -1289,9 +1481,13 @@ mod tests {
             spawned: Mutex::default(),
             fail_create: true.into(),
         });
-        let (mut u, state) = cron_uc(wiki, sessions, 7);
+        let clock = SettableClock::at(epoch_ms(20780, 1, 0, 0));
+        let state = MemCronState::new();
+        let mut u = cron_uc_clock(wiki, sessions, 7, clock.clone(), state.clone());
         let tg = Arc::new(MemTg(Mutex::default()));
         u.notify = Some((tg.clone() as Arc<dyn crate::bots::TelegramGateway>, 42));
+        u.tick().await.unwrap(); // якорь первой встречи (#1517)
+        clock.set(epoch_ms(20780, 1, 5, 0)); // +5 минут — оба due, спавны падают
         let fired = u.tick().await.unwrap();
         assert!(fired.is_empty(), "спавны не удались");
         assert_eq!(
@@ -1312,7 +1508,11 @@ mod tests {
             spawned: Mutex::default(),
             fail_create: true.into(),
         });
-        let (u, state) = cron_uc(wiki, sessions, 7);
+        let clock = SettableClock::at(epoch_ms(20780, 1, 0, 0));
+        let state = MemCronState::new();
+        let u = cron_uc_clock(wiki, sessions, 7, clock.clone(), state.clone());
+        u.tick().await.unwrap(); // якорь первой встречи (#1517)
+        clock.set(epoch_ms(20780, 1, 5, 0)); // +5 минут — файр, спавн падает
         let fired = u.tick().await.unwrap();
         assert!(fired.is_empty());
         assert_eq!(state.row("тест").fails, 1, "отказ посчитан без ТГ");
@@ -1337,12 +1537,15 @@ mod tests {
             spawned: Mutex::default(),
             fail_create: false.into(),
         });
-        let (u, _state) = cron_uc(wiki, sessions.clone(), 1);
+        let clock = SettableClock::at(epoch_ms(20780, 1, 0, 0));
+        let state = MemCronState::new();
+        let u = cron_uc_clock(wiki, sessions.clone(), 1, clock.clone(), state);
+        u.tick().await.unwrap(); // первая встреча — якорь обоих (#1517)
+        clock.set(epoch_ms(20780, 1, 5, 0)); // +5 минут — оба due
         let fired = u.tick().await.unwrap();
         assert_eq!(fired.len(), 1, "второй файр отложен занятым первым слотом");
         assert_eq!(sessions.spawned.lock().unwrap().len(), 1);
     }
-
     #[tokio::test]
     async fn spawn_failure_isolates_single_cron() {
         // Ревью #1214: сбой спавна одного мастера не обрывает тик —
@@ -1363,7 +1566,11 @@ mod tests {
             spawned: Mutex::default(),
             fail_create: true.into(),
         });
-        let (u, state) = cron_uc(wiki, sessions, 7);
+        let clock = SettableClock::at(epoch_ms(20780, 1, 0, 0));
+        let state = MemCronState::new();
+        let u = cron_uc_clock(wiki, sessions, 7, clock.clone(), state.clone());
+        u.tick().await.unwrap(); // первая встреча — якорь обоих (#1517)
+        clock.set(epoch_ms(20780, 1, 5, 0)); // +5 минут — оба due
         let fired = u.tick().await.unwrap();
         assert!(fired.is_empty(), "спавны не удались — outcome нет");
         for name in ["тест-1", "тест-2"] {

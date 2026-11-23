@@ -1695,6 +1695,7 @@ async fn cron_list_renders_machine_accounting() {
         "тест",
         uwuwu_usecase::CronRow {
             last_fire_ms: Some(((20771u64 * 86400) + 17 * 3600 + 29 * 60) * 1000),
+            anchor_ms: None,
             deferred_since_ms: None,
             run: None,
             fails: 2,
