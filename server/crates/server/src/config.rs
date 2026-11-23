@@ -341,6 +341,13 @@ impl Config {
         if self.policy.cup == 0 {
             return Err(ConfigError::Validation("cup = 0 (конвейер стоит)".into()));
         }
+        // [quota] (#1477): пустой base_url — включённая секция, которая
+        // молча не работает (Err пробы на каждый гейт) — громче на старте
+        if let Some(q) = &self.quota {
+            if q.base_url.trim().is_empty() {
+                return Err(ConfigError::Validation("[quota] base_url пуст".into()));
+            }
+        }
         // env-gc (#1431): снос обязан успевать до архивации строки в
         // холодный ящик — иначе env уходит в сироты вне досягаемости
         // доски. sweep_days = 0 (клин выключен) — инвариант не применим.

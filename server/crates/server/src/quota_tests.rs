@@ -243,3 +243,23 @@ async fn live_probe_real_endpoint() {
     assert!(!snap.exhausted, "текущее окно живо — проба не врёт");
     assert!(snap.window_pct.is_some(), "процент от провайдера получен");
 }
+
+#[tokio::test]
+async fn empty_key_env_is_loud_startup_err() {
+    // ветка пустого значения (ревью L5): filter непустых — Err, не тихий off
+    let cfg = QuotaCfg {
+        base_url: "https://api.z.ai".into(),
+        path: "/api/monitor/usage/quota/limit".into(),
+        api_key_env: "UWUWU_QUOTA_TEST_EMPTY_KEY".into(),
+    };
+    std::env::set_var("UWUWU_QUOTA_TEST_EMPTY_KEY", "   ");
+    let err = match crate::quota::quota_probe_from_cfg(&cfg) {
+        Err(e) => e,
+        Ok(_) => panic!("пустое значение ключа — старт должен отказать"),
+    };
+    std::env::remove_var("UWUWU_QUOTA_TEST_EMPTY_KEY");
+    assert!(
+        err.to_string().contains("пуст"),
+        "пустое значение ключа — тот же громкий старт-отказ: {err}"
+    );
+}

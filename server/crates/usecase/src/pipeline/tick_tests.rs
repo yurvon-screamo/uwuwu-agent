@@ -4662,8 +4662,11 @@ async fn limit_pause_releases_when_window_drains() {
     );
 }
 
-/// Гейт до судьи (#1477): лимитная тишина не сжигает вызов
-/// decision-модели на вердикт, который всё равно был бы эскалацией.
+/// Гейт до судьи (#1477, ревью раунд 2 Common-1): сцена с ВКЛЮЧЁННЫМ
+/// контуром судьи (enabled=true, hard-гейт тишины, judge-стадия) —
+/// лимитная тишина не сжигает вызов decision-модели; контроль — та же
+/// сцена с живым окном: судья вызывается. Перенос гейта ниже судьи
+/// краснит первый прогон (вызов случится на лимитной тишине).
 #[tokio::test]
 async fn limit_pause_skips_judge_call() {
     const NOW: u64 = 100_000_000;
@@ -4693,13 +4696,16 @@ async fn limit_pause_skips_judge_call() {
         clear_session_fails: AtomicBool::new(false),
         status_fails: AtomicBool::new(false),
     });
+    // тишина 70 мин, ход не завершён: hard-гейт (60 мин) звучит,
+    // In Progress — judge-стадия: старая механика зовёт судью
     let sess = Arc::new(FakeSessions {
         activity_ms: Some(NOW - 70 * 60_000),
         idle_reply: false,
         ..FakeSessions::new()
     });
-    let judge = FakeJudge::says(uwuwu_domain::JudgeStatus::NeedsAttention);
+    let judge = FakeJudge::says(uwuwu_domain::JudgeStatus::InProgress);
     let state = Arc::new(MemState(Mutex::default()));
+    let quota = Arc::new(FakeQuota::new(FakeQuotaState::Exhausted));
     let u = TickUseCase {
         board: board.clone(),
         sessions: Arc::new(SessionRouter::uniform(sess)),
@@ -4713,8 +4719,11 @@ async fn limit_pause_skips_judge_call() {
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: NOW - 50 * 60_000,
         judge: Some(judge.clone()),
-        judge_cfg: Default::default(),
-        quota: Some(Arc::new(FakeQuota::new(FakeQuotaState::Exhausted))),
+        judge_cfg: JudgeCfg {
+            enabled: true,
+            ..JudgeCfg::default()
+        },
+        quota: Some(quota.clone()),
     };
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
@@ -4723,11 +4732,21 @@ async fn limit_pause_skips_judge_call() {
     );
     assert_eq!(
         out.judge_calls, 0,
-        "гейт до судьи: вызов decision-модели не сжигается"
+        "гейт до судьи: на лимитной тишине decision-модель не вызывается"
     );
     assert!(
         judge.calls.lock().unwrap().is_empty(),
         "судья не видел лимитной тишины"
+    );
+    // Контроль порядка: окно живо (проба Ok) — тот же сталл-тик зовёт
+    // судью; красный при переносе гейта ниже судьи, если лимитная сцена
+    // тоже начинала звать судью (заявленное свойство различает порядок)
+    *quota.state.lock().unwrap() = FakeQuotaState::Ok;
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.limit_paused, 0, "окно живо — паузы нет");
+    assert_eq!(
+        out.judge_calls, 1,
+        "контроль: при живом окне судья вызывается на том же тике"
     );
 }
 
