@@ -39,11 +39,10 @@ pub(crate) struct BotLiveView {
 }
 
 impl BotLive {
-    /// Без уроков — регресс-гейт #1424: дока `Уроки` нет, поведение как
-    /// прежде. Прод-код строит бота через `with_lessons` (уроки читаются
-    /// из дока); конструктор без уроков живёт только в тестах —
-    /// cfg(test) вместо dead_code в bin-таргете (CI -D warnings,
-    /// #1506-ремедиация латентно-красного мастера).
+    /// Без уроков — регресс-гейт #1424: дока `Уроки` нет, поведение как прежде.
+    /// Тест-конструктор: бинтаргет его не зовёт (сноски уроков идут через
+    /// with_lessons) — вне cfg(test) он dead_code и красит CI с -D warnings
+    /// (мастер-долг #1424/#494, вскрыт ручным прогоном CI на PR #496).
     #[cfg(test)]
     pub(crate) fn new(owner: Option<String>, greeting: Option<String>, manual: String) -> Self {
         Self::with_lessons(owner, greeting, manual, String::new())

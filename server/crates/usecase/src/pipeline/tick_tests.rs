@@ -8087,6 +8087,182 @@ async fn named_executor_failure_is_isolated_from_healthy_peer() {
     );
 }
 
+// ===== Изоляция фейла чтения доски (#1503) =====
+
+/// Тик-юзкейс на мультиборде (#1503): per-board read_board (fail_reads).
+fn multi_board_usecase(board: Arc<FakeMultiBoard>) -> TickUseCase {
+    TickUseCase {
+        board,
+        sessions: Arc::new(SessionRouter::uniform(Arc::new(FakeSessions::new()))),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+            probes: Mutex::default(),
+        }),
+        clock: Arc::new(FixedClock),
+        state: Arc::new(MemState(Mutex::default())),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        boot_ms: 0,
+        judge: None,
+        judge_cfg: Default::default(),
+    }
+}
+
+/// План на две доски (#1503): B1 — здоровая, B2 — падающая в сценарии.
+fn two_board_plan(mode: Mode) -> TickPlan {
+    TickPlan {
+        mode,
+        policy: SpawnPolicy {
+            cup: 7,
+            peak: PeakWindow {
+                enabled: false,
+                start_min: 0,
+                end_min: 0,
+            },
+        },
+        boards: vec![
+            BoardPlan {
+                project: "p1".into(),
+                board: "B1".into(),
+                repo: "a/c".into(),
+                checkout: "/tmp/c1".into(),
+                env_root: "/tmp/env".into(),
+            },
+            BoardPlan {
+                project: "p2".into(),
+                board: "B2".into(),
+                repo: "a/c".into(),
+                checkout: "/tmp/c2".into(),
+                env_root: "/tmp/env".into(),
+            },
+        ],
+    }
+}
+
+/// 502 одной доски не роняет тик (#1503): строки здоровой доски прочитаны
+/// и обработаны (decide по прочитанным), упавшая — warn-событие
+/// (board.read_failed) + имя в outcome; ретрай — следующий тик (poll 180 c).
+#[tokio::test]
+async fn one_board_read_failure_does_not_kill_tick() {
+    let board = Arc::new(FakeMultiBoard {
+        boards: vec![
+            (
+                "B1".into(),
+                vec![task(1, Status::Todo), task(2, Status::Todo)],
+            ),
+            ("B2".into(), vec![task(3, Status::Todo)]),
+        ],
+        fail_reads: vec!["B2".into()],
+        log: Mutex::default(),
+    });
+    let u = multi_board_usecase(board);
+    let out = u
+        .run(&two_board_plan(Mode::Live))
+        .await
+        .expect("фейл одной доски не роняет тик");
+    assert_eq!(
+        out.boards_failed,
+        vec!["B2".to_string()],
+        "фейл доски — имя в outcome"
+    );
+    assert_eq!(
+        out.rows_total, 2,
+        "строки здоровой доски посчитаны, упавшей — нет"
+    );
+    assert_eq!(out.observed, 2, "decide прошёл по строкам здоровой доски");
+}
+
+/// Полный отказ чтения — громкий tick.failed сохраняется (#1503):
+/// изоляция не маскирует полный отказ «успешным» пустым тиком.
+#[tokio::test]
+async fn total_board_read_failure_is_loud_tick_failed() {
+    let board = Arc::new(FakeMultiBoard {
+        boards: vec![
+            ("B1".into(), vec![task(1, Status::Todo)]),
+            ("B2".into(), vec![task(2, Status::Todo)]),
+        ],
+        fail_reads: vec!["B1".into(), "B2".into()],
+        log: Mutex::default(),
+    });
+    let u = multi_board_usecase(board);
+    let err = u
+        .run(&two_board_plan(Mode::Live))
+        .await
+        .expect_err("полный отказ — Err наверх (tick.failed)");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("B1") && msg.contains("B2"),
+        "ошибка называет все упавшие доски: {msg}"
+    );
+}
+
+/// Форма инцидента 22–23.11 (наблюдение прода): падает несколько досок,
+/// но не все — тик выживает, outcome называет весь состав упавших
+/// (#1503; ~50% запросов — 502, состав падающих досок меняется между
+/// прогонами).
+#[tokio::test]
+async fn several_boards_read_failure_tick_survives_with_full_composition() {
+    let board = Arc::new(FakeMultiBoard {
+        boards: vec![
+            (
+                "B1".into(),
+                vec![task(1, Status::Todo), task(2, Status::Todo)],
+            ),
+            ("B2".into(), vec![task(3, Status::Todo)]),
+            (
+                "B3".into(),
+                vec![task(4, Status::Todo), task(5, Status::Todo)],
+            ),
+        ],
+        fail_reads: vec!["B2".into(), "B3".into()],
+        log: Mutex::default(),
+    });
+    let mut plan = two_board_plan(Mode::Live);
+    plan.boards.push(BoardPlan {
+        project: "p3".into(),
+        board: "B3".into(),
+        repo: "a/c".into(),
+        checkout: "/tmp/c3".into(),
+        env_root: "/tmp/env".into(),
+    });
+    let u = multi_board_usecase(board);
+    let out = u
+        .run(&plan)
+        .await
+        .expect("падение двух досок из трёх не роняет тик");
+    assert_eq!(
+        out.boards_failed,
+        vec!["B2".to_string(), "B3".to_string()],
+        "outcome называет весь состав упавших, порядок — порядок плана"
+    );
+    assert_eq!(out.rows_total, 2, "посчитаны строки только здоровой доски");
+    assert_eq!(out.observed, 2, "decide прошёл по строкам здоровой доски");
+}
+
+/// Пустой план — легитимный пустой тик (#1503): гвард полного отказа
+/// не триггерит на плане без досок («boards.is_empty()» сам по себе —
+/// не отказ).
+#[tokio::test]
+async fn empty_plan_is_legit_empty_tick_without_guard_trip() {
+    let board = Arc::new(FakeMultiBoard {
+        boards: vec![],
+        fail_reads: vec![],
+        log: Mutex::default(),
+    });
+    let mut plan = two_board_plan(Mode::Live);
+    plan.boards.clear();
+    let u = multi_board_usecase(board);
+    let out = u
+        .run(&plan)
+        .await
+        .expect("план без досок — Ok, гвард не срабатывает");
+    assert!(
+        out.boards_failed.is_empty(),
+        "упавших досок нет — изоляции здесь нет и быть не должно"
+    );
+    assert_eq!(out.rows_total, 0, "строк нет");
+}
+
 // ===== Dead-session доставка: маршрутизация потери сессии (#1288) =====
 
 /// Часы с большим now_ms — тишина сессии ≥ сталл-порогов (сталл-ветка T5).

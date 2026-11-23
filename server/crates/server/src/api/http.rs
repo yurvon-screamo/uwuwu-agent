@@ -98,4 +98,43 @@ mod tests {
         assert_eq!(json["service"], "uwuwu-server");
         assert_eq!(json["mode"], "observe");
     }
+
+    /// /health несёт состав упавших досок из TickOutcome (#1503, fork А):
+    /// сериализация outcome наружу — автоматическая, пин от «потеряли
+    /// поле при правке структуры».
+    #[tokio::test]
+    async fn health_carries_boards_failed_from_tick_outcome() {
+        let tick = TickOutcome {
+            boards_failed: vec!["Задачи origa".to_string()],
+            rows_total: 5,
+            ..TickOutcome::default()
+        };
+        let state = Arc::new(AppState {
+            bearer: Arc::new("s3cret".into()),
+            mode: "observe",
+            tick: Arc::new(std::sync::RwLock::new(tick)),
+        });
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("authorization", "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["tick"]["boards_failed"],
+            serde_json::json!(["Задачи origa"]),
+            "fork А: /health несёт состав упавших досок"
+        );
+        assert_eq!(
+            json["tick"]["rows_total"], 5,
+            "outcome сериализуется целиком"
+        );
+    }
 }
