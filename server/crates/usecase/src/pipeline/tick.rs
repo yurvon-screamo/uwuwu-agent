@@ -133,6 +133,11 @@ pub struct TickOutcome {
     /// громкость (порог/анти-повтор) и ТГ-сигнал — tick_loop (main.rs);
     /// тик несёт факт поимённо, дубль-детекции нет.
     pub executors_failed: Vec<String>,
+    /// Доски плана, чей снапшот не прочитан (транспортный отказ после
+    /// ретрая #1330): строки пропущены до следующего тика (#1503).
+    /// Полный отказ (не прочитана ни одна) — Err наверх (tick.failed),
+    /// сюда не попадает.
+    pub boards_failed: Vec<String>,
 }
 
 /// Гейт CUP на доставке мягкого пинга (#1313): пинг — запуск хода,
@@ -334,9 +339,35 @@ impl TickUseCase {
         // считаются по всем доскам до обхода, не per-board
         let mut boards = Vec::with_capacity(plan.boards.len());
         for board in &plan.boards {
-            let tasks = self.board.read_board(&board.board).await?;
+            // Изоляция фейла доски (#1503): 502 одной доски не роняет тик —
+            // её строки пропускаются до следующего прохода (poll 180 c),
+            // транспортный ретрай нижнего уровня уже стоит (#1330).
+            // Прецеденты деградации: enrich.failed (#1163), analyst
+            // board_failed; полный отказ — гард ниже.
+            let tasks = match self.board.read_board(&board.board).await {
+                Ok(tasks) => tasks,
+                Err(e) => {
+                    out.boards_failed.push(board.board.clone());
+                    tracing::warn!(
+                        event = "board.read_failed",
+                        board = %board.board,
+                        error = %e,
+                        "Снапшот доски не прочитан — строки пропущены до следующего тика"
+                    );
+                    continue;
+                }
+            };
             out.rows_total += tasks.len();
             boards.push((board, tasks));
+        }
+        // Гвард полного отказа (#1503): не прочитана ни одна доска плана —
+        // tick.failed как раньше, изоляция не маскирует отказ «успешным»
+        // пустым тиком. Ошибка называет весь состав упавших досок.
+        if boards.is_empty() && !plan.boards.is_empty() {
+            return Err(UsecaseError::Board(format!(
+                "все доски плана не прочитаны: {}",
+                out.boards_failed.join(", ")
+            )));
         }
         // Enrichment: snapshot Projects v2 не несёт глобальных полей issue
         // (сессии/ветка/PR) — строки действующих стадий дотягиваем одним
