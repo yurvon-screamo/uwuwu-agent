@@ -368,12 +368,15 @@ pub struct CronRunTrack {
 
 /// Машинный учёт крона (state.json, секция `crons`, #1480 — снос журнала):
 /// last_fire — факт файра (источник is_due вместо журнальной строки),
+/// anchor — якорь первой встречи (None не файрит: крон без факта ждёт
+/// ближайшей плановой минуты, #1517 — класс масс-догона на потере state),
 /// run — незавершённый ран (детект тишины), deferred_since — файр due,
 /// но отложен (детект пропуска), fails — счётчик отказов (канон ADR-103
 /// «счётчики отказов — в state»).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CronRow {
     pub last_fire_ms: Option<u64>,
+    pub anchor_ms: Option<u64>,
     pub deferred_since_ms: Option<u64>,
     pub run: Option<CronRunTrack>,
     pub fails: u32,
