@@ -1003,4 +1003,28 @@ env_root = "/tmp/env"
             );
         }
     }
+
+    /// [quota] (#1477, ревью раунд 3 L5): validate видит секцию — пустой
+    /// base_url это громкий отказ старта, а не молчаливо неработающая
+    /// включённая секция (Err пробы на каждый гейт).
+    #[test]
+    fn quota_validate_rejects_empty_base_url() {
+        let good = format!(
+            "{}\n[quota]\nbase_url = \"https://api.z.ai\"\npath = \"/api/monitor/usage/quota/limit\"\napi_key_env = \"UWUWU_ZAI_API_KEY\"\n",
+            example()
+        );
+        let cfg = toml::from_str::<Config>(&good).expect("toml парсится");
+        cfg.validate().expect("непустой base_url валиден");
+
+        let bad = format!(
+            "{}\n[quota]\nbase_url = \"\"\npath = \"/api/monitor/usage/quota/limit\"\napi_key_env = \"UWUWU_ZAI_API_KEY\"\n",
+            example()
+        );
+        let cfg = toml::from_str::<Config>(&bad).expect("toml парсится");
+        let err = cfg.validate().expect_err("пустой base_url должен падать");
+        assert!(
+            err.to_string().contains("base_url"),
+            "validate называет причину: {err}"
+        );
+    }
 }
