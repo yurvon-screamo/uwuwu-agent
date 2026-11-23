@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use uwuwu_domain::{Status, Task};
+use uwuwu_domain::{PrUrl, Status, Task};
 use uwuwu_usecase::{CommentRef, Goal, GoalsRepo, IssueView, TaskBoardRepo};
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
@@ -967,13 +967,9 @@ impl TaskBoardRepo for GitHubHub {
         Ok(())
     }
 
-    async fn set_pr(&self, board: &str, number: u64, pr_url: &str) -> UsecaseResult<()> {
-        // валидация формы — как у task_edit (write.rs) и mockhub-а: мусор
-        // в canonical ячейку не попадает (ревью Low #1519)
-        let url = uwuwu_domain::PrUrl::parse(pr_url)
-            .ok_or_else(|| UsecaseError::Board(format!("PR «{pr_url}» is not an http(s) URL")))?;
+    async fn set_pr(&self, board: &str, number: u64, pr_url: &PrUrl) -> UsecaseResult<()> {
         self.fields
-            .store(number, &[("PR", Some(url.as_str().to_string()))])
+            .store(number, &[("PR", Some(pr_url.as_str().to_string()))])
             .await?;
         self.invalidate_snapshot(board);
         Ok(())

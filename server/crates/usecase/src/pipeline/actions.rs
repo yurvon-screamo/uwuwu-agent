@@ -654,24 +654,17 @@ impl TickUseCase {
             // и ждёт владельца (инцидент #1151/#1162: ложный bounce
             // вручную смерженной строки недопустим). Резолв известен —
             // canonical ячейка дозаполняется, Done-кандидат не остаётся
-            // без ссылки на артефакт.
+            // без ссылки на артефакт; отказ записи — warn без bounce
+            // (строка и так ждёт владельца, мержа не будет).
             PrState::Merged => {
                 if let Some(url) = probe.url.as_deref() {
-                    if task.pr().map(|u| u.as_str()) != Some(url) {
-                        match self.board.set_pr(&board.board, task.number(), url).await {
-                            Ok(()) => tracing::info!(
-                                event = "automerge.pr_cell_filled",
-                                number = task.number(),
-                                url,
-                                "Automerge: PR уже смержен — canonical ячейка дозаполнена резолвом (#1519)"
-                            ),
-                            Err(e) => tracing::warn!(
-                                event = "automerge.pr_cell_fill_failed",
-                                number = task.number(),
-                                error = %e,
-                                "Automerge: дозаполнение смерженного PR не удалось — строка ждёт владельца в Review"
-                            ),
-                        }
+                    if let Err(e) = self.fill_cell_if_differs(board, task, url).await {
+                        tracing::warn!(
+                            event = "automerge.pr_cell_fill_failed",
+                            number = task.number(),
+                            error = %e,
+                            "Automerge: дозаполнение смерженного PR не удалось — строка ждёт владельца в Review"
+                        );
                     }
                 }
                 tracing::info!(
@@ -733,20 +726,10 @@ impl TickUseCase {
                         return Ok(false);
                     }
                 };
-                if task.pr().map(|u| u.as_str()) != Some(url) {
-                    match self.board.set_pr(&board.board, task.number(), url).await {
-                        Ok(()) => tracing::info!(
-                            event = "automerge.pr_cell_filled",
-                            number = task.number(),
-                            url,
-                            "Automerge: canonical PR-ячейка дозаполнена резолвом (#1519)"
-                        ),
-                        Err(e) => {
-                            self.bounce(board, task, &format!("PR cell fill failed: {e}"), out)
-                                .await?;
-                            return Ok(false);
-                        }
-                    }
+                if let Err(e) = self.fill_cell_if_differs(board, task, url).await {
+                    self.bounce(board, task, &format!("PR cell fill failed: {e}"), out)
+                        .await?;
+                    return Ok(false);
                 }
                 match self.prs.merge(&board.repo, url).await {
                     Ok(()) => {
@@ -769,8 +752,37 @@ impl TickUseCase {
         }
     }
 
+    /// Дозаполнение canonical PR-ячейки, если она расходится с резолвом
+    /// (#1519; ревью Low раунда 3 — единая точка «записать, если
+    /// расходится» вместо дубля в Merged/Open ветках): живая ячейка не
+    /// переписывается, запись логируется. Err — отказ записи, решение
+    /// (bounce/warn) за вызывающей веткой. URL резолва парсится здесь
+    /// один раз — дальше в порты идёт доменный \`&PrUrl\`.
+    async fn fill_cell_if_differs(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        url: &str,
+    ) -> UsecaseResult<()> {
+        if task.pr().map(|u| u.as_str()) == Some(url) {
+            return Ok(());
+        }
+        let parsed = uwuwu_domain::PrUrl::parse(url)
+            .ok_or_else(|| UsecaseError::Board(format!("PR «{url}» is not an http(s) URL")))?;
+        self.board
+            .set_pr(&board.board, task.number(), &parsed)
+            .await?;
+        tracing::info!(
+            event = "automerge.pr_cell_filled",
+            number = task.number(),
+            url,
+            "Automerge: canonical PR-ячейка дозаполнена резолвом (#1519)"
+        );
+        Ok(())
+    }
+
     /// Bounce в In Progress с комментом-причиной (канон UC-01) — единая
-    /// точка инкремента \`automerge_bounced\` (#1519, ревью Low: правило
+    /// точка инкремента `automerge_bounced` (#1519, ревью Low: правило
     /// «семантический bounce = +1» живёт здесь, не на сайтах вызова).
     async fn bounce(
         &self,

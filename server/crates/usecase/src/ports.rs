@@ -5,7 +5,7 @@
 use crate::error::UsecaseResult;
 use async_trait::async_trait;
 use uwuwu_domain::{
-    Agent, AgentSlot, BranchName, ModelRef, Slot, Status, Task, TaskFields, UtcMinute,
+    Agent, AgentSlot, BranchName, ModelRef, PrUrl, Slot, Status, Task, TaskFields, UtcMinute,
 };
 
 /// Мутатор fm-ячеек задачи (branch/pr/priority/…).
@@ -42,11 +42,13 @@ pub trait TaskBoardRepo: Send + Sync {
 
     /// Запись canonical PR-ячейки (issue-field «PR») — дозаполнение
     /// демоном из резолва пробы (#1519): пустая/протухшая ячейка при
-    /// живом PR по ветке заполняется до мержа. Путь task_edit
-    /// (IssueFieldStore, мимо снапшота — «Ветка/PR/Тип живут мимо
-    /// снапшота»); read-your-writes не требуется — enrichment прочтёт
-    /// носитель следующим проходом.
-    async fn set_pr(&self, board: &str, number: u64, pr_url: &str) -> UsecaseResult<()>;
+    /// живом PR по ветке заполняется до мержа. Доменный тип — парс
+    /// валидной формы один раз у вызывающего (ревью Low раунда 3:
+    /// три копии PrUrl::parse в имплементациях — не контракт). Путь
+    /// task_edit (IssueFieldStore, мимо снапшота — «Ветка/PR/Тип живут
+    /// мимо снапшота»); read-your-writes не требуется — enrichment
+    /// прочтёт носитель следующим проходом.
+    async fn set_pr(&self, board: &str, number: u64, pr_url: &PrUrl) -> UsecaseResult<()>;
 
     /// Запись нестатусных ячеек снапшота доски (Приоритет, Automerge):
     /// поле + кеш-гигиена одним методом (паттерн set_session/set_branch).

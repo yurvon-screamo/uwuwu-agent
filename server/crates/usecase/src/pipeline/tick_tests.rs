@@ -81,11 +81,14 @@ impl TaskBoardRepo for FakeBoard {
             .push(format!("branch#{n}={}", branch.as_str()));
         Ok(())
     }
-    async fn set_pr(&self, _b: &str, n: u64, pr_url: &str) -> UsecaseResult<()> {
+    async fn set_pr(&self, _b: &str, n: u64, pr_url: &uwuwu_domain::PrUrl) -> UsecaseResult<()> {
         if self.set_pr_fails.load(Ordering::Relaxed) {
             return Err(UsecaseError::Session("set_pr недоступен (мок)".into()));
         }
-        self.log.lock().unwrap().push(format!("pr#{n}={pr_url}"));
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("pr#{n}={}", pr_url.as_str()));
         Ok(())
     }
     async fn set_board_cells(
@@ -1614,7 +1617,7 @@ impl TaskBoardRepo for CommentBoard {
     async fn set_branch(&self, _b: &str, _n: u64, _branch: &BranchName) -> UsecaseResult<()> {
         Ok(())
     }
-    async fn set_pr(&self, _b: &str, _n: u64, _pr_url: &str) -> UsecaseResult<()> {
+    async fn set_pr(&self, _b: &str, _n: u64, _pr_url: &uwuwu_domain::PrUrl) -> UsecaseResult<()> {
         Ok(())
     }
     async fn clear_session(&self, _b: &str, _n: u64, _slot: Slot) -> UsecaseResult<()> {
@@ -1964,6 +1967,63 @@ async fn automerge_merged_via_branch_is_noop_and_fills_cell() {
     assert!(
         !log.iter().any(|l| l.contains("status#82")),
         "строка остаётся в Review: {log:?}"
+    );
+}
+
+#[tokio::test]
+async fn automerge_merged_cell_fill_failure_warns_without_bounce() {
+    // #1519, ревью Low раунда 3: отказ записи на Merged — warn без bounce
+    // (строка и так ждёт владельца в Review, мержа не будет)
+    let mut t = task(85, Status::UserReview);
+    carrier(&mut t, 85, false);
+    let (u, board, _, prs) = usecase(vec![t], PrState::Merged);
+    *prs.url.lock().unwrap() = Some("https://github.com/a/c/pull/99".into());
+    board
+        .set_pr_fails
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.automerged, 0);
+    assert_eq!(
+        out.automerge_bounced, 0,
+        "отказ записи на Merged — не bounce: строка ждёт владельца"
+    );
+    assert!(prs.merges.lock().unwrap().is_empty());
+    let log = board.log.lock().unwrap();
+    assert!(
+        log.iter().all(|l| !l.contains("pr#85=")),
+        "ячейка не записана (отказ носителя): {log:?}"
+    );
+    assert!(
+        !log.iter().any(|l| l.contains("status#85")),
+        "строка остаётся в Review: {log:?}"
+    );
+}
+
+#[tokio::test]
+async fn automerge_green_open_without_url_bounces_defensively() {
+    // #1519, ревью Low (остаток раунда 1): defensive-ветка «зелёный Open
+    // без цели» — bounce с честным текстом, счётчик стоит; на текущих
+    // гейтвеях недостижима (Open = вердикт о конкретном PR) — фиксация
+    // контракта на случай будущего шлюза
+    let mut t = task(86, Status::UserReview);
+    carrier(&mut t, 86, false);
+    let (u, board, _, prs) = usecase(
+        vec![t],
+        PrState::Open {
+            mergeable: true,
+            ci_green: true,
+        },
+    );
+    // url: None — вердикт Open без конкретного PR
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.automerged, 0);
+    assert_eq!(out.automerge_bounced, 1, "без цели вердикта мержа нет");
+    assert!(prs.merges.lock().unwrap().is_empty());
+    let log = board.log.lock().unwrap();
+    assert!(
+        log.iter()
+            .any(|l| l.contains("comment#86=") && l.contains("probe resolved no PR URL")),
+        "bounce-коммент называет настоящую причину: {log:?}"
     );
 }
 
@@ -6289,7 +6349,7 @@ impl TaskBoardRepo for FakeMultiBoard {
     async fn set_branch(&self, _: &str, _: u64, _: &uwuwu_domain::BranchName) -> UsecaseResult<()> {
         Ok(())
     }
-    async fn set_pr(&self, _: &str, _: u64, _: &str) -> UsecaseResult<()> {
+    async fn set_pr(&self, _: &str, _: u64, _: &uwuwu_domain::PrUrl) -> UsecaseResult<()> {
         Ok(())
     }
     async fn set_board_cells(
@@ -6721,7 +6781,7 @@ impl TaskBoardRepo for CloseBoard {
     async fn set_branch(&self, _: &str, _: u64, _: &uwuwu_domain::BranchName) -> UsecaseResult<()> {
         Ok(())
     }
-    async fn set_pr(&self, _: &str, _: u64, _: &str) -> UsecaseResult<()> {
+    async fn set_pr(&self, _: &str, _: u64, _: &uwuwu_domain::PrUrl) -> UsecaseResult<()> {
         Ok(())
     }
     async fn set_board_cells(

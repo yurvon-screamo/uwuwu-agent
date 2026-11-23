@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use uwuwu_domain::{Priority, Slot, Status, Task, TaskFields};
+use uwuwu_domain::{PrUrl, Priority, Slot, Status, Task, TaskFields};
 use uwuwu_usecase::{AppendDocOutcome, UsecaseError, UsecaseResult};
 use uwuwu_usecase::{CommentRef, IssueView};
 use uwuwu_usecase::{IssueFieldStore, TaskBoardRepo};
@@ -372,15 +372,13 @@ impl TaskBoardRepo for MemoryHub {
         })
     }
 
-    async fn set_pr(&self, _board: &str, number: u64, pr_url: &str) -> UsecaseResult<()> {
-        let url = uwuwu_domain::PrUrl::parse(pr_url)
-            .ok_or_else(|| UsecaseError::Board(format!("PR «{pr_url}» is not an http(s) URL")))?;
+    async fn set_pr(&self, _board: &str, number: u64, pr_url: &PrUrl) -> UsecaseResult<()> {
         self.with_state(|state| {
             state
                 .fields
                 .entry(number)
                 .or_default()
-                .open_pr(url)
+                .open_pr(pr_url.clone())
                 .map_err(|e| UsecaseError::Board(e.to_string()))?;
             Ok(())
         })
@@ -1002,6 +1000,35 @@ mod tests {
     use crate::clock::SystemClock;
     use std::sync::Arc;
     use uwuwu_usecase::{TaskPatch, TaskWriteUseCase, TaskWriter};
+
+    /// MemoryHub::set_pr без HTTP (#1519, ревью Low раунда 3): инвариант
+    /// «PR требует ветку» (open_pr) и запись canonical ячейки — пин шва
+    /// носителя рядом с соседними set_branch/set_board_cells.
+    #[tokio::test]
+    async fn set_pr_requires_branch_then_sets_cell() {
+        let hub = MemoryHub::with_seeds(vec![SeedRow {
+            board: Some("Задачи uwuwu".into()),
+            number: 31,
+            status: Status::ReviewResult,
+            priority: Priority::Empty,
+            days_closed: 0,
+        }]);
+        let url = uwuwu_domain::PrUrl::parse("https://github.com/a/c/pull/31").unwrap();
+        // без ветки — инвариант open_pr: PR без ветки не существует
+        assert!(
+            hub.set_pr("Задачи uwuwu", 31, &url).await.is_err(),
+            "PR без ветки отвергается"
+        );
+        let branch = uwuwu_domain::BranchName::parse("work/task-31").unwrap();
+        hub.set_branch("Задачи uwuwu", 31, &branch).await.unwrap();
+        hub.set_pr("Задачи uwuwu", 31, &url).await.unwrap();
+        let fields = hub.issue_fields(31).await.unwrap();
+        assert_eq!(
+            fields.pr().map(|u| u.as_str()),
+            Some("https://github.com/a/c/pull/31"),
+            "canonical ячейка несёт резолв"
+        );
+    }
 
     /// Расщеплённая строка стенда (#1403, инцидент foilcap #1332): issue
     /// закрыт мимо task_close — close_issue_ext молча блокирует transition

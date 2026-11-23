@@ -209,7 +209,7 @@ impl TaskBoardRepo for RowsBoard {
     ) -> UsecaseResult<()> {
         Ok(())
     }
-    async fn set_pr(&self, _b: &str, _n: u64, _pr_url: &str) -> UsecaseResult<()> {
+    async fn set_pr(&self, _b: &str, _n: u64, _pr_url: &uwuwu_domain::PrUrl) -> UsecaseResult<()> {
         Ok(())
     }
     async fn clear_session(&self, _b: &str, _n: u64, _s: Slot) -> UsecaseResult<()> {

@@ -1119,7 +1119,12 @@ mod tests {
             }
             Ok(())
         }
-        async fn set_pr(&self, _b: &str, _n: u64, _pr_url: &str) -> UsecaseResult<()> {
+        async fn set_pr(
+            &self,
+            _b: &str,
+            _n: u64,
+            _pr_url: &uwuwu_domain::PrUrl,
+        ) -> UsecaseResult<()> {
             Ok(())
         }
         async fn post_comment(&self, n: u64, body: &str) -> UsecaseResult<String> {
