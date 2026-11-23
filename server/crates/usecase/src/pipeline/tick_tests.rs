@@ -5820,7 +5820,7 @@ async fn reviewer_spawns_for_review_analys_wave() {
     ));
     assert_eq!(
         specs[0].model,
-        uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.3#high")
+        uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.3-flash#high")
             .unwrap()
             .model,
         "модель ревьювера аналитики — карта сервера (#1154)"
@@ -7371,12 +7371,12 @@ async fn review_and_test_spawns_carry_map_models_per_agent() {
         (
             Status::ReviewPlan,
             "plan-reviewer",
-            "zai-coding-plan/glm-5.3#high",
+            "zai-coding-plan/glm-5.4#high",
         ),
         (
             Status::ReviewResult,
             "code-quality-reviewer",
-            "zai-coding-plan/glm-5.3#high",
+            "zai-coding-plan/glm-5.4#high",
         ),
         (
             Status::Testing,

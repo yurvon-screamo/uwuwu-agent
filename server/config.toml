@@ -33,12 +33,12 @@ url = "https://opencode.uwuwu.net"
 [executor.models]
 default = "zai-coding-plan/glm-5.3-flash#high"
 developer = "zai-coding-plan/glm-5.3-flash#high"
-plan-reviewer = "zai-coding-plan/glm-5.3#high"
-code-quality-reviewer = "zai-coding-plan/glm-5.3#high"
+plan-reviewer = "zai-coding-plan/glm-5.4#high"
+code-quality-reviewer = "zai-coding-plan/glm-5.4#high"
 tester = "zai-coding-plan/glm-5.3-flash#high"
-test-reviewer = "zai-coding-plan/glm-5.3#high"
+test-reviewer = "zai-coding-plan/glm-5.4#high"
 analyst = "zai-coding-plan/glm-5.3-flash#high"
-analyst-reviewer = "zai-coding-plan/glm-5.3#high"
+analyst-reviewer = "zai-coding-plan/glm-5.3-flash#high"
 dreamer = "zai-coding-plan/glm-5.3-flash#high"
 
 [policy]

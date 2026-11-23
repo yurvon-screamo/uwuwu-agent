@@ -336,7 +336,7 @@ async fn analyst_review_spawn_carries_model_from_server_map() {
     assert_model(
         sessions.spec_of(),
         "ревью-спавн аналитики",
-        "zai-coding-plan/glm-5.3#high",
+        "zai-coding-plan/glm-5.3-flash#high",
     );
 }
 
