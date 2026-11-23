@@ -8196,6 +8196,73 @@ async fn total_board_read_failure_is_loud_tick_failed() {
     );
 }
 
+/// Форма инцидента 22–23.11 (наблюдение прода): падает несколько досок,
+/// но не все — тик выживает, outcome называет весь состав упавших
+/// (#1503; ~50% запросов — 502, состав падающих досок меняется между
+/// прогонами).
+#[tokio::test]
+async fn several_boards_read_failure_tick_survives_with_full_composition() {
+    let board = Arc::new(FakeMultiBoard {
+        boards: vec![
+            (
+                "B1".into(),
+                vec![task(1, Status::Todo), task(2, Status::Todo)],
+            ),
+            ("B2".into(), vec![task(3, Status::Todo)]),
+            (
+                "B3".into(),
+                vec![task(4, Status::Todo), task(5, Status::Todo)],
+            ),
+        ],
+        fail_reads: vec!["B2".into(), "B3".into()],
+        log: Mutex::default(),
+    });
+    let mut plan = two_board_plan(Mode::Live);
+    plan.boards.push(BoardPlan {
+        project: "p3".into(),
+        board: "B3".into(),
+        repo: "a/c".into(),
+        checkout: "/tmp/c3".into(),
+        env_root: "/tmp/env".into(),
+    });
+    let u = multi_board_usecase(board);
+    let out = u
+        .run(&plan)
+        .await
+        .expect("падение двух досок из трёх не роняет тик");
+    assert_eq!(
+        out.boards_failed,
+        vec!["B2".to_string(), "B3".to_string()],
+        "outcome называет весь состав упавших, порядок — порядок плана"
+    );
+    assert_eq!(out.rows_total, 2, "посчитаны строки только здоровой доски");
+    assert_eq!(out.observed, 2, "decide прошёл по строкам здоровой доски");
+}
+
+/// Пустой план — легитимный пустой тик (#1503): гвард полного отказа
+/// не триггерит на плане без досок («boards.is_empty()» сам по себе —
+/// не отказ).
+#[tokio::test]
+async fn empty_plan_is_legit_empty_tick_without_guard_trip() {
+    let board = Arc::new(FakeMultiBoard {
+        boards: vec![],
+        fail_reads: vec![],
+        log: Mutex::default(),
+    });
+    let mut plan = two_board_plan(Mode::Live);
+    plan.boards.clear();
+    let u = multi_board_usecase(board);
+    let out = u
+        .run(&plan)
+        .await
+        .expect("план без досок — Ok, гвард не срабатывает");
+    assert!(
+        out.boards_failed.is_empty(),
+        "упавших досок нет — изоляции здесь нет и быть не должно"
+    );
+    assert_eq!(out.rows_total, 0, "строк нет");
+}
+
 // ===== Dead-session доставка: маршрутизация потери сессии (#1288) =====
 
 /// Часы с большим now_ms — тишина сессии ≥ сталл-порогов (сталл-ветка T5).
