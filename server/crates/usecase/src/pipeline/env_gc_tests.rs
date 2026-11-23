@@ -522,3 +522,29 @@ async fn status_probe_failure_skips_the_row_fail_safe() {
     assert_eq!(out.dispatched, 0);
     assert!(gw.commands.lock().unwrap().is_empty());
 }
+
+// ---------- пин контракта «шаблон ↔ args» (#1506) ----------
+
+/// Реальные шаблоны slash-команд. include_str! мёртвым путём —
+/// compile-error, не тишина (канон mock_route_coverage).
+const TASK_ENV_GC_TEMPLATE: &str = include_str!("../../../../../commands/task-env-gc.md");
+const TASK_ENV_TEMPLATE: &str = include_str!("../../../../../commands/task-env.md");
+
+/// Фейк выше эмулирует резолв opencode ($1 = первый токен args, слово
+/// sweep литерально в шаблоне), но ни один юнит не читает реальный файл
+/// шаблона — его правка мимо args-контракта (слово выкинуто, $1
+/// подвинут) прошла бы все тесты и сломала канал вердиктов тем же
+/// классом бага #1506, только на стороне шаблона.
+#[test]
+fn sweep_template_carries_subcommand_literally_and_row_via_arg1() {
+    // shell-блок: скрипт получает sweep литералом, row — $1 (первый
+    // токен args); контракт единый с эталонным task-env (args = row)
+    assert!(
+        TASK_ENV_GC_TEMPLATE.contains("task-env-gc.sh sweep $1"),
+        "шаблон task-env-gc обязан нести «sweep $1»: подкоманда литерально в шаблоне, args = row (#1506)"
+    );
+    assert!(
+        TASK_ENV_TEMPLATE.contains("task-env.sh $1"),
+        "эталонный контракт task-env: args = row, без подкоманды в args"
+    );
+}
