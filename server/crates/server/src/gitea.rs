@@ -124,10 +124,7 @@ impl PrGateway for GiteaPrGateway {
         // url — конкретная цель вердикта: ячейка, если она распарсилась
         // (веточной пробы у Gitea нет); None — Missing без цели.
         let url = pr_url.filter(|u| !u.is_empty()).map(str::to_string);
-        let Some((host, owner, repo, number)) = pr_url
-            .filter(|u| !u.is_empty())
-            .and_then(parse_gitea_pr_url)
-        else {
+        let Some((host, owner, repo, number)) = url.as_deref().and_then(parse_gitea_pr_url) else {
             return Ok(PrProbe {
                 state: PrState::Missing,
                 url: None,
@@ -171,8 +168,10 @@ impl PrGateway for GiteaPrGateway {
                     })
                 }
             },
-            // JSON-404 — PR нет (ветка есть, bounce «PR не найден» честен);
-            // plain-text 404 — роута нет, инстанс API-нечитаем → Foreign
+            // JSON-404 — PR нет (ветка есть, bounce «PR не найден» честен):
+            // цели вердикта нет — url None (контракт PrProbe, ревью Low
+            // #1519); plain-text 404 — роута нет, инстанс API-нечитаем →
+            // Foreign
             404 => Ok(PrProbe {
                 state: if body.is_some() {
                     PrState::Missing
@@ -185,7 +184,7 @@ impl PrGateway for GiteaPrGateway {
                     );
                     PrState::Foreign
                 },
-                url,
+                url: if body.is_some() { None } else { url },
             }),
             401 | 403 => {
                 tracing::warn!(

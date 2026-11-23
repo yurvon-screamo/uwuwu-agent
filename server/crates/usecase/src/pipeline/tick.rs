@@ -87,7 +87,9 @@ pub struct TickOutcome {
     /// Семантических bounce автомержа (red CI / конфликт / PR не найден /
     /// closed / merge fail / отказ дозаполнения ячейки): исход «мерж не
     /// состоялся, причина на строке» — наблюдаемость исходов (#1519).
-    /// Err-действия считаются actions_failed, pending/no-op — не считаются.
+    /// Инкремент — единая точка в actions::bounce; pending/no-op не
+    /// считаются. Транспортный Err пробы/мержа сюда не попадает: он
+    /// пробрасывается из тика (\`tick.failed\`) и счётчиков не несёт.
     pub automerge_bounced: usize,
     /// Строк, переведённых в Needs attention спавн-петлёй.
     pub attention_flagged: usize,

@@ -496,6 +496,8 @@ impl AgentSessionGateway for FakeSessions {
 struct FakePrs {
     state: PrState,
     merges: Mutex<Vec<String>>,
+    /// Отказ merge-API — bounce «merge failed» (#1519, пин счётчика).
+    merge_fails: AtomicBool,
     /// URL-аргументы probe — фикс «артефакт доезжает до gateway» (#1155)
     probes: Mutex<Vec<Option<String>>>,
     /// URL, который вердикт называет своей целью (#1519): None по умолчанию
@@ -514,6 +516,9 @@ impl PrGateway for FakePrs {
         })
     }
     async fn merge(&self, _r: &str, pr: &str) -> UsecaseResult<()> {
+        if self.merge_fails.load(Ordering::Relaxed) {
+            return Err(UsecaseError::Pr("merge API недоступен (мок)".into()));
+        }
         self.merges.lock().unwrap().push(pr.into());
         Ok(())
     }
@@ -893,6 +898,7 @@ fn usecase_with_state(
     let prs = Arc::new(FakePrs {
         state: pr,
         merges: Mutex::default(),
+        merge_fails: AtomicBool::new(false),
         probes: Mutex::default(),
         url: Mutex::default(),
     });
@@ -949,6 +955,7 @@ fn fixture_usecase(
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
         merges: Mutex::default(),
+        merge_fails: AtomicBool::new(false),
         probes: Mutex::default(),
         url: Mutex::default(),
     });
@@ -1002,6 +1009,7 @@ fn usecase_with_sessions(
     let prs = Arc::new(FakePrs {
         state: pr,
         merges: Mutex::default(),
+        merge_fails: AtomicBool::new(false),
         probes: Mutex::default(),
         url: Mutex::default(),
     });
@@ -1070,6 +1078,7 @@ fn routed_usecase(
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         }),
@@ -1346,6 +1355,7 @@ fn wake_usecase(
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         }),
@@ -1782,6 +1792,7 @@ async fn dev_spawn_pins_the_developer_agent() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         }),
@@ -1906,15 +1917,95 @@ async fn automerge_merged_is_noop_row_stays_review() {
     let mut t = task(3, Status::UserReview);
     carrier(&mut t, 3, true);
     let (u, board, _, prs) = usecase(vec![t], PrState::Merged);
+    // резолв совпадает с живой ячейкой — переписывания нет (ревью Low #1519)
+    *prs.url.lock().unwrap() = Some("https://github.com/a/c/pull/3".into());
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.automerged, 0, "no-op не считается мержем");
+    assert_eq!(out.automerge_bounced, 0, "no-op — не bounce");
     assert_eq!(prs.merges.lock().unwrap().len(), 0, "merge-API не зовётся");
     let log = board.log.lock().unwrap();
+    assert!(
+        log.iter().all(|l| !l.contains("pr#3=")),
+        "живая ячейка не переписывается: {log:?}"
+    );
     assert!(
         !log.iter().any(|l| l.contains("status#3")),
         "статус не трогается: {log:?}"
     );
     assert!(!log.iter().any(|l| l.contains("close#3")));
+}
+
+#[tokio::test]
+async fn automerge_merged_via_branch_is_noop_and_fills_cell() {
+    // #1519, ревью Common: ячейка пуста/протухла, PR смержен руками
+    // (веточная проба state=all) — Merged, НЕ Missing-bounce: строка
+    // ждёт владельца в Review, canonical ячейка дозаполняется резолвом
+    // (шторм-кейс #1424: тики стоят, владелец мержит руками)
+    let mut t = task(82, Status::UserReview);
+    carrier(&mut t, 82, false);
+    let (u, board, _, prs) = usecase(vec![t], PrState::Merged);
+    *prs.url.lock().unwrap() = Some("https://github.com/a/c/pull/99".into());
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.automerged, 0);
+    assert_eq!(
+        out.automerge_bounced, 0,
+        "смерженный руками PR — не bounce «PR not found»"
+    );
+    assert!(
+        prs.merges.lock().unwrap().is_empty(),
+        "merge-API не зовётся"
+    );
+    let log = board.log.lock().unwrap();
+    assert!(
+        log.iter()
+            .any(|l| l.contains("pr#82=https://github.com/a/c/pull/99")),
+        "ячейка дозаполнена резолвом смерженного PR: {log:?}"
+    );
+    assert!(
+        !log.iter().any(|l| l.contains("status#82")),
+        "строка остаётся в Review: {log:?}"
+    );
+}
+
+#[tokio::test]
+async fn automerge_closed_bounces_with_counter() {
+    // #1519, ревью Low: bounce любого типа — счётчик; Closed — семантический
+    let mut t = task(83, Status::UserReview);
+    carrier(&mut t, 83, true);
+    let (u, board, _, _) = usecase(vec![t], PrState::Closed);
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.automerge_bounced, 1);
+    let log = board.log.lock().unwrap();
+    assert!(
+        log.iter().any(|l| l.contains("status#83=InProgress")),
+        "{log:?}"
+    );
+}
+
+#[tokio::test]
+async fn automerge_merge_failure_bounces_with_counter() {
+    // #1519, ревью Low: отказ merge-API — bounce с причиной, счётчик стоит
+    let mut t = task(84, Status::UserReview);
+    carrier(&mut t, 84, true);
+    let (u, board, _, prs) = usecase(
+        vec![t],
+        PrState::Open {
+            mergeable: true,
+            ci_green: true,
+        },
+    );
+    prs.merge_fails.store(true, Ordering::Relaxed);
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.automerged, 0, "неудавшийся мерж не считается");
+    assert_eq!(
+        out.automerge_bounced, 1,
+        "merge fail — семантический bounce"
+    );
+    let log = board.log.lock().unwrap();
+    assert!(
+        log.iter().any(|l| l.contains("status#84=InProgress")),
+        "{log:?}"
+    );
 }
 
 #[tokio::test]
@@ -1964,6 +2055,10 @@ async fn automerge_green_merges_row_stays_review() {
     assert_eq!(out.automerged, 1);
     assert_eq!(out.automerge_bounced, 0, "мерж — не bounce");
     let log = board.log.lock().unwrap();
+    assert!(
+        log.iter().all(|l| !l.contains("pr#5=")),
+        "живая ячейка не переписывается (резолв == ячейке): {log:?}"
+    );
     assert!(
         !log.iter().any(|l| l.contains("status#5")),
         "статус не трогается (остаётся Review): {log:?}"
@@ -2039,7 +2134,11 @@ async fn automerge_repairs_stale_pr_cell_from_probe() {
 
 #[tokio::test]
 async fn automerge_cell_fill_failure_bounces_without_merge() {
-    // #1519: отказ записи ячейки — bounce (канон UC-01), мержа нет
+    // #1519: отказ записи ячейки — bounce (канон UC-01), мержа нет.
+    // Пин порядка «дозаполнение ДО мержа» (ревью Low #1519): merge
+    // структурно стоит за fill-блоком одной линейной функции — отказ
+    // fill делает merge недостижимым; «fill после merge» исключён
+    // `?`-секвенированием, не только тестом.
     let mut t = task(79, Status::UserReview);
     carrier(&mut t, 79, false);
     let (u, board, _, prs) = usecase(
@@ -3009,6 +3108,7 @@ async fn mixed_health_cup_counts_only_reachable_busy() {
         let prs = Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         });
@@ -3071,6 +3171,7 @@ async fn foreign_executor_failure_does_not_blind_project_guard() {
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
         merges: Mutex::default(),
+        merge_fails: AtomicBool::new(false),
         probes: Mutex::default(),
         url: Mutex::default(),
     });
@@ -3240,6 +3341,7 @@ async fn wakeup_held_when_cup_full() {
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
         merges: Mutex::default(),
+        merge_fails: AtomicBool::new(false),
         probes: Mutex::default(),
         url: Mutex::default(),
     });
@@ -3315,6 +3417,7 @@ async fn wakeup_delivery_occupies_cup_slot() {
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
         merges: Mutex::default(),
+        merge_fails: AtomicBool::new(false),
         probes: Mutex::default(),
         url: Mutex::default(),
     });
@@ -3637,6 +3740,7 @@ async fn undelivered_comment_is_not_marked_seen() {
         let prs = Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         });
@@ -3714,6 +3818,7 @@ async fn undelivered_comment_is_not_marked_seen() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         }),
@@ -3798,6 +3903,7 @@ async fn multi_comment_tail_delivered_together() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         }),
@@ -3869,6 +3975,7 @@ async fn inflight_comment_delivered_after_agent_reply() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         }),
@@ -3943,6 +4050,7 @@ async fn busy_session_not_pinged_early() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         }),
@@ -4011,6 +4119,7 @@ async fn soft_ping_wakes_idle_session_without_transaction() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         }),
@@ -4089,6 +4198,7 @@ async fn soft_ping_held_when_cup_full_then_delivered_on_free_slot() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         }),
@@ -4174,6 +4284,7 @@ async fn soft_ping_mass_stall_oversell_is_capped() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         }),
@@ -4253,6 +4364,7 @@ async fn restored_counters_from_previous_process_do_not_escalate_on_first_tick()
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         }),
@@ -4330,6 +4442,7 @@ async fn counters_earned_by_current_process_still_escalate() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         }),
@@ -4415,6 +4528,7 @@ async fn escalation_deferred_when_liveness_probe_unreliable() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         }),
@@ -4496,6 +4610,7 @@ async fn design_phantom_stall_escalates_and_frees_cup_slot() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         }),
@@ -4563,6 +4678,7 @@ async fn probe_failure_records_outcome_without_escalation_or_counters() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         }),
@@ -4645,6 +4761,7 @@ async fn probe_failure_isolated_per_row_other_rows_processed() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         }),
@@ -4724,6 +4841,7 @@ async fn probe_degradation_strip_reaches_threshold_signal() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         }),
@@ -4895,6 +5013,7 @@ async fn idle_sessions_do_not_hold_cup() {
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
         merges: Mutex::default(),
+        merge_fails: AtomicBool::new(false),
         probes: Mutex::default(),
         url: Mutex::default(),
     });
@@ -6884,6 +7003,7 @@ fn tick_with_clock(
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
         merges: Mutex::default(),
+        merge_fails: AtomicBool::new(false),
         probes: Mutex::default(),
         url: Mutex::default(),
     });
@@ -7089,6 +7209,7 @@ async fn enrichment_failure_skips_row() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         }),
@@ -7132,6 +7253,7 @@ async fn orphan_deleted_when_set_session_fails() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         }),
@@ -7501,6 +7623,7 @@ async fn round_stale_reset_gives_true_fresh_round_two_pings_before_escalation() 
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         }),
@@ -7950,6 +8073,7 @@ async fn cup_preempt_wave_does_not_escalate_victim_loop() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         }),
@@ -8222,6 +8346,7 @@ async fn executor_failure_lands_in_outcome_by_name() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         }),
@@ -8276,6 +8401,7 @@ async fn named_executor_failure_is_isolated_from_healthy_peer() {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         }),
@@ -8304,6 +8430,7 @@ fn multi_board_usecase(board: Arc<FakeMultiBoard>) -> TickUseCase {
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         }),
@@ -8508,6 +8635,7 @@ fn lost_usecase(
     let prs = Arc::new(FakePrs {
         state: PrState::Missing,
         merges: Mutex::default(),
+        merge_fails: AtomicBool::new(false),
         probes: Mutex::default(),
         url: Mutex::default(),
     });
@@ -9328,6 +9456,7 @@ fn judge_usecase(
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
             probes: Mutex::default(),
             url: Mutex::default(),
         }),

@@ -968,8 +968,12 @@ impl TaskBoardRepo for GitHubHub {
     }
 
     async fn set_pr(&self, board: &str, number: u64, pr_url: &str) -> UsecaseResult<()> {
+        // валидация формы — как у task_edit (write.rs) и mockhub-а: мусор
+        // в canonical ячейку не попадает (ревью Low #1519)
+        let url = uwuwu_domain::PrUrl::parse(pr_url)
+            .ok_or_else(|| UsecaseError::Board(format!("PR «{pr_url}» is not an http(s) URL")))?;
         self.fields
-            .store(number, &[("PR", Some(pr_url.to_string()))])
+            .store(number, &[("PR", Some(url.as_str().to_string()))])
             .await?;
         self.invalidate_snapshot(board);
         Ok(())

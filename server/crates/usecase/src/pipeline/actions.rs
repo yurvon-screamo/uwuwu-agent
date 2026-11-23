@@ -648,10 +648,32 @@ impl TickUseCase {
         }
         match probe.state {
             PrState::Pending => unreachable!("pending обработан выше"),
-            // Уже влит (вручную или раньше): no-op — merge-API не зовётся,
-            // строка остаётся в Review и ждёт владельца (инцидент #1151/#1162:
-            // ложный bounce вручную смерженной строки недопустим)
+            // Уже влит (вручную или раньше, либо ячейка пуста/протухла, а
+            // веточная проба нашла смерженный PR — state=all, ревью Common
+            // #1519): no-op — merge-API не зовётся, строка остаётся в Review
+            // и ждёт владельца (инцидент #1151/#1162: ложный bounce
+            // вручную смерженной строки недопустим). Резолв известен —
+            // canonical ячейка дозаполняется, Done-кандидат не остаётся
+            // без ссылки на артефакт.
             PrState::Merged => {
+                if let Some(url) = probe.url.as_deref() {
+                    if task.pr().map(|u| u.as_str()) != Some(url) {
+                        match self.board.set_pr(&board.board, task.number(), url).await {
+                            Ok(()) => tracing::info!(
+                                event = "automerge.pr_cell_filled",
+                                number = task.number(),
+                                url,
+                                "Automerge: PR уже смержен — canonical ячейка дозаполнена резолвом (#1519)"
+                            ),
+                            Err(e) => tracing::warn!(
+                                event = "automerge.pr_cell_fill_failed",
+                                number = task.number(),
+                                error = %e,
+                                "Automerge: дозаполнение смерженного PR не удалось — строка ждёт владельца в Review"
+                            ),
+                        }
+                    }
+                }
                 tracing::info!(
                     event = "automerge.merged",
                     number = task.number(),
@@ -668,28 +690,26 @@ impl TickUseCase {
                 Ok(false)
             }
             PrState::Missing => {
-                self.bounce(board, task, "branch set, PR not found").await?;
-                out.automerge_bounced += 1;
+                self.bounce(board, task, "branch set, PR not found", out)
+                    .await?;
                 Ok(false)
             }
             PrState::Closed => {
-                self.bounce(board, task, "PR closed without a merge")
+                self.bounce(board, task, "PR closed without a merge", out)
                     .await?;
-                out.automerge_bounced += 1;
                 Ok(false)
             }
             PrState::Open {
                 mergeable: false, ..
             } => {
-                self.bounce(board, task, "PR conflicts with master").await?;
-                out.automerge_bounced += 1;
+                self.bounce(board, task, "PR conflicts with master", out)
+                    .await?;
                 Ok(false)
             }
             PrState::Open {
                 ci_green: false, ..
             } => {
-                self.bounce(board, task, "PR has red CI").await?;
-                out.automerge_bounced += 1;
+                self.bounce(board, task, "PR has red CI", out).await?;
                 Ok(false)
             }
             PrState::Open {
@@ -705,13 +725,11 @@ impl TickUseCase {
                 let url = match probe.url.as_deref() {
                     Some(u) => u,
                     None => {
-                        tracing::warn!(
-                            event = "automerge.no_pr_url",
-                            number = task.number(),
-                            "Automerge: зелёный Open без конкретного PR — bounce"
-                        );
-                        self.bounce(board, task, "branch set, PR not found").await?;
-                        out.automerge_bounced += 1;
+                        // Defensive: на текущих гейтвеях недостижимо
+                        // (Open = вердикт о конкретном PR) — текст без
+                        // «not found», чтобы не лгал о причине
+                        self.bounce(board, task, "probe resolved no PR URL", out)
+                            .await?;
                         return Ok(false);
                     }
                 };
@@ -724,9 +742,8 @@ impl TickUseCase {
                             "Automerge: canonical PR-ячейка дозаполнена резолвом (#1519)"
                         ),
                         Err(e) => {
-                            self.bounce(board, task, &format!("PR cell fill failed: {e}"))
+                            self.bounce(board, task, &format!("PR cell fill failed: {e}"), out)
                                 .await?;
-                            out.automerge_bounced += 1;
                             return Ok(false);
                         }
                     }
@@ -743,9 +760,8 @@ impl TickUseCase {
                         Ok(true)
                     }
                     Err(e) => {
-                        self.bounce(board, task, &format!("merge failed: {e}"))
+                        self.bounce(board, task, &format!("merge failed: {e}"), out)
                             .await?;
-                        out.automerge_bounced += 1;
                         Ok(false)
                     }
                 }
@@ -753,7 +769,16 @@ impl TickUseCase {
         }
     }
 
-    async fn bounce(&self, board: &BoardPlan, task: &Task, why: &str) -> UsecaseResult<()> {
+    /// Bounce в In Progress с комментом-причиной (канон UC-01) — единая
+    /// точка инкремента \`automerge_bounced\` (#1519, ревью Low: правило
+    /// «семантический bounce = +1» живёт здесь, не на сайтах вызова).
+    async fn bounce(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        why: &str,
+        out: &mut TickOutcome,
+    ) -> UsecaseResult<()> {
         self.board
             .set_status(&board.board, task.number(), Status::InProgress)
             .await?;
@@ -766,6 +791,7 @@ impl TickUseCase {
             why,
             "Automerge: bounce"
         );
+        out.automerge_bounced += 1;
         Ok(())
     }
 }
