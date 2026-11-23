@@ -5,6 +5,7 @@
 //! с семантикой #1363), полоса вызовов — локальный скользящий лимит
 //! (квоты волны общие, TPM-пик массовой тишины не долбим).
 
+use crate::github::HTTP_TIMEOUT;
 use crate::search::{parse_retry_delay, RATE_LIMIT_CAP_SECS, RATE_LIMIT_DEFAULT_SECS};
 use async_trait::async_trait;
 use std::collections::VecDeque;
@@ -49,7 +50,11 @@ impl GeminiJudge {
         };
         let endpoint = std::env::var(ENV_ENDPOINT).unwrap_or_else(|_| API_ENDPOINT.to_string());
         Some(Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .user_agent(concat!("uwuwu-server/", env!("CARGO_PKG_VERSION")))
+                .timeout(HTTP_TIMEOUT)
+                .build()
+                .expect("reqwest client"),
             key,
             model: model.unwrap_or_else(|| MODEL_DEFAULT.to_string()),
             endpoint,

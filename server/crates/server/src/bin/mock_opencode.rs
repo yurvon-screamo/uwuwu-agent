@@ -31,8 +31,10 @@
 //!     switch_agent → 404 — lost-resurrection-ветка (юнит-класс T2
 //!     живьём); включается ПОСЛЕ успешного спавна.
 //!
-//! Env: MOCK_MODE (деф. plain), MOCK_PORT (8099), MOCK_STEP_MS (1500),
-//!      MOCK_MCP_URL (http://127.0.0.1:8090), MOCK_MCP_TOKEN («»),
+//! Env: MOCK_MODE (деф. plain), MOCK_PORT (8099 — дефолт standalone-ручного
+//!      запуска; скрипты стенда порт подбирают/передают явно, #1304),
+//!      MOCK_STEP_MS (1500), MOCK_MCP_URL (http://127.0.0.1:8090),
+//!      MOCK_MCP_TOKEN («»),
 //!      MOCK_VERDICTS («plan:request_changes;result:request_changes;...») —
 //!      сценарные вердикты ревью-стадий по порядку (ре-энтри-циклы);
 //!      ключ «test-review:request_changes» — находки тест-ревьювера
@@ -301,10 +303,6 @@ async fn main() {
         ..Store::default()
     });
     let verdicts_left = store.verdicts.lock().expect("verdicts").len();
-    tracing::info!(event = "mock.started", %mode, port, mcp_url = %mcp_url,
-        verdicts_left,
-        prompt_404_after = store.prompt_404_after,
-        "mock-opencode up");
     let counter = Arc::new(AtomicU64::new(1));
     // случайный префикс id: инстансы на стенде не должны делить id-пространство
     // (second source #1163 матчит сессии по id в union-скане — коллизия
@@ -475,7 +473,10 @@ async fn main() {
                         // bootstrap-команды детерминированы: task-env-gc —
                         // канал вердиктов env-gc (#1431), мок эмулирует
                         // shell-исход user-сообщением «ENV-GC <row> SWEPT»;
-                        // прочие принимаются без эмуляции shell
+                        // прочие принимаются без эмуляции shell. row — из
+                        // $1 args (первый токен): резолв шаблона opencode
+                        // подставляет в $1 только args[0] (bug #1506 —
+                        // бывший next_back маскировал чужой args-контракт)
                         let name = body["name"].as_str().unwrap_or_default();
                         tracing::info!(event = "mock.command", id = %id, name, "POST /command");
                         if name == "task-env-gc" {
@@ -483,7 +484,7 @@ async fn main() {
                                 .as_str()
                                 .unwrap_or_default()
                                 .split_whitespace()
-                                .next_back()
+                                .next()
                                 .unwrap_or_default()
                                 .to_string();
                             let mut sessions = store.sessions.lock().expect("store");
@@ -541,6 +542,15 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
         .expect("bind mock port");
+    // up-лог строго после успешного бинда, с фактическим адресом: занятый
+    // порт больше не маскируется «up + паника» (#1304); requested_port —
+    // что просили (оверрайд/дефолт), port — что реально слушаем
+    let bound = listener.local_addr().expect("mock local addr");
+    tracing::info!(event = "mock.started", %mode, requested_port = port,
+        port = bound.port(), mcp_url = %mcp_url,
+        verdicts_left,
+        prompt_404_after = store.prompt_404_after,
+        "mock-opencode up");
     axum::serve(listener, app).await.expect("mock serve");
 }
 

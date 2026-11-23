@@ -7,6 +7,7 @@ pub mod blobs;
 pub mod bots;
 mod crons;
 mod error;
+pub mod fm_guard;
 mod fm_lite;
 pub mod goals;
 mod naming;
@@ -30,7 +31,10 @@ pub use bots::{
     build_prompt, chunk_reply, classify_message, parse_bot_doc, plan_action, BotStateStore,
     TelegramGateway, TgMessage, TgUpdate,
 };
-pub use crons::{parse_schedule_text, CronUseCase, FireOutcome, CRON_DIR};
+pub use crons::{
+    cron_name, jst_stamp, parse_schedule_text, CronUseCase, FireOutcome, CRON_DIR,
+    FIRE_SIGNAL_COOLDOWN_MS, RUN_SILENCE_MS,
+};
 pub use error::{UsecaseError, UsecaseResult, ViewError};
 pub use goals::{gist_of, Goal, GoalsRepo, GoalsView};
 pub use naming::{
@@ -49,10 +53,11 @@ pub use pipeline::{
     ANALYST_WAVE_MARKER, STAGE_PROMPTS,
 };
 pub use ports::{
-    AgentSessionGateway, AppendDocOutcome, AssistantReply, Clock, CommentRef, DecisionJudge,
-    DreamerMark, FmMutator, IssueDigest, IssueFieldStore, IssueIndexSource, IssueView, JudgeCfg,
-    JudgeContext, JudgeSessionTail, Liveness, PrGateway, PrState, SessionInfo, SessionSpec,
-    StatusDelivery, TaskBoardRepo, TickStateStore, WikiRepo,
+    AgentSessionGateway, AppendDocOutcome, AssistantReply, Clock, CommentRef, CronRow,
+    CronRunTrack, CronStateStore, DecisionJudge, DreamerMark, FmMutator, IssueDigest,
+    IssueFieldStore, IssueIndexSource, IssueView, JudgeCfg, JudgeContext, JudgeSessionTail,
+    Liveness, PrGateway, PrState, SessionInfo, SessionSpec, StatusDelivery, TaskBoardRepo,
+    TickStateStore, WikiRepo,
 };
 pub use router::SessionRouter;
 pub use search::{sync_allowed, SearchHit, SearchUseCase, SemanticBackend};

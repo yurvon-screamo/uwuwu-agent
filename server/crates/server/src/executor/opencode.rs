@@ -768,12 +768,12 @@ mod tests {
 
         let without = create_session_body(&spec(
             AgentSlot::Default,
-            ModelRef::new("zai-coding-plan", "glm-5.3"),
+            ModelRef::new("zai-coding-plan", "glm-5.4"),
             None,
         ));
         assert!(without.get("agent").is_none(), "Default — без agent");
         assert_eq!(
-            without["model"]["id"], "glm-5.3",
+            without["model"]["id"], "glm-5.4",
             "модель в теле всегда (карта сервера)"
         );
     }

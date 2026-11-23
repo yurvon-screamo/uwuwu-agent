@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use uwuwu_domain::{AgentSlot, BotModel, ModelRef};
 use uwuwu_usecase::bots::{
-    build_prompt, chunk_reply, classify_message, BotStateStore, Incoming, MediaKind,
-    TelegramGateway, TgMedia, TgMessage, TgUpdate,
+    build_lessons_prompt, build_lessons_revoked_prompt, build_prompt, chunk_reply,
+    classify_message, BotStateStore, Incoming, MediaKind, TelegramGateway, TgMedia, TgMessage,
+    TgUpdate,
 };
 use uwuwu_usecase::{
     AgentSessionGateway, DreamerMark, Liveness, SessionSpec, TickStateStore, UsecaseResult,
@@ -219,8 +220,25 @@ async fn run_turn(deps: &BotDeps, chat_id: i64, text: &str) -> UsecaseResult<()>
     //   (hash-детект в state) и остаётся в памяти вечной сессии.
     let manual_hash = view.manual.len() as u64 ^ view.manual.chars().count() as u64;
     let need_manual = deps.state.bot_manual_hash(&deps.slug) != Some(manual_hash);
+    // Уроки (agent-режим, #1424): префикс одним сообщением при смене
+    // носителя; doc-режим везёт уроки в композите методички. Пустой
+    // носитель при доставлявшихся ранее уроках — тоже смена: бот обязан
+    // узнать об отзыве (гейт «!empty» не режет), а бот без уроков от
+    // рождения — без промпта (регресс-гейт «дока нет»).
+    let lessons_hash = view.lessons.len() as u64 ^ view.lessons.chars().count() as u64;
+    let stored_lessons = deps.state.bot_lessons_hash(&deps.slug);
+    let lessons_empty = view.lessons.trim().is_empty();
+    let need_lessons = deps.structural.agent.is_some()
+        && stored_lessons != Some(lessons_hash)
+        && (!lessons_empty || stored_lessons.is_some());
     let prompt_text = if deps.structural.agent.is_some() {
-        text.to_string()
+        if need_lessons && lessons_empty {
+            build_lessons_revoked_prompt(text)
+        } else if need_lessons {
+            build_lessons_prompt(&view.lessons, text)
+        } else {
+            text.to_string()
+        }
     } else if need_manual {
         build_prompt(&view.manual, text)
     } else {
@@ -239,6 +257,14 @@ async fn run_turn(deps: &BotDeps, chat_id: i64, text: &str) -> UsecaseResult<()>
         if let Err(e) = deps.state.save() {
             tracing::warn!(event = "bot.state_save_failed", slug = %deps.slug, error = %e,
                 "Manual-hash не персистится — методичка уедет повторно после рестарта");
+        }
+    }
+    if need_lessons {
+        deps.state
+            .set_bot_lessons_hash(&deps.slug, Some(lessons_hash));
+        if let Err(e) = deps.state.save() {
+            tracing::warn!(event = "bot.state_save_failed", slug = %deps.slug, error = %e,
+                "Lessons-hash не персистится — уроки уедут повторно после рестарта");
         }
     }
     match wait_reply(deps, &session, baseline).await {
@@ -270,8 +296,10 @@ async fn ensure_session(deps: &BotDeps) -> UsecaseResult<String> {
                 // не получит: сброс hash = дозаправка первым же промптом
                 // (#1221 тест-круг 1, тот же инвариант, что у компакта и
                 // recreate-ветки супервизора; персист — save() пути
-                // пересоздания ниже).
+                // пересоздания ниже). Уроки (agent-режим) ехали префиксом
+                // в историю мёртвой сессии — сброс lessons-hash тоже.
                 deps.state.set_bot_manual_hash(&deps.slug, None);
+                deps.state.set_bot_lessons_hash(&deps.slug, None);
             }
         }
     }

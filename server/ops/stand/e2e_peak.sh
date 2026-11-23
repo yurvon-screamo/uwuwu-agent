@@ -15,14 +15,23 @@
 #     временем тика), medium выезжает на первом тике, потерь и эскалаций нет.
 #
 # Запуск: server/ops/stand/e2e_peak.sh   (из каталога server; cargo build сам)
-# Порты — свои дефолты 8199/8190 (гонки с e2e.sh 8099/8090 исключены,
-# #1304/#1328); пер-оверрайд: PORT_MOCK=X PORT_SRV=Y bash e2e_peak.sh
+# Порты — подбор свободных (stand_ports.sh), оверрайды PORT_MOCK/PORT_SRV
+# работают как раньше: PORT_MOCK=X PORT_SRV=Y bash e2e_peak.sh
 # Пик реален (weekday-гейт PeakWindow): прогон в будни; в выходные —
 # громкий отказ с причиной, не тихий скип.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."   # server/
-PORT_MOCK="${PORT_MOCK:-8199}"; PORT_SRV="${PORT_SRV:-8190}"
+# Порты: оверрайды заданы — как есть; не заданы — свободные из пробы-бинда:
+# и с e2e.sh, и между параллельными прогонами самого peak столкновений нет
+# (#1304). stand_ports.sh — первая python3-зависимость этого скрипта
+# stand_ports.sh подключается по пути рантайма ($(dirname "$0")) — статически
+# не следует; сам файл валиден отдельно (SC1091 off на этой строке, #1304)
+# shellcheck disable=SC1091
+source "$(dirname "$0")/stand_ports.sh"
+ports="$(stand_pick_ports 2)"
+read -r PORT_SRV_D PORT_MOCK_D <<<"$ports"
+PORT_MOCK="${PORT_MOCK:-$PORT_MOCK_D}"; PORT_SRV="${PORT_SRV:-$PORT_SRV_D}"
 BEARER="${UWUWU_SERVER_BEARER:-stand-e2e-bearer}"
 # config.secrets() валидирует GH_TOKEN безусловно (non_empty_env), хотя
 # memory-driver в GitHub не ходит — дамми достаточно (основной e2e.sh
@@ -42,6 +51,8 @@ MOCK_PID=""; SRV_PID=""
 
 say()  { printf '\033[1;34m[e2e-peak]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[e2e-peak FAIL]\033[0m %s\n' "$*"; KEEP=1; exit 1; }
+
+say "порты: сервер $PORT_SRV, мок $PORT_MOCK"
 
 cleanup() {
   for pid in "$SRV_PID" "$MOCK_PID"; do

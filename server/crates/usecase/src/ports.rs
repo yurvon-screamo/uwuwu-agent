@@ -393,6 +393,40 @@ pub trait PrGateway: Send + Sync {
     async fn merge(&self, project_repo: &str, pr_url: &str) -> UsecaseResult<()>;
 }
 
+/// Трек незавершённого крон-рана (#1480, снос журнала): файр записан —
+/// ран ждёт факта завершения от сессии исполнителя. Пустая строка сессии —
+/// краш между записью файра и спавном: тишина-детект ведёт по fired_ms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CronRunTrack {
+    pub session: String,
+    pub fired_ms: u64,
+}
+
+/// Машинный учёт крона (state.json, секция `crons`, #1480 — снос журнала):
+/// last_fire — факт файра (источник is_due вместо журнальной строки),
+/// anchor — якорь первой встречи (None не файрит: крон без факта ждёт
+/// ближайшей плановой минуты, #1517 — класс масс-догона на потере state),
+/// run — незавершённый ран (детект тишины), deferred_since — файр due,
+/// но отложен (детект пропуска), fails — счётчик отказов (канон ADR-103
+/// «счётчики отказов — в state»).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CronRow {
+    pub last_fire_ms: Option<u64>,
+    pub anchor_ms: Option<u64>,
+    pub deferred_since_ms: Option<u64>,
+    pub run: Option<CronRunTrack>,
+    pub fails: u32,
+}
+
+/// Персистентное состояние кронов — третий делегат JsonStateStore
+/// (рядом с TickStateStore/BotStateStore); md-мастер остаётся чистой
+/// декларацией, runtime-факты — в state (канон ADR-103).
+pub trait CronStateStore: Send + Sync {
+    fn cron_row(&self, name: &str) -> CronRow;
+    fn set_cron_row(&self, name: &str, row: CronRow);
+    fn save(&self) -> UsecaseResult<()>;
+}
+
 /// Часы: домен считает минуту UTC; оркестрация — эпоху.
 pub trait Clock: Send + Sync {
     fn utc_minute(&self) -> UtcMinute;

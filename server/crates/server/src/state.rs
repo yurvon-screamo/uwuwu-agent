@@ -3,12 +3,16 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use uwuwu_domain::{Slot, Status};
 use uwuwu_usecase as naming;
 use uwuwu_usecase::BotStateStore;
 use uwuwu_usecase::Clock;
+use uwuwu_usecase::CronRow;
+use uwuwu_usecase::CronRunTrack;
+use uwuwu_usecase::CronStateStore;
 use uwuwu_usecase::DreamerMark;
 use uwuwu_usecase::TickStateStore;
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
@@ -42,6 +46,10 @@ struct BotRow {
     offset: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     manual_hash: Option<u64>,
+    /// Hash уроков, доставленных префиксом (agent-режим #1424): None —
+    /// не доставлены/сброс (компакт/recreate); персиста переживает рестарт.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lessons_hash: Option<u64>,
     /// Метка последней адмиссии нативного компакта (ms; None — не было):
     /// коулдаун автокомпакта переживает рестарт сервера (#1221, ADR-082).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -88,10 +96,71 @@ struct StateFile {
     /// «slug бота» → сессия + offset (раннер ботов, #1150).
     #[serde(default)]
     bots: BTreeMap<String, BotRow>,
+    /// «имя крона» → машинный учёт ранов (#1480, снос журнала):
+    /// last_fire — источник is_due, run — детект тишины UC-02,
+    /// deferred_since — детект пропуска файра, fails — счётчик отказов
+    /// (канон ADR-103 «runtime-факты — в state»).
+    #[serde(default)]
+    crons: BTreeMap<String, CronRowState>,
     /// Реестр серверных постов: node_id → ms поста (self-эхо-фильтр #1204).
     /// Id GitHub глобально уникальны — плоский map без ключа доски.
     #[serde(default)]
     own_comments: BTreeMap<String, u64>,
+}
+
+/// Машинный учёт крона на носителе (срез #1480): SERDE-форма CronRow
+/// (usecase::ports); трек без сессии = краш между записью и спавном.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct CronRowState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_fire_ms: Option<u64>,
+    /// Якорь первой встречи (#1517): None не файрит — крон без факта
+    /// ждёт ближайшей плановой минуты. serde default — старые state
+    /// (без поля) читаются.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anchor_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deferred_since_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run: Option<CronRunState>,
+    #[serde(default)]
+    fails: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CronRunState {
+    session: String,
+    fired_ms: u64,
+}
+
+impl From<&CronRow> for CronRowState {
+    fn from(row: &CronRow) -> Self {
+        Self {
+            last_fire_ms: row.last_fire_ms,
+            anchor_ms: row.anchor_ms,
+            deferred_since_ms: row.deferred_since_ms,
+            run: row.run.as_ref().map(|r| CronRunState {
+                session: r.session.clone(),
+                fired_ms: r.fired_ms,
+            }),
+            fails: row.fails,
+        }
+    }
+}
+
+impl From<CronRowState> for CronRow {
+    fn from(s: CronRowState) -> Self {
+        CronRow {
+            last_fire_ms: s.last_fire_ms,
+            anchor_ms: s.anchor_ms,
+            deferred_since_ms: s.deferred_since_ms,
+            run: s.run.map(|r| CronRunTrack {
+                session: r.session,
+                fired_ms: r.fired_ms,
+            }),
+            fails: s.fails,
+        }
+    }
 }
 
 /// Переезд носителя ботов (#1214): ключи старой раскладки
@@ -126,16 +195,54 @@ fn migrate_bot_keys(bots: &mut BTreeMap<String, BotRow>) {
 pub struct JsonStateStore {
     path: PathBuf,
     state: std::sync::Mutex<StateFile>,
+    /// Сериализация записи файла: конкурентные save (тик-сайдкары ×
+    /// per-bot раннеры) писали общий tmp с truncate — интерливинг двух
+    /// записей портил state.json, следующий старт брал тихий сброс
+    /// (класс масс-догона кронов, #1517).
+    save_lock: std::sync::Mutex<()>,
     /// Штамп времени возрастного GC реестра серверных постов.
     clock: Arc<dyn Clock>,
 }
 
 impl JsonStateStore {
     pub fn load(path: PathBuf, clock: Arc<dyn Clock>) -> Self {
-        let mut state: StateFile = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default();
+        // Чтение в bytes: невалидный UTF-8 доходит до парсера и ловится
+        // как коррупция (громко + улика), а не тихим InvalidData чтения.
+        let mut state: StateFile = match std::fs::read(&path) {
+            // Файла нет — первый старт: тихо.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => StateFile::default(),
+            // Иная ошибка чтения (права, сбой тома) — громко: тихий сброс
+            // учёта кронов невидим оператору (#1517). Улика — попыткой
+            // rename: ему нужны права на каталог, не на чтение файла.
+            Err(e) => {
+                tracing::error!(
+                    event = "state.load_unreadable",
+                    path = %path.display(),
+                    error = %e,
+                    "state.json не читается — старт с пустым state, улика сохраняется rename'ом (сброс учёта кронов: окна тишины UC-02 обнулены, файры возобновятся с ближайших плановых минут)"
+                );
+                preserve_corrupt_state(&path, clock.now_ms());
+                StateFile::default()
+            }
+            Ok(raw) => match serde_json::from_slice(&raw) {
+                Ok(state) => state,
+                // Битый файл — громко: класс инцидента #1517 (тихий сброс
+                // раньше давал масс-догон, ныне — якоря и тишину до
+                // плановых минут; оператору важно знать о сбросе учёта).
+                // Улика сохраняется рядом (одна последняя), старт
+                // продолжается.
+                Err(e) => {
+                    tracing::error!(
+                        event = "state.load_corrupt",
+                        path = %path.display(),
+                        error = %e,
+                        "state.json не парсится — старт с пустым state, битый файл сохранён рядом (сброс учёта кронов: окна тишины UC-02 обнулены, файры возобновятся с ближайших плановых минут)"
+                    );
+                    preserve_corrupt_state(&path, clock.now_ms());
+                    StateFile::default()
+                }
+            },
+        };
         // Миграция ключей ботов при переезде носителя (#1214): старая
         // раскладка `Projects/<proj>/Боты/<имя>` → `bot/<имя>`. Сессия
         // и offset переживают переезд; существующий новый ключ
@@ -168,6 +275,7 @@ impl JsonStateStore {
         Self {
             path,
             state: std::sync::Mutex::new(state),
+            save_lock: std::sync::Mutex::default(),
             clock,
         }
     }
@@ -177,7 +285,12 @@ impl JsonStateStore {
     }
 
     /// Атомарная запись файла (единая точка: оба трейта — делегаты).
+    /// save_lock захватывается до снапшота: сериализация и запись под
+    /// одним замком — порядок файлов = порядок вызовов save (иначе
+    /// писатель со старым снапшотом, захватив лок позже, перезаписал бы
+    /// более свежий файл).
     fn save_now(&self) -> UsecaseResult<()> {
+        let _writer = self.save_lock.lock().expect("save lock");
         {
             let mut guard = self.state.lock().expect("state lock");
             if guard.spawns.len() > 5000 {
@@ -225,12 +338,55 @@ impl JsonStateStore {
             std::fs::create_dir_all(dir)
                 .map_err(|e| UsecaseError::State(format!("mkdir {}: {e}", dir.display())))?;
         }
+        // fsync tmp перед rename + fsync каталога после: без сброса
+        // каталога rename может не дожить до диска при падении хоста
+        // (процессный рестарт безопасен — содержимое tmp уже на диске).
+        // Битый state на следующем старте — тихий сброс учёта кронов
+        // (класс масс-догона, #1517).
         let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, &raw)
+        let mut file = std::fs::File::create(&tmp)
+            .map_err(|e| UsecaseError::State(format!("create {}: {e}", tmp.display())))?;
+        file.write_all(&raw)
             .map_err(|e| UsecaseError::State(format!("write {}: {e}", tmp.display())))?;
+        file.sync_all()
+            .map_err(|e| UsecaseError::State(format!("sync {}: {e}", tmp.display())))?;
         std::fs::rename(&tmp, &self.path)
             .map_err(|e| UsecaseError::State(format!("rename {}: {e}", self.path.display())))?;
+        if let Some(dir) = self.path.parent() {
+            if let Ok(d) = std::fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
         Ok(())
+    }
+}
+
+/// Улика битого state: переименовать в `<имя>.corrupt-<unix сек>`,
+/// предыдущие копии снести (удержание одной последней). Отказ сохранения
+/// — warn, старт продолжается (громкий error уже отдан).
+fn preserve_corrupt_state(path: &std::path::Path, now_ms: u64) {
+    let base = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("state.json")
+        .to_string();
+    let prefix = format!("{base}.corrupt-");
+    let backup = path.with_file_name(format!("{prefix}{}", now_ms / 1000));
+    if let Some(dir) = path.parent() {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+    if let Err(e) = std::fs::rename(path, &backup) {
+        tracing::warn!(
+            event = "state.corrupt_preserve_failed",
+            error = %e,
+            "Битый state.json не сохранён как улика (старт продолжен)"
+        );
     }
 }
 
@@ -644,6 +800,27 @@ impl BotStateStore for JsonStateStore {
         }
     }
 
+    fn bot_lessons_hash(&self, slug: &str) -> Option<u64> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .bots
+            .get(slug)
+            .and_then(|b| b.lessons_hash)
+    }
+
+    fn set_bot_lessons_hash(&self, slug: &str, hash: Option<u64>) {
+        let mut guard = self.state.lock().expect("state lock");
+        match guard.bots.get_mut(slug) {
+            Some(row) => row.lessons_hash = hash,
+            // пустой строке нечего забывать — Some завёл бы сироту
+            None if hash.is_some() => {
+                guard.bots.entry(slug.to_string()).or_default().lessons_hash = hash;
+            }
+            None => {}
+        }
+    }
+
     fn bot_compact_ms(&self, slug: &str) -> u64 {
         self.state
             .lock()
@@ -672,6 +849,31 @@ impl BotStateStore for JsonStateStore {
             .entry(slug.to_string())
             .or_default()
             .offset = Some(offset);
+    }
+
+    fn save(&self) -> UsecaseResult<()> {
+        self.save_now()
+    }
+}
+
+impl CronStateStore for JsonStateStore {
+    fn cron_row(&self, name: &str) -> CronRow {
+        self.state
+            .lock()
+            .expect("state lock")
+            .crons
+            .get(name)
+            .cloned()
+            .map(Into::into)
+            .unwrap_or_default()
+    }
+
+    fn set_cron_row(&self, name: &str, row: CronRow) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .crons
+            .insert(name.to_string(), CronRowState::from(&row));
     }
 
     fn save(&self) -> UsecaseResult<()> {
@@ -717,6 +919,21 @@ mod tests {
             // бот: сессия + offset переживают рестарт (секция bots)
             s.set_bot_session("bot/x", Some("ses_abc"));
             s.set_bot_offset("bot/x", 42);
+            // крон: машинный учёт рана переживает рестарт (секция crons, #1480)
+            CronStateStore::set_cron_row(
+                &s,
+                "qa-night",
+                CronRow {
+                    last_fire_ms: Some(1_000),
+                    anchor_ms: Some(900),
+                    deferred_since_ms: None,
+                    run: Some(CronRunTrack {
+                        session: "ses_run".into(),
+                        fired_ms: 1_000,
+                    }),
+                    fails: 2,
+                },
+            );
             TickStateStore::save(&s).unwrap();
         }
         let s = store(path.clone());
@@ -727,6 +944,20 @@ mod tests {
             "рестарт восстанавливает сессию бота"
         );
         assert_eq!(s.bot_offset("bot/x"), Some(42));
+        let row = s.cron_row("qa-night");
+        assert_eq!(
+            row.last_fire_ms,
+            Some(1_000),
+            "учёт рана переживает рестарт"
+        );
+        assert_eq!(row.anchor_ms, Some(900), "якорь переживает рестарт (#1517)");
+        assert_eq!(
+            row.run.map(|r| r.session).as_deref(),
+            Some("ses_run"),
+            "run-трек переживает рестарт"
+        );
+        assert_eq!(row.fails, 2, "счётчик отказов переживает рестарт");
+        assert_eq!(s.cron_row("нет-такого").fails, 0, "нет записи — дефолт");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1036,6 +1267,157 @@ mod tests {
         let s = store(path);
         assert_eq!(s.review_rounds("B", 5001), 7, "свежий ключ жив");
         assert_eq!(s.review_rounds("B", 1), 0, "старейший ключ срезан капом");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bot_lessons_hash_round_trip_and_orphan_reset() {
+        // #1424 (тестер): lessons-hash (agent-режим) переживает рестарт;
+        // Some(0) — «носитель опустел, уроки отозваны» — не схлопывается
+        // в None (иначе следующий ход ложно доставит уроки снова);
+        // сброс None на несуществующей строке не заводит сироту-строку.
+        let dir = std::env::temp_dir().join(format!("uwuwu-state-lessons-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        {
+            let s = store(path.clone());
+            assert_eq!(
+                s.bot_lessons_hash("bot/a"),
+                None,
+                "старый state без поля — уроков нет"
+            );
+            s.set_bot_lessons_hash("bot/a", Some(0)); // отзыв: hash пустого носителя
+            s.set_bot_lessons_hash("bot/b", Some(77));
+            TickStateStore::save(&s).unwrap();
+        }
+        let s = store(path.clone());
+        assert_eq!(
+            s.bot_lessons_hash("bot/a"),
+            Some(0),
+            "Some(0) переживает рестарт и не читается как None"
+        );
+        assert_eq!(s.bot_lessons_hash("bot/b"), Some(77));
+        s.set_bot_lessons_hash("bot/ghost", None);
+        TickStateStore::save(&s).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let bots = json.get("bots").expect("секция bots");
+        assert!(
+            bots.get("bot/ghost").is_none(),
+            "сброс None на несуществующей строке не заводит сироту: {bots}"
+        );
+        assert!(
+            bots.get("bot/a")
+                .expect("строка a жива")
+                .get("lessons_hash")
+                .is_some(),
+            "lessons_hash сериализуется в state.json"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrupt_state_preserved_and_starts_empty() {
+        // #1517: битый state.json — громкий старт с пустым state, улика
+        // рядом со штампом; старые улики сносятся (удержание одной).
+        let dir = std::env::temp_dir().join(format!("uwuwu-corrupt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(&path, "{ не json").unwrap();
+        std::fs::write(dir.join("state.json.corrupt-1"), "старая улика").unwrap();
+        let s = store_at(path.clone(), 5_000);
+        assert_eq!(
+            CronStateStore::cron_row(&s, "любой"),
+            CronRow::default(),
+            "битый файл — старт с пустым state"
+        );
+        assert!(
+            dir.join("state.json.corrupt-5").exists(),
+            "улика сохранена со штампом (now_ms/1000)"
+        );
+        assert!(
+            !dir.join("state.json.corrupt-1").exists(),
+            "старая улика снесена"
+        );
+        // после сброса запись работает штатно
+        CronStateStore::set_cron_row(&s, "x", CronRow::default());
+        TickStateStore::save(&s).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        serde_json::from_str::<serde_json::Value>(&raw).expect("файл снова валиден");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn binary_garbage_state_is_loud_corruption_not_quiet_start() {
+        // #1517 (ревью Common): невалидный UTF-8 — реалистичный режим
+        // порчи (усечённая запись/сбой тома); чтение в bytes доходит до
+        // парсера → громкая коррупция + улика, не тихий пустой старт.
+        let dir = std::env::temp_dir().join(format!("uwuwu-binary-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(&path, [0xFF, 0xFE, 0x00, 0xC3, 0x28, 0x7B]).unwrap();
+        let s = store_at(path.clone(), 9_000);
+        assert_eq!(CronStateStore::cron_row(&s, "x"), CronRow::default());
+        assert!(
+            dir.join("state.json.corrupt-9").exists(),
+            "бинарный мусор сохранён уликой"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_state_file_starts_quietly() {
+        // Нет файла — первый старт, тихо и без улик.
+        let dir = std::env::temp_dir().join(format!("uwuwu-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let s = store_at(path.clone(), 1_000);
+        assert_eq!(CronStateStore::cron_row(&s, "x"), CronRow::default());
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("corrupt"))
+            .collect();
+        assert!(leftovers.is_empty(), "улик нет: {leftovers:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_saves_leave_valid_file() {
+        // #1517: save из разных тасков (тик-сайдкары × бот-раннеры)
+        // сериализован мьютексом — файл после гонки валиден, tmp один.
+        let dir = std::env::temp_dir().join(format!("uwuwu-race-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let s = Arc::new(store(path.clone()));
+        let handles: Vec<_> = (0..8)
+            .map(|n| {
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    for i in 0..20 {
+                        CronStateStore::set_cron_row(
+                            &*s,
+                            &format!("cron-{n}"),
+                            CronRow {
+                                last_fire_ms: Some((n * 100 + i) as u64),
+                                ..CronRow::default()
+                            },
+                        );
+                        CronStateStore::save(&*s).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let raw = std::fs::read_to_string(&path).unwrap();
+        serde_json::from_str::<serde_json::Value>(&raw).expect("state.json валиден после гонки");
+        assert_eq!(
+            CronStateStore::cron_row(&*s, "cron-7").last_fire_ms,
+            Some(719)
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

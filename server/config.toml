@@ -33,12 +33,12 @@ url = "https://opencode.uwuwu.net"
 [executor.models]
 default = "zai-coding-plan/glm-5.3-flash#high"
 developer = "zai-coding-plan/glm-5.3-flash#high"
-plan-reviewer = "zai-coding-plan/glm-5.3#high"
-code-quality-reviewer = "zai-coding-plan/glm-5.3#high"
+plan-reviewer = "zai-coding-plan/glm-5.4#high"
+code-quality-reviewer = "zai-coding-plan/glm-5.4#high"
 tester = "zai-coding-plan/glm-5.3-flash#high"
-test-reviewer = "zai-coding-plan/glm-5.3#high"
+test-reviewer = "zai-coding-plan/glm-5.4#high"
 analyst = "zai-coding-plan/glm-5.3-flash#high"
-analyst-reviewer = "zai-coding-plan/glm-5.3#high"
+analyst-reviewer = "zai-coding-plan/glm-5.3-flash#high"
 dreamer = "zai-coding-plan/glm-5.3-flash#high"
 
 [policy]
@@ -57,8 +57,11 @@ env_root = "/home/yurvon/agents-env"
 
 # Подключены 16.11 (доски смигрированы: fm→колонки/поля, ∅→Todo); строки
 # вне действующих стадий — конвейер не спавнит (владелец: «в работу не берём»).
-# true-washing/foilcap: каркасные GitHub-репо (основной код в Gitea —
-# см. их Деплоймент в вики).
+# true-washing/foilcap — код вне GitHub: repo ниже = GitHub-каркас, его
+# потребляет только PR-слой конвейера (автомерж-проба/мерж). Носители кода:
+# foilcap — self-hosted Gitea git.l4a.ru/ek/ai-generator (checkout = Gitea-клон;
+# перевод in-place, #1333); true-washing — Forgejo git.true-wash.com
+# true-wash/detector (checkout = Forgejo-клон; #1333). Детали — их Деплоймент в вики.
 [[project]]
 name = "origa"
 board = "Задачи origa"
@@ -70,7 +73,7 @@ env_root = "/home/yurvon/agents-env"
 name = "true-washing"
 board = "Задачи true-washing"
 repo = "yurvon-screamo/true-washing"
-checkout = "/home/yurvon/true-washing"
+checkout = "/home/yurvon/true-wash/detector"
 env_root = "/home/yurvon/agents-env"
 
 [[project]]

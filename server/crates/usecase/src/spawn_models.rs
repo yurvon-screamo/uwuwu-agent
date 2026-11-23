@@ -2,7 +2,7 @@
 //! механизм конфигурации — модель кладётся сервером в тело спавна
 //! (`SessionSpec.model`), деф-файлы агентов моделей не несут. Канон
 //! владельца (18.11, #417): везде flash#high, ревьюверы — полный
-//! glm-5.3#high; canonical() следует config.example дословно
+//! glm-5.4#high; canonical() следует config.example дословно
 //! (кросс-гвард spawn_models_config_sync_test).
 //! Ключи карты — имена агентов (naming::agent_name) + "default"
 //! (bootstrap-сессии подготовки env; до #1300 — также дев-семья, после
@@ -35,12 +35,12 @@ impl SpawnModels {
         };
         put("default", "zai-coding-plan/glm-5.3-flash#high");
         put("developer", "zai-coding-plan/glm-5.3-flash#high");
-        put("plan-reviewer", "zai-coding-plan/glm-5.3#high");
-        put("code-quality-reviewer", "zai-coding-plan/glm-5.3#high");
+        put("plan-reviewer", "zai-coding-plan/glm-5.4#high");
+        put("code-quality-reviewer", "zai-coding-plan/glm-5.4#high");
         put("tester", "zai-coding-plan/glm-5.3-flash#high");
-        put("test-reviewer", "zai-coding-plan/glm-5.3#high");
+        put("test-reviewer", "zai-coding-plan/glm-5.4#high");
         put("analyst", "zai-coding-plan/glm-5.3-flash#high");
-        put("analyst-reviewer", "zai-coding-plan/glm-5.3#high");
+        put("analyst-reviewer", "zai-coding-plan/glm-5.3-flash#high");
         put("dreamer", "zai-coding-plan/glm-5.3-flash#high");
         Self { map }
     }
@@ -108,7 +108,7 @@ mod tests {
         let m = SpawnModels::canonical();
         assert_eq!(
             m.for_agent(Agent::PlanReviewer),
-            SpawnModel::parse("zai-coding-plan/glm-5.3#high").unwrap(),
+            SpawnModel::parse("zai-coding-plan/glm-5.4#high").unwrap(),
             "ревьюверы — полный 5.3#high (канон #417)"
         );
         assert_eq!(

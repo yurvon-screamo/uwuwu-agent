@@ -3,6 +3,7 @@
 //! чанкование реплая, диф-действие супервизора.
 
 use crate::bots::ports::{Incoming, TgMessage};
+use crate::fm_lite;
 use uwuwu_domain::{BotAction, BotSpec};
 
 /// Классификация входящего: private-only (группы/каналы игнорируются),
@@ -49,6 +50,45 @@ pub fn build_prompt(manual: &str, text: &str) -> String {
         "The bot manual is the only valid version; earlier instructions \
          in the session history are stale.\n\n## Manual\n\n{manual}\n\n## User message\n\n{text}"
     )
+}
+
+/// Композит методички для дозаправки (#1424): методичка-основа владельца
+/// плюс блок уроков бота. Пустые уроки — методичка как прежде
+/// (регресс-гейт: дока `Уроки` нет — текст дозаправки не меняется).
+pub fn compose_manual(manual: &str, lessons: &str) -> String {
+    if lessons.trim().is_empty() {
+        return manual.to_string();
+    }
+    format!(
+        "{manual}\n\n## Уроки (выучено автоматически; пишет ночной крон)\n\n{}",
+        lessons.trim()
+    )
+}
+
+/// Промпт доставки уроков (agent-режим, #1424): уроки едут одним
+/// сообщением при изменении (hash-гейт в state), дальше чистый текст;
+/// шапка подавляет устаревшие копии уроков в истории сессии.
+pub fn build_lessons_prompt(lessons: &str, text: &str) -> String {
+    format!(
+        "New bot lessons (auto-learned rules) below; earlier lesson copies \
+         in the session history are stale.\n\n## Lessons\n\n{lessons}\n\n## User message\n\n{text}"
+    )
+}
+
+/// Промпт отзыва уроков (agent-режим, #1424): носитель опустел
+/// (компактизация/поглощение методичкой/отзыв) — ранние копии уроков
+/// в истории сессии устарели и исполнению не подлежат.
+pub fn build_lessons_revoked_prompt(text: &str) -> String {
+    format!(
+        "The bot lessons carrier is now empty: earlier lesson copies in the \
+         session history are stale and must not be followed.\n\n## User message\n\n{text}"
+    )
+}
+
+/// Нормализация носителя уроков (#1424): fm-шапка (если появилась) —
+/// долой, обрамление — трим. Конвенция — body-only док; strip защитен.
+pub fn normalize_lessons(raw: &str) -> String {
+    fm_lite::strip(raw).trim().to_string()
 }
 
 /// Чанки ≤4000 символов (лимит ТГ 4096, запас); разрыв — по границе
@@ -198,6 +238,48 @@ mod tests {
         assert!(p.ends_with("заявка"));
     }
 
+    /// #1424: пустые уроки — композит тождественен методичке (регресс-гейт),
+    /// непустые — блок уроков после методички.
+    #[test]
+    fn compose_manual_appends_lessons_block() {
+        assert_eq!(compose_manual("методичка", ""), "методичка");
+        assert_eq!(compose_manual("методичка", "   "), "методичка");
+        let composed = compose_manual("методичка", "урок один");
+        assert!(composed.starts_with("методичка\n\n## Уроки"));
+        assert!(composed.ends_with("урок один"));
+    }
+
+    /// #1424: промпт уроков несёт шапку-подавитель устаревших копий,
+    /// уроки и текст пользователя.
+    #[test]
+    fn lessons_prompt_carries_prefix() {
+        let p = build_lessons_prompt("урок один", "вопрос");
+        assert!(p.starts_with("New bot lessons"));
+        assert!(p.contains("урок один"));
+        assert!(p.ends_with("вопрос"));
+    }
+
+    /// #1424 (ревью Common 1): промпт отзыва — носитель опустел, ранние
+    /// копии уроков в истории объявлены устаревшими.
+    #[test]
+    fn lessons_revoked_prompt_suppresses_history() {
+        let p = build_lessons_revoked_prompt("вопрос");
+        assert!(p.starts_with("The bot lessons carrier is now empty"));
+        assert!(p.ends_with("вопрос"));
+    }
+
+    /// #1424: нормализация носителя уроков — fm-шапка срезается,
+    /// body-only док проходит как есть, обрамление триммится.
+    #[test]
+    fn normalize_lessons_strips_fm_and_trims() {
+        assert_eq!(
+            normalize_lessons("---\ntitle: Уроки\n---\n\nурок один"),
+            "урок один"
+        );
+        assert_eq!(normalize_lessons("  урок один\n"), "урок один");
+        assert_eq!(normalize_lessons(""), "");
+    }
+
     #[test]
     fn chunks_at_limit_preferring_newline() {
         assert_eq!(chunk_reply("короткий"), vec!["короткий"]);
@@ -270,6 +352,7 @@ mod tests {
             workspace: "/w".into(),
             greeting: None,
             manual: "м".into(),
+            lessons: None,
         }
     }
 }

@@ -1,21 +1,26 @@
-# rathole-server для Railway-сервиса `relay` (туннель Ollama kisa → Railway).
+# rathole-server для Railway-сервиса `relay` (исполнительные туннели kisa/redmi → Railway).
 # Образ: docker.io/rapiz1/rathole. Переменные сервиса (Railway):
 #   RATHOLE_TOKEN — общий секрет сервис-клиент (у владельца)
 #   PORT          — 2333 (внутренний порт Railway)
 # Start command сервиса (конфиг генерируется из env, файл в образ не нужен):
-#   sh -c 'printf "[server]\nbind_addr=\"0.0.0.0:%s\"\n\n[server.services.ollama]\ntoken=\"%s\"\n" "$PORT" "$RATHOLE_TOKEN" > /tmp/rathole.toml && rathole /tmp/rathole.toml'
+#   sh -c 'printf "[server]\nbind_addr=\"0.0.0.0:%s\"\n\n[server.services.opencode]\ntoken=\"%s\"\nbind_addr=\"0.0.0.0:2335\"\n\n[server.services.opencode2]\ntoken=\"%s\"\nbind_addr=\"0.0.0.0:2336\"\n" "$PORT" "$RATHOLE_TOKEN" "$RATHOLE_TOKEN" > /tmp/rathole.toml && rathole /tmp/rathole.toml'
 #
-# Схема: uwuwu-server → http://relay.railway.internal:2333 → (туннель) → kisa ollama :11434
-# Наружу — только публичный TCP-домен relay (для kisa-клиента), Ollama в интернет не торчит.
+# Схема: uwuwu-server → http://relay.railway.internal:2335 (opencode — kisa)
+# и :2336 (opencode2 — redmi) → туннель → исполнители opencode serve.
+# Наружу — только публичный TCP-домен relay (для rathole-клиентов исполнителей),
+# сервисные порты в интернет не торчат.
+# Легаси ollama-сервис (:2334) снесён — эмбеддинги переехали на Gemini API (#1363).
 #
 # Эквивалентный статический конфиг (если класть файл):
 [server]
 bind_addr = "0.0.0.0:2333"
 # heartbeat — дефолты rathole достаточны для idle-туннеля
 
-[server.services.ollama]
+# Исполнитель-гейт kisa: uwuwu-server → http://relay.railway.internal:2335 → туннель → kisa opencode serve
+[server.services.opencode]
 # token = "$RATHOLE_TOKEN" — подставляется env в start command
 token = "CHANGE_ME"
+bind_addr = "0.0.0.0:2335"
 
 # Второй исполнитель (ноутбук-2, 16.11): тот же паттерн —
 # uwuwu-server → http://relay.railway.internal:2336 → (туннель) → ноут-2 opencode serve

@@ -1,7 +1,9 @@
-# relay (rathole-server) — туннель Ollama kisa → Railway.
+# relay (rathole-server) — исполнительные туннели kisa/redmi → Railway.
 # Railway-сервис `relay` деплоится из корня репо (source = master):
 # uwuwu-server билдится railway up из server/ — этот Dockerfile его
 # не касается. Переменные сервиса: RATHOLE_TOKEN, PORT (2333).
+# Легаси ollama-туннель (:2334) снесён — эмбеддинги переехали на
+# Gemini API (#1363).
 #
 # ВАЖНО: rapiz1/rathole:latest — distroless (без /bin/sh): конфиг в
 # рантайме генерить нечем, `CMD ["/bin/sh", …]` умирает мгновенно без
