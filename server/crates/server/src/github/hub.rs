@@ -2624,55 +2624,122 @@ mod tests {
         });
     }
 
-    /// #1437 живая проба (tester): честная квитанция статусной записи
-    /// против реального носителя. МУТАЦИОННАЯ, идемпотентная — пишет
-    /// ТО ЖЕ значение статуса, что носитель уже несёт (базлайн не
-    /// искажается, восстановления не требуется); носитель — sandbox
-    /// #1265 (носитель живых проб #1232/#1258). Контракт: PATCH
-    /// применился → квитанция Confirmed с raw-именем носителя +
-    /// fresh_row_status (тот же gql_issue_status — путь идемпотентного
-    /// гарда) видит записанный статус. Красный на момент пробы 22.11:
-    /// gql_issue_status разворачивает envelope дважды (gql() уже
-    /// возвращает body["data"], функция читает data["data"]) — все
+    /// #1437 живая проба (tester, тест-ревью C1/L1): честная квитанция
+    /// статусной записи на НАСТОЯЩЕМ ПЕРЕХОДЕ против реального носителя.
+    /// Фикстура строится пробой самой (зашитых номеров нет): create_issue
+    /// на доске sandbox, create-дефолт Analys (#1135). Проба пишет статус,
+    /// ОТЛИЧНЫЙ от базлайна — запись того же значения квитанцию не
+    /// доказывает (носитель и до записи держит ожидаемое, Confirmed не
+    /// зависел бы ни от ухода PATCH, ни от чтения носителя). Контракт:
+    /// PATCH применился → квитанция Confirmed с raw-именем НОВОГО
+    /// значения + fresh_row_status (тот же gql_issue_status — путь
+    /// verify и идемпотентного гарда) видит переход. Восстановление
+    /// базлайна не зависит от исхода ассертов (catch_unwind), за строкой
+    /// проба убирается (close not_planned). Красный на момент пробы
+    /// 22.11: gql_issue_status разворачивала envelope дважды (gql() уже
+    /// возвращает body["data"], функция читала data["data"]) — все
     /// verify-риды дают Ok(None) → Mismatch → громкий отказ ПРИМЕНЁННОЙ
-    /// записи и «строка не на доске» из гарда.
+    /// записи; на непосланном PATCH — тот же Mismatch (носитель не
+    /// сдвинулся с базлайна).
     #[test]
-    #[ignore] // живой прогон: GH_TOKEN + сеть к api.github.com; МУТАЦИЯ — идемпотентная запись своего же значения
+    #[ignore] // живой прогон: GH_TOKEN + сеть к api.github.com; МУТАЦИЯ — настоящий переход с восстановлением базлайна
     fn live_set_status_honest_receipt_on_real_carrier() {
+        use futures::FutureExt as _;
         let repo =
             std::env::var("UWUWU_HUB_REPO").unwrap_or_else(|_| "yurvon-screamo/uwuwu-hub".into());
         let token = std::env::var("GH_TOKEN").expect("GH_TOKEN");
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         rt.block_on(async {
             let board = "Задачи sandbox";
-            let n = 1265u64;
-            let hub = GitHubHub::new(repo.clone(), token.clone());
-            let rows = hub.read_board(board).await.expect("read_board базлайн");
-            let row = rows
-                .iter()
-                .find(|t| t.number() == n)
-                .expect("#1265 на доске sandbox");
-            let base = row.status();
-            // идемпотентная проба: запись значения, которое носитель уже несёт
-            let delivery = hub
-                .set_status(board, n, base)
+            let hub = std::sync::Arc::new(GitHubHub::new(repo.clone(), token.clone()));
+            // 1. фикстура пробой самой: строка на sandbox, дефолт Analys
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_secs();
+            let title = format!("[pin #1437] честная квитанция: настоящий переход {stamp}");
+            let n = hub
+                .create_issue(
+                    board,
+                    "sandbox",
+                    &title,
+                    "живая проба тестера #1437 (честная квитанция статусной записи); \
+                     убирается за собой — close not_planned",
+                    None,
+                )
                 .await
-                .expect("применённая запись → честная квитанция Confirmed (#1437)");
-            let uwuwu_usecase::StatusDelivery::Confirmed { actual } = delivery else {
-                panic!("квитанция без доказательства применения: {delivery:?}");
-            };
+                .expect("фикстура: строка создана на доске sandbox");
+            // 2. базлайн свежим ридом носителя; create-конвергенция — в
+            //    бюджете verify (5×1с, измеренные ~2с)
+            let mut seen: Option<uwuwu_domain::Status> = None;
+            for _ in 0..5u32 {
+                seen = hub
+                    .fresh_row_status(board, n)
+                    .await
+                    .expect("свежий рид после create");
+                if seen.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            let base = seen.expect("фикстура легла на доску: статус не пуст");
             assert_eq!(
-                uwuwu_usecase::parse_status(&actual),
                 base,
-                "raw-имя носителя совпало с записанным: {actual}"
+                uwuwu_domain::Status::Analys,
+                "create-дефолт Analys (#1135) — иначе проба пишет мимо фикстуры"
             );
-            // тот же путь чтения (gql_issue_status) в идемпотентном гарде
-            let fresh = hub
-                .fresh_row_status(board, n)
-                .await
-                .expect("свежее чтение носителя отвечает")
-                .expect("строка #1265 на доске по свежему GraphQL-риду");
-            assert_eq!(fresh, base, "fresh_row_status видит записанный статус");
+            // 3. проба: настоящий переход In Progress ≠ Analys; ассерты
+            //    под catch_unwind — восстановление ниже не зависит от исхода
+            let probe = std::panic::AssertUnwindSafe(async {
+                let delivery = hub
+                    .set_status(board, n, uwuwu_domain::Status::InProgress)
+                    .await
+                    .expect("применённая запись → честная квитанция Confirmed (#1437)");
+                let uwuwu_usecase::StatusDelivery::Confirmed { actual } = delivery else {
+                    panic!("квитанция без доказательства применения: {delivery:?}");
+                };
+                assert_eq!(
+                    uwuwu_usecase::parse_status(&actual),
+                    uwuwu_domain::Status::InProgress,
+                    "raw-имя носителя = НОВОЕ значение перехода: {actual}"
+                );
+                // тот же путь чтения (gql_issue_status) в verify и гарде
+                let fresh = hub
+                    .fresh_row_status(board, n)
+                    .await
+                    .expect("свежее чтение носителя отвечает")
+                    .expect("строка пробы на доске по свежему GraphQL-риду");
+                assert_eq!(
+                    fresh,
+                    uwuwu_domain::Status::InProgress,
+                    "носитель несёт переход"
+                );
+            })
+            .catch_unwind()
+            .await;
+            // 4. восстановление базлайна + уборка — при любом исходе пробы
+            let cleanup = std::panic::AssertUnwindSafe(async {
+                hub.set_status(board, n, base)
+                    .await
+                    .expect("восстановление базлайна");
+                let fresh = hub
+                    .fresh_row_status(board, n)
+                    .await
+                    .expect("свежий рид после отката")
+                    .expect("строка пробы жива после отката");
+                assert_eq!(fresh, base, "базлайн восстановлен на носителе");
+                hub.close_issue_ext(n, true)
+                    .await
+                    .expect("строка пробы закрыта (за собой, not_planned)");
+            })
+            .catch_unwind()
+            .await;
+            if let Err(panic) = probe {
+                std::panic::resume_unwind(panic);
+            }
+            if let Err(panic) = cleanup {
+                std::panic::resume_unwind(panic);
+            }
         });
     }
 
