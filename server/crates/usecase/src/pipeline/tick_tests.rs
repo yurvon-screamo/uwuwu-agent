@@ -4735,6 +4735,7 @@ async fn limit_pause_skips_judge_call() {
 /// строка (тишина ниже гейтов) не дёргает пробу вовсе.
 #[tokio::test]
 async fn limit_probe_runs_only_at_stall_decision() {
+    const NOW: u64 = 100_000_000;
     let board = Arc::new(FakeBoard {
         rows: std::sync::Mutex::new(vec![dev_task(64, "ses_dev_64")]),
         log: Mutex::default(),
@@ -4745,8 +4746,8 @@ async fn limit_probe_runs_only_at_stall_decision() {
         status_fails: AtomicBool::new(false),
     });
     let sess = Arc::new(FakeSessions {
-        // активность 5 минут назад — ниже мягкого гейта тишины
-        activity_ms: Some(95_000_000),
+        // активность 5 минут назад (300_000 ms) — ниже мягкого гейта тишины
+        activity_ms: Some(NOW - 5 * 60_000),
         idle_reply: true,
         ..FakeSessions::new()
     });
