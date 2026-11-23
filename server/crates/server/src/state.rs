@@ -1307,7 +1307,10 @@ mod tests {
             dir.join("state.json.corrupt-5").exists(),
             "улика сохранена со штампом (now_ms/1000)"
         );
-        assert!(!dir.join("state.json.corrupt-1").exists(), "старая улика снесена");
+        assert!(
+            !dir.join("state.json.corrupt-1").exists(),
+            "старая улика снесена"
+        );
         // после сброса запись работает штатно
         CronStateStore::set_cron_row(&s, "x", CronRow::default());
         TickStateStore::save(&s).unwrap();
@@ -1365,7 +1368,10 @@ mod tests {
         }
         let raw = std::fs::read_to_string(&path).unwrap();
         serde_json::from_str::<serde_json::Value>(&raw).expect("state.json валиден после гонки");
-        assert_eq!(CronStateStore::cron_row(&*s, "cron-7").last_fire_ms, Some(719));
+        assert_eq!(
+            CronStateStore::cron_row(&*s, "cron-7").last_fire_ms,
+            Some(719)
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

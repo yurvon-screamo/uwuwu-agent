@@ -395,7 +395,10 @@ mod tests {
         // уже покрыл минуту 08:30 этого дня
         let late_fact = ms(20779, 0, 0); // 23.11 09:00 JST
         let far_now = ms(20779, 0, 30); // 23.11 09:30 JST
-        assert!(!s.is_due(far_now, Some(late_fact)), "матч старше факта — нет");
+        assert!(
+            !s.is_due(far_now, Some(late_fact)),
+            "матч старше факта — нет"
+        );
     }
 
     #[test]

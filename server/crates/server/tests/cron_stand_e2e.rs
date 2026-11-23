@@ -194,9 +194,10 @@ async fn cron_fire_machine_accounting_without_journal() {
 
     // 1+2. Файр + сеттлмент: оба мастера с last_fire, треки сняты, отказов
     // нет (мок plain: ход завершается succeeded за step_ms, следующий тик
-    // закрывает трек). Тик ~10 c, файр-волна успевает за два цикла.
+    // закрывает трек). Тик ~10 c; якорная семантика (#1517) сдвигает
+    // первый файр на интервал после якоря — окно с запасом на три тика.
     let state_path = stand.dir.join("state.json");
-    let poll_deadline = Instant::now() + Duration::from_secs(45);
+    let poll_deadline = Instant::now() + Duration::from_secs(120);
     let state: Value = loop {
         assert!(
             Instant::now() < poll_deadline,
@@ -320,10 +321,7 @@ async fn corrupt_state_restart_anchors_without_catchup() {
         return;
     }
 
-    let dir = std::env::temp_dir().join(format!(
-        "cron-stand-e2e-corrupt-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("cron-stand-e2e-corrupt-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("checkout")).expect("tempdir");
     let bearer = "e2e-stand-bearer";
     let masters = json!({
@@ -370,14 +368,10 @@ async fn corrupt_state_restart_anchors_without_catchup() {
         };
         let crons = &v["crons"];
         let anchored = |row: &Value| {
-            row["anchor_ms"].is_u64()
-                && !row["last_fire_ms"].is_u64()
-                && row.get("run").is_none()
+            row["anchor_ms"].is_u64() && !row["last_fire_ms"].is_u64() && row.get("run").is_none()
         };
-        if [crons["e2e-zayavitel"], crons["e2e-isp"]]
-            .iter()
-            .all(anchored)
-        {
+        let rows = [&crons["e2e-zayavitel"], &crons["e2e-isp"]];
+        if rows.iter().all(|r| anchored(r)) {
             break v;
         }
     };
@@ -399,9 +393,10 @@ async fn corrupt_state_restart_anchors_without_catchup() {
         .expect("mock sessions JSON");
     let rows = sessions["data"].as_array().expect("session list");
     assert!(
-        !rows
-            .iter()
-            .any(|s| s["title"].as_str().map(|t| t.starts_with("⏰ ")).unwrap_or(false)),
+        !rows.iter().any(|s| s["title"]
+            .as_str()
+            .map(|t| t.starts_with("⏰ "))
+            .unwrap_or(false)),
         "якорь спавнит раны — регрессия масс-догона: {rows:?}"
     );
     let list = mcp_call(&http, stand.port, bearer, "cron_list", json!({})).await;

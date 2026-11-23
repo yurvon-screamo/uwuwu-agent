@@ -63,6 +63,19 @@ pub struct FireOutcome {
     pub session: String,
 }
 
+/// Факт файра с якорем первой встречи (#1517): max(last_fire, anchor).
+/// Once живёт на голом last_fire — его None доживает до планового
+/// момента (якорь в формулу Once не входит).
+fn effective_last(row: &CronRow, once_kind: bool) -> Option<u64> {
+    if once_kind {
+        return row.last_fire_ms;
+    }
+    match (row.last_fire_ms, row.anchor_ms) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 impl CronUseCase {
     /// Каноническая сборка: анти-повтор сигналов — IncidentLoudness
     /// «порог 1 + cooldown» (один ТГ на эпизод сбоя крона, ин-мемори —
@@ -155,14 +168,7 @@ impl CronUseCase {
             // тома) больше не даёт масс-догона прошлых минут. Once —
             // исключение: его None должен дожить до планового момента.
             let once_kind = matches!(master.schedule.kind(), ScheduleKind::Once { .. });
-            let effective = if once_kind {
-                row.last_fire_ms
-            } else {
-                match (row.last_fire_ms, row.anchor_ms) {
-                    (Some(a), Some(b)) => Some(a.max(b)),
-                    (a, b) => a.or(b),
-                }
-            };
+            let effective = effective_last(&row, once_kind);
             if effective.is_none() && !once_kind {
                 row.anchor_ms = Some(now);
                 self.state.set_cron_row(&name, row);
@@ -1150,7 +1156,13 @@ mod tests {
         });
         let clock = SettableClock::at(epoch_ms(20780, 1, 0, 0)); // 23.11 10:00 JST
         let lost = MemCronState::new();
-        let u = cron_uc_clock(two_cron_masters(), sessions.clone(), 7, clock.clone(), lost.clone());
+        let u = cron_uc_clock(
+            two_cron_masters(),
+            sessions.clone(),
+            7,
+            clock.clone(),
+            lost.clone(),
+        );
         let fired = u.tick().await.unwrap();
         assert!(fired.is_empty(), "потеря state — догона нет");
         assert!(sessions.spawned.lock().unwrap().is_empty(), "спавнов нет");
@@ -1190,7 +1202,10 @@ mod tests {
         clock.set(epoch_ms(20780, 16, 31, 0));
         let fired = u.tick().await.unwrap();
         assert_eq!(fired.len(), 1, "файр в плановую минуту после якоря");
-        assert_eq!(state.row("daily").last_fire_ms, Some(epoch_ms(20780, 16, 31, 0)));
+        assert_eq!(
+            state.row("daily").last_fire_ms,
+            Some(epoch_ms(20780, 16, 31, 0))
+        );
         assert_eq!(
             state.row("daily").anchor_ms,
             Some(epoch_ms(20780, 5, 0, 0)),
