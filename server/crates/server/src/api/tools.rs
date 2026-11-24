@@ -5,8 +5,8 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use uwuwu_usecase::{
-    fm_guard, jst_stamp, BlobPlace, BlobUseCase, Clock, DocsView, PersonView, TaskView,
-    TaskWriteUseCase, TaskWriter,
+    fm_guard, jst_stamp, BlobPlace, BlobUseCase, Clock, DocsView, PersonView, SectionWrite,
+    TaskView, TaskWriteUseCase, TaskWriter,
 };
 
 pub struct ToolHub {
@@ -31,6 +31,126 @@ pub struct ToolHub {
 
 /// Дефолтный проект для инструментов без явного project.
 pub const DEFAULT_PROJECT: &str = "uwuwu";
+
+/// Мутационные тулы: имена — семантический факт «тул мутирует носитель»
+/// (в дескрипторах не кодируется). Новый мутационный тул — добавь имя
+/// сюда; ключи гард возьмёт из дескриптора сам. Тул из списка без
+/// дескриптора гардится громко (всё чужое) — дескриптор обязателен.
+const MUTATION_TOOLS: &[&str] = &[
+    "task_create",
+    "task_edit",
+    "task_claim",
+    "task_comment",
+    "task_close",
+    "task_clean",
+    "task_undo",
+    "board_status_rename",
+    "task_body",
+    "task_body_section",
+    "blob_put",
+    "docs_write",
+    "docs_append",
+];
+
+/// Ключи диспетчера: легальны на любом мутационном туле. Семантика
+/// честная (ревью #1572 Low): диспетчер читает project на каждом вызове
+/// (дефолт uwuwu, канон «проект — канал вызова»); на тулах без
+/// маршрутизации доски ключ принимается и не влияет на поведение —
+/// канон предписывает агентам передавать project всюду. В текст отказа
+/// «the tool knows» не входят — рекламировать надо только ключи схемы.
+const DISPATCHER_KEYS: &[&str] = &["project"];
+
+/// Читающие тулы: явное дополнение MUTATION_TOOLS до каталога
+/// (ревью #1572, Common). Пин catalog_partition_... держит разбиение
+/// «мутационные ∪ читающие = каталог»: новый тул без записи в один из
+/// списков валит тест — тихий пропуск гарда исключён.
+/// Тест-носитель: в рантайме гард не нужен.
+#[cfg(test)]
+const READ_TOOLS: &[&str] = &[
+    "task_list",
+    "task_get",
+    "docs_ls",
+    "docs_read",
+    "person_show",
+    "goal_list",
+    "projects",
+    "cron_list",
+    "search",
+    "session_export",
+    "blob_get",
+];
+
+/// Legacy-ключи: читаются хендлерами, в схему не рекламируются —
+/// осознанное решение #1232 («legacy-ключ не рекламится (но читается)»,
+/// пин descriptors_expose_automerge). Единственное исключение из
+/// дескриптор-вывода, перечислено явно: (тул, ключ).
+const LEGACY_KEYS: &[(&str, &str)] = &[("task_create", "autodone")];
+
+/// Разрешённые ключи мутационного тула: legal — что принимает хендлер
+/// (inputSchema дескриптора + LEGACY_KEYS), advertised — что отказ
+/// рекламирует в «the tool knows» (только схема: legacy-ключи и
+/// диспетчерский project легальны молча — пин решения #1232 «legacy-ключ
+/// не рекламится (но читается)», ревью #1572 дельта-раунд 3). Some(пусто)
+/// — тул из списка без дескриптора: гардится громко; None — не
+/// мутационный (читающий: принадлежность проверена пином
+/// catalog_partition_mutation_or_read_is_total — каждый тул каталога
+/// заявлен ровно в одном списке).
+fn mutation_keys(name: &str) -> Option<(Vec<String>, Vec<String>)> {
+    if !MUTATION_TOOLS.contains(&name) {
+        return None;
+    }
+    let list = tool_descriptors();
+    let props = list
+        .as_array()?
+        .iter()
+        .find(|t| t["name"].as_str() == Some(name))
+        .map(|t| &t["inputSchema"]["properties"]);
+    let Some(props) = props else {
+        return Some((Vec::new(), Vec::new()));
+    };
+    let schema: Vec<String> = props
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    let mut legal = schema.clone();
+    for (tool, key) in LEGACY_KEYS {
+        if *tool == name {
+            legal.push((*key).to_string());
+        }
+    }
+    Some((legal, schema))
+}
+
+/// Гард чужих ключей мутационной поверхности (#1572, сценарий 2): вызов
+/// с ключами вне схемы — громкий отказ до мутации; носитель не трогается,
+/// контент не передан. Отказ вместо тихого strip (ADR-065: «стрип
+/// маскировал бы ошибку навсегда»); история деградации — вторым
+/// предложением (ревью #1572 Low: прошедшее время читалось как «прошло»).
+fn refuse_unknown_args(name: &str, args: &Value) -> Result<(), String> {
+    let Some((legal, advertised)) = mutation_keys(name) else {
+        return Ok(());
+    };
+    let mut unknown: Vec<&str> = Vec::new();
+    if let Some(map) = args.as_object() {
+        for key in map.keys() {
+            if DISPATCHER_KEYS.contains(&key.as_str()) || legal.iter().any(|a| a == key) {
+                continue;
+            }
+            unknown.push(key.as_str());
+        }
+    }
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "unknown argument(s) {} for {name} — the write is REFUSED, the carrier is untouched \
+         (no content was passed); the tool knows: {} — re-send with the schema keys (unknown \
+         keys used to be silently ignored and degraded the call to a partial write, \
+         bug #1572)",
+        unknown.join(", "),
+        advertised.join(", ")
+    ))
+}
 
 impl ToolHub {
     pub fn descriptors(&self) -> Value {
@@ -110,7 +230,6 @@ pub fn tool_descriptors() -> Value {
             "Claim your session into the dev slot (the factory will not spawn a duplicate)",
             object(json!({
                 "number": integer("task number"),
-                "project": string("project; default uwuwu"),
                 "session": string("your session id (ses_…)")
             }))
         ),
@@ -128,7 +247,6 @@ pub fn tool_descriptors() -> Value {
             "Close the task (Done; reason not_planned for rejections)",
             object(json!({
                 "number": integer("task number"),
-                "project": string("project; default uwuwu"),
                 "not_planned": json!({"type":"boolean","description":"true — rejected/duplicate, false — done"})
             }))
         ),
@@ -226,26 +344,35 @@ pub fn tool_descriptors() -> Value {
         tool(
             "task_body",
             "Full replacement of the task body (fm is not written into the body — fields are \
-             native; edit large bodies sectionally via task_body_section)",
+             native; edit large bodies sectionally via task_body_section). Write, not read: \
+             without the body parameter — loud refusal; explicit empty string clears the body",
             object(json!({
                 "number": integer("task number"),
                 "project": string("project; default uwuwu"),
-                "body": string("full markdown body (no fm)")
+                "body": string("full markdown body (no fm); ABSENT parameter is a loud \
+                              refusal (read via task_get); empty or whitespace-only string — \
+                              clear deliberately; fm/task_get-header-only input is refused \
+                              (no effective content)")
             }))
         ),
         tool(
             "task_body_section",
             "Sectional edit of the task body: a section delta instead of the full body \
-             (large bodies — this path only); freshness — base_hash",
+             (large bodies — this path only); freshness — base_hash; radical shrink (a third \
+             of the carrier or a big section cut) refuses — deliberate shrink repeats with \
+             confirm: true",
             object(json!({
                 "number": integer("task number"),
                 "project": string("project; default uwuwu"),
                 "section": string("section heading; ATX prefix pins the level \
                                   («### X» — h3), bare/«## X» — default h2"),
-                "content": string("new section content without the heading; empty \
-                                  string — clear the section"),
+                "content": string("new section content without the heading; ABSENT \
+                                  parameter is a loud refusal (write, not read); empty \
+                                  string — clear the section deliberately"),
                 "base_hash": string("body_hash of the body at read time (fm block of \
-                                    task_get or a prior receipt); required")
+                                    task_get or a prior receipt); required"),
+                "confirm": json!({"type":"boolean","description":"true — deliberately \
+                                  re-run a write refused by the shrink guard"})
             }))
         ),
         tool(
@@ -280,6 +407,8 @@ impl ToolHub {
     pub async fn call(&self, msg: &Value) -> Result<Value, String> {
         let name = msg["params"]["name"].as_str().unwrap_or_default();
         let args = &msg["params"]["arguments"];
+        // чужие ключи мутаций — отказ до разбора и до носителя (#1572)
+        refuse_unknown_args(name, args)?;
         let project = {
             let p = arg_str(args, "project");
             if p.is_empty() {
@@ -698,19 +827,27 @@ impl ToolHub {
 
     async fn task_body(&self, project: &str, args: &Value) -> Result<Value, String> {
         let number = need_number(args)?;
-        let body = arg_str(args, "body");
-        if body.trim().is_empty() {
-            return Err("empty body".into());
-        }
+        // «параметр отсутствует» ≠ «явно пустая строка» (#1572): Option-разбор
+        // на границе; отказ с длиной носителя и рецептом строит юзкейс
+        let body = args.get("body").and_then(|v| v.as_str());
         let receipt = self
             .writer
-            .set_body(project, number, &body)
+            .set_body(project, number, body)
             .await
             .map_err(|e| e.to_string())?;
-        let mut msg = format!(
-            "body of #{number} replaced; {} bytes; body_hash: {}",
-            receipt.body_size, receipt.body_hash
-        );
+        // явная очистка названа актом (ревью #1572 Low): секционный путь
+        // тот же акт зовёт «cleared»
+        let mut msg = if receipt.body_size == 0 {
+            format!(
+                "body of #{number} cleared; 0 bytes; body_hash: {}",
+                receipt.body_hash
+            )
+        } else {
+            format!(
+                "body of #{number} replaced; {} bytes; body_hash: {}",
+                receipt.body_size, receipt.body_hash
+            )
+        };
         if !receipt.verified {
             msg.push_str(delivery_unverified_marker());
         }
@@ -720,8 +857,14 @@ impl ToolHub {
     async fn task_body_section(&self, project: &str, args: &Value) -> Result<Value, String> {
         let number = need_number(args)?;
         let section = arg_str(args, "section");
-        let content = arg_str(args, "content");
+        let content = args.get("content").and_then(|v| v.as_str());
         let base_hash = arg_str(args, "base_hash");
+        // confirm (#1409): осознанное проведение радикального сжатия мимо
+        // гарда; без него гард отвечает отказом с длинами было/стало
+        let confirm = args
+            .get("confirm")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         if section.trim().is_empty() {
             return Err("section is required (the section heading)".into());
         }
@@ -730,7 +873,16 @@ impl ToolHub {
         }
         let report = self
             .writer
-            .set_body_section(project, number, &section, &content, &base_hash)
+            .set_body_section(
+                project,
+                number,
+                SectionWrite {
+                    section: &section,
+                    content,
+                    base_hash: &base_hash,
+                    confirm,
+                },
+            )
             .await
             .map_err(|e| e.to_string())?;
         ok_text(render_section_report(&section, &report))
@@ -886,9 +1038,10 @@ fn arg_numbers(args: &Value, key: &str) -> Result<Vec<u64>, String> {
         .collect()
 }
 
-/// Квитанция секционной правки для агента: исход + новое тело (хэш/размер).
-/// Компактно — полное тело не возвращается (сознательное сужение #1152:
-/// возврат больших тел убивал бы экономию секционного пути).
+/// Квитанция секционной правки для агента: исход + длины было/стало по
+/// телу и по секции (#1409: сверка без второго GET) + новое тело
+/// (хэш/размер). Компактно — полное тело не возвращается (сознательное
+/// сужение #1152: возврат больших тел убивал бы экономию секционного пути).
 fn render_section_report(section: &str, report: &uwuwu_usecase::SectionEditReport) -> String {
     use uwuwu_usecase::SectionAction;
     let mut verdict = match (report.action, report.cleared) {
@@ -902,16 +1055,23 @@ fn render_section_report(section: &str, report: &uwuwu_usecase::SectionEditRepor
             report.duplicates_removed
         ));
     }
-    format!(
-        "{verdict}; body {} bytes; body_hash: {}{}",
+    let mut out = format!(
+        "{verdict}; body {} bytes (was {}); section {} bytes (was {}); body_hash: {}{}",
         report.body_size,
+        report.body_was,
+        report.section_now,
+        report.section_was,
         report.body_hash,
         if report.verified {
             String::new()
         } else {
             delivery_unverified_marker().to_string()
         }
-    )
+    );
+    if report.confirmed {
+        out.push_str("; shrink passed with confirm: true");
+    }
+    out
 }
 
 /// Маркер деградированной квитанции (#1331): контрольное чтение носителя
@@ -1153,6 +1313,112 @@ mod tests {
             assert!(names.contains(&expected), "нет инструмента {expected}");
         }
         assert_eq!(names.len(), 24, "контракт поверхности: {names:?}");
+    }
+
+    /// Пин консистентности Common-2 (ревью #1572): allow-list гарда
+    /// выводится из дескрипторов — единый носитель контракта. Тест ловит
+    /// дрейф ключей («ключ в схеме, гард отвергает» и «чужой ключ гард
+    /// пропускает») и требует от каждого мутационного тула дескриптора
+    /// (тул из списка без дескриптора гардится громко, не молча); дрейф
+    /// членства «мутирующие ∕ читающие» держит соседний пин
+    /// catalog_partition_mutation_or_read_is_total.
+    #[test]
+    fn mutation_guard_keys_match_descriptors() {
+        let list = tool_descriptors();
+        for name in MUTATION_TOOLS {
+            let tool = list
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"].as_str() == Some(name))
+                .unwrap_or_else(|| panic!("мутационный тул {name} вне каталога дескрипторов"));
+            let keys: Vec<&str> = tool["inputSchema"]["properties"]
+                .as_object()
+                .expect("inputSchema.properties")
+                .keys()
+                .map(String::as_str)
+                .chain(
+                    LEGACY_KEYS
+                        .iter()
+                        .filter(|(t, _)| *t == *name)
+                        .map(|(_, k)| *k),
+                )
+                .collect();
+            assert!(!keys.is_empty(), "{name}: дескриптор без ключей");
+            // схема-ключи + диспетчерский project легальны
+            let mut args = serde_json::Map::new();
+            for k in &keys {
+                args.insert((*k).to_string(), json!("x"));
+            }
+            args.insert("project".to_string(), json!("uwuwu"));
+            assert!(
+                refuse_unknown_args(name, &Value::Object(args.clone())).is_ok(),
+                "{name}: схема-ключи + project легальны"
+            );
+            // мусорный ключ — громкий отказ с перечнем известных
+            args.insert("__find__".to_string(), json!("x"));
+            let err = refuse_unknown_args(name, &Value::Object(args))
+                .expect_err("чужой ключ отвергается");
+            assert!(err.contains("__find__"), "{name}: чужой ключ назван: {err}");
+            // внесхемные легальные ключи не рекламируются в «the tool
+            // knows» (ревью #1572 дельта-раунд 3): project — канал
+            // диспетчера, legacy autodone — решение #1232
+            for legacy in LEGACY_KEYS
+                .iter()
+                .filter(|(t, _)| *t == *name)
+                .map(|(_, k)| *k)
+            {
+                assert!(
+                    !err.contains(legacy),
+                    "{name}: legacy-ключ {legacy} легален молча, в отказе его нет: {err}"
+                );
+            }
+        }
+        // диспетчерский project не рекламируется в «the tool knows» —
+        // только ключи схемы (мёртвых ключей в отказе нет)
+        let err = refuse_unknown_args("task_comment", &json!({ "find": "x" })).expect_err("отказ");
+        assert!(
+            !err.contains("project"),
+            "project — канал диспетчера, не ключ схемы: {err}"
+        );
+        // project легален на любом мутационном туле, даже не объявленном
+        assert!(refuse_unknown_args(
+            "task_comment",
+            &json!({ "number": 1, "text": "т", "project": "uwuwu" })
+        )
+        .is_ok());
+    }
+
+    /// Пин разбиения поверхности (ревью #1572, Common): каждый тул
+    /// каталога — либо мутационный (MUTATION_TOOLS), либо
+    /// явно заявленный читающий (READ_TOOLS); третий статус красный.
+    /// Направление дрейфа «новый мутационный тул с дескриптором, но без
+    /// записи в списке» ловится: имя без принадлежности валит тест, а
+    /// мёртвые имена в списках — тоже.
+    #[test]
+    fn catalog_partition_mutation_or_read_is_total() {
+        let list = tool_descriptors();
+        let names: Vec<&str> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 24, "контракт поверхности: {names:?}");
+        for name in &names {
+            let is_mutation = MUTATION_TOOLS.contains(name);
+            let is_read = READ_TOOLS.contains(name);
+            assert!(
+                is_mutation ^ is_read,
+                "тул {name} обязан быть заявлен ровно в одном списке (мутационные ∪ читающие)"
+            );
+        }
+        for name in MUTATION_TOOLS.iter().chain(READ_TOOLS.iter()) {
+            assert!(
+                names.contains(name),
+                "имя {name} из списков вне каталога дескрипторов"
+            );
+        }
     }
 
     #[test]

@@ -9,7 +9,7 @@ color: success
 All work lives in a uwuwu task — no exceptions:
 - the user came directly or the task arrived from an external tracker → first create it in uwuwu (`uwuwu_task_create` with `title`/`project`/`body`), work on it, close through it
 - dialog/questions/reports — the task's comments, the statement and the result — in the body
-- **a large task body is edited sectionally** — `MCP uwuwu_task_body_section` (a section delta + base_hash from the fm of `task_get`); the full body (`uwuwu_task_body`) — for small bodies and the first write; a gh PATCH bypassing MCP — forbidden (#1152)
+- **a large task body is edited sectionally** — `MCP uwuwu_task_body_section` (a section delta + base_hash from the fm of `task_get`); the full body (`uwuwu_task_body`) — for small bodies and the first write; a gh PATCH bypassing MCP — forbidden (#1152). Write-paths refuse loudly without content (read via task_get; deliberate clear — explicit empty string) and on unknown arguments (#1572); a radical section shrink repeats with `confirm: true` (#1409)
 - **you change UI — a screenshot into the task**: before/after (or the result), an image attachment into the task — without a screenshot UI work is not considered done. "Works" ≠ "not slop": a UI slice carries UX acceptance criteria on par with mechanical ones — a slop/UX markup pass (the screen.review tool: the ui-slop checklist plus custom questions on naming and UX logic; flags are an aim, your judgment is final), screenshots of new screens in all states (empty/loading/error/long strings/dark theme), a live run on real data volume — presentation scale ("what if 600 changes?"); the e2e contour is not replaced
 
 The only carve-out — the `/fast` command (`opencode.json`): the user invoked it in chat themselves

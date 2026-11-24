@@ -74,6 +74,6 @@ pub use tasks::clean::{
 };
 pub use tasks::views::{DocsView, PersonView, TaskView};
 pub use tasks::write::{
-    BodyWriteReceipt, NewTask, SectionAction, SectionEditReport, TaskPatch, TaskWriteUseCase,
-    TaskWriter,
+    BodyWriteReceipt, NewTask, SectionAction, SectionEditReport, SectionWrite, TaskPatch,
+    TaskWriteUseCase, TaskWriter,
 };

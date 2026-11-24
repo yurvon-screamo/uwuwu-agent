@@ -104,8 +104,25 @@ fn replaces_body_keeps_heading() {
     assert_eq!(
         edit,
         SectionEdit::Replaced {
-            duplicates_removed: 0
+            duplicates_removed: 0,
+            old_content_len: 12,
         }
+    );
+}
+
+#[test]
+fn replaced_edit_carries_old_section_content_len() {
+    // мера снятого контента — вход гарда радикального сжатия и честных
+    // длин квитанции (#1409, #1572): ASCII-фикстура с точным байтом
+    let md = "## A\n12345\n\n## B\nsecond\n";
+    let (_, edit) = replace_md_section(md, "A", "new\n").unwrap();
+    assert_eq!(
+        edit,
+        SectionEdit::Replaced {
+            duplicates_removed: 0,
+            old_content_len: 5,
+        },
+        "мера — байты строк до границы, заголовок и пустые строки не считаются"
     );
 }
 
@@ -135,7 +152,8 @@ fn replaces_first_and_removes_duplicate_sections() {
     assert_eq!(
         edit,
         SectionEdit::Replaced {
-            duplicates_removed: 1
+            duplicates_removed: 1,
+            old_content_len: 62,
         }
     );
 }
@@ -176,7 +194,8 @@ fn normalizes_heading_and_argument() {
     assert_eq!(
         edit,
         SectionEdit::Replaced {
-            duplicates_removed: 0
+            duplicates_removed: 0,
+            old_content_len: 12,
         }
     );
 }
@@ -200,7 +219,8 @@ fn matches_heading_with_block_id_suffix() {
     assert_eq!(
         edit,
         SectionEdit::Replaced {
-            duplicates_removed: 0
+            duplicates_removed: 0,
+            old_content_len: 12,
         }
     );
 }
@@ -320,7 +340,8 @@ fn h2_match_wins_over_h3_twin_without_guard() {
     assert_eq!(
         edit,
         SectionEdit::Replaced {
-            duplicates_removed: 0
+            duplicates_removed: 0,
+            old_content_len: 12,
         },
         "гард не стреляет при живом h2"
     );
@@ -365,7 +386,8 @@ fn prefixed_h3_query_replaces_live_h3() {
     assert_eq!(
         edit,
         SectionEdit::Replaced {
-            duplicates_removed: 0
+            duplicates_removed: 0,
+            old_content_len: 25,
         }
     );
 }
@@ -385,7 +407,8 @@ fn prefixed_h2_query_matches_live_section() {
     assert_eq!(
         edit,
         SectionEdit::Replaced {
-            duplicates_removed: 0
+            duplicates_removed: 0,
+            old_content_len: 12,
         }
     );
 }
@@ -458,7 +481,8 @@ fn pinned_h3_replaces_inside_parent_neighbors_intact() {
     assert_eq!(
         edit,
         SectionEdit::Replaced {
-            duplicates_removed: 0
+            duplicates_removed: 0,
+            old_content_len: 25,
         }
     );
 }
@@ -517,7 +541,8 @@ fn h1_pin_replaces_h1_section_with_document_content() {
     assert_eq!(
         edit,
         SectionEdit::Replaced {
-            duplicates_removed: 0
+            duplicates_removed: 0,
+            old_content_len: 54,
         }
     );
 }

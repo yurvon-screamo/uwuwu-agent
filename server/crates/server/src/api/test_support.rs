@@ -115,6 +115,28 @@ pub(crate) fn tool_hub_on_board(
     (tools, aux)
 }
 
+/// body_hash из fm-шапки вывода task_get (общий для tools_tests и
+/// wire-проб mcp.rs — identical-code #1256).
+pub(crate) fn fm_hash(task_get: &str) -> String {
+    task_get
+        .lines()
+        .find_map(|l| l.strip_prefix("body_hash: "))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// Номер задачи из квитанции «task #N …» (первое слово после префикса).
+pub(crate) fn receipt_number(receipt: &str) -> u64 {
+    receipt
+        .trim_start_matches("task #")
+        .split(' ')
+        .next()
+        .unwrap_or_default()
+        .parse()
+        .expect("номер в квитанции")
+}
+
 #[async_trait]
 impl WikiRepo for StubWiki {
     async fn doc_shas(&self) -> UsecaseResult<Vec<(String, String)>> {
