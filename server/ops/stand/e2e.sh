@@ -1136,6 +1136,7 @@ MOCK_MODE=idle MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=100 MOCK_CMD_DELAY_MS=25000 \
   "$BIN_MOCK" >"$LOG_MOCK" 2>&1 &
 MOCK_PID=$!
 sleep 1
+T14B_START=$(date +%s)
 UWUWU_SERVER_CONFIG="$CONFIG_EGC" UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
   UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
   UWUWU_MOCK_SEED="$EGC_SEED" RUST_LOG=info "$BIN_SRV" >"$LOG_SRV_EGC" 2>&1 &
@@ -1147,6 +1148,13 @@ while [ $SEEN -lt 45 ]; do
 done
 grep -q '"event":"env.gc.completed"' "$LOG_SRV_EGC" \
   || fail "live-env-gc не дошёл до completed за 180с (медленная команда 25с не доехала — per-request бюджет не работает?)"
+# пин факта медленной команды (Low-5 ревью кода): от старта фазы до
+# completed прошло ≥ задержки — откажи MOCK_CMD_DELAY_MS молча, ассерт
+# ловит исчезновение покрытия per-request таймаута
+T14B_END=$(date +%s)
+ELAPSED_14B=$((T14B_END - T14B_START))
+[ "$ELAPSED_14B" -ge 24 ] \
+  || fail "14b отработала за ${ELAPSED_14B}с < 25с задержки команды — MOCK_CMD_DELAY_MS не применился, покрытие per-request таймаута исчезло"
 CMDS=$(grep -c '"event":"mock.command".*task-env-gc' "$LOG_MOCK")
 [ "$CMDS" = "1" ] || fail "команд task-env-gc за проход: $CMDS, ждём ровно одну (батч #1526)"
 grep -q '"event":"env.swept"' "$LOG_SRV_EGC" \
@@ -1224,8 +1232,9 @@ echo "$GC_FAIL_BATCH" | grep -q '^ENV-GC 990016 FAIL (worktree remove)$' \
 echo "$GC_FAIL_BATCH" | grep -q '^ENV-GC 990017 SWEPT$' \
   || fail "цикл не продолжился после FAIL строки: «$GC_FAIL_BATCH»"
 [ -d "$GC_FIX/envs/990017" ] && fail "последняя строка батча 990017 не снесена — FAIL соседа прервал цикл"
-# внезапный abort строки: инъекция return ≠ 0 в копии скрипта (пин
-# структуры страховки — вызов под || ловит только явный return ≠ 0)
+# внезапный abort строки: инъекция явного return ≠ 0 в копии скрипта —
+# по контракту per-row функции страховка цикла ловит только не-ноль
+# статуса функции (|| гасит set -e внутри тела — см. хедер скрипта)
 GC_ABORT_COPY="$RUN_DIR/task-env-gc-abort-inject.sh"
 ABORT_ROW=990018
 GC_INJECT="s/^sweep_one() {\$/sweep_one() { [ \"\$1\" = \"$ABORT_ROW\" ] \&\& return 7;/"

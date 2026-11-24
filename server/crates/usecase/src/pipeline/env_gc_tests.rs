@@ -267,6 +267,33 @@ impl TaskBoardRepo for FakeBoard {
                 ));
             }
         }
+        Ok(Some(
+            *self
+                .statuses
+                .lock()
+                .unwrap()
+                .get(&number)
+                .unwrap_or(&Status::Done),
+        ))
+    }
+    /// Живое чтение с семантикой перепробы: ревайв-поле обрабатывается
+    /// ТОЛЬКО здесь (L3/L-1 ревью кода — пин с критерием «откат
+    /// env_gc/row.rs на row_status красит row_revived_between_cycles»).
+    /// row_status выше ревайв не видит намеренно: кеш-проба его не
+    /// возвращает.
+    async fn fresh_row_status(&self, _board: &str, number: u64) -> UsecaseResult<Option<Status>> {
+        let mut calls = self.calls.lock().unwrap();
+        let call = calls.entry(number).or_insert(0);
+        *call += 1;
+        let nth = *call;
+        drop(calls);
+        if let Some(&from) = self.fail_from_call.lock().unwrap().get(&number) {
+            if nth >= from {
+                return Err(UsecaseError::Session(
+                    "перепроба статуса недоступна (мок)".into(),
+                ));
+            }
+        }
         if let Some(&from) = self.revive_on_call.lock().unwrap().get(&number) {
             if nth >= from {
                 return Ok(Some(Status::InProgress));

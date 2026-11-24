@@ -1281,7 +1281,6 @@ async fn message_tail(store: Arc<Store>, id: String) -> Resp {
                     json!({
                         "id": format!("msg_u_{}", created_ms),
                         "type": "user",
-                        "role": "user",
                         "time": { "created": created_ms },
                         "text": text,
                     })

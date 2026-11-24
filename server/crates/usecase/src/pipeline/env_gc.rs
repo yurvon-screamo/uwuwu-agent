@@ -30,11 +30,12 @@ pub const ENV_GC_VERDICT_DEADLINE_MS: u64 = 15 * 60_000;
 
 /// Страх-дедлайн сбора вердиктов (мс): при Ok команды сообщение уже в
 /// ленте, штатно сбор мгновенный; запас — на ретраи Err опроса.
+/// Транспортные Err опроса ретраит адаптер (wait_user_message лупит до
+/// дедлайна с паузой USER_MSG_POLL и Err наружу не отдаёт — L2 ревью
+/// кода); юзкейс-контур ниже — запасной кап, если носитель Err отдаёт.
 const VERDICT_READ_GRACE_MS: u64 = 5_000;
 
-/// Кап ретраев Err опроса ленты: транспортный отказ возвращается
-/// адаптером немедленно, пауза между ретраями в юзкейсе недоступна
-/// (слой только домена) — ограничитель числа попыток.
+/// Кап запасных ретраев Err опроса ленты в юзкейсе.
 const VERDICT_READ_MAX_RETRIES: usize = 10;
 
 /// Политика прохода: возраст-порог и observe-гейт (срез 4 плана #1431:
@@ -239,6 +240,7 @@ pub async fn sweep_envs(ctx: &EnvGcCtx<'_>, policy: EnvGcPolicy) -> UsecaseResul
         held = out.held_live,
         revoked = out.revoked,
         batch = batch.len(),
+        bootstrap_created = bootstrap.is_some(),
         dispatched = out.dispatched,
         swept = out.swept,
         dirty = out.dirty,
