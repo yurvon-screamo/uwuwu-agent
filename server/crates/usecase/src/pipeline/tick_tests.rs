@@ -1391,13 +1391,14 @@ async fn own_comment_of_holding_session_is_not_delivered_and_baseline_stays() {
 }
 
 #[tokio::test]
-async fn own_comment_before_first_session_wake_is_sliced_without_baseline() {
+async fn own_comment_older_than_reader_birth_is_sliced_and_baseline_moves() {
     // #1204 (транзишн-класс NOTICED, live-репродакция 16.11): MCP-коммент,
     // опубликованный до спавна свежей сессии (seen-бейзлайна нет, активность
     // новее коммента — спавн и ход после поста), не доставляется
     // idle-фоллбеком: хвост целиком свой → тихий сдвиг бейзлайна.
     // #1533: сдвиг теперь требует метки рождения (спавн после коммента) —
-    // свежий читатель поглощает недостижимый хвост.
+    // свежий читатель поглощает недостижимый хвост. Имя = ассерт:
+    // коммент старше рождения читателя → срез и сдвиг.
     let state = Arc::new(MemState(Mutex::default()));
     state.mark_own_comment("triage-echo", 10);
     state.mark_spawn("Задачи uwuwu", 61, Slot::Dev, 7000);
@@ -1536,6 +1537,23 @@ async fn own_comment_mid_turn_with_live_journal_is_not_delivered() {
     );
 }
 
+fn review_window_comments() -> Vec<CommentRef> {
+    // литерал окна «вердикт опубликован → статус переведён» (#1533),
+    // общий для обеих фаз репродукции
+    vec![
+        CommentRef {
+            id: "old-seen".into(),
+            created_ms: 1000,
+            body: "старое".into(),
+        },
+        CommentRef {
+            id: "verdict".into(),
+            created_ms: 3000,
+            body: "request_changes ревьювера".into(),
+        },
+    ]
+}
+
 #[tokio::test]
 async fn verdict_in_review_window_is_not_consumed_and_wakes_next_holder() {
     // #1533: тик в окне «вердикт опубликован → статус переведён» читает хвост
@@ -1555,18 +1573,7 @@ async fn verdict_in_review_window_is_not_consumed_and_wakes_next_holder() {
     state.set_last_seen_status("Задачи uwuwu", 61, Status::ReviewPlan);
     let (u, sessions, state) = wake_usecase(
         vec![plan_review_task(61, "ses_rev_61")],
-        vec![
-            CommentRef {
-                id: "old-seen".into(),
-                created_ms: 1000,
-                body: "старое".into(),
-            },
-            CommentRef {
-                id: "verdict".into(),
-                created_ms: 3000,
-                body: "request_changes ревьювера".into(),
-            },
-        ],
+        review_window_comments(),
         Some(5000), // ход ревьюера закрылся после поста вердикта
         true,
         state,
@@ -1588,18 +1595,7 @@ async fn verdict_in_review_window_is_not_consumed_and_wakes_next_holder() {
     // дев-сессии (её активность старше коммента) — доставляется.
     let (u2, sessions2, state2) = wake_usecase(
         vec![dev_task(61, "ses_dev_61")],
-        vec![
-            CommentRef {
-                id: "old-seen".into(),
-                created_ms: 1000,
-                body: "старое".into(),
-            },
-            CommentRef {
-                id: "verdict".into(),
-                created_ms: 3000,
-                body: "request_changes ревьювера".into(),
-            },
-        ],
+        review_window_comments(),
         Some(1000), // активность держателя старше вердикта
         true,
         state,
@@ -1616,6 +1612,71 @@ async fn verdict_in_review_window_is_not_consumed_and_wakes_next_holder() {
         state2.0.lock().unwrap().comments.last().map(String::as_str),
         Some("verdict")
     );
+}
+
+#[tokio::test]
+async fn verdict_wakes_marked_holder_born_before_it() {
+    // #1533 Common (ревью PR#504, мутация-инверсия члена рождения проходила
+    // весь набор зелёным): помеченный держатель — норма прода. Геометрия
+    // инстанса #1524: держатель Design с меткой спавна своего слота
+    // (метка пишется под Slot::Design на спавне стадии); помеченный дев
+    // (fast-track/респавн) — тем же способом. Читатель рождён ДО вердикта:
+    // член рождения не режет вердикт — он доставляется. Два прогона:
+    // MemState слеп к номеру строки (глобальный курсор), общая доска
+    // сместила бы seen второго держателя чужой доставкой.
+    for (number, status, slot, session) in [
+        (
+            62u64,
+            Status::Design,
+            Slot::Design,
+            "ses_design_62".to_string(),
+        ),
+        (
+            63u64,
+            Status::InProgress,
+            Slot::Dev,
+            "ses_dev_63".to_string(),
+        ),
+    ] {
+        let state = Arc::new(MemState(Mutex::default()));
+        state.mark_own_comment("verdict", 10);
+        state.set_last_comment_id("Задачи uwuwu", number, "old-seen");
+        state.mark_spawn("Задачи uwuwu", number, slot, 1000);
+        let mut holder = task(number, status);
+        let mut f = TaskFields::default();
+        f.set_session(slot, uwuwu_domain::SessionRef::parse(&session).unwrap());
+        holder.apply_fields(f);
+        let (u, sessions, state) = wake_usecase(
+            vec![holder],
+            vec![
+                CommentRef {
+                    id: "old-seen".into(),
+                    created_ms: 500,
+                    body: "старое".into(),
+                },
+                CommentRef {
+                    id: "verdict".into(),
+                    created_ms: 3000,
+                    body: "request_changes ревьювера".into(),
+                },
+            ],
+            Some(2000), // ход держателя закрылся до вердикта
+            true,
+            state,
+        );
+        let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+        assert_eq!(
+            out.wakeups, 1,
+            "слот {session}: вердикт доходит держателю, рождённому до него"
+        );
+        let sent = sessions.prompts.lock().unwrap().join("\n");
+        assert!(sent.contains("request_changes ревьювера"), "{sent}");
+        assert_eq!(
+            state.0.lock().unwrap().comments.last().map(String::as_str),
+            Some("verdict"),
+            "seen двигается фактом доставки"
+        );
+    }
 }
 
 #[tokio::test]
