@@ -151,18 +151,6 @@ pub async fn sweep_envs(ctx: &EnvGcCtx<'_>, policy: EnvGcPolicy) -> UsecaseResul
     for t in &targets {
         preflight_row(&pf, t, &mut out, &mut ready).await;
     }
-    if ready.is_empty() {
-        tracing::info!(
-            event = "env.gc.completed",
-            board = ctx.board_name,
-            candidates = out.candidates,
-            held = out.held_live,
-            revoked = out.revoked,
-            failed = out.failed,
-            "env-gc: проход завершён — готовых строк нет, диспатча нет"
-        );
-        return Ok(out);
-    }
     // Перепроба непосредственно перед диспатчем: stalled-проба pre-flight
     // устаревает ранние строки — перепроба сужает окно «проба → снос» до
     // последнего цикла (ревью раунд 3, #1526).
@@ -170,81 +158,79 @@ pub async fn sweep_envs(ctx: &EnvGcCtx<'_>, policy: EnvGcPolicy) -> UsecaseResul
     for t in &ready {
         revalidate_row(ctx.board, ctx.board_name, t, &mut out, &mut batch).await;
     }
-    if batch.is_empty() {
-        tracing::info!(
-            event = "env.gc.completed",
-            board = ctx.board_name,
-            candidates = out.candidates,
-            revoked = out.revoked,
-            failed = out.failed,
-            "env-gc: проход завершён — перепроба сняла все строки"
-        );
-        return Ok(out);
-    }
     // Bootstrap-сессия на проход: cwd = чекаут проекта — в нём живёт
     // ownership-гард скрипта; slash-команды = shell без LLM-решений.
+    // Пустой батч (все строки pre-flight/перепробой сняты) — bootstrap
+    // не создаётся, команды нет.
     let boot_model = ctx.models.for_default();
-    let bootstrap = match ctx
-        .sessions
-        .create_session(&SessionSpec {
-            directory: ctx.checkout.to_string(),
-            title: format!("env-gc {}", ctx.board_name),
-            custom_agent: None,
-            agent: AgentSlot::Default,
-            model: boot_model.model,
-            variant: boot_model.variant,
-            bootstrap: true,
-        })
-        .await
-    {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::warn!(
-                event = "env.gc.blind",
-                board = ctx.board_name,
-                error = %e,
-                "Bootstrap-сессия не создана — проход no-op"
-            );
-            return Ok(out);
-        }
+    let bootstrap = match batch.is_empty() {
+        true => None,
+        false => match ctx
+            .sessions
+            .create_session(&SessionSpec {
+                directory: ctx.checkout.to_string(),
+                title: format!("env-gc {}", ctx.board_name),
+                custom_agent: None,
+                agent: AgentSlot::Default,
+                model: boot_model.model,
+                variant: boot_model.variant,
+                bootstrap: true,
+            })
+            .await
+        {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::warn!(
+                    event = "env.gc.blind",
+                    board = ctx.board_name,
+                    error = %e,
+                    "Bootstrap-сессия не создана — проход no-op"
+                );
+                None
+            }
+        },
     };
     // Одна команда на проход: строки батча через пробел; скрипт циклит
     // сам и печатает вердикт на каждую (tail-join $1 шаблона — проба #1526).
-    let args: String = batch
-        .iter()
-        .map(|t| t.number().to_string())
-        .collect::<Vec<_>>()
-        .join(" ");
     let started = Instant::now();
-    match ctx
-        .sessions
-        .run_command(&bootstrap, "task-env-gc", &args, ENV_GC_VERDICT_DEADLINE_MS)
-        .await
-    {
-        Ok(()) => {
-            out.dispatched = batch.len();
-            collect_verdicts(ctx.sessions, &bootstrap, &batch, &mut out).await;
-        }
-        Err(e) => {
-            // Транспортный отказ: обрыв запроса убивает скрипт посреди
-            // выполнения (проба #1526, script.log) — сообщение не сядет,
-            // ждать нечего; все строки батча переедут следующим проходом.
-            // elapsed у бюджета — маршрут режет длинный запрос (детектор
-            // «Риски» плана), мгновенный — носитель недоступен.
-            out.failed += batch.len();
-            tracing::warn!(
-                event = "env.gc_fail",
-                board = ctx.board_name,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                budget_ms = ENV_GC_VERDICT_DEADLINE_MS,
-                batch = batch.len(),
-                error = %e,
-                "Команда сноса не принята исполнителем — батч переедет следующим проходом"
-            );
+    if let Some(bootstrap) = &bootstrap {
+        let args: String = batch
+            .iter()
+            .map(|t| t.number().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        match ctx
+            .sessions
+            .run_command(bootstrap, "task-env-gc", &args, ENV_GC_VERDICT_DEADLINE_MS)
+            .await
+        {
+            Ok(()) => {
+                out.dispatched = batch.len();
+                collect_verdicts(ctx.sessions, bootstrap, &batch, &mut out).await;
+            }
+            Err(e) => {
+                // Транспортный отказ: обрыв запроса убивает скрипт посреди
+                // выполнения (проба #1526, script.log) — сообщение не сядет,
+                // ждать нечего; все строки батча переедут следующим проходом.
+                // elapsed у бюджета — маршрут режет длинный запрос (детектор
+                // «Риски» плана), мгновенный — носитель недоступен.
+                out.failed += batch.len();
+                tracing::warn!(
+                    event = "env.gc_fail",
+                    board = ctx.board_name,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    budget_ms = ENV_GC_VERDICT_DEADLINE_MS,
+                    batch = batch.len(),
+                    error = %e,
+                    "Команда сноса не принята исполнителем — батч переедет следующим проходом"
+                );
+            }
         }
     }
     // Любой исход: bootstrap гасится (нет утечки сессий, как у спавна).
-    let _ = ctx.sessions.delete_session(&bootstrap).await;
+    if let Some(bootstrap) = &bootstrap {
+        let _ = ctx.sessions.delete_session(bootstrap).await;
+    }
     tracing::info!(
         event = "env.gc.completed",
         board = ctx.board_name,
