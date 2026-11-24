@@ -10790,8 +10790,10 @@ fn order_plan(mode: Mode, cup: usize) -> TickPlan {
     p
 }
 
-/// Строка с ячейкой стадии: поля несут и строка, и issue_fields —
-/// enrichment не стирает ячейку (иначе reverse-инженерия по снапшоту).
+/// Строка с ячейкой стадии: поля несут и строка, и issue_fields.
+/// Причина дублирования: enrichment подменяет поля строки результатом
+/// issue_fields целиком — ячейка, лежащая только в строке, у stage-строк
+/// теста стирается (apply_fields, tick.rs).
 fn staged_row(n: u64, status: Status, slot: Slot, session: &str) -> (Task, TaskFields) {
     let mut t = task(n, status);
     let mut f = TaskFields::default();
