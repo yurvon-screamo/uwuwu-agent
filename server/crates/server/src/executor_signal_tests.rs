@@ -121,3 +121,55 @@ async fn notify_off_stays_log_only() {
         "сигнал ущёл в лог, cooldown держит анти-повтор — громкость жива"
     );
 }
+
+/// Лимитное окно (#1477): threshold 1 + cooldown ≥ окна — один сигнал на
+/// окно исчерпания подписки (L2 ревью плана). Провайдер-специфичный
+/// cooldown живёт в композиции (main.rs), тест крутит те же константы.
+#[tokio::test]
+async fn limit_window_signals_once_per_cooldown() {
+    const COOLDOWN_MS: u64 = super::LIMIT_SIGNAL_COOLDOWN_MS;
+    let tg = Arc::new(FakeTg::new(false));
+    let notify = Some((tg.clone() as Arc<dyn TelegramGateway>, 42));
+    let mut loudness =
+        uwuwu_usecase::IncidentLoudness::new(super::LIMIT_SIGNAL_THRESHOLD, 60 * MIN, COOLDOWN_MS);
+
+    super::limit_pause_signal(&notify, &mut loudness, 0, 3).await;
+    assert_eq!(
+        tg.sent.lock().unwrap().len(),
+        1,
+        "threshold 1: первая лимитная пауза окно сигналит"
+    );
+    super::limit_pause_signal(&notify, &mut loudness, 2 * MIN, 5).await;
+    assert_eq!(
+        tg.sent.lock().unwrap().len(),
+        1,
+        "повторные паузы в окне сигнал не дублируют"
+    );
+    super::limit_pause_signal(&notify, &mut loudness, COOLDOWN_MS - MIN, 4).await;
+    assert_eq!(tg.sent.lock().unwrap().len(), 1, "cooldown держит");
+    super::limit_pause_signal(&notify, &mut loudness, COOLDOWN_MS + MIN, 2).await;
+    assert_eq!(
+        tg.sent.lock().unwrap().len(),
+        2,
+        "новое окно после cooldown сигналит снова"
+    );
+}
+
+/// Текст лимитного сигнала не называет провайдера (требование владельца:
+/// привязка не жёсткая — смена провайдера не должна врать в сигнале).
+#[tokio::test]
+async fn limit_signal_text_is_provider_agnostic() {
+    let tg = Arc::new(FakeTg::new(false));
+    let notify = Some((tg.clone() as Arc<dyn TelegramGateway>, 42));
+    let mut loudness =
+        uwuwu_usecase::IncidentLoudness::new(super::LIMIT_SIGNAL_THRESHOLD, 60 * MIN, 60 * MIN);
+    super::limit_pause_signal(&notify, &mut loudness, 0, 1).await;
+    let sent = tg.sent.lock().unwrap();
+    let (chat_id, text) = sent.first().expect("сигнал доставлен");
+    assert_eq!(*chat_id, 42, "получатель — из [notify]");
+    assert!(
+        !text.to_lowercase().contains("glm") && !text.contains("5h"),
+        "сигнал без имени провайдера и без жёсткого окна: {text}"
+    );
+    assert!(text.contains("лимит квоты"), "суть сигнала сохранена");
+}
