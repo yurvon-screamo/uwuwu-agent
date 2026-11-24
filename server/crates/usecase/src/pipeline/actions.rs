@@ -283,6 +283,11 @@ impl TickUseCase {
         {
             let sessions = self.sessions.project(&board.project);
             let activity = sessions.last_activity_ms(session).await?;
+            // Рождение читателя: метка последнего спавна слота. Реестр-коммент,
+            // изданный до рождения сессии, никогда не был для неё «новым» —
+            // спавн-промпт несёт контекст (#1204). Нет метки (внешний claim,
+            // legacy-state) — член рождения выключен, семантика прежняя.
+            let spawned_at = self.state.last_spawn_ms(&board.board, task.number(), slot);
             let fresh = last.created_ms > activity.unwrap_or(0);
             // Ход завершён (последнее сообщение сессии — финальный ответ
             // агента): коммиты хвоста созданы во время хода — активность
@@ -291,12 +296,20 @@ impl TickUseCase {
             // застынет ниже коммента» заменена честным idle-критерием)
             let idle = !fresh && self.session_idle(board, session).await;
             if fresh || idle {
-                let foreign = self.slice_self_echo(task.number(), &tail, activity);
+                let foreign = self.slice_self_echo(task.number(), &tail, activity, spawned_at);
                 if foreign.is_empty() {
-                    // Хвост целиком свой (#1204): тихо двигаем бейзлайн —
-                    // следующий чужой коммент доставится без накопленного эха
-                    self.state
-                        .set_last_comment_id(&board.board, task.number(), &last.id);
+                    // Хвост целиком свой (#1204): эхо-будки нет. Поглощение
+                    // (тихий сдвиг бейзлайна) допустимо, только когда читатель
+                    // родился после хвоста — такой хвост не достанется этому
+                    // слоту ни в одном будущем раунде. Читатель старше хвоста
+                    // (автор: вердикт опубликован в его же ход) — коммент
+                    // адресован СЛЕДУЮЩЕМУ держателю: seen не двигается,
+                    // иначе тик в окне «вердикт опубликован → статус
+                    // переведён» съедает доставку держателю (#1533).
+                    if spawned_at.is_some_and(|ms| ms > last.created_ms) {
+                        self.state
+                            .set_last_comment_id(&board.board, task.number(), &last.id);
+                    }
                     return Ok(WakeAct::None);
                 }
                 // CUP-гвард (#1231): доставка промпта — новый ход, тот же
@@ -357,21 +370,30 @@ impl TickUseCase {
     /// Own-срез self-эха (#1204): коммент хвоста — «свой» для держащей
     /// сессии, если он из реестра серверных постов (MCP task_comment) и не
     /// свежее её последней активности — ход после поста двигает активность
-    /// (инвариант own-среза ADR-050). Чужие агентские (вердикты других
-    /// стадий) и юзерские будят. Активность недоступна — без среза:
-    /// лишняя эхо-будка лучше потерянного коммента (fail-open, семантика TS).
+    /// (инвариант own-среза ADR-050) — либо не свежее её рождения: коммент,
+    /// изданный до спавна сессии, спавн-промптом уже покрыт (#1533, член
+    /// рождения). Чужие агентские (вердикты других стадий) и юзерские будят.
+    /// Ни активность, ни рождение недоступны — без среза: лишняя
+    /// эхо-будка лучше потерянного коммента (fail-open, семантика TS).
     fn slice_self_echo<'a>(
         &self,
         number: u64,
         tail: &'a [CommentRef],
         activity: Option<u64>,
+        spawned_at: Option<u64>,
     ) -> Vec<&'a CommentRef> {
-        let Some(active_at) = activity else {
+        if activity.is_none() && spawned_at.is_none() {
             return tail.iter().collect();
-        };
+        }
         let foreign: Vec<&CommentRef> = tail
             .iter()
-            .filter(|c| !(self.state.own_comment(&c.id) && c.created_ms <= active_at))
+            .filter(|c| {
+                !(self.state.own_comment(&c.id)
+                    && activity
+                        .into_iter()
+                        .chain(spawned_at)
+                        .any(|at| c.created_ms <= at))
+            })
             .collect();
         let own = tail.len() - foreign.len();
         if own > 0 {
