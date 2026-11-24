@@ -1046,6 +1046,84 @@ async fn task_get_renders_foreign_vendor_pull_url() {
     assert!(card.contains("branch: —"), "{card}");
 }
 
+/// #1604 (срез 1): task_list отдаёт машиночитаемые JSON rows — массив
+/// объектов number/status/priority/type/title; двухсловный статус
+/// («Needs attention») выживает сериализацию целым полем, канонные имена
+/// из словаря MCP-поверхности. Факт до фикса: ответ — текстовая таблица,
+/// ручной колоночный парс рвал «Needs attention» на две колонки.
+#[tokio::test]
+async fn task_list_returns_json_rows_with_two_word_status_intact() {
+    let (tools, _memory) = hub();
+    // direct-create → In Progress: ребро In Progress → Needs attention
+    // легально без аналитик-гейта (тот требует Priority на выходе из Analys)
+    let created = call(
+        &tools,
+        "task_create",
+        json!({
+            "project": "uwuwu",
+            "title": "t: json rows",
+            "body": "## Постановка\n\nx.\n",
+            "direct": true
+        }),
+    )
+    .await
+    .expect("direct create");
+    let number: u64 = created
+        .trim()
+        .split('#')
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .and_then(|s| s.parse().ok())
+        .expect("номер в ответе");
+    // прямой create → In Progress; двухсловный статус — легальным переходом
+    call(
+        &tools,
+        "task_edit",
+        json!({ "number": number, "status": "Needs attention" }),
+    )
+    .await
+    .expect("needs attention edit");
+
+    let list = call(&tools, "task_list", json!({ "project": "uwuwu" }))
+        .await
+        .expect("list");
+    let rows: Value = serde_json::from_str(&list)
+        .unwrap_or_else(|e| panic!("ответ не JSON-массив rows: {e}: {list}"));
+    let arr = rows.as_array().expect("rows — JSON-массив");
+    let row = arr
+        .iter()
+        .find(|r| r["title"] == "t: json rows")
+        .expect("строка в списке");
+    assert_eq!(row["number"], json!(number), "номер строки: {row}");
+    assert_eq!(
+        row["status"],
+        json!("Needs attention"),
+        "двухсловный статус целым полем: {row}"
+    );
+    assert_eq!(
+        row["priority"],
+        json!("medium"),
+        "create-дефолт priority канонным именем: {row}"
+    );
+    assert_eq!(
+        row["type"],
+        json!("feature"),
+        "create-дефолт типа канонным именем (#1271): {row}"
+    );
+}
+
+/// #1604 (срез 1): «доска пуста» программно отличима от «ответ не читается» —
+/// пустая доска отдаёт JSON `[]`; отказ чтения идёт isError-конвертом и
+/// бросается в скрипте (вне этой поверхности).
+#[tokio::test]
+async fn task_list_empty_board_reads_as_empty_json_array() {
+    let (tools, _memory) = hub();
+    let list = call(&tools, "task_list", json!({ "project": "uwuwu" }))
+        .await
+        .expect("list");
+    let rows: Value = serde_json::from_str(&list).expect("пустая доска — JSON, не таблица");
+    assert_eq!(rows, json!([]), "пустая доска — пустой JSON-массив: {list}");
+}
 /// #1155 (поручение владельца): автомерж-ячейка живёт на mock-носителе —
 /// create пишет дефолт on, edit переключает, fm рендерит фактическое
 /// состояние (без хранения на носителе fm и тик стенда врали «false»).
@@ -1599,15 +1677,18 @@ async fn task_type_native_carrier_roundtrip_on_mcp_surface() {
     .expect("task_get ок");
     assert!(get.contains("type: docs"), "fm-шапка с типом: {get}");
 
-    // task_list: колонка типа
+    // task_list: тип канонным именем из носителя (#1604 — JSON rows)
     let list = call(&tools, "task_list", json!({ "project": "uwuwu" }))
         .await
         .expect("task_list ок");
-    let row_line = list
-        .lines()
-        .find(|l| l.contains("носитель типа"))
+    let list_rows: Value = serde_json::from_str(&list).expect("rows — JSON");
+    let list_row = list_rows
+        .as_array()
+        .expect("массив rows")
+        .iter()
+        .find(|r| r["title"] == "носитель типа")
         .expect("строка в списке");
-    assert!(row_line.contains(" docs "), "колонка типа: {row_line}");
+    assert_eq!(list_row["type"], json!("docs"), "тип в rows: {list_row}");
 
     // мусорный type в edit — громкий отказ, носитель не тронут
     let err = call(
@@ -1654,11 +1735,18 @@ async fn task_type_create_default_feature_renders_on_mcp_surface() {
     let list = call(&tools, "task_list", json!({ "project": "uwuwu" }))
         .await
         .expect("task_list ок");
-    let row_line = list
-        .lines()
-        .find(|l| l.contains("native-null строка"))
+    let list_rows: Value = serde_json::from_str(&list).expect("rows — JSON");
+    let list_row = list_rows
+        .as_array()
+        .expect("массив rows")
+        .iter()
+        .find(|r| r["title"] == "native-null строка")
         .expect("строка в списке");
-    assert!(row_line.contains(" feature "), "колонка типа: {row_line}");
+    assert_eq!(
+        list_row["type"],
+        json!("feature"),
+        "дефолт типа в rows (#1604): {list_row}"
+    );
     let rows = memory.read_board("Задачи uwuwu").await.unwrap();
     let row = rows.iter().find(|t| t.number() == number).unwrap();
     assert_eq!(row.kind(), Some(uwuwu_domain::TaskType::Feature));
