@@ -2869,6 +2869,197 @@ mod tests {
         });
     }
 
+    /// #1615 живая догфуд-приёмка ребра Review Analys → Todo (процедура
+    /// честной квитанции, прецедент приёмки #1384): настоящий переход
+    /// через канон-гард usecase edit() против живого носителя sandbox —
+    /// весь путь гарда, не raw set_status. Инстанс #1612 (25.11): гард
+    /// отклонял легальное ребро по стейл кеш-виду за пределами wt-окна
+    /// щита #1346 («transition Analys → Todo outside the pipeline
+    /// canon») три попытки подряд при честном носителе. Пауза между
+    /// рёбрами переживает wt-окно (STATUS_TTL 240с, pv2.rs) — у второго
+    /// гарда статусная запись давняя, режим инстанса: исход
+    /// детерминирован — ребро проходит без ложного отказа (инвариант
+    /// #1235 на канон-пути), квитанция честная; кеш-лаг ловит событие
+    /// board.guard_stale_cache. Третий вызов — отказная ветка: незаконное
+    /// ребро Todo → Review гард отрезает по fresh-подтверждению, записи
+    /// нет. Фикстура/уборка — по прецеденту #1437: create_issue на
+    /// sandbox (дефолт Analys #1135), close not_planned на каждом
+    /// выходе, номер строки в каждом отказе.
+    #[test]
+    #[ignore] // живой прогон: GH_TOKEN + сеть; МУТАЦИЯ — настоящие переходы, строка убирается за собой (≈5 мин: пауза wt-окна)
+    fn live_edit_guard_passes_review_analys_to_todo_edge_after_wt_window() {
+        use futures::FutureExt as _;
+        use uwuwu_usecase::{StatusDelivery, TaskPatch, TaskWriteUseCase, TaskWriter, UsecaseError};
+        let repo =
+            std::env::var("UWUWU_HUB_REPO").unwrap_or_else(|_| "yurvon-screamo/uwuwu-hub".into());
+        let token = std::env::var("GH_TOKEN").expect("GH_TOKEN");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let board = "Задачи sandbox";
+            let hub = std::sync::Arc::new(GitHubHub::new(repo.clone(), token.clone()));
+            let writer = std::sync::Arc::new(TaskWriteUseCase {
+                board: hub.clone() as std::sync::Arc<dyn uwuwu_usecase::TaskBoardRepo>,
+                fields: std::sync::Arc::new(crate::github::fields::IssueFields::new(
+                    repo.clone(),
+                    token.clone(),
+                )),
+                boards: vec![("sandbox".to_string(), board.to_string())],
+                clock: std::sync::Arc::new(crate::clock::SystemClock),
+                state: std::sync::Arc::new(crate::api::test_support::StubState),
+            });
+            // 1. фикстура пробой самой: строка на sandbox, дефолт Analys
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_secs();
+            let title = format!("[pin #1615] гард канона: ребро Review Analys → Todo {stamp}");
+            let n = hub
+                .create_issue(
+                    board,
+                    "sandbox",
+                    &title,
+                    "живая догфуд-приёмка #1615 (ребро Review Analys → Todo после wt-окна); \
+                     убирается за собой — close not_planned",
+                    None,
+                )
+                .await
+                .expect("фикстура: строка создана на доске sandbox");
+            // 2. проба — под catch_unwind; close ниже на каждом выходе
+            let probe = std::panic::AssertUnwindSafe(async {
+                // create-конвергенция: свежий рид носителя в бюджете #1437
+                // (GraphQL ~2с) — фикстура легла до первого ребра
+                let mut base = None;
+                for _ in 0..5u32 {
+                    base = hub
+                        .fresh_row_status(board, n)
+                        .await
+                        .unwrap_or_else(|e| panic!("#{n}: свежий рид после create упал: {e}"));
+                    if base == Some(uwuwu_domain::Status::Analys) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+                assert_eq!(
+                    base,
+                    Some(uwuwu_domain::Status::Analys),
+                    "#{n}: create-дефолт Analys (#1135) не прочитан за 5×1с — фикстура не легла"
+                );
+                // Ребро 1: Analys → Review Analys (легальное; гейт полноты
+                // #1280 кормится из патча). Свежесозданной строки может не
+                // быть в items-индексе, пока REST-лист лагает: бюджет
+                // 6×10с, каждый отказ громкий, последний всплывает наверх
+                let mut edge1 = Err(UsecaseError::Board("fixture: edit not attempted".into()));
+                for _ in 0..6u32 {
+                    edge1 = writer
+                        .edit(
+                            "sandbox",
+                            n,
+                            TaskPatch {
+                                status: Some(uwuwu_domain::Status::ReviewAnalys),
+                                priority: Some("medium".to_string()),
+                                automerge: Some(false),
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                    if edge1.is_ok() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                }
+                edge1.expect("#{n}: ребро Analys → Review Analys не прошло за бюджет create-конвергенции");
+                let fresh = pin_fresh_status(&hub, board, n, "рид после ребра 1").await;
+                assert_eq!(
+                    fresh,
+                    uwuwu_domain::Status::ReviewAnalys,
+                    "#{n}: носитель несёт Review Analys после ребра 1"
+                );
+                // Пауза переживает wt-окно щита #1346 (STATUS_TTL 240с):
+                // у следующего гарда запись давняя — тот самый режим
+                // инстанса #1612
+                std::thread::sleep(std::time::Duration::from_secs(245));
+                // Ребро 2 (пин #1615): Review Analys → Todo — легальное
+                // ребро UC-01 проходит без ложного «вне канона» при любом
+                // возрасте записи. Без ретрая: канон-отказ здесь = живой
+                // баг-класс (красный), транспортный — честный красный
+                let receipt = writer
+                    .edit(
+                        "sandbox",
+                        n,
+                        TaskPatch {
+                            status: Some(uwuwu_domain::Status::Todo),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("#{n}: легальное ребро Review Analys → Todo отклонено гардом — класс #1615 жив");
+                let delivery = receipt
+                    .status
+                    .expect("#{n}: статусный патч без квитанции");
+                match delivery {
+                    StatusDelivery::Confirmed { actual } => assert_eq!(
+                        uwuwu_usecase::parse_status(&actual),
+                        uwuwu_domain::Status::Todo,
+                        "#{n}: raw-имя носителя = Todo: {actual}"
+                    ),
+                    StatusDelivery::Unverified { reason } => {
+                        // честная ветка #1437: success не заявляется —
+                        // доказательство несёт свежий рид ниже
+                        eprintln!("#{n}: квитанция Unverified ({reason}) — доказывает свежий рид ниже");
+                    }
+                }
+                let mut seen = None;
+                for _ in 0..5u32 {
+                    seen = hub
+                        .fresh_row_status(board, n)
+                        .await
+                        .unwrap_or_else(|e| panic!("#{n}: свежий рид после ребра 2 упал: {e}"));
+                    if seen == Some(uwuwu_domain::Status::Todo) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+                assert_eq!(
+                    seen,
+                    Some(uwuwu_domain::Status::Todo),
+                    "#{n}: носитель не несёт Todo после ребра 2 — переход не доехал"
+                );
+                // Ребро 3 (отказная ветка пина): Todo → Review вне канона —
+                // fresh-сверка подтверждает кеш-вид, честный отказ, носитель
+                // не сдвинулся
+                let err = writer
+                    .edit(
+                        "sandbox",
+                        n,
+                        TaskPatch {
+                            status: Some(uwuwu_domain::Status::UserReview),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect_err("#{n}: незаконное ребро Todo → Review прошло канон-гард");
+                assert!(
+                    format!("{err}").contains("outside the pipeline canon"),
+                    "#{n}: текст отказа: {err}"
+                );
+                let fresh = pin_fresh_status(&hub, board, n, "рид после отказа").await;
+                assert_eq!(
+                    fresh,
+                    uwuwu_domain::Status::Todo,
+                    "#{n}: после отказа носитель не сдвинулся"
+                );
+            })
+            .catch_unwind()
+            .await;
+            // 3. уборка тотальная (#1437 L2): close на каждом выходе —
+            //    независимо от исхода пробы и ассертов
+            let close_err = hub.close_issue_ext(n, true).await.err();
+            // 4. сводка исходов (отдельной откатной стадии нет: строка
+            //    уходит в close прямо из Todo)
+            pin_report_outcome(n, probe, Ok(()), close_err);
+        });
+    }
+
     #[test]
     fn is_rate_limited_matches_only_owned_tag_not_github_texts() {
         // Permission-отказ: Display содержит «не rate limit» — старый
