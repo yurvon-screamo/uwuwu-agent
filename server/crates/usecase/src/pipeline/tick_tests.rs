@@ -6877,6 +6877,11 @@ struct FakeMultiBoard {
     /// доски, чтение которых падает (кейс prune при частичном сбое)
     fail_reads: Vec<String>,
     log: Mutex<Vec<String>>,
+    /// поля строк для enrichment (#1586): issue_fields возвращает
+    /// сохранённое — apply_fields при enrichment не стирает ячейки стадий
+    fields: std::collections::HashMap<u64, uwuwu_domain::TaskFields>,
+    /// хвост комментов по номерам строк (wakeup-сценарии #1586)
+    comments: std::collections::HashMap<u64, Vec<CommentRef>>,
 }
 
 #[async_trait]
@@ -6944,8 +6949,8 @@ impl TaskBoardRepo for FakeMultiBoard {
     async fn clear_session(&self, _b: &str, _n: u64, _s: Slot) -> UsecaseResult<()> {
         Ok(())
     }
-    async fn issue_fields(&self, _n: u64) -> UsecaseResult<TaskFields> {
-        Ok(TaskFields::default())
+    async fn issue_fields(&self, n: u64) -> UsecaseResult<TaskFields> {
+        Ok(self.fields.get(&n).cloned().unwrap_or_default())
     }
     async fn post_comment(&self, n: u64, _body: &str) -> UsecaseResult<String> {
         self.log.lock().unwrap().push(format!("comment#{n}"));
@@ -6954,8 +6959,8 @@ impl TaskBoardRepo for FakeMultiBoard {
     async fn close_issue(&self, _n: u64) -> UsecaseResult<()> {
         Ok(())
     }
-    async fn latest_comments(&self, _n: u64) -> UsecaseResult<Vec<CommentRef>> {
-        Ok(vec![])
+    async fn latest_comments(&self, n: u64) -> UsecaseResult<Vec<CommentRef>> {
+        Ok(self.comments.get(&n).cloned().unwrap_or_default())
     }
     async fn read_issue(&self, _b: &str, n: u64) -> UsecaseResult<crate::ports::IssueView> {
         let task = self
@@ -7087,6 +7092,8 @@ async fn analyst_wave_per_board_own_checkout_and_project() {
         ],
         fail_reads: vec![],
         log: Mutex::default(),
+        fields: Default::default(),
+        comments: Default::default(),
     });
     let u = AnalystUseCase {
         board: board.clone(),
@@ -7265,6 +7272,8 @@ async fn prune_skipped_when_a_board_read_fails() {
         ],
         fail_reads: vec!["B2".into()],
         log: Mutex::default(),
+        fields: Default::default(),
+        comments: Default::default(),
     });
     let u = AnalystUseCase {
         board: board.clone(),
@@ -9142,6 +9151,8 @@ async fn one_board_read_failure_does_not_kill_tick() {
         ],
         fail_reads: vec!["B2".into()],
         log: Mutex::default(),
+        fields: Default::default(),
+        comments: Default::default(),
     });
     let u = multi_board_usecase(board);
     let out = u
@@ -9171,6 +9182,8 @@ async fn total_board_read_failure_is_loud_tick_failed() {
         ],
         fail_reads: vec!["B1".into(), "B2".into()],
         log: Mutex::default(),
+        fields: Default::default(),
+        comments: Default::default(),
     });
     let u = multi_board_usecase(board);
     let err = u
@@ -9204,6 +9217,8 @@ async fn several_boards_read_failure_tick_survives_with_full_composition() {
         ],
         fail_reads: vec!["B2".into(), "B3".into()],
         log: Mutex::default(),
+        fields: Default::default(),
+        comments: Default::default(),
     });
     let mut plan = two_board_plan(Mode::Live);
     plan.boards.push(BoardPlan {
@@ -9236,6 +9251,8 @@ async fn empty_plan_is_legit_empty_tick_without_guard_trip() {
         boards: vec![],
         fail_reads: vec![],
         log: Mutex::default(),
+        fields: Default::default(),
+        comments: Default::default(),
     });
     let mut plan = two_board_plan(Mode::Live);
     plan.boards.clear();
@@ -10745,4 +10762,302 @@ async fn judge_cap_verdict_continues_row_without_park() {
         sessions.prompts.lock().unwrap().is_empty(),
         "кап-продолжение без промптов: review-слот очищен до вызова, будить нечего (ревью C3)"
     );
+}
+
+// =========================================================================
+// Порядок кандидатов тика «продолжение начатой > новый кандидат» (#1586)
+// =========================================================================
+
+/// План на две доски с настраиваемым капом (#1586). B1 — первая доска
+/// конфига, B2 — поздняя: до фикса обход шёл досками по очереди.
+fn order_plan(mode: Mode, cup: usize) -> TickPlan {
+    let mut p = two_board_plan(mode);
+    p.policy.cup = cup;
+    p
+}
+
+/// Юзкейс мультиборда с хэндлами сессий и state (#1586): тело
+/// multi_board_usecase (#1503) с управляемыми фейками.
+fn order_usecase(
+    board: Arc<FakeMultiBoard>,
+    sessions: Arc<FakeSessions>,
+    state: Arc<MemState>,
+) -> TickUseCase {
+    TickUseCase {
+        board,
+        sessions: Arc::new(SessionRouter::uniform(sessions)),
+        prs: Arc::new(FakePrs {
+            state: PrState::Missing,
+            merges: Mutex::default(),
+            merge_fails: AtomicBool::new(false),
+            probes: Mutex::default(),
+            url: Mutex::default(),
+        }),
+        clock: Arc::new(FixedClock),
+        state,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        boot_ms: 0,
+        judge: None,
+        judge_cfg: Default::default(),
+        quota: None,
+    }
+}
+
+/// Строка с ячейкой стадии: поля несут и строка, и issue_fields —
+/// enrichment не стирает ячейку (предусловие Low-2 ревью плана #1586).
+fn staged_row(n: u64, status: Status, slot: Slot, session: &str) -> (Task, TaskFields) {
+    let mut t = task(n, status);
+    let mut f = TaskFields::default();
+    f.set_session(slot, uwuwu_domain::SessionRef::parse(session).unwrap());
+    t.apply_fields(f.clone());
+    (t, f)
+}
+
+/// Строка без ячейки (новый кандидат или продолжение по фасетке статуса).
+fn fresh_row(n: u64, status: Status) -> (Task, TaskFields) {
+    let t = task(n, status);
+    (t, TaskFields::default())
+}
+
+fn order_board(
+    b1: Vec<Task>,
+    b2: Vec<Task>,
+    fields: std::collections::HashMap<u64, TaskFields>,
+    comments: std::collections::HashMap<u64, Vec<CommentRef>>,
+) -> Arc<FakeMultiBoard> {
+    Arc::new(FakeMultiBoard {
+        boards: vec![("B1".into(), b1), ("B2".into(), b2)],
+        fail_reads: vec![],
+        log: Mutex::default(),
+        fields,
+        comments,
+    })
+}
+
+fn idle_info(id: &str, busy: bool) -> crate::ports::SessionInfo {
+    crate::ports::SessionInfo {
+        id: id.into(),
+        agent: String::new(),
+        directory: String::new(),
+        updated_ms: 0,
+        outcome: "succeeded".into(),
+        total_tokens: 0,
+        busy,
+    }
+}
+
+/// (а) #1586: слот достаётся продолжению начатой — wakeup ReviewResult
+/// на поздней доске — а не новому Design-кандидату high на первой доске.
+#[tokio::test]
+async fn continuation_wakeup_on_later_board_beats_new_design_on_first() {
+    let state = Arc::new(MemState(Mutex::default()));
+    let (mut newcomer, nf) = fresh_row(101, Status::Design);
+    let (mut cont, cf) = staged_row(201, Status::ReviewResult, Slot::ResultReview, "ses_201");
+    newcomer.set_priority(Priority::High);
+    cont.set_priority(Priority::Medium);
+    // тик уже видел строку в этом статусе — не переход (иначе fresh-eyes
+    // снял бы ревью-ячейку безусловно и строка пошла путём Spawn)
+    state.set_last_seen_status("B2", 201, Status::ReviewResult);
+    let board = order_board(
+        vec![newcomer],
+        vec![cont],
+        [(101u64, nf), (201u64, cf)].into_iter().collect(),
+        [(
+            201u64,
+            vec![CommentRef {
+                id: "c201".into(),
+                created_ms: 3000,
+                body: "владелец: продолжай".into(),
+            }],
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let sessions = Arc::new(FakeSessions {
+        activity_ms: Some(1000), // коммент 3000 свежее — fresh
+        ..FakeSessions::new()
+    });
+    sessions
+        .extra
+        .lock()
+        .unwrap()
+        .push(idle_info("ses_201", false));
+    let u = order_usecase(board, sessions.clone(), state);
+    let out = u.run(&order_plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(out.wakeups, 1, "wakeup продолжения доставлен");
+    assert_eq!(out.spawns_done, 0, "новый кандидат слот не получил");
+    assert_eq!(out.held_cup, 1, "новичок удержан капом");
+    let prompts = sessions.prompts.lock().unwrap();
+    assert!(
+        prompts.iter().any(|p| p.starts_with("ses_201|Wakeup")),
+        "доставка в ревью-сессию: {prompts:?}"
+    );
+}
+
+/// (б) #1586: равный приоритет, порядок строк [новичок, продолжение] —
+/// продолжение (InProgress с пустой дев-ячейкой → Action::Spawn) бьёт
+/// Design medium того же приоритета.
+#[tokio::test]
+async fn continuation_in_progress_beats_same_priority_design_newcomer() {
+    let state = Arc::new(MemState(Mutex::default()));
+    let (mut newcomer, nf) = fresh_row(301, Status::Design);
+    let (mut cont, cf) = fresh_row(302, Status::InProgress);
+    newcomer.set_priority(Priority::Medium);
+    cont.set_priority(Priority::Medium);
+    let board = order_board(
+        vec![newcomer, cont],
+        vec![],
+        [(301u64, nf), (302u64, cf)].into_iter().collect(),
+        Default::default(),
+    );
+    let sessions = Arc::new(FakeSessions::new());
+    let u = order_usecase(board, sessions.clone(), state);
+    let out = u.run(&order_plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(out.spawns_done, 1, "ровно один свободный слот");
+    let specs = sessions.specs.lock().unwrap();
+    let work = specs
+        .iter()
+        .find(|s| !s.bootstrap)
+        .expect("рабочая сессия спавнится");
+    assert!(
+        work.title.contains("#302"),
+        "продолжение 302 идёт раньше новичка 301, спавн: {}",
+        work.title
+    );
+    assert_eq!(out.held_cup, 1, "новичок 301 удержан капом");
+}
+
+/// (в) #1586, граница преемпшена (пин): кап полон, low-жертва busy;
+/// продолжение-будильник держится — руки преемпшена нет (Deferred без
+/// гашения), новичок Design high проходит гашением жертвы тем же тиком.
+/// Асимметрия задокументирована: пин зелёный до и после смены порядка.
+#[tokio::test]
+async fn preempt_serves_spawn_newcomer_while_wakeup_continuation_holds() {
+    let state = Arc::new(MemState(Mutex::default()));
+    let (mut newcomer, nf) = fresh_row(501, Status::Design);
+    let (mut victim, vf) = staged_row(503, Status::InProgress, Slot::Dev, "ses_503");
+    let (mut cont, cf) = staged_row(502, Status::ReviewResult, Slot::ResultReview, "ses_502");
+    newcomer.set_priority(Priority::High);
+    victim.set_priority(Priority::Low);
+    cont.set_priority(Priority::Medium);
+    state.set_last_seen_status("B2", 502, Status::ReviewResult);
+    let board = order_board(
+        vec![newcomer, victim],
+        vec![cont],
+        [(501u64, nf), (503u64, vf), (502u64, cf)]
+            .into_iter()
+            .collect(),
+        [(
+            502u64,
+            vec![CommentRef {
+                id: "c502".into(),
+                created_ms: 3000,
+                body: "владелец: продолжай".into(),
+            }],
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let sessions = Arc::new(FakeSessions {
+        activity_ms: Some(1000),
+        ..FakeSessions::new()
+    });
+    {
+        let mut extra = sessions.extra.lock().unwrap();
+        extra.push(idle_info("ses_502", false));
+        extra.push(idle_info("ses_503", true)); // busy-жертва держит кап
+    }
+    let u = order_usecase(board, sessions.clone(), state);
+    let out = u.run(&order_plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(out.preempts, 1, "жертва 503 погашена в пользу новичка 501");
+    assert_eq!(
+        out.spawns_done, 1,
+        "новичок 501 прошёл гашением тем же тиком"
+    );
+    assert_eq!(out.wakeups, 0);
+    assert_eq!(
+        out.wakeups_deferred, 1,
+        "продолжение-будильник 502 держится: руки преемпшена нет"
+    );
+    assert!(
+        sessions
+            .aborted
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s == "ses_503"),
+        "жертва погашена abort'ом"
+    );
+}
+
+/// (д) #1586: пин порядка компонентов ключа — внутри тира новичков
+/// приоритет раньше доски: high с поздней доски обгоняет medium первой.
+#[tokio::test]
+async fn within_tier_priority_beats_board_order() {
+    let state = Arc::new(MemState(Mutex::default()));
+    let (mut first_board, f1) = fresh_row(401, Status::Design);
+    let (mut late_board, f2) = fresh_row(402, Status::Design);
+    first_board.set_priority(Priority::Medium);
+    late_board.set_priority(Priority::High);
+    let board = order_board(
+        vec![first_board],
+        vec![late_board],
+        [(401u64, f1), (402u64, f2)].into_iter().collect(),
+        Default::default(),
+    );
+    let sessions = Arc::new(FakeSessions::new());
+    let u = order_usecase(board, sessions.clone(), state);
+    let out = u.run(&order_plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(out.spawns_done, 1, "ровно один свободный слот");
+    let specs = sessions.specs.lock().unwrap();
+    let work = specs
+        .iter()
+        .find(|s| !s.bootstrap)
+        .expect("рабочая сессия спавнится");
+    assert!(
+        work.title.contains("#402"),
+        "high с поздней доски раньше medium с первой, спавн: {}",
+        work.title
+    );
+    assert_eq!(out.held_cup, 1);
+}
+
+/// (г) #1586: возврат ReviewPlan → Design с мёртвой ячейкой — тир
+/// продолжений на тике перехода: снапшот до round_transition несёт
+/// ячейку, классификация по нему. Design medium с мёртвой ячейкой на
+/// поздней доске бьёт нового Design high на первой доске.
+#[tokio::test]
+async fn design_return_with_dead_cell_is_continuation_on_transition_tick() {
+    let state = Arc::new(MemState(Mutex::default()));
+    let (mut newcomer, nf) = fresh_row(602, Status::Design);
+    let (mut returned, rf) = staged_row(601, Status::Design, Slot::Design, "ses_601");
+    newcomer.set_priority(Priority::High);
+    returned.set_priority(Priority::Medium);
+    // строка на тике перехода: prev-статус ревью плана, вердикт вернул
+    // её в Design с мёртвой design-ячейкой
+    state.set_last_seen_status("B2", 601, Status::ReviewPlan);
+    let board = order_board(
+        vec![newcomer],
+        vec![returned],
+        [(602u64, nf), (601u64, rf)].into_iter().collect(),
+        Default::default(),
+    );
+    let sessions = Arc::new(FakeSessions {
+        dead_sessions: Mutex::new(vec!["ses_601".into()]),
+        ..FakeSessions::new()
+    });
+    let u = order_usecase(board, sessions.clone(), state);
+    let out = u.run(&order_plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(out.spawns_done, 1, "ровно один свободный слот");
+    let specs = sessions.specs.lock().unwrap();
+    let work = specs
+        .iter()
+        .find(|s| !s.bootstrap)
+        .expect("рабочая сессия спавнится");
+    assert!(
+        work.title.contains("#601"),
+        "возврат в Design с мёртвой ячейкой — продолжение: спавн {}",
+        work.title
+    );
+    assert_eq!(out.held_cup, 1, "новичок 602 удержан капом");
 }

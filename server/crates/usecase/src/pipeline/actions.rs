@@ -324,6 +324,11 @@ impl TickUseCase {
                         number = task.number(),
                         active = global_active,
                         cap = policy.cup,
+                        tier = if uwuwu_domain::is_continuation(task) {
+                            "continuation"
+                        } else {
+                            "new"
+                        },
                         "Wakeup held: CUP cap"
                     );
                     return Ok(WakeAct::Deferred);

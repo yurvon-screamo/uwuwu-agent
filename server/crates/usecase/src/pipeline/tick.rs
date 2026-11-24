@@ -517,25 +517,58 @@ impl TickUseCase {
         // спавн одной доски занимает слот глобального капа, следующая
         // доска видит занятость через ссылку
         let mut active_now = global_active;
-        for (board, tasks) in boards {
+        // Глобальная очередь кандидатов (#1586, шаг 2): строки всех досок
+        // упорядочиваются до обхода — сначала продолжения начатых, затем
+        // новые кандидаты; внутри тира — приоритет, доска в порядке
+        // конфига, порядок строк. Владелец 24.11.2026: «Приоритет на
+        // задачи которые уже были ранее взяты в работу? Или мы дёргаем
+        // с дизайна хотя по старым строкам ещё работа не доведена?».
+        // Классификация — по снапшоту после enrichment, до round_transition.
+        // Дебаг-гейт одной строки (мок-Е2Е): UWUWU_ONLY_TASK=<number> —
+        // конвейер действует только по ней, остальная доска read-only.
+        let only = std::env::var("UWUWU_ONLY_TASK")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        let now = self.clock.utc_minute();
+        let now_ms = self.clock.now_ms();
+        let mut rows: Vec<(usize, usize, &BoardPlan, Task)> = Vec::new();
+        for (bi, (board, tasks)) in boards.iter_mut().enumerate() {
+            for (ri, t) in tasks.drain(..).enumerate() {
+                if only.is_some_and(|n| t.number() != n) {
+                    continue;
+                }
+                rows.push((bi, ri, *board, t));
+            }
+        }
+        rows.sort_by_key(|(bi, ri, _board, t)| {
+            (
+                u8::from(!uwuwu_domain::is_continuation(t)),
+                t.priority().rank(),
+                *bi,
+                *ri,
+            )
+        });
+        for (_bi, _ri, board, task) in &rows {
             // Пер-проектное зрение (#1263): контекст доски — список её
             // исполнителя; чужие исполнители зрение проекта не гасят.
             let executor = self.sessions.project_executor_name(&board.project);
             let sightings = sight_by_executor.get(executor).and_then(|v| v.as_deref());
-            out = self
-                .run_board(
-                    plan,
-                    board,
-                    tasks,
-                    &mut active_now,
-                    &RowContext {
-                        sightings,
-                        enrich_failed: &enrich_failed,
-                        preempts: &preempt_pool,
-                    },
-                    out,
-                )
-                .await?;
+            let ctx = RowContext {
+                sightings,
+                enrich_failed: &enrich_failed,
+                preempts: &preempt_pool,
+            };
+            self.process_row(
+                plan,
+                board,
+                task,
+                now,
+                now_ms,
+                &mut active_now,
+                &ctx,
+                &mut out,
+            )
+            .await?;
         }
         if let Err(e) = self.state.save() {
             tracing::error!(event = "state.save_failed", error = %e, "Failed to save tick state");
@@ -582,44 +615,10 @@ impl TickUseCase {
         Ok(out)
     }
 
-    async fn run_board(
-        &self,
-        plan: &TickPlan,
-        board: &BoardPlan,
-        mut tasks: Vec<Task>,
-        active_now: &mut usize,
-        ctx: &RowContext<'_>,
-        mut out: TickOutcome,
-    ) -> UsecaseResult<TickOutcome> {
-        let now = self.clock.utc_minute();
-        let now_ms = self.clock.now_ms();
-        // Активные для гейтов: снапшот обхода + состоявшиеся спавны
-        // этого тика, общий для всех досок (ссылка из run, #1244) —
-        // иначе несколько мёртвых stage-строк пройдут CUP по одному
-        // снапшоту и оверселят кап внутри прохода (Low-находка #1200),
-        // а много-досочные тики — по разу на доску.
-        // Дебаг-гейт одной строки (мок-Е2Е): UWUWU_ONLY_TASK=<number> —
-        // конвейер действует только по ней, остальная доска read-only
-        if let Ok(only) = std::env::var("UWUWU_ONLY_TASK") {
-            if let Ok(n) = only.trim().parse::<u64>() {
-                tasks.retain(|t| t.number() == n);
-            }
-        }
-        tasks.sort_by_key(|t| t.priority().rank());
-        for task_ref in &tasks {
-            self.process_row(
-                plan, board, task_ref, now, now_ms, active_now, ctx, &mut out,
-            )
-            .await?;
-        }
-        Ok(out)
-    }
-
-    /// Один ход обхода доски: enrichment-гард, переход стадии, гард-цепочка
-    /// и действие тика (спавн/автомерж/наблюдение). Вынос тела цикла
-    /// run_board без изменения поведения (#1586, шаг 1 из двух: сначала
-    /// вынос — «кроме порядка бит-в-бит» по истории, затем глобальный
-    /// порядок кандидатов).
+    /// Один ход обхода тика: enrichment-гард, переход стадии, гард-цепочка
+    /// и действие тика (спавн/автомерж/наблюдение). Тело вынесено из
+    /// run_board (#1586, шаг 1 — «кроме порядка бит-в-бит» по истории);
+    /// шаг 2 — глобальный порядок кандидатов до обхода.
     #[allow(clippy::too_many_arguments)]
     async fn process_row(
         &self,
@@ -823,6 +822,11 @@ impl TickUseCase {
                             number = task.number(),
                             active,
                             cap,
+                            tier = if uwuwu_domain::is_continuation(task) {
+                                "continuation"
+                            } else {
+                                "new"
+                            },
                             "Spawn held: CUP cap"
                         );
                     }
@@ -2106,6 +2110,11 @@ impl TickUseCase {
                     number = task.number(),
                     active = cup.active_now,
                     cap = cup.policy.cup,
+                    tier = if uwuwu_domain::is_continuation(task) {
+                        "continuation"
+                    } else {
+                        "new"
+                    },
                     "Мягкий пинг отложен: CUP cap — запуск хода ждёт слот"
                 );
                 return Ok(StallAct::Deferred);

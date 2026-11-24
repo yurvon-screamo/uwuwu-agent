@@ -148,6 +148,21 @@ pub fn can_preempt(waiter: Priority, victim: Priority) -> bool {
     matches!(victim, Priority::Low | Priority::Empty) && waiter.rank() < victim.rank()
 }
 
+/// Порядок кандидатов тика (#1586 — владелец 24.11.2026: «Приоритет на
+/// задачи которые уже были ранее взяты в работу?»): продолжение начатой
+/// строки раньше нового кандидата. Продолжение — строка стадии, чья
+/// работа уже начата: сессия на слоте стадии (живая — wakeup/мягкий
+/// пинг, мёртвая — respawn) или статус глубже входной Design-стадии.
+/// Новый кандидат — Design без сессии (первый спавн); не-stage строки —
+/// не кандидаты (слот не потребляют). Вход — снапшот строки после
+/// enrichment, до round_transition.
+pub fn is_continuation(task: &Task) -> bool {
+    let Some(slot) = task.stage_slot() else {
+        return false;
+    };
+    task.session_of(slot).is_some() || task.status() != Status::Design
+}
+
 /// Кап подряд request_changes ревью-контура (#1311): 4-й подряд без
 /// approve эскалирует строку владельцу вместо назначения следующего
 /// раунда. Калибровка семейства ADR-107 (порог 4, владелец 15.11:
@@ -252,6 +267,50 @@ mod tests {
 
     fn task(status: Status) -> Task {
         Task::new(7, "t".into(), status)
+    }
+
+    /// #1586: матрица классификатора «продолжение начатой». Новое —
+    /// Design с пустым слотом; всё остальное со слотом стадии —
+    /// продолжение; не-stage строки — не кандидаты (тир нематериален,
+    /// компаратор тотален).
+    #[test]
+    fn is_continuation_matrix() {
+        use Slot::{Design, Dev, PlanReview, ResultReview, Test, TestReview};
+        // новый кандидат: Design без сессии
+        assert!(!is_continuation(&task(Status::Design)));
+        // Design с сессией (живой или мёртвой) — стадия начата
+        let mut started = task(Status::Design);
+        let mut f = crate::TaskFields::default();
+        f.set_session(Design, crate::SessionRef::parse("ses_d").unwrap());
+        started.apply_fields(f);
+        assert!(is_continuation(&started));
+        // глубокие стадии: продолжение с сессией и без
+        for (status, slot) in [
+            (Status::ReviewPlan, PlanReview),
+            (Status::InProgress, Dev),
+            (Status::ReviewResult, ResultReview),
+            (Status::Testing, Test),
+            (Status::ReviewTesting, TestReview),
+        ] {
+            assert!(
+                is_continuation(&task(status)),
+                "{status:?} без сессии — статус глубже входной стадии"
+            );
+            let mut t = task(status);
+            let mut f = crate::TaskFields::default();
+            f.set_session(slot, crate::SessionRef::parse("ses_x").unwrap());
+            t.apply_fields(f);
+            assert!(is_continuation(&t), "{status:?} с сессией");
+        }
+        // не-stage строки — не кандидаты
+        for status in [
+            Status::UserReview,
+            Status::NeedsAttention,
+            Status::Todo,
+            Status::Analys,
+        ] {
+            assert!(!is_continuation(&task(status)), "{status:?} вне стадий");
+        }
     }
 
     #[test]
