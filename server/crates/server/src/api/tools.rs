@@ -52,11 +52,33 @@ const MUTATION_TOOLS: &[&str] = &[
     "docs_append",
 ];
 
-/// Ключи диспетчера: легальны на любом тулe (канон «проект — канал
-/// вызова», читается диспетчером до хендлера), в текст отказа «the tool
-/// knows» не входят — рекламировать надо только ключи схемы (ревью #1572
-/// Common-2: project в списке task_comment рекламировал мёртвый ключ).
+/// Ключи диспетчера: легальны на любом мутационном тулe. Семантика
+/// честная (ревью #1572 Low): диспетчер читает project на каждом вызове
+/// (дефолт uwuwu, канон «проект — канал вызова»); на тулax без
+/// маршрутизации доски ключ принимается и не влияет на поведение —
+/// канон предписывает агентам передавать project всюду. В текст отказа
+/// «the tool knows» не входят — рекламировать надо только ключи схемы.
 const DISPATCHER_KEYS: &[&str] = &["project"];
+
+/// Читающие тулы: явное дополнение MUTATION_TOOLS до каталога
+/// (ревью #1572 дельта-раунд 2, Common). Пин catalog_partition_... держит
+/// разбиение «мутационные ∪ читающие = каталог»: новый тул без записи в
+/// один из списков валит тест — тихий пропуск гарда исключён.
+/// Тест-носитель: в рантайме гард не нужен.
+#[cfg(test)]
+const READ_TOOLS: &[&str] = &[
+    "task_list",
+    "task_get",
+    "docs_ls",
+    "docs_read",
+    "person_show",
+    "goal_list",
+    "projects",
+    "cron_list",
+    "search",
+    "session_export",
+    "blob_get",
+];
 
 /// Legacy-ключи: читаются хендлерами, в схему не рекламируются —
 /// осознанное решение #1232 («legacy-ключ не рекламится (но читается)»,
@@ -67,7 +89,10 @@ const LEGACY_KEYS: &[(&str, &str)] = &[("task_create", "autodone")];
 /// Разрешённые ключи мутационного тула — из inputSchema дескриптора,
 /// единый носитель контракта «какие ключи принимает тул» (ревью #1572
 /// Common-2: рукописная копия схемы дрейфовала) + LEGACY_KEYS. Some(пусто)
-/// — тул из списка без дескриптора: гардится громко; None — не мутационный.
+/// — тул из списка без дескриптора: гардится громко; None — не
+/// мутационный (читающий: принадлежность проверена пином
+/// catalog_partition_mutation_or_read_is_total — каждый тул каталога
+/// заявлен ровно в одном списке).
 fn mutation_allowed_keys(name: &str) -> Option<Vec<String>> {
     if !MUTATION_TOOLS.contains(&name) {
         return None;
@@ -202,7 +227,6 @@ pub fn tool_descriptors() -> Value {
             "Claim your session into the dev slot (the factory will not spawn a duplicate)",
             object(json!({
                 "number": integer("task number"),
-                "project": string("project; default uwuwu"),
                 "session": string("your session id (ses_…)")
             }))
         ),
@@ -220,7 +244,6 @@ pub fn tool_descriptors() -> Value {
             "Close the task (Done; reason not_planned for rejections)",
             object(json!({
                 "number": integer("task number"),
-                "project": string("project; default uwuwu"),
                 "not_planned": json!({"type":"boolean","description":"true — rejected/duplicate, false — done"})
             }))
         ),
@@ -1291,9 +1314,11 @@ mod tests {
 
     /// Пин консистентности Common-2 (ревью #1572): allow-list гарда
     /// выводится из дескрипторов — единый носитель контракта. Тест ловит
-    /// оба дрейфа: «ключ в схеме, гард отвергает» и «чужой ключ гард
-    /// пропускает», и требует от каждого мутационного тула дескриптора
-    /// (тул из списка без дескриптора гардится громко, не молча).
+    /// дрейф ключей («ключ в схеме, гард отвергает» и «чужой ключ гард
+    /// пропускает») и требует от каждого мутационного тула дескриптора
+    /// (тул из списка без дескриптора гардится громко, не молча); дрейф
+    /// членства «мутирующие ∕ читающие» держит соседний пин
+    /// catalog_partition_mutation_or_read_is_total.
     #[test]
     fn mutation_guard_keys_match_descriptors() {
         let list = tool_descriptors();
@@ -1346,6 +1371,38 @@ mod tests {
             &json!({ "number": 1, "text": "т", "project": "uwuwu" })
         )
         .is_ok());
+    }
+
+    /// Пин разбиения поверхности (ревью #1572 дельта-раунд 2, Common):
+    /// каждый тул каталога — либо мутационный (MUTATION_TOOLS), либо
+    /// явно заявленный читающий (READ_TOOLS); третий статус красный.
+    /// Направление дрейфа «новый мутационный тул с дескриптором, но без
+    /// записи в списке» ловится: имя без принадлежности валит тест, а
+    /// мёртвые имена в списках — тоже.
+    #[test]
+    fn catalog_partition_mutation_or_read_is_total() {
+        let list = tool_descriptors();
+        let names: Vec<&str> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 24, "контракт поверхности: {names:?}");
+        for name in &names {
+            let is_mutation = MUTATION_TOOLS.contains(name);
+            let is_read = READ_TOOLS.contains(name);
+            assert!(
+                is_mutation ^ is_read,
+                "тул {name} обязан быть заявлен ровно в одном списке (мутационные ∪ читающие)"
+            );
+        }
+        for name in MUTATION_TOOLS.iter().chain(READ_TOOLS.iter()) {
+            assert!(
+                names.contains(name),
+                "имя {name} из списков вне каталога дескрипторов"
+            );
+        }
     }
 
     #[test]

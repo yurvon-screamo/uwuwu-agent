@@ -781,7 +781,10 @@ impl TaskWriter for TaskWriteUseCase {
         // 23–24.11: find/replace молча strip'нулись).
         let Some(content) = content else {
             let now = match md_section::section_content_len(&current.body, section) {
-                Some(was) => format!("section «{section}» carries {was} bytes now"),
+                Some(was) => format!(
+                    "section «{section}» carries {was} bytes now (namesake duplicates \
+                     included in the measure)"
+                ),
                 None => format!("section «{section}» is not in the body"),
             };
             return Err(UsecaseError::Board(format!(
@@ -833,7 +836,7 @@ impl TaskWriter for TaskWriteUseCase {
             md_section::SectionEdit::Appended => (SectionAction::Appended, 0),
         };
         Ok(SectionEditReport {
-            cleared: action == SectionAction::Replaced && content.trim().is_empty(),
+            cleared: action == SectionAction::Replaced && explicit_clear,
             action,
             duplicates_removed,
             body_was,
