@@ -324,6 +324,9 @@ impl TickUseCase {
                         number = task.number(),
                         active = global_active,
                         cap = policy.cup,
+                        // будильник достижим только при сессии на слоте
+                        // стадии — тир продолжений всегда
+                        tier = "continuation",
                         "Wakeup held: CUP cap"
                     );
                     return Ok(WakeAct::Deferred);
