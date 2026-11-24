@@ -242,8 +242,20 @@ pub trait AgentSessionGateway: Send + Sync {
     async fn switch_agent(&self, _session: &str, _agent: Agent) -> UsecaseResult<()> {
         Ok(())
     }
-    /// Slash-команда сессии (детерминированные shell-блоки — env-подготовка).
-    async fn run_command(&self, session: &str, name: &str, args: &str) -> UsecaseResult<()>;
+    /// Slash-команда сессии (детерминированные shell-блоки — env-подготовка,
+    /// батч-снос env-gc #1526). Бюджет ожидания ответа: POST /command
+    /// синхронен — opencode отвечает после полного завершения shell-блока
+    /// (проба #1526: sleep 25с → 204 через 25.5с), per-request таймаут
+    /// обязан покрывать длительность скрипта; бюджет приходит от юзкейса
+    /// (симметрично deadline_ms в wait_user_message), общий клиентский
+    /// таймаут адаптера не трогается.
+    async fn run_command(
+        &self,
+        session: &str,
+        name: &str,
+        args: &str,
+        budget_ms: u64,
+    ) -> UsecaseResult<()>;
     async fn liveness(&self, session: &str) -> Liveness;
     async fn delete_session(&self, session: &str) -> UsecaseResult<()>;
     /// Прервать активный ход сессии (преемпшен CUP #1259): opencode

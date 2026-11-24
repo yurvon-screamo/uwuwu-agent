@@ -373,7 +373,7 @@ impl AgentSessionGateway for FakeSessions {
             .push(format!("{session}|{text}"));
         Ok(())
     }
-    async fn run_command(&self, _s: &str, _n: &str, _a: &str) -> UsecaseResult<()> {
+    async fn run_command(&self, _s: &str, _n: &str, _a: &str, _b: u64) -> UsecaseResult<()> {
         Ok(())
     }
     async fn liveness(&self, s: &str) -> Liveness {
@@ -5908,7 +5908,7 @@ impl AgentSessionGateway for FailingCreate {
     async fn prompt(&self, _s: &str, _t: &str) -> UsecaseResult<()> {
         Ok(())
     }
-    async fn run_command(&self, _s: &str, _n: &str, _a: &str) -> UsecaseResult<()> {
+    async fn run_command(&self, _s: &str, _n: &str, _a: &str, _b: u64) -> UsecaseResult<()> {
         Ok(())
     }
     async fn delete_session(&self, _s: &str) -> UsecaseResult<()> {

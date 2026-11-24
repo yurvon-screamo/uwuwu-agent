@@ -52,7 +52,7 @@ impl AgentSessionGateway for CaptureSessions {
     async fn prompt(&self, _session: &str, _text: &str) -> UsecaseResult<()> {
         Ok(())
     }
-    async fn run_command(&self, _s: &str, _n: &str, _a: &str) -> UsecaseResult<()> {
+    async fn run_command(&self, _s: &str, _n: &str, _a: &str, _b: u64) -> UsecaseResult<()> {
         Ok(())
     }
     async fn liveness(&self, _s: &str) -> Liveness {

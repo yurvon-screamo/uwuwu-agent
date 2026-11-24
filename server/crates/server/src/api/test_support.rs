@@ -239,7 +239,7 @@ impl AgentSessionGateway for StubSessions {
     async fn prompt(&self, _: &str, _: &str) -> UsecaseResult<()> {
         Ok(())
     }
-    async fn run_command(&self, _: &str, _: &str, _: &str) -> UsecaseResult<()> {
+    async fn run_command(&self, _: &str, _: &str, _: &str, _: u64) -> UsecaseResult<()> {
         Ok(())
     }
     async fn liveness(&self, _: &str) -> Liveness {

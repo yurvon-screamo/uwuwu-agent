@@ -91,7 +91,12 @@ impl TickUseCase {
         slot: Slot,
     ) -> UsecaseResult<String> {
         sessions
-            .run_command(bootstrap, "task-env", &task.number().to_string())
+            .run_command(
+                bootstrap,
+                "task-env",
+                &task.number().to_string(),
+                TASK_ENV_COMMAND_BUDGET_MS,
+            )
             .await?;
         // Фабрика пишет Branch-ячейку: env готов, ветка work/task-N
         // существует (ADR-041 «ячейки доски пишет фабрика»); без неё PR
@@ -735,6 +740,11 @@ fn session_title(task: &Task, slot: Slot) -> String {
 /// фрагментам (импортирует константу — правка стадии через этот массив,
 /// расхождение источника и мока ловится тестом
 /// `stage_prompts_spawned_per_slot`).
+/// Бюджет команды task-env (мс): один снос env укладывается — носитель
+/// числа, бывший общий таймаут клиента адаптера (opencode.rs); батч
+/// env-gc носит свой бюджет прохода (env_gc.rs). #1526.
+pub const TASK_ENV_COMMAND_BUDGET_MS: u64 = 20_000;
+
 pub const STAGE_PROMPTS: &[(Slot, &str)] = &[
     (
         Slot::Design,

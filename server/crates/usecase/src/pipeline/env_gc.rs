@@ -2,8 +2,11 @@
 //! аналог погибшего с ADR-104 cleanupEnv. Паттерн — клин холодного
 //! ящика (sweeper.rs): отбор из снапшота доски, батч-кап, observe.
 //! Исполнение — детерминированный shell-канал спавна: bootstrap-сессия
-//! в чекауте проекта → slash-команда task-env-gc → ops/task-env-gc.sh;
-//! вердикт строки сервер ждёт в message-ленте (wait_user_message).
+//! в чекауте проекта → одна slash-команда task-env-gc на проход с
+//! батчем строк (#1526) → ops/task-env-gc.sh; вердикты строк сервер
+//! собирает из батч-сообщения ленты (wait_user_message + parse-all).
+
+use std::time::Instant;
 
 use crate::error::UsecaseResult;
 use crate::ports::SessionSpec;
@@ -12,16 +15,27 @@ use crate::spawn_models::SpawnModels;
 use uwuwu_domain::{AgentSlot, SessionSighting, Task};
 
 mod row;
-use row::sweep_row;
+use row::{collect_verdicts, preflight_row, revalidate_row};
 
 /// Батч-кап прохода (путь клина): rm мульти-ГБ каталогов медленный,
 /// остаток переезжает следующими проходами.
 pub const ENV_GC_BATCH_CAP: usize = 20;
 
-/// Дедлайн ожидания вердикта одной строки (мс): rm гигабайтных
-/// target/node_modules занимает минуты — щедро; недождённая строка
-/// переезжает следующим проходом.
+/// Бюджет прохода (мс): пост-батчинг это цена прохода, а не строки —
+/// скрипт батча исполняется внутри синхронного POST /command (проба
+/// #1526: ответ после полного завершения shell-блока), per-request
+/// таймаут команды обязан его покрывать; недождённые строки переезжают
+/// следующим проходом.
 pub const ENV_GC_VERDICT_DEADLINE_MS: u64 = 15 * 60_000;
+
+/// Страх-дедлайн сбора вердиктов (мс): при Ok команды сообщение уже в
+/// ленте, штатно сбор мгновенный; запас — на ретраи Err опроса.
+const VERDICT_READ_GRACE_MS: u64 = 5_000;
+
+/// Кап ретраев Err опроса ленты: транспортный отказ возвращается
+/// адаптером немедленно, пауза между ретраями в юзкейсе недоступна
+/// (слой только домена) — ограничитель числа попыток.
+const VERDICT_READ_MAX_RETRIES: usize = 10;
 
 /// Политика прохода: возраст-порог и observe-гейт (срез 4 плана #1431:
 /// проба перед live-флипом).
@@ -39,16 +53,18 @@ pub struct EnvGcOutcome {
     pub candidates: usize,
     /// Строк, удержанных живой сессией в env (переедут следующим тиком).
     pub held_live: usize,
-    /// Команд сноса, принятых исполнителем.
+    /// Строк батча, принятых исполнителем одной командой (растёт только
+    /// после Ok команды; транспортный отказ — все failed, dispatched = 0).
     pub dispatched: usize,
     pub swept: usize,
     pub dirty: usize,
     pub norepo: usize,
     pub foreign: usize,
     pub absent: usize,
-    /// Команда не принята / вердикт FAIL или за дедлайном.
+    /// Команда не принята / вердикт FAIL / вердикта нет / лента не
+    /// прочитана.
     pub failed: usize,
-    /// Строк, возрождённых после снапшота (ревалидация перед диспатчем).
+    /// Строк, возрождённых после снапшота (ревалидация + перепроба).
     pub revoked: usize,
 }
 
@@ -67,7 +83,8 @@ pub struct EnvGcCtx<'a> {
     pub board: &'a dyn crate::ports::TaskBoardRepo,
 }
 
-/// Проход env-gc по одной доске: отбор → гарды сессий → shell-снос.
+/// Проход env-gc по одной доске: отбор → pre-flight → перепроба →
+/// одна команда с батчем строк → сбор вердиктов из батч-сообщения.
 pub async fn sweep_envs(ctx: &EnvGcCtx<'_>, policy: EnvGcPolicy) -> UsecaseResult<EnvGcOutcome> {
     let mut out = EnvGcOutcome::default();
     let mut candidates: Vec<&Task> = ctx
@@ -120,6 +137,50 @@ pub async fn sweep_envs(ctx: &EnvGcCtx<'_>, policy: EnvGcPolicy) -> UsecaseResul
         })
         .collect();
     let targets: Vec<&Task> = candidates.into_iter().take(ENV_GC_BATCH_CAP).collect();
+    // Pre-flight без команд: ревалидация статуса, гарды сессий, гашение
+    // завершённых; готовые строки — в батч.
+    let pf = row::PreflightCtx {
+        board: ctx.board,
+        sessions: ctx.sessions,
+        board_name: ctx.board_name,
+        env_root: ctx.env_root,
+        sightings: &sightings,
+        now_ms: policy.now_ms,
+    };
+    let mut ready: Vec<&Task> = Vec::new();
+    for t in &targets {
+        preflight_row(&pf, t, &mut out, &mut ready).await;
+    }
+    if ready.is_empty() {
+        tracing::info!(
+            event = "env.gc.completed",
+            board = ctx.board_name,
+            candidates = out.candidates,
+            held = out.held_live,
+            revoked = out.revoked,
+            failed = out.failed,
+            "env-gc: проход завершён — готовых строк нет, диспатча нет"
+        );
+        return Ok(out);
+    }
+    // Перепроба непосредственно перед диспатчем: stalled-проба pre-flight
+    // устаревает ранние строки — перепроба сужает окно «проба → снос» до
+    // последнего цикла (ревью раунд 3, #1526).
+    let mut batch: Vec<&Task> = Vec::new();
+    for t in &ready {
+        revalidate_row(ctx.board, ctx.board_name, t, &mut out, &mut batch).await;
+    }
+    if batch.is_empty() {
+        tracing::info!(
+            event = "env.gc.completed",
+            board = ctx.board_name,
+            candidates = out.candidates,
+            revoked = out.revoked,
+            failed = out.failed,
+            "env-gc: проход завершён — перепроба сняла все строки"
+        );
+        return Ok(out);
+    }
     // Bootstrap-сессия на проход: cwd = чекаут проекта — в нём живёт
     // ownership-гард скрипта; slash-команды = shell без LLM-решений.
     let boot_model = ctx.models.for_default();
@@ -147,17 +208,40 @@ pub async fn sweep_envs(ctx: &EnvGcCtx<'_>, policy: EnvGcPolicy) -> UsecaseResul
             return Ok(out);
         }
     };
-    let row_ctx = row::RowCtx {
-        board_name: ctx.board_name,
-        env_root: ctx.env_root,
-        bootstrap: &bootstrap,
-        sessions: ctx.sessions,
-        board: ctx.board,
-        sightings: &sightings,
-        policy,
-    };
-    for t in &targets {
-        sweep_row(&row_ctx, t, &mut out).await;
+    // Одна команда на проход: строки батча через пробел; скрипт циклит
+    // сам и печатает вердикт на каждую (tail-join $1 шаблона — проба #1526).
+    let args: String = batch
+        .iter()
+        .map(|t| t.number().to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let started = Instant::now();
+    match ctx
+        .sessions
+        .run_command(&bootstrap, "task-env-gc", &args, ENV_GC_VERDICT_DEADLINE_MS)
+        .await
+    {
+        Ok(()) => {
+            out.dispatched = batch.len();
+            collect_verdicts(ctx.sessions, &bootstrap, &batch, &mut out).await;
+        }
+        Err(e) => {
+            // Транспортный отказ: обрыв запроса убивает скрипт посреди
+            // выполнения (проба #1526, script.log) — сообщение не сядет,
+            // ждать нечего; все строки батча переедут следующим проходом.
+            // elapsed у бюджета — маршрут режет длинный запрос (детектор
+            // «Риски» плана), мгновенный — носитель недоступен.
+            out.failed += batch.len();
+            tracing::warn!(
+                event = "env.gc_fail",
+                board = ctx.board_name,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                budget_ms = ENV_GC_VERDICT_DEADLINE_MS,
+                batch = batch.len(),
+                error = %e,
+                "Команда сноса не принята исполнителем — батч переедет следующим проходом"
+            );
+        }
     }
     // Любой исход: bootstrap гасится (нет утечки сессий, как у спавна).
     let _ = ctx.sessions.delete_session(&bootstrap).await;
@@ -167,6 +251,7 @@ pub async fn sweep_envs(ctx: &EnvGcCtx<'_>, policy: EnvGcPolicy) -> UsecaseResul
         candidates = out.candidates,
         held = out.held_live,
         revoked = out.revoked,
+        batch = batch.len(),
         dispatched = out.dispatched,
         swept = out.swept,
         dirty = out.dirty,

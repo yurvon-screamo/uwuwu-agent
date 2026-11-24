@@ -471,26 +471,43 @@ async fn main() {
                             return gate_post_reject();
                         }
                         // bootstrap-команды детерминированы: task-env-gc —
-                        // канал вердиктов env-gc (#1431), мок эмулирует
-                        // shell-исход user-сообщением «ENV-GC <row> SWEPT»;
-                        // прочие принимаются без эмуляции shell. row — из
-                        // $1 args (первый токен): резолв шаблона opencode
-                        // подставляет в $1 только args[0] (bug #1506 —
-                        // бывший next_back маскировал чужой args-контракт)
+                        // батч-канал вердиктов env-gc (#1431/#1526): мок
+                        // эмулирует shell-исход user-сообщением, печатая
+                        // вердикт-строку на каждый токен args (tail-join
+                        // $1 шаблона). MOCK_CMD_DELAY_MS — ручка задержки
+                        // ответа: e2e видит, что цикл переживает
+                        // медленную команду (путь транспортного отказа
+                        // покрыт юнитом Err-ветки usecase). Прочие
+                        // принимаются без эмуляции shell.
                         let name = body["name"].as_str().unwrap_or_default();
                         tracing::info!(event = "mock.command", id = %id, name, "POST /command");
                         if name == "task-env-gc" {
-                            let row = body["text"]
+                            let delay_ms: u64 = std::env::var("MOCK_CMD_DELAY_MS")
+                                .ok()
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(0);
+                            if delay_ms > 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
+                                    .await;
+                            }
+                            let rows: Vec<String> = body["text"]
                                 .as_str()
                                 .unwrap_or_default()
                                 .split_whitespace()
-                                .next()
-                                .unwrap_or_default()
-                                .to_string();
+                                .map(str::to_string)
+                                .collect();
                             let mut sessions = store.sessions.lock().expect("store");
                             if let Some(s) = sessions.get_mut(&id) {
-                                s.user_messages
-                                    .push((now_ms(), format!("ENV-GC {row} SWEPT")));
+                                // Один user-сообщение на батч: живой носитель
+                                // инлайнит весь STDOUT shell-блока одним
+                                // сообщением (проба #1526), не строку на токен
+                                let feed: Vec<String> = rows
+                                    .iter()
+                                    .map(|row| format!("ENV-GC {row} SWEPT"))
+                                    .collect();
+                                if !feed.is_empty() {
+                                    s.user_messages.push((now_ms(), feed.join("\n")));
+                                }
                             }
                         }
                         (StatusCode::OK, Json(json!({}))).into_response()
@@ -1248,18 +1265,25 @@ async fn message_tail(store: Arc<Store>, id: String) -> Resp {
             // ассистента несёт created/firstToken/streamed/completed,
             // сессия без ответа открывается idle-событием (только
             // created — активность хвоста по нему же). User-сообщения
-            // команд (вердикты env-gc, #1431) идут перед ним в desc —
-            // свежайший первым, как order=desc живого API
+            // команд (вердикты env-gc, #1431/#1526) идут перед ним в
+            // desc — свежайший первым, как order=desc живого API. Форма
+            // user-сообщения — живой носитель: верхнеуровневый text без
+            // content[] (проба #1526 + прод-БД; content[]-форма была
+            // дрейфом мока — читатель адаптера на живом носителе
+            // возвращал None, канал вердиктов был глух); пин формы —
+            // fixtures/executor_form_pin.json, юнит
+            // user_message_text_reads_live_carrier_shape
             let mut tail: Vec<Value> = s
                 .user_messages
                 .iter()
                 .rev()
                 .map(|(created_ms, text)| {
                     json!({
+                        "id": format!("msg_u_{}", created_ms),
                         "type": "user",
                         "role": "user",
                         "time": { "created": created_ms },
-                        "content": [{ "type": "text", "text": text }],
+                        "text": text,
                     })
                 })
                 .collect();

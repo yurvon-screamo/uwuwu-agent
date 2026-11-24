@@ -16,6 +16,8 @@ pub struct Pin {
     pub assistant_final_time: Vec<String>,
     pub assistant_streaming_time: Vec<String>,
     pub idle_time: Vec<String>,
+    pub user_message_form: String,
+    pub user_message_forbidden: Vec<String>,
     pub list_wrapper: String,
     pub list_cursor: bool,
     pub item_time: Vec<String>,
@@ -28,6 +30,7 @@ impl Pin {
     pub fn load() -> Self {
         let p: Value = serde_json::from_str(PIN_JSON).expect("пин-файл — валидный JSON");
         let mt = &p["message_tail"];
+        let um = &p["user_message"];
         let sl = &p["session_list"];
         let ds = &sl["default_session"];
         let rs = &sl["role_session"];
@@ -37,6 +40,8 @@ impl Pin {
             assistant_final_time: str_list(&mt["assistant_final_time"]),
             assistant_streaming_time: str_list(&mt["assistant_streaming_time"]),
             idle_time: str_list(&mt["idle_time"]),
+            user_message_form: um["form"].as_str().expect("user_message.form").into(),
+            user_message_forbidden: str_list(&um["forbidden_keys"]),
             list_wrapper: sl["wrapper"].as_str().expect("session_list.wrapper").into(),
             list_cursor: sl["cursor"].as_bool().expect("session_list.cursor"),
             item_time: str_list(&sl["item_time"]),

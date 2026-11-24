@@ -1,8 +1,11 @@
-//! Тесты env-gc (#1431): матрица гардов прохода, вердикт-канал, батч,
-//! observe. Фейки изолированы на тест (rules-test-rule); вердикт-канал
-//! отвечает мгновенно — темп ожидания инфра-забота адаптера.
+//! Тесты env-gc (#1431, батч #1526): матрица гардов прохода, одна
+//! команда на проход, сбор вердиктов из батч-сообщения, observe. Фейки
+//! изолированы на тест (rules-test-rule); вердикт-канал отвечает
+//! мгновенно — темп ожидания инфра-забота адаптера.
 
-use super::env_gc::{sweep_envs, EnvGcCtx, EnvGcOutcome, EnvGcPolicy, ENV_GC_BATCH_CAP};
+use super::env_gc::{
+    sweep_envs, EnvGcCtx, EnvGcOutcome, EnvGcPolicy, ENV_GC_BATCH_CAP, ENV_GC_VERDICT_DEADLINE_MS,
+};
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::ports::{
     AgentSessionGateway, AssistantReply, CommentRef, IssueView, Liveness, SessionInfo, SessionSpec,
@@ -23,15 +26,25 @@ struct FakeGcSessions {
     list_fails: bool,
     created: Mutex<Vec<String>>,
     deleted: Mutex<Vec<String>>,
+    /// Полные args принятых команд («<row> <row> …», порядок диспатча).
     commands: Mutex<Vec<String>>,
-    /// $1 последней команды — первый токен args (резолв шаблона opencode:
-    /// argsRegex сплитит arguments по пробелам, позиционный $1 = args[0]).
-    /// Вердикт в ленте вычисляется по $1, не по маркеру сервера — так
-    /// юниты ловят расхождение args-контракта (bug #1506: args
-    /// «sweep <row>» делали $1 = "sweep", вердикт уходил с чужим row).
-    arg1: Mutex<String>,
-    /// Ключ → вердикт-глагол; ключ матчится к $1 args; «*» — дефолт.
+    /// Последний budget_ms команды — юзкейс обязан носить бюджет прохода.
+    last_budget_ms: Mutex<u64>,
+    /// Команда не принята исполнителем (транспортный отказ).
+    command_fails: Mutex<bool>,
+    /// Ключ → вердикт-глагол; ключ матчится к токену args; «*» — дефолт.
+    /// Отсутствие записи для строки = вердикта в батч-сообщении нет
+    /// (parse-all: строка failed).
     verdicts: Mutex<HashMap<String, String>>,
+    /// Переопределение текста ленты целиком (кейс «сообщение без нужных
+    /// вердикт-строк»); None — лента собирается по verdicts.
+    feed_override: Mutex<Option<String>>,
+    /// Сколько первых ожиданий вернут Err (ретрай сбора, #1526).
+    wait_fail_first: Mutex<usize>,
+    /// Все ожидания Err (страх-дедлайн/кап исчерпан).
+    wait_always_fails: Mutex<bool>,
+    /// Ok(None) — дедлайн ожидания (вердиктов нет).
+    wait_none: Mutex<bool>,
 }
 
 fn fake(list: Vec<SessionInfo>) -> Arc<FakeGcSessions> {
@@ -70,13 +83,20 @@ impl AgentSessionGateway for FakeGcSessions {
     async fn prompt(&self, _s: &str, _t: &str) -> UsecaseResult<()> {
         Ok(())
     }
-    async fn run_command(&self, _s: &str, _n: &str, args: &str) -> UsecaseResult<()> {
+    /// Команда с батчем: args = все строки через пробел (tail-join $1
+    /// шаблона, проба #1526); бюджет носится юзкейсом.
+    async fn run_command(
+        &self,
+        _s: &str,
+        _n: &str,
+        args: &str,
+        budget_ms: u64,
+    ) -> UsecaseResult<()> {
+        *self.last_budget_ms.lock().unwrap() = budget_ms;
         self.commands.lock().unwrap().push(args.into());
-        *self.arg1.lock().unwrap() = args
-            .split_whitespace()
-            .next()
-            .unwrap_or_default()
-            .to_string();
+        if *self.command_fails.lock().unwrap() {
+            return Err(UsecaseError::Session("команда не принята (мок)".into()));
+        }
         Ok(())
     }
     async fn liveness(&self, _s: &str) -> Liveness {
@@ -92,22 +112,49 @@ impl AgentSessionGateway for FakeGcSessions {
         }
         Ok(self.list.clone())
     }
+    /// Лента содержит все вердикт-строки батча одним user-сообщением
+    /// (вывод shell-блока шаблона); маркер сервера («ENV-GC ») в неё
+    /// входит. Пустые verdicts — None (путь страх-дедлайна Ok(None)).
     async fn wait_user_message(
         &self,
         _s: &str,
         _marker: &str,
         _deadline_ms: u64,
     ) -> UsecaseResult<Option<String>> {
-        // Лента содержит вердикт, отрезолвленный opencode'ом по $1 args
-        // (вывод shell-блока шаблона); маркер сервера сюда не входит.
-        // Пустая карта — None (путь дедлайна).
-        let row = self.arg1.lock().unwrap().clone();
+        let mut fail_first = self.wait_fail_first.lock().unwrap();
+        if *fail_first > 0 {
+            *fail_first -= 1;
+            return Err(UsecaseError::Session("опрос ленты упал (мок)".into()));
+        }
+        drop(fail_first);
+        if *self.wait_always_fails.lock().unwrap() {
+            return Err(UsecaseError::Session("опрос ленты упал (мок)".into()));
+        }
+        if *self.wait_none.lock().unwrap() {
+            return Ok(None);
+        }
+        if let Some(feed) = self.feed_override.lock().unwrap().clone() {
+            return Ok(Some(feed));
+        }
         let map = self.verdicts.lock().unwrap();
-        Ok(map
-            .get(&row)
-            .or_else(|| map.get("*"))
-            .filter(|_| !row.is_empty())
-            .map(|v| format!("ENV-GC {row} {v}")))
+        // Порядок строк не важен: парсер матчит по токенам row
+        let mut lines: Vec<String> = Vec::new();
+        for row in self
+            .commands
+            .lock()
+            .unwrap()
+            .last()
+            .map(|a| a.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+            .unwrap_or_default()
+        {
+            if let Some(v) = map.get(&row).or_else(|| map.get("*")) {
+                lines.push(format!("ENV-GC {row} {v}"));
+            }
+        }
+        if lines.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(lines.join("\n")))
     }
     async fn last_activity_ms(&self, _s: &str) -> UsecaseResult<Option<u64>> {
         Ok(None)
@@ -132,12 +179,17 @@ fn session(id: &str, directory: &str, outcome: &str, updated_ms: u64) -> Session
     }
 }
 
-/// Носитель доски: row_status настраивается построчно (ревалидация
-/// ревайва #1431); дефолт — Some(Done) для любого номера. Неиспользуемые
-/// методы трейта — todo!(): проход их не зовёт, вызов = честная паника.
+/// Носитель доски: row_status настраивается построчно; «счётчик ревайва»
+/// — строка, чей второй вызов возвращает In Progress (ревайв между
+/// pre-flight и перепробой). Неиспользуемые методы трейта — todo!():
+/// проход их не зовёт, вызов = честная паника.
 struct FakeBoard {
     statuses: Mutex<HashMap<u64, Status>>,
     row_status_fails: bool,
+    /// Номер → сколько вызовов row_status уже было; на n-м вызове строки
+    /// возвращает In Progress (ревайв на перепробе).
+    revive_on_call: Mutex<HashMap<u64, usize>>,
+    calls: Mutex<HashMap<u64, usize>>,
 }
 
 impl FakeBoard {
@@ -145,12 +197,26 @@ impl FakeBoard {
         Arc::new(Self {
             statuses: Mutex::new(HashMap::new()),
             row_status_fails: false,
+            revive_on_call: Mutex::new(HashMap::new()),
+            calls: Mutex::new(HashMap::new()),
         })
     }
     fn with_status(row: u64, status: Status) -> Arc<Self> {
         Arc::new(Self {
             statuses: Mutex::new(HashMap::from([(row, status)])),
             row_status_fails: false,
+            revive_on_call: Mutex::new(HashMap::new()),
+            calls: Mutex::new(HashMap::new()),
+        })
+    }
+    /// Строка жива на pre-flight (1-й вызов) и возрождена к перепробе
+    /// (2-й и далее) — владельческий ревайв между циклами.
+    fn with_revive_between_cycles(row: u64) -> Arc<Self> {
+        Arc::new(Self {
+            statuses: Mutex::new(HashMap::new()),
+            row_status_fails: false,
+            revive_on_call: Mutex::new(HashMap::from([(row, 2)])),
+            calls: Mutex::new(HashMap::new()),
         })
     }
 }
@@ -166,6 +232,16 @@ impl TaskBoardRepo for FakeBoard {
     async fn row_status(&self, _board: &str, number: u64) -> UsecaseResult<Option<Status>> {
         if self.row_status_fails {
             return Err(UsecaseError::Session("носитель недоступен (мок)".into()));
+        }
+        let mut calls = self.calls.lock().unwrap();
+        let call = calls.entry(number).or_insert(0);
+        *call += 1;
+        let nth = *call;
+        drop(calls);
+        if let Some(&from) = self.revive_on_call.lock().unwrap().get(&number) {
+            if nth >= from {
+                return Ok(Some(Status::InProgress));
+            }
         }
         Ok(Some(
             *self
@@ -303,13 +379,19 @@ const THREE_DAYS: u64 = 3 * 86_400_000;
 
 #[tokio::test]
 async fn mature_done_row_dispatches_sweep_and_is_swept() {
-    // Красный тест плана #1431: Done 3 суток, env жив, сессий нет →
-    // проход диспатчит sweep, вердикт SWEPT, bootstrap гасится
+    // Красный тест плана #1431 (батч #1526: одна строка = одна команда
+    // с одним токеном): проход диспатчит sweep, вердикт SWEPT, bootstrap
+    // гасится
     let gw = fake(Vec::new());
     verdict_default(&gw, "SWEPT");
     let tasks = [done_closed(1431, THREE_DAYS, NOW)];
     let out = run(&tasks, &gw, &FakeBoard::all_done(), NOW, false).await;
     assert_eq!(gw.commands.lock().unwrap().as_slice(), ["1431"]);
+    assert_eq!(
+        *gw.last_budget_ms.lock().unwrap(),
+        ENV_GC_VERDICT_DEADLINE_MS,
+        "юзкейс носит бюджет прохода в команде"
+    );
     assert_eq!(out.swept, 1);
     assert_eq!(out.dispatched, 1);
     assert_eq!(
@@ -412,7 +494,9 @@ async fn observe_mode_counts_candidates_without_commands() {
 }
 
 #[tokio::test]
-async fn batch_cap_bounds_dispatch_per_pass() {
+async fn batch_cap_bounds_dispatch_per_pass_in_one_command() {
+    // 25 кандидатов, кап 20: одна команда со всеми 20 строками,
+    // остаток переезжает следующим проходом (#1526)
     let gw = fake(Vec::new());
     verdict_default(&gw, "SWEPT");
     let tasks: Vec<Task> = (0..25)
@@ -421,11 +505,13 @@ async fn batch_cap_bounds_dispatch_per_pass() {
     let out = run(&tasks, &gw, &FakeBoard::all_done(), NOW, false).await;
     assert_eq!(out.candidates, 25);
     assert_eq!(out.dispatched, ENV_GC_BATCH_CAP);
-    assert_eq!(gw.commands.lock().unwrap().len(), ENV_GC_BATCH_CAP);
+    let commands = gw.commands.lock().unwrap();
+    assert_eq!(commands.len(), 1, "одна команда на проход");
+    assert_eq!(commands[0].split_whitespace().count(), ENV_GC_BATCH_CAP);
 }
 
 #[tokio::test]
-async fn oldest_candidates_are_dispatched_first() {
+async fn oldest_candidates_are_dispatched_first_in_args() {
     let gw = fake(Vec::new());
     verdict_default(&gw, "SWEPT");
     let tasks = [
@@ -435,9 +521,26 @@ async fn oldest_candidates_are_dispatched_first() {
     run(&tasks, &gw, &FakeBoard::all_done(), NOW, false).await;
     assert_eq!(
         gw.commands.lock().unwrap().as_slice(),
-        ["1433", "1432"],
-        "старейшие первыми (путь клина)"
+        ["1433 1432"],
+        "старейшие первыми внутри args (путь клина)"
     );
+}
+
+#[tokio::test]
+async fn prefix_row_ids_in_one_batch_do_not_cross_match() {
+    // Префиксные row-id одного батча: «ENV-GC 143» не матчится в
+    // «ENV-GC 1431 …» — точный матч по токенам
+    let gw = fake(Vec::new());
+    verdict_on(&gw, "143", "SWEPT");
+    verdict_on(&gw, "1431", "ABSENT");
+    let tasks = [
+        done_closed(143, THREE_DAYS, NOW),
+        done_closed(1431, THREE_DAYS + 1, NOW),
+    ];
+    let out = run(&tasks, &gw, &FakeBoard::all_done(), NOW, false).await;
+    assert_eq!(out.swept, 1);
+    assert_eq!(out.absent, 1);
+    assert_eq!(out.failed, 0);
 }
 
 #[tokio::test]
@@ -461,10 +564,53 @@ async fn norepo_verdict_is_counted_without_sweep() {
 }
 
 #[tokio::test]
-async fn verdict_timeout_counts_the_row_failed() {
-    // Фейк без вердиктов: канал отвечает None (дедлайн), строка — failed
-    // (переедет следующим проходом)
+async fn foreign_and_absent_verdicts_are_counted_in_one_batch() {
     let gw = fake(Vec::new());
+    verdict_on(&gw, "1431", "FOREIGN");
+    verdict_on(&gw, "1432", "ABSENT");
+    let tasks = [
+        done_closed(1432, THREE_DAYS, NOW),
+        done_closed(1431, 10 * 86_400_000, NOW),
+    ];
+    let out = run(&tasks, &gw, &FakeBoard::all_done(), NOW, false).await;
+    assert_eq!(out.foreign, 1);
+    assert_eq!(out.absent, 1);
+}
+
+#[tokio::test]
+async fn verdict_feed_without_first_row_verdict_counts_it_failed_others_ok() {
+    // Сообщение село без вердикта первой строки: недостающая — failed,
+    // остальные учтены (пин Design #1526, развилка 2)
+    let gw = fake(Vec::new());
+    verdict_on(&gw, "1432", "SWEPT");
+    let tasks = [
+        done_closed(1431, THREE_DAYS, NOW),
+        done_closed(1432, THREE_DAYS + 1, NOW),
+    ];
+    let out = run(&tasks, &gw, &FakeBoard::all_done(), NOW, false).await;
+    assert_eq!(out.dispatched, 2);
+    assert_eq!(out.swept, 1);
+    assert_eq!(out.failed, 1);
+}
+
+#[tokio::test]
+async fn feed_without_any_needed_verdict_counts_all_failed() {
+    // Ok(Some) без нужных вердикт-строк (чужой row): все failed — после
+    // посадки сообщения новых не будет
+    let gw = fake(Vec::new());
+    *gw.feed_override.lock().unwrap() = Some("ENV-GC 999999 SWEPT".into());
+    let tasks = [done_closed(1431, THREE_DAYS, NOW)];
+    let out = run(&tasks, &gw, &FakeBoard::all_done(), NOW, false).await;
+    assert_eq!(out.dispatched, 1);
+    assert_eq!(out.swept, 0);
+    assert_eq!(out.failed, 1);
+}
+
+#[tokio::test]
+async fn wait_deadline_counts_all_rows_failed() {
+    // Ok(None) — страх-дедлайн: все failed (переедут следующим проходом)
+    let gw = fake(Vec::new());
+    *gw.wait_none.lock().unwrap() = true;
     let tasks = [done_closed(1431, THREE_DAYS, NOW)];
     let out = run(&tasks, &gw, &FakeBoard::all_done(), NOW, false).await;
     assert_eq!(out.dispatched, 1);
@@ -478,17 +624,45 @@ async fn verdict_timeout_counts_the_row_failed() {
 }
 
 #[tokio::test]
-async fn foreign_and_absent_verdicts_are_counted() {
+async fn read_err_retry_recovers_and_counts_verdicts() {
+    // Err опроса ленты: ретрай до страх-дедлайна — два упавших чтения,
+    // третье вернуло ленту → вердикты учтены (#1526, развилка 2)
     let gw = fake(Vec::new());
-    verdict_on(&gw, "1431", "FOREIGN");
-    verdict_on(&gw, "1432", "ABSENT");
-    let tasks = [
-        done_closed(1432, THREE_DAYS, NOW),
-        done_closed(1431, 10 * 86_400_000, NOW),
-    ];
+    verdict_default(&gw, "SWEPT");
+    *gw.wait_fail_first.lock().unwrap() = 2;
+    let tasks = [done_closed(1431, THREE_DAYS, NOW)];
     let out = run(&tasks, &gw, &FakeBoard::all_done(), NOW, false).await;
-    assert_eq!(out.foreign, 1);
-    assert_eq!(out.absent, 1);
+    assert_eq!(out.swept, 1);
+    assert_eq!(out.failed, 0);
+}
+
+#[tokio::test]
+async fn read_err_exhaustion_counts_all_failed() {
+    // Err всегда: кап ретраев/страх-дедлайн исчерпан — все failed
+    let gw = fake(Vec::new());
+    verdict_default(&gw, "SWEPT");
+    *gw.wait_always_fails.lock().unwrap() = true;
+    let tasks = [done_closed(1431, THREE_DAYS, NOW)];
+    let out = run(&tasks, &gw, &FakeBoard::all_done(), NOW, false).await;
+    assert_eq!(out.swept, 0);
+    assert_eq!(out.failed, 1);
+}
+
+#[tokio::test]
+async fn command_transport_failure_fails_all_rows_without_dispatch() {
+    // Транспортный отказ команды: скрипт убит посреди выполнения (проба
+    // #1526) — все failed, dispatched = 0, bootstrap гашен
+    let gw = fake(Vec::new());
+    *gw.command_fails.lock().unwrap() = true;
+    let tasks = [done_closed(1431, THREE_DAYS, NOW)];
+    let out = run(&tasks, &gw, &FakeBoard::all_done(), NOW, false).await;
+    assert_eq!(out.dispatched, 0);
+    assert_eq!(out.failed, 1);
+    assert_eq!(
+        gw.deleted.lock().unwrap().as_slice(),
+        ["ses_gc_1"],
+        "bootstrap гасится и после отказа команды"
+    );
 }
 
 #[tokio::test]
@@ -507,12 +681,45 @@ async fn revived_row_is_revalidated_and_not_swept() {
 }
 
 #[tokio::test]
+async fn row_revived_between_cycles_is_dropped_from_batch() {
+    // Ревайв между pre-flight и перепробой (ревью раунд 3): pre-flight
+    // видел Done, перепроба видит In Progress — строка не входит в args
+    let board = FakeBoard::with_revive_between_cycles(1431);
+    let gw = fake(Vec::new());
+    verdict_default(&gw, "SWEPT");
+    let tasks = [done_closed(1431, THREE_DAYS, NOW)];
+    let out = run(&tasks, &gw, &board, NOW, false).await;
+    assert_eq!(out.revoked, 1);
+    assert_eq!(out.dispatched, 0);
+    assert!(gw.commands.lock().unwrap().is_empty());
+    assert!(
+        gw.created.lock().unwrap().is_empty(),
+        "bootstrap не создаётся"
+    );
+}
+
+#[tokio::test]
+async fn no_ready_rows_means_no_bootstrap_and_no_command() {
+    // Все строки revoked на pre-flight: bootstrap не создаётся, команды
+    // нет (Low-6 ревью-4)
+    let board = FakeBoard::with_status(1431, Status::InProgress);
+    let gw = fake(Vec::new());
+    let tasks = [done_closed(1431, THREE_DAYS, NOW)];
+    let out = run(&tasks, &gw, &board, NOW, false).await;
+    assert_eq!(out.revoked, 1);
+    assert!(gw.created.lock().unwrap().is_empty());
+    assert!(gw.commands.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn status_probe_failure_skips_the_row_fail_safe() {
     // «Не знаю» ≠ «можно сносить» (ADR-058): недоступная проба статуса —
     // строка переезжает, диспатча нет
     let board = Arc::new(FakeBoard {
         statuses: Mutex::new(HashMap::new()),
         row_status_fails: true,
+        revive_on_call: Mutex::new(HashMap::new()),
+        calls: Mutex::new(HashMap::new()),
     });
     let gw = fake(Vec::new());
     verdict_default(&gw, "SWEPT");
@@ -523,25 +730,22 @@ async fn status_probe_failure_skips_the_row_fail_safe() {
     assert!(gw.commands.lock().unwrap().is_empty());
 }
 
-// ---------- пин контракта «шаблон ↔ args» (#1506) ----------
+// ---------- пин контракта «шаблон ↔ args» (#1506, #1526) ----------
 
 /// Реальные шаблоны slash-команд. include_str! мёртвым путём —
 /// compile-error, не тишина (канон mock_route_coverage).
 const TASK_ENV_GC_TEMPLATE: &str = include_str!("../../../../../commands/task-env-gc.md");
 const TASK_ENV_TEMPLATE: &str = include_str!("../../../../../commands/task-env.md");
 
-/// Фейк выше эмулирует резолв opencode ($1 = первый токен args, слово
-/// sweep литерально в шаблоне), но ни один юнит не читает реальный файл
-/// шаблона — его правка мимо args-контракта (слово выкинуто, $1
-/// подвинут) прошла бы все тесты и сломала канал вердиктов тем же
-/// классом бага #1506, только на стороне шаблона.
 #[test]
 fn sweep_template_carries_subcommand_literally_and_row_via_arg1() {
-    // shell-блок: скрипт получает sweep литералом, row — $1 (первый
-    // токен args); контракт единый с эталонным task-env (args = row)
+    // shell-блок: «sweep $1» — подкоманда литерально в шаблоне, args =
+    // строки. Для однотокенового args $1 = строка (#1506), для батча $1
+    // = весь хвост (tail-join старшего placeholder, проба #1526) —
+    // текст шаблона не меняется ни в одной из форм.
     assert!(
         TASK_ENV_GC_TEMPLATE.contains("task-env-gc.sh sweep $1"),
-        "шаблон task-env-gc обязан нести «sweep $1»: подкоманда литерально в шаблоне, args = row (#1506)"
+        "шаблон task-env-gc обязан нести «sweep $1»: подкоманда литерально в шаблоне"
     );
     assert!(
         TASK_ENV_TEMPLATE.contains("task-env.sh $1"),

@@ -338,6 +338,67 @@ async fn session_list_matches_pin_wrapper_and_agent_semantics() {
 
 // ---------- юнит-пины: носитель пина и дифф-механика ----------
 
+#[tokio::test]
+async fn command_user_message_matches_pin_live_shape() {
+    // Батч-вердики env-gc (#1431/#1526): user-сообщение команды несёт
+    // верхнеуровневый text со всеми вердикт-строками, content[] не
+    // даётся — живая форма по пробе #1526 (оси пина user_message).
+    // content[]-форма мока была дрейфом от носителя: адаптер на живом
+    // opencode возвращал None, канал вердиктов был глух
+    let (base, _mock) = spawn_mock(&[]);
+    wait_ready(&base).await;
+    let http = reqwest::Client::new();
+    let pin = Pin::load();
+
+    let id = create_session_with(&base, &http, json!({ "title": "verdict probe" })).await;
+    http.post(format!("{base}/api/session/{id}/command"))
+        .json(&json!({ "name": "task-env-gc", "text": "1431 1432" }))
+        .send()
+        .await
+        .expect("command");
+    let tail = get_json(
+        &http,
+        &format!("{base}/api/session/{id}/message?limit=5&order=desc"),
+    )
+    .await;
+
+    let mut d = Diff::default();
+    let msgs = tail["data"].as_array().cloned().unwrap_or_default();
+    let user = msgs.iter().find(|m| m["type"] == "user").cloned();
+    d.expect(
+        "user_message.present",
+        user.is_some(),
+        "хвост без user-сообщения команды",
+    );
+    let msg = user.unwrap_or_default();
+    let text = msg["text"].as_str().unwrap_or_default();
+    d.expect(
+        &format!("user_message.form[{}]", pin.user_message_form),
+        !text.is_empty(),
+        "text верхнеуровневый пуст — мок не в живой форме",
+    );
+    d.expect(
+        "user_message.batch_lines",
+        text.contains("ENV-GC 1431 SWEPT") && text.contains("ENV-GC 1432 SWEPT"),
+        "батч-сообщение без вердикт-строки на каждый токен args",
+    );
+    let leaked: Vec<String> = pin
+        .user_message_forbidden
+        .iter()
+        .filter(|k| !msg[k.as_str()].is_null())
+        .cloned()
+        .collect();
+    d.expect(
+        "user_message.forbidden_keys",
+        leaked.is_empty(),
+        &format!(
+            "запрещённые живой формой ключи в user-сообщении: {leaked:?} ({})",
+            pin.user_message_form
+        ),
+    );
+    d.finish("command user message");
+}
+
 #[test]
 fn pin_carries_every_contract_axis() {
     let pin = Pin::load();
@@ -347,6 +408,14 @@ fn pin_carries_every_contract_axis() {
     assert!(
         pin.forbidden_time.contains(&"updated".to_string()),
         "forbidden-ось без updated — страж инцидента #1249 потерян"
+    );
+    assert_eq!(
+        pin.user_message_form, "top-level text",
+        "ось формы user-сообщения (#1526): живой носитель несёт верхнеуровневый text"
+    );
+    assert!(
+        pin.user_message_forbidden.contains(&"content".to_string()),
+        "content[] в user-сообщении — дрейф мока, канал вердиктов глух"
     );
     assert!(pin.assistant_final_time.contains(&"completed".to_string()));
     assert!(pin.assistant_final_time.contains(&"created".to_string()));

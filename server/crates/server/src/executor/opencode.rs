@@ -59,6 +59,21 @@ fn message_array(resp: &Value) -> Option<&Vec<Value>> {
     resp.as_array().or_else(|| resp["data"].as_array())
 }
 
+/// Текст user-сообщения. Форма живого носителя (opencode 2.3.2, проба
+/// #1526 + прод-БД, пин ниже): верхнеуровневый `text` без content[] —
+/// {"id","time","text","type"}. Чтение content[] возвращало None на
+/// живом носителе — канал вердиктов env-gc был глух (#1506-класс:
+/// вердикты в ленте, сервер их не читает). Одна форма, один механизм:
+/// content[]-форма живым носителем для user-сообщений не даётся и не
+/// читается (assistant-сообщения content[] несут — их читают отдельные
+/// ручки).
+fn user_message_text(msg: &Value) -> Option<String> {
+    match msg["text"].as_str() {
+        Some(t) if !t.is_empty() => Some(t.to_string()),
+        _ => None,
+    }
+}
+
 /// Хвост журнала (order=desc): является ли самый свежий содержательный
 /// блок (user|assistant) ассистентским. Служебные записи поверх ответа
 /// (idle и пр., #1150/#1206 Common-1) пропускаются.
@@ -213,8 +228,15 @@ impl OpencodeClient {
         }
     }
 
+    /// call: маршруты клиента. Бюджет (Option<u64>) — per-request таймаут
+    /// в миллисекундах, переопределяет общий клиентский на этот запрос:
+    /// синхронные команды env-gc (#1526) несут бюджет прохода — ответ
+    /// приходит после полного завершения shell-блока; None — общий
+    /// клиентский таймаут. Литерал пути живёт на сайте вызова — канарейка
+    /// route-пина (#1329) сверяет их с манифестом мока.
     async fn call(
         &self,
+        budget_ms: Option<u64>,
         path: &str,
         method: reqwest::Method,
         body: Option<Value>,
@@ -223,6 +245,9 @@ impl OpencodeClient {
             .http
             .request(method, format!("{}/api{path}", self.base))
             .basic_auth("opencode", Some(&self.password));
+        if let Some(ms) = budget_ms {
+            req = req.timeout(std::time::Duration::from_millis(ms));
+        }
         if let Some(b) = body {
             req = req.json(&b);
         }
@@ -316,7 +341,7 @@ impl AgentSessionGateway for OpencodeClient {
     async fn create_session(&self, spec: &SessionSpec) -> UsecaseResult<String> {
         let body = create_session_body(spec);
         let (status, resp) = self
-            .call("/session", reqwest::Method::POST, Some(body))
+            .call(None, "/session", reqwest::Method::POST, Some(body))
             .await?;
         Self::check(status, "create_session")?;
         let id = resp["data"]["id"]
@@ -333,6 +358,7 @@ impl AgentSessionGateway for OpencodeClient {
     async fn prompt(&self, session: &str, text: &str) -> UsecaseResult<()> {
         let (status, _) = self
             .call(
+                None,
                 &format!("/session/{session}/prompt"),
                 reqwest::Method::POST,
                 Some(json!({ "text": text })),
@@ -346,6 +372,7 @@ impl AgentSessionGateway for OpencodeClient {
     async fn switch_agent(&self, session: &str, agent: uwuwu_domain::Agent) -> UsecaseResult<()> {
         let (status, _) = self
             .call(
+                None,
                 &format!("/session/{session}/agent"),
                 reqwest::Method::POST,
                 Some(json!({ "agent": uwuwu_usecase::agent_name(agent) })),
@@ -357,9 +384,21 @@ impl AgentSessionGateway for OpencodeClient {
         Self::check_session(status, &format!("switch agent {session}"))
     }
 
-    async fn run_command(&self, session: &str, name: &str, args: &str) -> UsecaseResult<()> {
+    /// Slash-команда сессии. POST /command синхронен (проба #1526): ответ
+    /// после полного завершения shell-блока, поэтому per-request таймаут
+    /// = budget_ms от юзкейса (батч env-gc — 15 мин); общий клиентский
+    /// таймаут не трогается — зависшие GET/промпты других контуров
+    /// остаются на 20с.
+    async fn run_command(
+        &self,
+        session: &str,
+        name: &str,
+        args: &str,
+        budget_ms: u64,
+    ) -> UsecaseResult<()> {
         let (status, _) = self
             .call(
+                Some(budget_ms),
                 &format!("/session/{session}/command"),
                 reqwest::Method::POST,
                 Some(json!({ "name": name, "text": args })),
@@ -370,7 +409,12 @@ impl AgentSessionGateway for OpencodeClient {
 
     async fn liveness(&self, session: &str) -> Liveness {
         match self
-            .call(&format!("/session/{session}"), reqwest::Method::GET, None)
+            .call(
+                None,
+                &format!("/session/{session}"),
+                reqwest::Method::GET,
+                None,
+            )
             .await
         {
             Ok((status, _)) => liveness_of_status(status),
@@ -381,6 +425,7 @@ impl AgentSessionGateway for OpencodeClient {
     async fn delete_session(&self, session: &str) -> UsecaseResult<()> {
         let (status, _) = self
             .call(
+                None,
                 &format!("/session/{session}"),
                 reqwest::Method::DELETE,
                 None,
@@ -410,6 +455,7 @@ impl AgentSessionGateway for OpencodeClient {
         // снимается (две строки).
         if let Ok((status, _)) = self
             .call(
+                None,
                 &format!("/session/{session}/abort"),
                 reqwest::Method::POST,
                 None,
@@ -422,6 +468,7 @@ impl AgentSessionGateway for OpencodeClient {
         }
         match self
             .call(
+                None,
                 &format!("/session/{session}/interrupt"),
                 reqwest::Method::POST,
                 None,
@@ -451,7 +498,7 @@ impl AgentSessionGateway for OpencodeClient {
             if let Some(c) = &cursor {
                 url.push_str(&format!("&cursor={c}"));
             }
-            let (status, resp) = self.call(&url, reqwest::Method::GET, None).await?;
+            let (status, resp) = self.call(None, &url, reqwest::Method::GET, None).await?;
             Self::check(status, "list sessions")?;
             let (page, next) = parse_session_page(&resp, PAGE_LIMIT);
             out.extend(page);
@@ -468,6 +515,7 @@ impl AgentSessionGateway for OpencodeClient {
     async fn export_session(&self, session: &str) -> UsecaseResult<String> {
         let (status, resp) = self
             .call(
+                None,
                 &format!("/experimental/session/{session}/export"),
                 reqwest::Method::GET,
                 None,
@@ -487,6 +535,7 @@ impl AgentSessionGateway for OpencodeClient {
     async fn last_activity_ms(&self, session: &str) -> UsecaseResult<Option<u64>> {
         let (status, resp) = self
             .call(
+                None,
                 &format!("/session/{session}/message?limit=1&order=desc"),
                 reqwest::Method::GET,
                 None,
@@ -507,6 +556,7 @@ impl AgentSessionGateway for OpencodeClient {
     async fn last_assistant_reply(&self, session: &str) -> UsecaseResult<Option<AssistantReply>> {
         let (status, resp) = self
             .call(
+                None,
                 &format!("/session/{session}/message?limit=5&order=desc"),
                 reqwest::Method::GET,
                 None,
@@ -576,6 +626,7 @@ impl AgentSessionGateway for OpencodeClient {
     ) -> UsecaseResult<Option<f64>> {
         let (status, resp) = self
             .call(
+                None,
                 &format!("/session/{session}/message?limit=10&order=desc"),
                 reqwest::Method::GET,
                 None,
@@ -597,6 +648,7 @@ impl AgentSessionGateway for OpencodeClient {
     async fn compact_session(&self, session: &str) -> UsecaseResult<()> {
         let (status, _) = self
             .call(
+                None,
                 &format!("/session/{session}/compact"),
                 reqwest::Method::POST,
                 Some(serde_json::json!({})),
@@ -607,12 +659,18 @@ impl AgentSessionGateway for OpencodeClient {
 }
 
 impl OpencodeClient {
-    /// Текст свежайшего user-сообщения сессии (content[].text склеенный);
-    /// None — user-сообщений нет. Форма та же, что у ассистентского
-    /// хвоста (opencode 2.3.0): type «user», content[].text.
+    /// Текст свежайшего user-сообщения сессии; None — user-сообщений нет.
+    /// Форма живого носителя (opencode 2.3.2, проба #1526 + прод-БД):
+    /// user-сообщение несёт верхнеуровневый `text` без content[] —
+    /// {"id","time","text","type"}; чтение content[] возвращало None на
+    /// живом носителе и канал вердиктов env-gc был глух (#1506-класс:
+    /// вердикты в ленте, сервер их не читает). Форма пинится в
+    /// контракт-контуре #1254; assistant-сообщения content[] несут — их
+    /// читают отдельные ручки.
     async fn last_user_message_text(&self, session: &str) -> UsecaseResult<Option<String>> {
         let (status, resp) = self
             .call(
+                None,
                 &format!("/session/{session}/message?limit=5&order=desc"),
                 reqwest::Method::GET,
                 None,
@@ -623,20 +681,7 @@ impl OpencodeClient {
         else {
             return Ok(None);
         };
-        let text: Vec<&str> = msg["content"]
-            .as_array()
-            .map(|parts| {
-                parts
-                    .iter()
-                    .filter(|p| p["type"] == "text")
-                    .filter_map(|p| p["text"].as_str())
-                    .collect()
-            })
-            .unwrap_or_default();
-        if text.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(text.join("\n")))
+        Ok(user_message_text(msg))
     }
 
     /// Лимит окна контекста модели из каталога исполнителя GET /model
@@ -649,7 +694,9 @@ impl OpencodeClient {
         if let Some(cached) = self.model_limits.lock().expect("limits lock").get(&key) {
             return Ok(*cached);
         }
-        let (status, resp) = self.call("/model", reqwest::Method::GET, None).await?;
+        let (status, resp) = self
+            .call(None, "/model", reqwest::Method::GET, None)
+            .await?;
         Self::check(status, "model catalog")?;
         let empty = Vec::new();
         let items = resp
@@ -787,6 +834,38 @@ mod tests {
         assert_eq!(message_array(&bare).map(Vec::len), Some(1));
         assert_eq!(message_array(&wrapped).map(Vec::len), Some(1));
         assert!(message_array(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn user_message_text_reads_live_carrier_shape() {
+        // Живая форма user-сообщения opencode 2.3.2 (проба #1526
+        // feed3.json + прод-БД: 34/34 после мерджа #497): верхнеуровневый
+        // text без content[] — чтение content[] возвращало None и канал
+        // вердиктов env-gc был глух (класс #1506: вердикты в ленте,
+        // сервер их не читает)
+        let live = serde_json::json!({
+            "id": "msg_x", "type": "user",
+            "time": { "created": 1795405007028u64 },
+            "text": "ENV-GC 990001 SWEPT\nENV-GC 990002 SWEPT\n\n\nСлужебная команда конвейера."
+        });
+        assert_eq!(
+            user_message_text(&live).as_deref(),
+            Some("ENV-GC 990001 SWEPT\nENV-GC 990002 SWEPT\n\n\nСлужебная команда конвейера."),
+            "живая форма: верхнеуровневый text"
+        );
+        // Одна форма, один механизм: content[]-форма живым носителем для
+        // user-сообщений не даётся и не читается (мок перекалиброван)
+        let content_only = serde_json::json!({
+            "id": "msg_y", "type": "user",
+            "content": [{ "type": "text", "text": "ENV-GC 1431 SWEPT" }]
+        });
+        assert!(
+            user_message_text(&content_only).is_none(),
+            "content[]-форма user-сообщения не читается (живой носитель её не даёт)"
+        );
+        // Пустой text — нет текста
+        let empty = serde_json::json!({ "id": "msg_z", "type": "user", "text": "" });
+        assert!(user_message_text(&empty).is_none());
     }
 
     #[test]

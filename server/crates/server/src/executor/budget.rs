@@ -71,8 +71,14 @@ impl AgentSessionGateway for BudgetedSessions {
         self.inner.switch_agent(session, agent).await
     }
 
-    async fn run_command(&self, session: &str, name: &str, args: &str) -> UsecaseResult<()> {
-        self.inner.run_command(session, name, args).await
+    async fn run_command(
+        &self,
+        session: &str,
+        name: &str,
+        args: &str,
+        budget_ms: u64,
+    ) -> UsecaseResult<()> {
+        self.inner.run_command(session, name, args, budget_ms).await
     }
 
     async fn liveness(&self, session: &str) -> Liveness {
@@ -160,7 +166,7 @@ mod tests {
         async fn prompt(&self, _s: &str, _t: &str) -> UsecaseResult<()> {
             Ok(())
         }
-        async fn run_command(&self, _s: &str, _n: &str, _a: &str) -> UsecaseResult<()> {
+        async fn run_command(&self, _s: &str, _n: &str, _a: &str, _b: u64) -> UsecaseResult<()> {
             Ok(())
         }
         async fn delete_session(&self, _s: &str) -> UsecaseResult<()> {
