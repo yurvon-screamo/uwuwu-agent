@@ -1237,6 +1237,18 @@ fn dev_task(n: u64, session: &str) -> Task {
     t
 }
 
+/// Задача Plan review с живой сессией план-ревьюера (окно вердикта #1533).
+fn plan_review_task(n: u64, session: &str) -> Task {
+    let mut t = task(n, Status::ReviewPlan);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::PlanReview,
+        uwuwu_domain::SessionRef::parse(session).unwrap(),
+    );
+    t.apply_fields(f);
+    t
+}
+
 /// Гейтвей с N busy-сессиями union-скана — харнес held_cup-пинов
 /// сайдкаров (#1313): dreamer/analyst/analyst_review решают по busy.
 /// outcome задаёт кандидатность филлеров для дримера (is_fresh_candidate).
@@ -1339,9 +1351,13 @@ fn wake_usecase(
 }
 
 #[tokio::test]
-async fn own_comment_of_holding_session_is_not_delivered_and_baseline_moves() {
+async fn own_comment_of_holding_session_is_not_delivered_and_baseline_stays() {
     // #1204 (self-эхо): агент опубликовал коммент в свой ход, ход закрылся
-    // (активность новее коммента) — эхо-будки нет, бейзлайн двигается тихо.
+    // (активность новее коммента) — эхо-будки нет. #1533 уточняет контракт:
+    // читатель (спавн до коммента) — автор эха, хвост адресован следующему
+    // держателю — seen не двигается. Эхо дальше не приедет: срез гасит его
+    // на каждом тике, при смешанном хвосте доставляется только чужой
+    // (mixed_tail), свежий читатель следующего раунда поглотит его рождением.
     let state = Arc::new(MemState(Mutex::default()));
     state.mark_own_comment("own-echo", 10);
     // геометрия прод-эха: seen-бейзлайн стоит, хвост = свой коммент
@@ -1369,8 +1385,8 @@ async fn own_comment_of_holding_session_is_not_delivered_and_baseline_moves() {
     assert!(sessions.prompts.lock().unwrap().is_empty());
     assert_eq!(
         state.0.lock().unwrap().comments.last().map(String::as_str),
-        Some("own-echo"),
-        "бейзлайн двигается тихо — хвост не приедет в следующей доставке"
+        Some("old-seen"),
+        "читатель родился до коммента — хвост ждёт следующего держателя (#1533)"
     );
 }
 
@@ -1380,8 +1396,11 @@ async fn own_comment_before_first_session_wake_is_sliced_without_baseline() {
     // опубликованный до спавна свежей сессии (seen-бейзлайна нет, активность
     // новее коммента — спавн и ход после поста), не доставляется
     // idle-фоллбеком: хвост целиком свой → тихий сдвиг бейзлайна.
+    // #1533: сдвиг теперь требует метки рождения (спавн после коммента) —
+    // свежий читатель поглощает недостижимый хвост.
     let state = Arc::new(MemState(Mutex::default()));
     state.mark_own_comment("triage-echo", 10);
+    state.mark_spawn("Задачи uwuwu", 61, Slot::Dev, 7000);
     let (u, sessions, state) = wake_usecase(
         vec![dev_task(61, "ses_dev_61")],
         vec![CommentRef {
@@ -1514,6 +1533,119 @@ async fn own_comment_mid_turn_with_live_journal_is_not_delivered() {
     assert!(
         state.0.lock().unwrap().comments.is_empty(),
         "seen не двигается при работающем агенте — доставка повторится"
+    );
+}
+
+#[tokio::test]
+async fn verdict_in_review_window_is_not_consumed_and_wakes_next_holder() {
+    // #1533: тик в окне «вердикт опубликован → статус переведён» читает хвост
+    // глазами слота ревьюера: own-срез (#1204) признаёт вердикт своим
+    // (активность ревьюера новее собственного поста), но seen-курсор через
+    // вердикт двигать нельзя — читатель (спавн до коммента) не его адресат,
+    // вердикт ждёт следующего держателя. Прод-факт #1526 24.11: тик 10:08:20
+    // в 65-секундной паузе съел вердикт (self_echo_sliced foreign=0), держатель
+    // получил ложный мягкий сталл-пинг и откатил вердикт.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.mark_own_comment("verdict", 10);
+    state.set_last_comment_id("Задачи uwuwu", 61, "old-seen");
+    // ревьюер заспавнен до вердикта (раунд открылся раньше поста);
+    // seen-статус пре-сию — тик не считает строку входом в стадию
+    // и не снимает PlanReview-сессию по fresh-eyes
+    state.mark_spawn("Задачи uwuwu", 61, Slot::PlanReview, 500);
+    state.set_last_seen_status("Задачи uwuwu", 61, Status::ReviewPlan);
+    let (u, sessions, state) = wake_usecase(
+        vec![plan_review_task(61, "ses_rev_61")],
+        vec![
+            CommentRef {
+                id: "old-seen".into(),
+                created_ms: 1000,
+                body: "старое".into(),
+            },
+            CommentRef {
+                id: "verdict".into(),
+                created_ms: 3000,
+                body: "request_changes ревьювера".into(),
+            },
+        ],
+        Some(5000), // ход ревьюера закрылся после поста вердикта
+        true,
+        state,
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.wakeups, 0, "свой вердикт не будит ревьюера");
+    let sent1 = sessions.prompts.lock().unwrap().join("\n");
+    assert!(
+        sessions.prompts.lock().unwrap().is_empty(),
+        "фаза 1 без доставок: {sent1}"
+    );
+    assert_eq!(
+        state.0.lock().unwrap().comments.last().map(String::as_str),
+        Some("old-seen"),
+        "seen не двигается через вердикт — он адресован следующему держателю"
+    );
+
+    // Перевод статуса (ревьюер вернул строку в работу): вердикт foreign для
+    // дев-сессии (её активность старше коммента) — доставляется.
+    let (u2, sessions2, state2) = wake_usecase(
+        vec![dev_task(61, "ses_dev_61")],
+        vec![
+            CommentRef {
+                id: "old-seen".into(),
+                created_ms: 1000,
+                body: "старое".into(),
+            },
+            CommentRef {
+                id: "verdict".into(),
+                created_ms: 3000,
+                body: "request_changes ревьювера".into(),
+            },
+        ],
+        Some(1000), // активность держателя старше вердикта
+        true,
+        state,
+    );
+    let out2 = u2.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out2.wakeups, 1,
+        "вердикт доходит до держателя после перевода статуса"
+    );
+    let sent = sessions2.prompts.lock().unwrap().join("\n");
+    assert!(sent.contains("request_changes ревьювера"), "{sent}");
+    // seen двигается только фактом доставки
+    assert_eq!(
+        state2.0.lock().unwrap().comments.last().map(String::as_str),
+        Some("verdict")
+    );
+}
+
+#[tokio::test]
+async fn fresh_reader_consumes_stale_registry_tail_without_delivery() {
+    // #1533 (член рождения own-среза): реестр-комменты, изданные ДО рождения
+    // читателя (spawn-метка новее коммента), не доставляются свежей сессии
+    // даже с пустым журналом (активности нет) — спавн-промпт уже несёт
+    // контекст (#1204, триаж-класс) — и поглощаются: такой хвост не
+    // достанется этому слоту ни в одном будущем раунде.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.mark_own_comment("triage-echo", 10);
+    state.mark_spawn("Задачи uwuwu", 61, Slot::Dev, 7000);
+    let (u, sessions, state) = wake_usecase(
+        vec![dev_task(61, "ses_dev_61")],
+        vec![CommentRef {
+            id: "triage-echo".into(),
+            created_ms: 3000,
+            body: "старый триаж-коммент".into(),
+        }],
+        None, // пустой журнал свежей сессии
+        true,
+        state,
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.wakeups, 0, "коммент до рождения читателя не будит");
+    assert!(sessions.prompts.lock().unwrap().is_empty());
+    assert_eq!(
+        state.0.lock().unwrap().comments.last().map(String::as_str),
+        Some("triage-echo"),
+        "поглощено: читатель родился после коммента — хвост недостижим"
     );
 }
 
