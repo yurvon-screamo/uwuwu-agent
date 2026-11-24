@@ -1713,3 +1713,303 @@ async fn cron_list_renders_machine_accounting() {
     assert!(out.contains("last fire never"), "{out}");
     assert!(out.contains("fails 0"), "{out}");
 }
+
+// ==== #1572: гард пустой записи и чужих параметров на write-path тел ====
+
+/// Тело с крупной секцией в ещё более крупном теле — дыра гарда сжатия
+/// (#1572 срез 3): доля сжатия тела мала, ошибочный короткий контент
+/// стирает большую секцию мимо телесного гарда (класс #1277).
+fn body_with_fat_tail_section() -> String {
+    let mut tail = String::new();
+    for i in 0..25 {
+        tail.push_str(&format!(
+            "строка отчёта хвоста {i}: содержимое, которое теряется\n"
+        ));
+    }
+    let mut filler = String::new();
+    for i in 0..300 {
+        filler.push_str(&format!(
+            "строка наполнителя тела {i}: большая секция в ещё большем теле\n"
+        ));
+    }
+    format!("## Постановка\n\nДержатель массы тела.\n\n## Хвост\n\n{tail}\n## Прочее\n\n{filler}")
+}
+
+/// Сценарий 1 (#1572, BDD): task_body без body — громкий отказ с длиной
+/// текущего тела и рецептом следующего хода; носитель цел. Босый
+/// «empty body» (гард #406) дважды прочитан знающим агентом как успех
+/// (инстансы foilcap #31, 22–23.11) — отказ обязан сам объяснять ход.
+#[tokio::test]
+async fn task_body_without_body_refuses_with_carrier_size_and_recipe() {
+    let (tools, memory) = hub();
+    let (number, _) = create_task(&tools, "t: no-body", &big_body()).await;
+    let err = call(&tools, "task_body", json!({ "number": number }))
+        .await
+        .expect_err("запись без body отказывает громко");
+    assert!(
+        err.contains("REPLACES"),
+        "отказ называет природу вызова (запись, не чтение): {err}"
+    );
+    assert!(err.contains("task_get"), "рецепт чтения в отказе: {err}");
+    assert!(
+        err.contains("body: \"\""),
+        "рецепт осознанной очистки в отказе: {err}"
+    );
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert!(
+        err.contains(&format!("{} bytes", stored.len())),
+        "длина текущего тела в отказе — агент сверяет, что ничего не стёрто: {err}"
+    );
+    assert!(
+        stored.contains("строка наполнителя 119"),
+        "носитель цел: {stored}"
+    );
+}
+
+/// Сценарий 1, развилка А (#1572): явный `body: ""` — осознанная очистка
+/// без confirm-параметра: пустая строка — уже явный акт, стоп-кран поверх
+/// явного действия не заводится (гран ADR-037). Транспорт доносит пустую
+/// строку как присутствующее значение (живая проба 24.11: task_clean
+/// ack: "" → «garbage token „"“»).
+#[tokio::test]
+async fn task_body_with_explicit_empty_string_clears_carrier() {
+    let (tools, memory) = hub();
+    let (number, _) = create_task(&tools, "t: clear", "## Постановка\n\nЧерновик.\n").await;
+    let receipt = call(&tools, "task_body", json!({ "number": number, "body": "" }))
+        .await
+        .expect("явная пустая строка — осознанная очистка");
+    assert!(receipt.contains("replaced"), "квитанция очистки: {receipt}");
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert!(stored.trim().is_empty(), "носитель очищен явно: {stored:?}");
+}
+
+/// Сценарий 2 (#1572, инстансы 23–24.11 дословно): task_body_section с
+/// контентом в чужих параметрах find/replace (в схеме их нет) — громкий
+/// отказ с перечнем чужих ключей; секция целa. Факт-механика: чужие ключи
+/// молча strip'ились, вызов деградировал до очистки секции (квитанции
+/// «cleared», каждый обход — полная перезапись тела).
+#[tokio::test]
+async fn task_body_section_with_foreign_find_replace_arguments_refuses_loud() {
+    let (tools, memory) = hub();
+    let (number, hash) = create_task(&tools, "t: find-replace", &big_body()).await;
+    let err = call(
+        &tools,
+        "task_body_section",
+        json!({
+            "number": number,
+            "section": "Постановка",
+            "find": "Наблюдение",
+            "replace": "Новое наблюдение",
+            "base_hash": hash,
+        }),
+    )
+    .await
+    .expect_err("чужие параметры — громкий отказ до мутации");
+    assert!(err.contains("find"), "чужой ключ назван: {err}");
+    assert!(err.contains("replace"), "чужой ключ назван: {err}");
+    assert!(
+        err.contains("content"),
+        "отказ раскрывает известные ключи (контент не передан): {err}"
+    );
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert!(
+        stored.contains("Наблюдение: тело задачи"),
+        "секция целa — деградации до очистки нет: {stored}"
+    );
+    assert!(!stored.contains("Новое наблюдение"), "замены нет: {stored}");
+}
+
+/// Сценарий 2, обобщение (#1572): чужой ключ на мутационном тулe —
+/// громкий отказ до мутации, не тихий strip (task_body с лишним «text»).
+#[tokio::test]
+async fn unknown_argument_on_task_body_refuses_loud() {
+    let (tools, memory) = hub();
+    let (number, _) = create_task(&tools, "t: stray", "## А\nтело\n").await;
+    let err = call(
+        &tools,
+        "task_body",
+        json!({ "number": number, "body": "## А\nновое тело\n", "text": "лишний" }),
+    )
+    .await
+    .expect_err("чужой ключ — громкий отказ");
+    assert!(err.contains("text"), "чужой ключ назван: {err}");
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert!(
+        stored.contains("тело") && !stored.contains("новое тело"),
+        "записи нет: {stored:?}"
+    );
+}
+
+/// Легально потребляемый лишний ключ жив: legacy autodone на task_create
+/// («the legacy autodone field is read» — канон) не отвергается чужим-гардом.
+#[tokio::test]
+async fn legacy_autodone_argument_passes_unknown_guard() {
+    let (tools, _) = hub();
+    let receipt = call(
+        &tools,
+        "task_create",
+        json!({ "title": "легаси autodone жив", "body": "б", "autodone": true }),
+    )
+    .await
+    .expect("legacy-ключ проходит чужой-гард");
+    assert!(receipt.contains("created"), "{receipt}");
+}
+
+/// Сценарий 3 (#1572): task_body_section без content — громкий отказ с
+/// длиной текущей секции и рецептом; секция целa (тихая деградация до
+/// очистки закрыта). «Параметр отсутствует» ≠ «явно пустая строка».
+#[tokio::test]
+async fn task_body_section_without_content_refuses_with_section_size_and_recipe() {
+    let (tools, memory) = hub();
+    let (number, hash) = create_task(&tools, "t: no-content", &big_body()).await;
+    let err = call(
+        &tools,
+        "task_body_section",
+        json!({ "number": number, "section": "План", "base_hash": hash }),
+    )
+    .await
+    .expect_err("запись без content отказывает громко");
+    assert!(
+        err.contains("REPLACES"),
+        "отказ называет природу вызова (запись, не чтение): {err}"
+    );
+    assert!(err.contains("task_get"), "рецепт чтения в отказе: {err}");
+    assert!(
+        err.contains("content: \"\""),
+        "рецепт осознанной очистки в отказе: {err}"
+    );
+    assert!(
+        err.contains("bytes"),
+        "длина текущей секции в отказе: {err}"
+    );
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert!(
+        stored.contains("Контракт секционного пути"),
+        "секция «План» целa — деградации до очистки нет: {stored}"
+    );
+}
+
+/// Развилка А на секциях (#1572, пин сохранённой семантики): явный
+/// `content: ""` — осознанная очистка секции; гард сжатия явную очистку
+/// не трогает — рецепт отказа полного task_body на неё опирается.
+#[tokio::test]
+async fn explicit_empty_content_still_clears_existing_section() {
+    let (tools, memory) = hub();
+    let (number, hash) = create_task(&tools, "t: clear-sec", "## А\nтело\n").await;
+    let receipt = call(
+        &tools,
+        "task_body_section",
+        json!({ "number": number, "section": "А", "content": "", "base_hash": hash }),
+    )
+    .await
+    .expect("явная очистка проходит");
+    assert!(receipt.contains("cleared"), "квитанция: {receipt}");
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert!(
+        stored.contains("## А") && !stored.contains("тело"),
+        "контент секции снят, заголовок жив: {stored:?}"
+    );
+}
+
+/// Сценарий 4 (#1572, класс #1277): ошибочный короткий контент на большой
+/// секции — громкий отказ с длинами было/стало по телу и секции; носитель
+/// цел (срез 3: секция в крупном теле — мимо телесной доли сжатия).
+#[tokio::test]
+async fn radical_section_shrink_refuses_with_lengths_without_write() {
+    let (tools, memory) = hub();
+    let (number, hash) = create_task(&tools, "t: shrink", &body_with_fat_tail_section()).await;
+    let err = call(
+        &tools,
+        "task_body_section",
+        json!({
+            "number": number,
+            "section": "Хвост",
+            "content": "короткий хвост\n",
+            "base_hash": hash,
+        }),
+    )
+    .await
+    .expect_err("радикальное сжатие секции — громкий отказ");
+    assert!(err.contains("radical shrink"), "природа отказа: {err}");
+    assert!(err.contains("(was"), "длины было/стало в отказе: {err}");
+    assert!(
+        err.contains("confirm: true"),
+        "рецепт осознанного преодоления: {err}"
+    );
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert!(
+        stored.contains("строка отчёта хвоста 24"),
+        "секция целa — записи нет: {stored}"
+    );
+}
+
+/// Осознанное сжатие: confirm: true проводит запись; квитанция несёт
+/// было/стало по телу и по секции + отметку confirm (контракт #1409).
+#[tokio::test]
+async fn radical_shrink_with_confirm_writes_and_receipt_carries_lengths() {
+    let (tools, memory) = hub();
+    let (number, hash) = create_task(&tools, "t: confirm", &body_with_fat_tail_section()).await;
+    // первый вызов без confirm — отказ (гард), записи нет
+    call(
+        &tools,
+        "task_body_section",
+        json!({
+            "number": number,
+            "section": "Хвост",
+            "content": "короткий хвост\n",
+            "base_hash": hash,
+        }),
+    )
+    .await
+    .expect_err("гард отказывает без confirm");
+    // повтор с confirm той же свежести — запись проходит
+    let receipt = call(
+        &tools,
+        "task_body_section",
+        json!({
+            "number": number,
+            "section": "Хвост",
+            "content": "короткий хвост\n",
+            "base_hash": hash,
+            "confirm": true,
+        }),
+    )
+    .await
+    .expect("confirm-запись проходит");
+    assert!(receipt.contains("confirm"), "квитанция помечает confirm: {receipt}");
+    assert!(receipt.contains("(was"), "было/стало по телу и секции: {receipt}");
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert!(stored.contains("короткий хвост"), "контент записан: {stored}");
+}
