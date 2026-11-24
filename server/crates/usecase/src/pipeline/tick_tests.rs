@@ -10823,18 +10823,6 @@ fn order_board(
     })
 }
 
-fn idle_info(id: &str, busy: bool) -> crate::ports::SessionInfo {
-    crate::ports::SessionInfo {
-        id: id.into(),
-        agent: String::new(),
-        directory: String::new(),
-        updated_ms: 0,
-        outcome: "succeeded".into(),
-        total_tokens: 0,
-        busy,
-    }
-}
-
 /// (а) #1586: слот достаётся продолжению начатой — wakeup ReviewResult
 /// на поздней доске — а не новому Design-кандидату high на первой доске.
 #[tokio::test]
@@ -10870,7 +10858,7 @@ async fn continuation_wakeup_on_later_board_beats_new_design_on_first() {
         .extra
         .lock()
         .unwrap()
-        .push(idle_info("ses_201", false));
+        .push(fake_session("ses_201", "", "succeeded", 0, false));
     let u = multi_board_usecase_with(board, sessions.clone(), state);
     let out = u.run(&order_plan(Mode::Live, 1)).await.unwrap();
     assert_eq!(out.wakeups, 1, "wakeup продолжения доставлен");
@@ -10953,8 +10941,8 @@ async fn preempt_serves_spawn_newcomer_while_wakeup_continuation_holds() {
     });
     {
         let mut extra = sessions.extra.lock().unwrap();
-        extra.push(idle_info("ses_502", false));
-        extra.push(idle_info("ses_503", true)); // busy-жертва держит кап
+        extra.push(fake_session("ses_502", "", "succeeded", 0, false));
+        extra.push(fake_session("ses_503", "", "succeeded", 0, true)); // busy-жертва держит кап
     }
     let u = multi_board_usecase_with(board, sessions.clone(), state);
     let out = u.run(&order_plan(Mode::Live, 1)).await.unwrap();
