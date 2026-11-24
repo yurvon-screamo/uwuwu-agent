@@ -135,11 +135,24 @@ pub trait TaskWriter: Send + Sync {
         &self,
         project: &str,
         number: u64,
-        section: &str,
-        content: Option<&str>,
-        base_hash: &str,
-        confirm: bool,
+        write: SectionWrite<'_>,
     ) -> UsecaseResult<SectionEditReport>;
+}
+
+/// Payload секционной записи: дельта + свежесть + осознанное преодоление
+/// гарда сжатия (#1572). Один семантический юнит — сигнатура юзкейса
+/// остаётся плоской (identity → payload → квитанция).
+#[derive(Debug, Clone, Copy)]
+pub struct SectionWrite<'a> {
+    /// заголовок секции; ATX-префикс пинит уровень.
+    pub section: &'a str,
+    /// новый контент секции; None — запись без контента (гард #1572),
+    /// Some("") — осознанная очистка.
+    pub content: Option<&'a str>,
+    /// body_hash тела на момент чтения (fm task_get / квитанция).
+    pub base_hash: &'a str,
+    /// осознанное проведение радикального сжатия (#1409).
+    pub confirm: bool,
 }
 
 /// Option<Status> с носителя → верифицируемый current гарда: строки
@@ -707,11 +720,14 @@ impl TaskWriter for TaskWriteUseCase {
         &self,
         project: &str,
         number: u64,
-        section: &str,
-        content: Option<&str>,
-        base_hash: &str,
-        confirm: bool,
+        write: SectionWrite<'_>,
     ) -> UsecaseResult<SectionEditReport> {
+        let SectionWrite {
+            section,
+            content,
+            base_hash,
+            confirm,
+        } = write;
         if section.trim().is_empty() {
             return Err(UsecaseError::Board(
                 "the section is empty — provide the heading".into(),
@@ -758,43 +774,37 @@ impl TaskWriter for TaskWriteUseCase {
         // дельта не срезает треть носителя / большую секцию; ошибочный
         // короткий контент стирал отчёты (инстанс #1277, 19.11: 19К → 1).
         // Явная очистка (пустой content) — осознанный акт, гард не трогает
-        // (рецепт отказа полного task_body на неё опирается); осознанное
-        // сокращение — confirm на поверхности тула (семантика --force
-        // ADR-053), append растит тело — не сжимает.
+        // (рецепт отказа полного task_body на неё опирается); append растит
+        // тело — мера секции 0, оба плеча молчат.
         let body_was = current.body.len();
         let explicit_clear = content.trim().is_empty();
-        let mut confirmed = false;
-        if let md_section::SectionEdit::Replaced {
-            old_content_len, ..
-        } = &edit
-        {
-            if !explicit_clear {
-                let section_now = content.trim().len();
-                let body_shrunk = radical_shrink(body_was, next.len());
-                let section_shrunk = *old_content_len >= SECTION_GUARD_FLOOR
-                    && radical_shrink(*old_content_len, section_now);
-                if body_shrunk || section_shrunk {
-                    if !confirm {
-                        return Err(UsecaseError::Board(format!(
-                            "section edit «{section}» of #{number} refused: radical shrink — \
-                             body {body_was} → {} bytes, section {old_content_len} → \
-                             {section_now} bytes; a section delta must not cut a third of the \
-                             carrier; check the content, deliberate shrink — repeat with \
-                             confirm: true",
-                            next.len()
-                        )));
-                    }
-                    confirmed = true;
-                }
-            }
-        }
-        let receipt = self.set_body(project, number, Some(&next)).await?;
-        let (action, duplicates_removed, section_was) = match edit {
+        let section_was = match edit {
             md_section::SectionEdit::Replaced {
-                duplicates_removed,
-                old_content_len,
-            } => (SectionAction::Replaced, duplicates_removed, old_content_len),
-            md_section::SectionEdit::Appended => (SectionAction::Appended, 0, 0),
+                old_content_len, ..
+            } => old_content_len,
+            md_section::SectionEdit::Appended => 0,
+        };
+        let confirmed = if explicit_clear {
+            false
+        } else {
+            shrink_guard(
+                section,
+                number,
+                ShrinkMeasures {
+                    body_was,
+                    body_now: next.len(),
+                    section_was,
+                    section_now: content.trim().len(),
+                    confirm,
+                },
+            )?
+        };
+        let receipt = self.set_body(project, number, Some(&next)).await?;
+        let (action, duplicates_removed) = match edit {
+            md_section::SectionEdit::Replaced {
+                duplicates_removed, ..
+            } => (SectionAction::Replaced, duplicates_removed),
+            md_section::SectionEdit::Appended => (SectionAction::Appended, 0),
         };
         Ok(SectionEditReport {
             cleared: action == SectionAction::Replaced && content.trim().is_empty(),
@@ -813,6 +823,38 @@ impl TaskWriter for TaskWriteUseCase {
             verified: receipt.verified,
         })
     }
+}
+
+/// Меры гарда сжатия: объёмы было/стало по телу и по секции + флаг
+/// осознанного преодоления (#1409/#1572).
+struct ShrinkMeasures {
+    body_was: usize,
+    body_now: usize,
+    section_was: usize,
+    section_now: usize,
+    confirm: bool,
+}
+
+/// Гард радикального сжатия (#1409-класс, #1572 срез 3): Err — громкий
+/// отказ с длинами было→стало и рецептом; Ok(true) — осознанное
+/// сокращение проведено (confirm); Ok(false) — гард молчит (дельта в
+/// норме, либо плечи не сработали: секция ниже пола, append).
+fn shrink_guard(section: &str, number: u64, m: ShrinkMeasures) -> UsecaseResult<bool> {
+    let body_shrunk = radical_shrink(m.body_was, m.body_now);
+    let section_shrunk =
+        m.section_was >= SECTION_GUARD_FLOOR && radical_shrink(m.section_was, m.section_now);
+    if !body_shrunk && !section_shrunk {
+        return Ok(false);
+    }
+    if m.confirm {
+        return Ok(true);
+    }
+    Err(UsecaseError::Board(format!(
+        "section edit «{section}» of #{number} refused: radical shrink — \
+         body {} → {} bytes, section {} → {} bytes; a section delta must not cut a third of \
+         the carrier; check the content, deliberate shrink — repeat with confirm: true",
+        m.body_was, m.body_now, m.section_was, m.section_now
+    )))
 }
 
 /// Порог радикального сжатия (#1409, развилка А): новое < 70% старого —
@@ -2032,7 +2074,16 @@ mod tests {
         u.set_body("uwuwu", 1, Some(body)).await.unwrap();
         let hash = md_section::body_hash(body);
         let err = u
-            .set_body_section("uwuwu", 1, "А", None, &hash, false)
+            .set_body_section(
+                "uwuwu",
+                1,
+                SectionWrite {
+                    section: "А",
+                    content: None,
+                    base_hash: &hash,
+                    confirm: false,
+                },
+            )
             .await
             .expect_err("запись без content отказывает");
         let text = err.to_string();
@@ -2065,7 +2116,16 @@ mod tests {
         u.set_body("uwuwu", 1, Some(&body)).await.unwrap();
         let hash = md_section::body_hash(&body);
         let err = u
-            .set_body_section("uwuwu", 1, "Tail", Some("y"), &hash, false)
+            .set_body_section(
+                "uwuwu",
+                1,
+                SectionWrite {
+                    section: "Tail",
+                    content: Some("y"),
+                    base_hash: &hash,
+                    confirm: false,
+                },
+            )
             .await
             .expect_err("секция на полу под гардом");
         assert!(err.to_string().contains("radical shrink"), "{err}");
@@ -2074,9 +2134,18 @@ mod tests {
         let body = mk(1023);
         u.set_body("uwuwu", 1, Some(&body)).await.unwrap();
         let hash = md_section::body_hash(&body);
-        u.set_body_section("uwuwu", 1, "Tail", Some("y"), &hash, false)
-            .await
-            .expect("секция ниже пола свободно редактируема");
+        u.set_body_section(
+            "uwuwu",
+            1,
+            SectionWrite {
+                section: "Tail",
+                content: Some("y"),
+                base_hash: &hash,
+                confirm: false,
+            },
+        )
+        .await
+        .expect("секция ниже пола свободно редактируема");
         let stored = board.read_issue("Задачи uwuwu", 1).await.unwrap().body;
         assert!(stored.contains("## Tail\ny"), "контент записан: {stored}");
     }
@@ -2093,7 +2162,16 @@ mod tests {
         u.set_body("uwuwu", 1, Some(&body)).await.unwrap();
         let hash = md_section::body_hash(&body);
         let report = u
-            .set_body_section("uwuwu", 1, "Tail", Some(""), &hash, false)
+            .set_body_section(
+                "uwuwu",
+                1,
+                SectionWrite {
+                    section: "Tail",
+                    content: Some(""),
+                    base_hash: &hash,
+                    confirm: false,
+                },
+            )
             .await
             .expect("явная очистка без confirm");
         assert!(report.cleared, "секция очищена");
@@ -2117,7 +2195,16 @@ mod tests {
         u.set_body("uwuwu", 1, Some(&body)).await.unwrap();
         let hash = md_section::body_hash(&body);
         let err = u
-            .set_body_section("uwuwu", 1, "А", Some("0123456789"), &hash, false)
+            .set_body_section(
+                "uwuwu",
+                1,
+                SectionWrite {
+                    section: "А",
+                    content: Some("0123456789"),
+                    base_hash: &hash,
+                    confirm: false,
+                },
+            )
             .await
             .expect_err("срез трети тела — отказ");
         assert!(
@@ -2126,7 +2213,16 @@ mod tests {
         );
         // осознанное сокращение — confirm проводит
         let report = u
-            .set_body_section("uwuwu", 1, "А", Some("0123456789"), &hash, true)
+            .set_body_section(
+                "uwuwu",
+                1,
+                SectionWrite {
+                    section: "А",
+                    content: Some("0123456789"),
+                    base_hash: &hash,
+                    confirm: true,
+                },
+            )
             .await
             .expect("confirm проводит");
         assert!(report.confirmed, "квитанция помечает confirm");
@@ -2143,7 +2239,16 @@ mod tests {
         u.set_body("uwuwu", 1, Some(body)).await.unwrap();
         let hash = md_section::body_hash(body);
         let report = u
-            .set_body_section("uwuwu", 1, "А", Some("1234"), &hash, false)
+            .set_body_section(
+                "uwuwu",
+                1,
+                SectionWrite {
+                    section: "А",
+                    content: Some("1234"),
+                    base_hash: &hash,
+                    confirm: false,
+                },
+            )
             .await
             .expect("обычная дельта");
         assert_eq!(report.body_was, body.len());

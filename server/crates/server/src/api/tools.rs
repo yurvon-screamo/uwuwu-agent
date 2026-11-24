@@ -5,8 +5,8 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use uwuwu_usecase::{
-    fm_guard, jst_stamp, BlobPlace, BlobUseCase, Clock, DocsView, PersonView, TaskView,
-    TaskWriteUseCase, TaskWriter,
+    fm_guard, jst_stamp, BlobPlace, BlobUseCase, Clock, DocsView, PersonView, SectionWrite,
+    TaskView, TaskWriteUseCase, TaskWriter,
 };
 
 pub struct ToolHub {
@@ -831,7 +831,16 @@ impl ToolHub {
         }
         let report = self
             .writer
-            .set_body_section(project, number, &section, content, &base_hash, confirm)
+            .set_body_section(
+                project,
+                number,
+                SectionWrite {
+                    section: &section,
+                    content,
+                    base_hash: &base_hash,
+                    confirm,
+                },
+            )
             .await
             .map_err(|e| e.to_string())?;
         ok_text(render_section_report(&section, &report))
