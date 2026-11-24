@@ -256,7 +256,7 @@ pub(crate) struct PreemptCandidate {
 }
 
 /// Пул жертв тика: собирается в run() из union-скана, расходуется
-/// HeldCup-ветками run_board (по одной жертве на отдачу слота).
+/// HeldCup-ветками process_row (по одной жертве на отдачу слота).
 /// Mutex — не для параллелизма (доски обходятся последовательно):
 /// interior mutability для изъятия жертв между досками сквозь await
 /// и Send-ность будущего тика.
@@ -517,13 +517,10 @@ impl TickUseCase {
         // спавн одной доски занимает слот глобального капа, следующая
         // доска видит занятость через ссылку
         let mut active_now = global_active;
-        // Глобальная очередь кандидатов (#1586, шаг 2): строки всех досок
-        // упорядочиваются до обхода — сначала продолжения начатых, затем
-        // новые кандидаты; внутри тира — приоритет, доска в порядке
-        // конфига, порядок строк. Владелец 24.11.2026: «Приоритет на
-        // задачи которые уже были ранее взяты в работу? Или мы дёргаем
-        // с дизайна хотя по старым строкам ещё работа не доведена?».
-        // Классификация — по снапшоту после enrichment, до round_transition.
+        // Глобальная очередь кандидатов (#1586): строки всех досок — один
+        // порядок до обхода. Ключ: тир is_continuation (классификация по
+        // снапшоту до round_transition — см. doc в домене), приоритет,
+        // доска в порядке конфига, порядок строк.
         // Дебаг-гейт одной строки (мок-Е2Е): UWUWU_ONLY_TASK=<number> —
         // конвейер действует только по ней, остальная доска read-only.
         let only = std::env::var("UWUWU_ONLY_TASK")
@@ -542,13 +539,13 @@ impl TickUseCase {
         }
         rows.sort_by_key(|(bi, ri, _board, t)| {
             (
-                u8::from(!uwuwu_domain::is_continuation(t)),
+                !uwuwu_domain::is_continuation(t),
                 t.priority().rank(),
                 *bi,
                 *ri,
             )
         });
-        for (_bi, _ri, board, task) in &rows {
+        for (_, _, board, task) in &rows {
             // Пер-проектное зрение (#1263): контекст доски — список её
             // исполнителя; чужие исполнители зрение проекта не гасят.
             let executor = self.sessions.project_executor_name(&board.project);
@@ -615,10 +612,11 @@ impl TickUseCase {
         Ok(out)
     }
 
-    /// Один ход обхода тика: enrichment-гард, переход стадии, гард-цепочка
-    /// и действие тика (спавн/автомерж/наблюдение). Тело вынесено из
-    /// run_board (#1586, шаг 1 — «кроме порядка бит-в-бит» по истории);
-    /// шаг 2 — глобальный порядок кандидатов до обхода.
+    /// Один ход обхода глобальной очереди кандидатов (#1586): строка уже
+    /// заняла своё место в порядке; здесь — enrichment-гард, переход
+    /// стадии, гард-цепочка и действие тика (спавн/автомерж/наблюдение).
+    /// Эффекты — в общий счётчик капа и outcome тика; решение «какая
+    /// строка следующая» здесь не принимается.
     #[allow(clippy::too_many_arguments)]
     async fn process_row(
         &self,
@@ -822,7 +820,10 @@ impl TickUseCase {
                             number = task.number(),
                             active,
                             cap,
-                            tier = if uwuwu_domain::is_continuation(task) {
+                            // тир — по снапшоту строки (task_ref): очередь
+                            // строилась до round_transition, клон мог сменить
+                            // фасетку (возврат в Design с мёртвой ячейкой)
+                            tier = if uwuwu_domain::is_continuation(task_ref) {
                                 "continuation"
                             } else {
                                 "new"
@@ -2110,11 +2111,9 @@ impl TickUseCase {
                     number = task.number(),
                     active = cup.active_now,
                     cap = cup.policy.cup,
-                    tier = if uwuwu_domain::is_continuation(task) {
-                        "continuation"
-                    } else {
-                        "new"
-                    },
+                    // мягкий пинг достижим только при сессии на слоте
+                    // стадии — тир продолжений всегда
+                    tier = "continuation",
                     "Мягкий пинг отложен: CUP cap — запуск хода ждёт слот"
                 );
                 return Ok(StallAct::Deferred);

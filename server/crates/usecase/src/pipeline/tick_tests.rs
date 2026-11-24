@@ -9085,9 +9085,23 @@ async fn named_executor_failure_is_isolated_from_healthy_peer() {
 
 /// Тик-юзкейс на мультиборде (#1503): per-board read_board (fail_reads).
 fn multi_board_usecase(board: Arc<FakeMultiBoard>) -> TickUseCase {
+    multi_board_usecase_with(
+        board,
+        Arc::new(FakeSessions::new()),
+        Arc::new(MemState(Mutex::default())),
+    )
+}
+
+/// Вариант с хэндлами сессий и state — wakeup/порядок-сценарии (#1586)
+/// управляют фейками и пресетят last_seen_status.
+fn multi_board_usecase_with(
+    board: Arc<FakeMultiBoard>,
+    sessions: Arc<FakeSessions>,
+    state: Arc<MemState>,
+) -> TickUseCase {
     TickUseCase {
         board,
-        sessions: Arc::new(SessionRouter::uniform(Arc::new(FakeSessions::new()))),
+        sessions: Arc::new(SessionRouter::uniform(sessions)),
         prs: Arc::new(FakePrs {
             state: PrState::Missing,
             merges: Mutex::default(),
@@ -9096,7 +9110,7 @@ fn multi_board_usecase(board: Arc<FakeMultiBoard>) -> TickUseCase {
             url: Mutex::default(),
         }),
         clock: Arc::new(FixedClock),
-        state: Arc::new(MemState(Mutex::default())),
+        state,
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
         judge: None,
@@ -10776,35 +10790,8 @@ fn order_plan(mode: Mode, cup: usize) -> TickPlan {
     p
 }
 
-/// Юзкейс мультиборда с хэндлами сессий и state (#1586): тело
-/// multi_board_usecase (#1503) с управляемыми фейками.
-fn order_usecase(
-    board: Arc<FakeMultiBoard>,
-    sessions: Arc<FakeSessions>,
-    state: Arc<MemState>,
-) -> TickUseCase {
-    TickUseCase {
-        board,
-        sessions: Arc::new(SessionRouter::uniform(sessions)),
-        prs: Arc::new(FakePrs {
-            state: PrState::Missing,
-            merges: Mutex::default(),
-            merge_fails: AtomicBool::new(false),
-            probes: Mutex::default(),
-            url: Mutex::default(),
-        }),
-        clock: Arc::new(FixedClock),
-        state,
-        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
-        boot_ms: 0,
-        judge: None,
-        judge_cfg: Default::default(),
-        quota: None,
-    }
-}
-
 /// Строка с ячейкой стадии: поля несут и строка, и issue_fields —
-/// enrichment не стирает ячейку (предусловие Low-2 ревью плана #1586).
+/// enrichment не стирает ячейку (иначе reverse-инженерия по снапшоту).
 fn staged_row(n: u64, status: Status, slot: Slot, session: &str) -> (Task, TaskFields) {
     let mut t = task(n, status);
     let mut f = TaskFields::default();
@@ -10882,7 +10869,7 @@ async fn continuation_wakeup_on_later_board_beats_new_design_on_first() {
         .lock()
         .unwrap()
         .push(idle_info("ses_201", false));
-    let u = order_usecase(board, sessions.clone(), state);
+    let u = multi_board_usecase_with(board, sessions.clone(), state);
     let out = u.run(&order_plan(Mode::Live, 1)).await.unwrap();
     assert_eq!(out.wakeups, 1, "wakeup продолжения доставлен");
     assert_eq!(out.spawns_done, 0, "новый кандидат слот не получил");
@@ -10911,7 +10898,7 @@ async fn continuation_in_progress_beats_same_priority_design_newcomer() {
         Default::default(),
     );
     let sessions = Arc::new(FakeSessions::new());
-    let u = order_usecase(board, sessions.clone(), state);
+    let u = multi_board_usecase_with(board, sessions.clone(), state);
     let out = u.run(&order_plan(Mode::Live, 1)).await.unwrap();
     assert_eq!(out.spawns_done, 1, "ровно один свободный слот");
     let specs = sessions.specs.lock().unwrap();
@@ -10967,7 +10954,7 @@ async fn preempt_serves_spawn_newcomer_while_wakeup_continuation_holds() {
         extra.push(idle_info("ses_502", false));
         extra.push(idle_info("ses_503", true)); // busy-жертва держит кап
     }
-    let u = order_usecase(board, sessions.clone(), state);
+    let u = multi_board_usecase_with(board, sessions.clone(), state);
     let out = u.run(&order_plan(Mode::Live, 1)).await.unwrap();
     assert_eq!(out.preempts, 1, "жертва 503 погашена в пользу новичка 501");
     assert_eq!(
@@ -11006,7 +10993,7 @@ async fn within_tier_priority_beats_board_order() {
         Default::default(),
     );
     let sessions = Arc::new(FakeSessions::new());
-    let u = order_usecase(board, sessions.clone(), state);
+    let u = multi_board_usecase_with(board, sessions.clone(), state);
     let out = u.run(&order_plan(Mode::Live, 1)).await.unwrap();
     assert_eq!(out.spawns_done, 1, "ровно один свободный слот");
     let specs = sessions.specs.lock().unwrap();
@@ -11046,7 +11033,7 @@ async fn design_return_with_dead_cell_is_continuation_on_transition_tick() {
         dead_sessions: Mutex::new(vec!["ses_601".into()]),
         ..FakeSessions::new()
     });
-    let u = order_usecase(board, sessions.clone(), state);
+    let u = multi_board_usecase_with(board, sessions.clone(), state);
     let out = u.run(&order_plan(Mode::Live, 1)).await.unwrap();
     assert_eq!(out.spawns_done, 1, "ровно один свободный слот");
     let specs = sessions.specs.lock().unwrap();
