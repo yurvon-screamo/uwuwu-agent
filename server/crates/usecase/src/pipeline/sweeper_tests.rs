@@ -74,6 +74,9 @@ impl TaskBoardRepo for SweepBoard {
     async fn set_branch(&self, _b: &str, _n: u64, _branch: &BranchName) -> UsecaseResult<()> {
         Ok(())
     }
+    async fn set_pr(&self, _b: &str, _n: u64, _pr_url: &uwuwu_domain::PrUrl) -> UsecaseResult<()> {
+        Ok(())
+    }
     async fn set_board_cells(
         &self,
         _b: &str,

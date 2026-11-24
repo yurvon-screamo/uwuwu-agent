@@ -3,7 +3,7 @@
 use super::HTTP_TIMEOUT;
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use uwuwu_usecase::{PrGateway, PrState};
+use uwuwu_usecase::{PrGateway, PrProbe, PrState};
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 pub struct GhPrGateway {
@@ -142,13 +142,21 @@ impl GhPrGateway {
         }))
     }
 
-    async fn probe_by_branch(&self, repo: &str, branch: &str) -> UsecaseResult<Option<PrState>> {
+    async fn probe_by_branch(
+        &self,
+        repo: &str,
+        branch: &str,
+    ) -> UsecaseResult<Option<(u64, PrState)>> {
         let (owner, name) = repo
             .split_once('/')
             .ok_or_else(|| UsecaseError::Pr(format!("repo в форме owner/name: {repo}")))?;
+        // state=all, не open (#1519, ревью Common): смерженный руками PR при
+        // пустой/протухшей ячейке обязан классифицироваться Merged — no-op
+        // «строка ждёт владельца», а не bounce «PR не найден» (шторм-кейс
+        // #1424: тики стоят, владелец мержит руками)
         let (status, list) = self
             .get(&format!(
-                "/repos/{repo}/pulls?head={owner}:{branch}&state=open"
+                "/repos/{repo}/pulls?head={owner}:{branch}&state=all"
             ))
             .await?;
         if !status.is_success() {
@@ -156,15 +164,35 @@ impl GhPrGateway {
                 "probe by branch {branch}: HTTP {status}"
             )));
         }
-        let number = list
+        let items: Vec<(u64, bool)> = list
             .as_array()
-            .and_then(|l| l.first())
-            .and_then(|p| p["number"].as_u64());
-        match number {
-            Some(n) => self.probe_pull(owner, name, n).await,
+            .map(|l| {
+                l.iter()
+                    .filter_map(|p| {
+                        let number = p["number"].as_u64()?;
+                        let state = p["state"].as_str() == Some("open");
+                        Some((number, state))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        match pick_branch_pr(&items) {
+            Some(n) => Ok(self.probe_pull(owner, name, n).await?.map(|s| (n, s))),
             None => Ok(None),
         }
     }
+}
+
+/// Выбор PR веточной пробы из ответа state=all (#1519, ревью Common):
+/// открытый предпочтительнее закрытых/смерженных (ветка могла пережить
+/// закрытый PR и получить новый); иначе первый из списка — свежайший.
+/// Чистая функция — пин классификации без HTTP (ADR-110).
+fn pick_branch_pr(items: &[(u64, bool)]) -> Option<u64> {
+    items
+        .iter()
+        .find(|(_, open)| *open)
+        .or_else(|| items.first())
+        .map(|(n, _)| *n)
 }
 
 #[async_trait]
@@ -174,20 +202,29 @@ impl PrGateway for GhPrGateway {
         project_repo: &str,
         pr_url: Option<&str>,
         branch: Option<&str>,
-    ) -> UsecaseResult<PrState> {
+    ) -> UsecaseResult<PrProbe> {
         if let Some(url) = pr_url.filter(|u| !u.is_empty()) {
             if let Some((owner, repo, number)) = parse_pr_url(url) {
                 if let Some(state) = self.probe_pull(&owner, &repo, number).await? {
-                    return Ok(state);
+                    return Ok(PrProbe {
+                        state,
+                        url: Some(url.to_string()),
+                    });
                 }
             }
         }
         if let Some(branch) = branch.filter(|b| !b.is_empty()) {
-            if let Some(state) = self.probe_by_branch(project_repo, branch).await? {
-                return Ok(state);
+            if let Some((number, state)) = self.probe_by_branch(project_repo, branch).await? {
+                return Ok(PrProbe {
+                    state,
+                    url: Some(format!("https://github.com/{project_repo}/pull/{number}")),
+                });
             }
         }
-        Ok(PrState::Missing)
+        Ok(PrProbe {
+            state: PrState::Missing,
+            url: None,
+        })
     }
 
     async fn merge(&self, project_repo: &str, pr_url: &str) -> UsecaseResult<()> {
@@ -227,6 +264,17 @@ impl PrGateway for GhPrGateway {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pick_branch_pr_prefers_open_over_closed() {
+        // #1519, ревью Common: state=all — открытый PR предпочтительнее
+        // закрытых/смерженных предшественников той же ветки
+        assert_eq!(pick_branch_pr(&[(7, false), (9, true)]), Some(9));
+        assert_eq!(pick_branch_pr(&[(9, true), (7, false)]), Some(9));
+        // открытых нет — первый из списка (свежайший смерженный/закрытый)
+        assert_eq!(pick_branch_pr(&[(7, false)]), Some(7));
+        assert_eq!(pick_branch_pr(&[]), None);
+    }
 
     #[test]
     fn parses_pr_urls() {

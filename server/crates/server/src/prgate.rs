@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use uwuwu_domain::PrUrl;
-use uwuwu_usecase::{PrGateway, PrState, UsecaseError, UsecaseResult};
+use uwuwu_usecase::{PrGateway, PrProbe, PrState, UsecaseError, UsecaseResult};
 
 use crate::gitea::parse_gitea_pr_url;
 use crate::github::parse_pr_url;
@@ -59,7 +59,7 @@ where
         project_repo: &str,
         pr_url: Option<&str>,
         branch: Option<&str>,
-    ) -> UsecaseResult<PrState> {
+    ) -> UsecaseResult<PrProbe> {
         let Some(url) = pr_url.filter(|u| !u.is_empty()) else {
             return self.gh.probe(project_repo, None, branch).await;
         };
@@ -72,7 +72,10 @@ where
                     url = %url,
                     "PR-форм на неуправляемом вендоре — Foreign, строка ждёт владельца (#1269)"
                 );
-                Ok(PrState::Foreign)
+                Ok(PrProbe {
+                    state: PrState::Foreign,
+                    url: Some(url.to_string()),
+                })
             }
             Route::BranchProbe => self.gh.probe(project_repo, None, branch).await,
         }
@@ -126,12 +129,15 @@ mod tests {
             _project_repo: &str,
             pr_url: Option<&str>,
             branch: Option<&str>,
-        ) -> UsecaseResult<PrState> {
+        ) -> UsecaseResult<PrProbe> {
             self.calls
                 .lock()
                 .unwrap()
                 .push(format!("probe url={pr_url:?} branch={branch:?}"));
-            Ok(self.state)
+            Ok(PrProbe {
+                state: self.state,
+                url: None,
+            })
         }
 
         async fn merge(&self, _project_repo: &str, pr_url: &str) -> UsecaseResult<()> {
@@ -160,7 +166,7 @@ mod tests {
             },
             PrState::Foreign,
         );
-        let state = routed
+        let probe = routed
             .probe(
                 "hub/o/r",
                 Some("https://git.l4a.ru/o/r/pulls/7"),
@@ -168,7 +174,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(state, PrState::Foreign, "вердикт gitea-плеча");
+        assert_eq!(probe.state, PrState::Foreign, "вердикт gitea-плеча");
         assert!(gh.calls().is_empty(), "gh не зовётся: {:?}", gh.calls());
         assert_eq!(
             gitea.calls(),
@@ -181,7 +187,7 @@ mod tests {
         // github-URL — gh-плечо с веткой (probe_pull 404 → веточный фоллбэк
         // остаётся в gh); gitea молчит, вердикт — gh-плеча
         let (routed, gh, gitea) = routed(PrState::Pending, PrState::Foreign);
-        let state = routed
+        let probe = routed
             .probe(
                 "hub/o/r",
                 Some("https://github.com/o/r/pull/5"),
@@ -189,7 +195,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(state, PrState::Pending, "вердикт gh-плеча");
+        assert_eq!(probe.state, PrState::Pending, "вердикт gh-плеча");
         assert_eq!(
             gh.calls(),
             vec!["probe url=Some(\"https://github.com/o/r/pull/5\") branch=Some(\"work/task-1\")"]
@@ -201,11 +207,11 @@ mod tests {
     async fn probe_without_url_falls_back_to_gh_branch_probe() {
         // пустая PR-ячейка — веточная проба GitHub (как до #1269)
         let (routed, gh, gitea) = routed(PrState::Missing, PrState::Foreign);
-        let state = routed
+        let probe = routed
             .probe("hub/o/r", None, Some("work/task-1"))
             .await
             .unwrap();
-        assert_eq!(state, PrState::Missing);
+        assert_eq!(probe.state, PrState::Missing);
         assert_eq!(
             gh.calls(),
             vec!["probe url=None branch=Some(\"work/task-1\")"]
@@ -217,7 +223,7 @@ mod tests {
     async fn probe_artifact_url_falls_back_to_gh_branch_probe() {
         // артефакт-URL — не PR-форма: веточная проба GitHub без URL
         let (routed, gh, gitea) = routed(PrState::Missing, PrState::Foreign);
-        let state = routed
+        let probe = routed
             .probe(
                 "hub/o/r",
                 Some("https://github.com/o/r/issues/5"),
@@ -225,7 +231,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(state, PrState::Missing);
+        assert_eq!(probe.state, PrState::Missing);
         assert_eq!(
             gh.calls(),
             vec!["probe url=None branch=Some(\"work/task-1\")"]
@@ -237,7 +243,7 @@ mod tests {
     async fn probe_foreign_url_is_decided_without_any_gateway_call() {
         // PR-форма чужого вендора — вердикт диспетчера: Foreign без проб
         let (routed, gh, gitea) = routed(PrState::Missing, PrState::Missing);
-        let state = routed
+        let probe = routed
             .probe(
                 "hub/o/r",
                 Some("https://ghe.example.com/o/r/pull/5"),
@@ -245,7 +251,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(state, PrState::Foreign);
+        assert_eq!(probe.state, PrState::Foreign);
         assert!(gh.calls().is_empty());
         assert!(gitea.calls().is_empty());
     }

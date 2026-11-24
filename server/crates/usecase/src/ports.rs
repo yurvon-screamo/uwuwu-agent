@@ -5,7 +5,7 @@
 use crate::error::UsecaseResult;
 use async_trait::async_trait;
 use uwuwu_domain::{
-    Agent, AgentSlot, BranchName, ModelRef, Slot, Status, Task, TaskFields, UtcMinute,
+    Agent, AgentSlot, BranchName, ModelRef, PrUrl, Slot, Status, Task, TaskFields, UtcMinute,
 };
 
 /// Мутатор fm-ячеек задачи (branch/pr/priority/…).
@@ -75,6 +75,16 @@ pub trait TaskBoardRepo: Send + Sync {
     /// Заявка ветки задачи (фабрика при спавне: task-env создал env,
     /// ветка `work/task-<row>` существует — ячейка правдива; ADR-041).
     async fn set_branch(&self, board: &str, number: u64, branch: &BranchName) -> UsecaseResult<()>;
+
+    /// Запись canonical PR-ячейки (issue-field «PR») — дозаполнение
+    /// демоном из резолва пробы (#1519): пустая/протухшая ячейка при
+    /// живом PR по ветке заполняется до мержа. Доменный тип — парс
+    /// валидной формы один раз у вызывающего (ревью Low раунда 3:
+    /// три копии PrUrl::parse в имплементациях — не контракт). Путь
+    /// task_edit (IssueFieldStore, мимо снапшота — «Ветка/PR/Тип живут
+    /// мимо снапшота»); read-your-writes не требуется — enrichment
+    /// прочтёт носитель следующим проходом.
+    async fn set_pr(&self, board: &str, number: u64, pr_url: &PrUrl) -> UsecaseResult<()>;
 
     /// Запись нестатусных ячеек снапшота доски (Приоритет, Automerge):
     /// поле + кеш-гигиена одним методом (паттерн set_session/set_branch).
@@ -380,6 +390,18 @@ pub enum PrState {
     Closed,
 }
 
+/// Вердикт пробы вместе с PR, о котором вердикт (#1519): url — конкретная
+/// цель вердикта — идентифицированный PR (ячейка, если она жива; иначе —
+/// веточная проба; Foreign — URL ячейки); None — цели вердикта нет
+/// (Missing: ветки/URL нет или PR не существует). Демон дозаполняет
+/// canonical PR-ячейку этим URL до мержа и мержит по нему — мержится ровно
+/// то, что прощупано.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrProbe {
+    pub state: PrState,
+    pub url: Option<String>,
+}
+
 #[async_trait]
 pub trait PrGateway: Send + Sync {
     /// Проба PR: по ячейке (URL) либо по head-ветке.
@@ -388,7 +410,7 @@ pub trait PrGateway: Send + Sync {
         project_repo: &str,
         pr_url: Option<&str>,
         branch: Option<&str>,
-    ) -> UsecaseResult<PrState>;
+    ) -> UsecaseResult<PrProbe>;
     /// Мерж PR (merge-commit).
     async fn merge(&self, project_repo: &str, pr_url: &str) -> UsecaseResult<()>;
 }

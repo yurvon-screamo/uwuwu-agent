@@ -4,7 +4,8 @@
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
 use crate::pipeline::tick::{
-    BoardPlan, RowContext, SpawnHold, TickPlan, TickUseCase, SESSION_LOST_ESCALATE_AFTER,
+    BoardPlan, RowContext, SpawnHold, TickOutcome, TickPlan, TickUseCase,
+    SESSION_LOST_ESCALATE_AFTER,
 };
 use crate::ports::{CommentRef, Liveness, SessionSpec};
 use crate::router::Gateway;
@@ -620,10 +621,16 @@ impl TickUseCase {
     /// automerge_ready не прощупывает безветочные ячейки — Vcs::Local и
     /// Artifact, #1155 — и PR-ячейки с URL не PR-формы: wiki/issues/blob
     /// с фабричной веткой, #1286 — мержить нечего, строка ждёт владельца).
-    /// Возвращает true — PR смержен этим вызовом (счётчик тика).
-    pub async fn automerge(&self, board: &BoardPlan, task: &Task) -> UsecaseResult<bool> {
+    /// Возвращает true — PR смержен этим вызовом (счётчик тика);
+    /// семантические bounce инкрементят out.automerge_bounced (#1519).
+    pub async fn automerge(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        out: &mut TickOutcome,
+    ) -> UsecaseResult<bool> {
         use crate::ports::PrState;
-        let state = self
+        let probe = self
             .prs
             .probe(
                 &board.repo,
@@ -631,7 +638,7 @@ impl TickUseCase {
                 task.branch().map(|b| b.as_str()),
             )
             .await?;
-        if state == PrState::Pending {
+        if probe.state == PrState::Pending {
             tracing::info!(
                 event = "automerge.pending",
                 number = task.number(),
@@ -639,12 +646,27 @@ impl TickUseCase {
             );
             return Ok(false);
         }
-        match state {
+        match probe.state {
             PrState::Pending => unreachable!("pending обработан выше"),
-            // Уже влит (вручную или раньше): no-op — merge-API не зовётся,
-            // строка остаётся в Review и ждёт владельца (инцидент #1151/#1162:
-            // ложный bounce вручную смерженной строки недопустим)
+            // Уже влит (вручную или раньше, либо ячейка пуста/протухла, а
+            // веточная проба нашла смерженный PR — state=all, ревью Common
+            // #1519): no-op — merge-API не зовётся, строка остаётся в Review
+            // и ждёт владельца (инцидент #1151/#1162: ложный bounce
+            // вручную смерженной строки недопустим). Резолв известен —
+            // canonical ячейка дозаполняется, Done-кандидат не остаётся
+            // без ссылки на артефакт; отказ записи — warn без bounce
+            // (строка и так ждёт владельца, мержа не будет).
             PrState::Merged => {
+                if let Some(url) = probe.url.as_deref() {
+                    if let Err(e) = self.fill_cell_if_differs(board, task, url).await {
+                        tracing::warn!(
+                            event = "automerge.pr_cell_fill_failed",
+                            number = task.number(),
+                            error = %e,
+                            "Automerge: дозаполнение смерженного PR не удалось — строка ждёт владельца в Review"
+                        );
+                    }
+                }
                 tracing::info!(
                     event = "automerge.merged",
                     number = task.number(),
@@ -661,32 +683,55 @@ impl TickUseCase {
                 Ok(false)
             }
             PrState::Missing => {
-                self.bounce(board, task, "branch set, PR not found").await?;
+                self.bounce(board, task, "branch set, PR not found", out)
+                    .await?;
                 Ok(false)
             }
             PrState::Closed => {
-                self.bounce(board, task, "PR closed without a merge")
+                self.bounce(board, task, "PR closed without a merge", out)
                     .await?;
                 Ok(false)
             }
             PrState::Open {
                 mergeable: false, ..
             } => {
-                self.bounce(board, task, "PR conflicts with master").await?;
+                self.bounce(board, task, "PR conflicts with master", out)
+                    .await?;
                 Ok(false)
             }
             PrState::Open {
                 ci_green: false, ..
             } => {
-                self.bounce(board, task, "PR has red CI").await?;
+                self.bounce(board, task, "PR has red CI", out).await?;
                 Ok(false)
             }
             PrState::Open {
                 mergeable: true,
                 ci_green: true,
             } => {
-                let pr = task.pr().map(|u| u.as_str()).unwrap_or_default();
-                match self.prs.merge(&board.repo, pr).await {
+                // Дозаполнение canonical PR-ячейки (#1519): вердикт о
+                // конкретном PR есть, ячейка пуста или несёт протухший URL —
+                // пишем резолв до мержа; отказ записи — bounce (канон
+                // UC-01, авторемонт без мержа); мерж по
+                // probe-верифицированному URL — мержится ровно то, что
+                // прощупано.
+                let url = match probe.url.as_deref() {
+                    Some(u) => u,
+                    None => {
+                        // Defensive: на текущих гейтвеях недостижимо
+                        // (Open = вердикт о конкретном PR) — текст без
+                        // «not found», чтобы не лгал о причине
+                        self.bounce(board, task, "probe resolved no PR URL", out)
+                            .await?;
+                        return Ok(false);
+                    }
+                };
+                if let Err(e) = self.fill_cell_if_differs(board, task, url).await {
+                    self.bounce(board, task, &format!("PR cell fill failed: {e}"), out)
+                        .await?;
+                    return Ok(false);
+                }
+                match self.prs.merge(&board.repo, url).await {
                     Ok(()) => {
                         // мерж без закрытия: строка остаётся в Review —
                         // финализация (Done) всегда за владельцем (#1232)
@@ -698,7 +743,7 @@ impl TickUseCase {
                         Ok(true)
                     }
                     Err(e) => {
-                        self.bounce(board, task, &format!("merge failed: {e}"))
+                        self.bounce(board, task, &format!("merge failed: {e}"), out)
                             .await?;
                         Ok(false)
                     }
@@ -707,7 +752,45 @@ impl TickUseCase {
         }
     }
 
-    async fn bounce(&self, board: &BoardPlan, task: &Task, why: &str) -> UsecaseResult<()> {
+    /// Дозаполнение canonical PR-ячейки, если она расходится с резолвом
+    /// (#1519; ревью Low раунда 3 — единая точка «записать, если
+    /// расходится» вместо дубля в Merged/Open ветках): живая ячейка не
+    /// переписывается, запись логируется. Err — отказ записи, решение
+    /// (bounce/warn) за вызывающей веткой. URL резолва парсится здесь
+    /// один раз — дальше в порты идёт доменный \`&PrUrl\`.
+    async fn fill_cell_if_differs(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        url: &str,
+    ) -> UsecaseResult<()> {
+        if task.pr().map(|u| u.as_str()) == Some(url) {
+            return Ok(());
+        }
+        let parsed = uwuwu_domain::PrUrl::parse(url)
+            .ok_or_else(|| UsecaseError::Board(format!("PR «{url}» is not an http(s) URL")))?;
+        self.board
+            .set_pr(&board.board, task.number(), &parsed)
+            .await?;
+        tracing::info!(
+            event = "automerge.pr_cell_filled",
+            number = task.number(),
+            url,
+            "Automerge: canonical PR-ячейка дозаполнена резолвом (#1519)"
+        );
+        Ok(())
+    }
+
+    /// Bounce в In Progress с комментом-причиной (канон UC-01) — единая
+    /// точка инкремента `automerge_bounced` (#1519, ревью Low: правило
+    /// «семантический bounce = +1» живёт здесь, не на сайтах вызова).
+    async fn bounce(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        why: &str,
+        out: &mut TickOutcome,
+    ) -> UsecaseResult<()> {
         self.board
             .set_status(&board.board, task.number(), Status::InProgress)
             .await?;
@@ -720,6 +803,7 @@ impl TickUseCase {
             why,
             "Automerge: bounce"
         );
+        out.automerge_bounced += 1;
         Ok(())
     }
 }

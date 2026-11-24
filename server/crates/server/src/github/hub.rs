@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use uwuwu_domain::{Status, Task};
+use uwuwu_domain::{PrUrl, Status, Task};
 use uwuwu_usecase::{CommentRef, Goal, GoalsRepo, IssueView, StatusDelivery, TaskBoardRepo};
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
@@ -1150,6 +1150,14 @@ impl TaskBoardRepo for GitHubHub {
             )
             .await?;
         self.invalidate_snapshot(_board);
+        Ok(())
+    }
+
+    async fn set_pr(&self, board: &str, number: u64, pr_url: &PrUrl) -> UsecaseResult<()> {
+        self.fields
+            .store(number, &[("PR", Some(pr_url.as_str().to_string()))])
+            .await?;
+        self.invalidate_snapshot(board);
         Ok(())
     }
 

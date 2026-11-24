@@ -56,7 +56,7 @@ pub use ports::{
     AgentSessionGateway, AppendDocOutcome, AssistantReply, Clock, CommentRef, CronRow,
     CronRunTrack, CronStateStore, DecisionJudge, DreamerMark, FmMutator, IssueDigest,
     IssueFieldStore, IssueIndexSource, IssueView, JudgeCfg, JudgeContext, JudgeSessionTail,
-    Liveness, PrGateway, PrState, QuotaProbe, QuotaSnapshot, SessionInfo, SessionSpec,
+    Liveness, PrGateway, PrProbe, PrState, QuotaProbe, QuotaSnapshot, SessionInfo, SessionSpec,
     StatusDelivery, TaskBoardRepo, TickStateStore, WikiRepo,
 };
 pub use router::SessionRouter;

@@ -201,6 +201,14 @@ impl TaskBoardRepo for FakeBoard {
     ) -> UsecaseResult<()> {
         todo!("не используется проходом env-gc")
     }
+    async fn set_pr(
+        &self,
+        _board: &str,
+        _number: u64,
+        _pr_url: &uwuwu_domain::PrUrl,
+    ) -> UsecaseResult<()> {
+        todo!("не используется проходом env-gc")
+    }
     async fn set_board_cells(
         &self,
         _board: &str,

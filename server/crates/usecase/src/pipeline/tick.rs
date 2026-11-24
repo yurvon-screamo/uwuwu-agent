@@ -84,6 +84,13 @@ pub struct TickOutcome {
     pub wakeups_deferred: usize,
     /// Мержей автомержа: строка остаётся в Review (#1232).
     pub automerged: usize,
+    /// Семантических bounce автомержа (red CI / конфликт / PR не найден /
+    /// closed / merge fail / отказ дозаполнения ячейки): исход «мерж не
+    /// состоялся, причина на строке» — наблюдаемость исходов (#1519).
+    /// Инкремент — единая точка в actions::bounce; pending/no-op не
+    /// считаются. Транспортный Err пробы/мержа сюда не попадает: он
+    /// пробрасывается из тика (\`tick.failed\`) и счётчиков не несёт.
+    pub automerge_bounced: usize,
     /// Строк, переведённых в Needs attention спавн-петлёй.
     pub attention_flagged: usize,
     /// Автопингов сталл-детекта (ход завершён, статус не переведён).
@@ -555,6 +562,7 @@ impl TickUseCase {
             wakeups_deferred = out.wakeups_deferred,
             lost_deferred = out.lost_deferred,
             automerged = out.automerged,
+            automerge_bounced = out.automerge_bounced,
             held_live = out.held_live,
             stall_pings = out.stall_pings,
             soft_pings = out.soft_pings,
@@ -824,7 +832,7 @@ impl TickUseCase {
                 Action::Automerge => {
                     if plan.mode == Mode::Live {
                         let merged = self
-                            .automerge(board, task)
+                            .automerge(board, task, &mut out)
                             .await
                             .map_err(|e| self.log_action_failed(task, e))?;
                         // счётчик — факты мержа: bounce/pending/no-op не считаются
