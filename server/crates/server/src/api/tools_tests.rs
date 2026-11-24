@@ -1124,6 +1124,79 @@ async fn task_list_empty_board_reads_as_empty_json_array() {
     let rows: Value = serde_json::from_str(&list).expect("пустая доска — JSON, не таблица");
     assert_eq!(rows, json!([]), "пустая доска — пустой JSON-массив: {list}");
 }
+
+/// #1604 (срез 2): состав вывода task_get заявлен — body_bytes (точный
+/// размер тела в UTF-8; потребитель Code Mode сверяет через TextEncoder)
+/// и граница хвоста комментов «latest показано of всего». Инстанс 21.11:
+/// ложный сплит тела по заголовку-двойнику «## Комменты» стал бы виден
+/// сверкой (размер не сойдётся).
+#[tokio::test]
+async fn task_get_declares_body_bytes_and_comments_window_on_overflow() {
+    let (tools, _memory) = hub();
+    let body =
+        "## Постановка\n\nтело состава вывода.\n\n## Комменты\n\nзаголовок-двойник внутри тела.\n";
+    let (number, _) = create_task(&tools, "t: состав вывода", body).await;
+    for i in 0..12 {
+        call(
+            &tools,
+            "task_comment",
+            json!({ "number": number, "text": format!("коммент {i}") }),
+        )
+        .await
+        .expect("comment");
+    }
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+
+    // Потребительская сверка (аналог TextEncoder в Code Mode): заявленное
+    // body_bytes == байтам UTF-8 среза тела между fm-блоком и заголовком
+    // комментов. Носитель нормализует хвостовой перенос — входную строку
+    // не считаем, сверяем то, что реально в выводе.
+    let start = card.find("body_bytes: ").expect("fm несёт body_bytes") + "body_bytes: ".len();
+    let line_end = start + card[start..].find('\n').expect("конец строки body_bytes");
+    let declared: usize = card[start..line_end].parse().expect("body_bytes — целое");
+    let body_end = card
+        .find("\n\n--- comments (latest 10 of 12) ---")
+        .expect("граница хвоста комментов");
+    // после строки body_bytes в fm идёт пустая строка (\n\n) — тело с неё
+    assert_eq!(
+        card[line_end + 2..body_end].len(),
+        declared,
+        "срез тела == заявленному body_bytes: {card}"
+    );
+    assert!(
+        card.contains("--- comments (latest 10 of 12) ---"),
+        "граница хвоста комментов заявлена показано/всего: {card}"
+    );
+}
+
+/// #1604 (срез 2): в пределах окна состав заявлен без ложной
+/// усечённости — «latest N of N».
+#[tokio::test]
+async fn task_get_comments_window_full_when_within_limit() {
+    let (tools, _memory) = hub();
+    let (number, _) = create_task(&tools, "t: окно целиком", "## П\n\nx.\n").await;
+    for i in 0..2 {
+        call(
+            &tools,
+            "task_comment",
+            json!({ "number": number, "text": format!("к {i}") }),
+        )
+        .await
+        .expect("comment");
+    }
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    assert!(
+        card.contains("--- comments (latest 2 of 2) ---"),
+        "полное окно — без «усечённости»: {card}"
+    );
+}
+
 /// #1155 (поручение владельца): автомерж-ячейка живёт на mock-носителе —
 /// create пишет дефолт on, edit переключает, fm рендерит фактическое
 /// состояние (без хранения на носителе fm и тик стенда врали «false»).

@@ -9,6 +9,13 @@ use uwuwu_domain::Task;
 /// Сколько последних комментов несёт карточка задачи.
 const CARD_COMMENTS: usize = 10;
 
+/// Карточка task_get (#1604): носитель + размер ленты комментов до среза
+/// хвоста — граница «latest shown of total» заявляется в самом выводе.
+pub struct CardView {
+    pub issue: IssueView,
+    pub comments_total: usize,
+}
+
 pub struct TaskView {
     board: Arc<dyn TaskBoardRepo>,
     boards: Vec<(String, String)>, // (project, board)
@@ -38,8 +45,11 @@ impl TaskView {
         Ok(self.board.read_board(board).await?)
     }
 
-    /// Карточка задачи: агрегат + тело + хвост комментов.
-    pub async fn card(&self, project: &str, number: u64) -> Result<IssueView, ViewError> {
+    /// Карточка task_get: агрегат + тело + хвост комментов. `comments_total`
+    /// — размер ленты до среза: граница хвоста заявляется в выводе
+    /// (`latest shown of total`, #1604). Один клиент — tools.rs task_get,
+    /// поэтому обёртка здесь, а не поле в порте.
+    pub async fn card(&self, project: &str, number: u64) -> Result<CardView, ViewError> {
         let board = self.board_of(project).ok_or_else(|| {
             ViewError::NotFound(format!("project «{project}» is not in the config"))
         })?;
@@ -47,15 +57,17 @@ impl TaskView {
         if view.task.status() == uwuwu_domain::Status::Empty && view.body.is_empty() {
             return Err(ViewError::NotFound(format!("task #{number}")));
         }
-        Ok(IssueView {
-            comments: view
-                .comments
-                .into_iter()
-                .rev()
-                .take(CARD_COMMENTS)
-                .rev()
-                .collect(),
-            ..view
+        let comments_total = view.comments.len();
+        let comments = view
+            .comments
+            .into_iter()
+            .rev()
+            .take(CARD_COMMENTS)
+            .rev()
+            .collect();
+        Ok(CardView {
+            issue: IssueView { comments, ..view },
+            comments_total,
         })
     }
 }

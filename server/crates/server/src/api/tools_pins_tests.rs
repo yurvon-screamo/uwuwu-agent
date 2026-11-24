@@ -399,7 +399,7 @@ async fn task_get_comment_carries_iso_utc_stamp() {
         .await
         .expect("get");
     let block = text
-        .split("--- comments (latest) ---\n")
+        .split("--- comments (latest 1 of 1) ---\n")
         .nth(1)
         .expect("хвост комментов");
     let stamp = block

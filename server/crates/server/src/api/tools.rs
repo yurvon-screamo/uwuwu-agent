@@ -170,7 +170,8 @@ pub fn tool_descriptors() -> Value {
         ),
         tool(
             "task_get",
-            "Full task card: fm fields, issue body, latest comments",
+            "Full task card: fm fields (incl. body_bytes), issue body, \
+             latest comments (shown/total declared)",
             object(json!({ "number": integer("task number (row-id)"),
                          "project": string("project; default uwuwu") }))
         ),
@@ -476,9 +477,10 @@ impl ToolHub {
 
     async fn task_get(&self, project: &str, args: &Value) -> Result<Value, String> {
         let number = need_number(args)?;
-        let view = self.tasks.card(project, number).await.map_err(view_err)?;
+        let card = self.tasks.card(project, number).await.map_err(view_err)?;
+        let view = card.issue;
         let mut out = format!(
-            "#{} {} — {}\n\n--- fm ---\nbranch: {}\npr: {}\nautomerge: {}\ndirect: {}\ntype: {}\nbody_hash: {}\n\n",
+            "#{} {} — {}\n\n--- fm ---\nbranch: {}\npr: {}\nautomerge: {}\ndirect: {}\ntype: {}\nbody_hash: {}\nbody_bytes: {}\n\n",
             view.task.number(),
             view.task.title(),
             uwuwu_usecase::status_name(view.task.status()),
@@ -493,10 +495,18 @@ impl ToolHub {
                 .map(uwuwu_usecase::task_type_name)
                 .unwrap_or("—"),
             uwuwu_usecase::body_hash(&view.body),
+            // состав вывода заявлен (#1604): тело отдельно от хвоста
+            // комментов; потребитель сверяет TextEncoder'ом — байты UTF-8,
+            // те же единицы, что в квитанциях write-path
+            view.body.len(),
         );
         out.push_str(&view.body);
         if !view.comments.is_empty() {
-            out.push_str("\n\n--- comments (latest) ---\n");
+            out.push_str(&format!(
+                "\n\n--- comments (latest {} of {}) ---\n",
+                view.comments.len(),
+                card.comments_total
+            ));
             for c in &view.comments {
                 out.push_str(&format!(
                     "---\n{}\n{}\n",
