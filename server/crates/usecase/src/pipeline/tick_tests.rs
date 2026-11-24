@@ -9099,6 +9099,18 @@ fn multi_board_usecase_with(
     sessions: Arc<FakeSessions>,
     state: Arc<MemState>,
 ) -> TickUseCase {
+    multi_board_usecase_with_clock(board, sessions, state, Arc::new(FixedClock))
+}
+
+/// Вариант с настраиваемым клоком: сталл-сценарии считают тишину от
+/// now_ms клока, фиксированные 2000 мс FixedClock мягкий порог
+/// (15 мин) не проходят.
+fn multi_board_usecase_with_clock(
+    board: Arc<FakeMultiBoard>,
+    sessions: Arc<FakeSessions>,
+    state: Arc<MemState>,
+    clock: Arc<dyn Clock>,
+) -> TickUseCase {
     TickUseCase {
         board,
         sessions: Arc::new(SessionRouter::uniform(sessions)),
@@ -9109,7 +9121,7 @@ fn multi_board_usecase_with(
             probes: Mutex::default(),
             url: Mutex::default(),
         }),
-        clock: Arc::new(FixedClock),
+        clock,
         state,
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         boot_ms: 0,
@@ -11037,4 +11049,87 @@ async fn design_return_with_dead_cell_is_continuation_on_transition_tick() {
         work.title
     );
     assert_eq!(out.held_cup, 1, "новичок 602 удержан капом");
+}
+
+/// Клок с далёким now_ms — сталл-сценарии: тишина считается
+/// activity_ms - now_ms, порог мягкого пинга 15 мин.
+struct StallClock;
+impl Clock for StallClock {
+    fn utc_minute(&self) -> UtcMinute {
+        UtcMinute {
+            minute_of_day: 100,
+            weekday: 3,
+        }
+    }
+    fn now_ms(&self) -> u64 {
+        100_000_000
+    }
+}
+
+/// (е) #1586: путь мягкого пинга в конкурирующей геометрии — маркер
+/// живого случая #1521 именно `stall.soft_ping_held_cup`. Продолжение
+/// с уснувшей сессией (16 мин, idle) на поздней доске против новичка
+/// Design high на первой: свободный слот забирает пинг продолжения,
+/// спавн новичка — следующий слот. На прежнем порядке (доска →
+/// приоритет) тест красный: новичок первой доски спавнится раньше.
+#[tokio::test]
+async fn continuation_soft_ping_on_later_board_beats_new_design_on_first() {
+    let state = Arc::new(MemState(Mutex::default()));
+    let (mut newcomer, nf) = fresh_row(701, Status::Design);
+    let (mut cont, cf) = staged_row(702, Status::InProgress, Slot::Dev, "ses_702");
+    newcomer.set_priority(Priority::High);
+    cont.set_priority(Priority::Medium);
+    // строка уже видена тиком в этом статусе — не переход
+    state.set_last_seen_status("B2", 702, Status::InProgress);
+    let board = order_board(
+        vec![newcomer],
+        vec![cont],
+        [(701u64, nf), (702u64, cf)].into_iter().collect(),
+        Default::default(),
+    );
+    let sessions = Arc::new(FakeSessions {
+        // тишина 16 мин от клока — мягкий порог (15 мин) пройден
+        activity_ms: Some(100_000_000 - 16 * 60_000),
+        idle_reply: true, // ход завершён — класс мягкого пинга
+        ..FakeSessions::new()
+    });
+    {
+        let mut extra = sessions.extra.lock().unwrap();
+        extra.push(fake_session("ses_702", "", "succeeded", 0, false));
+        // кап полон: busy-филлер — не строка доски, пул жертв структурно
+        // пуст — руки преемпшена у новичка нет (граница пина (в))
+        extra.push(fake_session("ses_filler", "", "succeeded", 0, true));
+    }
+    let u = multi_board_usecase_with_clock(board, sessions.clone(), state, Arc::new(StallClock));
+    // тик 1 — кап полон: пинг продолжения держится, новичок тоже
+    let out = u.run(&order_plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(
+        out.soft_pings_deferred, 1,
+        "пинг продолжения держится полным капом"
+    );
+    assert_eq!(out.spawns_done, 0, "новичок не спавнится при полном капе");
+    assert_eq!(
+        out.held_cup, 1,
+        "новичок удержан: жертв нет (филлер — не строка)"
+    );
+    // слот освобождается (филлер погашен) — слот у пинга продолжения,
+    // не у спавна новичка
+    sessions.extra.lock().unwrap().retain(|s| !s.busy);
+    let out2 = u.run(&order_plan(Mode::Live, 1)).await.unwrap();
+    assert_eq!(
+        out2.soft_pings, 1,
+        "свободный слот — пинг продолжения доставлен"
+    );
+    assert_eq!(
+        out2.spawns_done, 0,
+        "спавн новичка не обогнал пинг продолжения"
+    );
+    assert_eq!(out2.held_cup, 1, "новичок ждёт следующего слота");
+    let prompts = sessions.prompts.lock().unwrap();
+    assert!(
+        prompts
+            .iter()
+            .any(|p| p.starts_with("ses_702|") && p.contains("Soft ping")),
+        "пинг доставлен в сессию продолжения: {prompts:?}"
+    );
 }

@@ -270,16 +270,20 @@ UWUWU_SERVER_CONFIG=$CONFIG UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
   UWUWU_MOCK_SEED="Доска p2:3450:Design:Medium" \
   RUST_LOG=info "$BIN_SRV" >>"$LOG_SRV" 2>&1 &
 SRV_PID=$!
-wait_phase 25   # тик: спавн dev-сессии 3450 — материал продолжения
+wait_phase 25   # тик: спавн сессии Design-слота 3450 — материал продолжения
 DEV3450=$(grep -oE '"event":"spawn.done","number":3450[^}]*"session":"ses_mock[0-9a-f]+' "$LOG_SRV" | grep -oE 'ses_mock[0-9a-f]+' | tail -1 || true)
-[ -n "$DEV3450" ] || fail "V6: dev-сессия 3450 не спавнена — сценарий недействителен"
-# MCP-вызов на стенде: создание новичка через канонический цепочке статусов
+[ -n "$DEV3450" ] || fail "V6: сессия Design-слота 3450 не спавнена — сценарий недействителен"
+# MCP-вызов на стенде: создание новичка через каноническую цепочку статусов
 # (гейты переходов сервера: Analys → Review Analys → Todo → Design)
 mcp_tool() { # $1 tool, $2 args-json
   curl -s --max-time 10 -X POST "http://127.0.0.1:$PORT_SRV/mcp" \
     -H "Authorization: Bearer $BEARER" -H 'Content-Type: application/json' \
     -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"$1\",\"arguments\":$2}}"
 }
+# кап полон ДО входа новичка в Design: тик в промежутке спавнил бы
+# новичка на свободном слоте — ложный красный на предусловии held ниже
+FA=$(mk_busy "$PORT_A" 0); FB=$(mk_busy "$PORT_A" 0)
+[ -n "$FA" ] && [ -n "$FB" ] || fail "V6: филлеры не созданы"
 R=$(mcp_tool task_create '{"title":"V6 новичок","project":"uwuwu","type":"bug","priority":"high"}')
 NEW6=$(echo "$R" | grep -oE '#[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
 [ -n "$NEW6" ] || fail "V6: task_create не вернул номер ($R)"
@@ -287,9 +291,6 @@ for st in "Review Analys" "Todo" "Design"; do
   R=$(mcp_tool task_edit "{\"number\":$NEW6,\"project\":\"uwuwu\",\"status\":\"$st\"}")
   echo "$R" | grep -q '"isError":true' && fail "V6: task_edit $st упал: $R"
 done
-# кап полон (cup=2): два fresh-busy филлера; зомби V4 кап не держит
-FA=$(mk_busy "$PORT_A" 0); FB=$(mk_busy "$PORT_A" 0)
-[ -n "$FA" ] && [ -n "$FB" ] || fail "V6: филлеры не созданы"
 # коммент владельца 3450 — будильник продолжения
 R=$(mcp_tool task_comment "{\"number\":3450,\"project\":\"p2\",\"text\":\"владелец: продолжай\"}")
 echo "$R" | grep -q '"isError":true' && fail "V6: task_comment упал: $R"
@@ -298,17 +299,23 @@ grep -q '"event":"wakeup.held_cup","number":3450' "$LOG_SRV" \
   || fail "V6: будильник 3450 не держится полным капом"
 grep '"event":"spawn.held_cup","number":'"$NEW6" "$LOG_SRV" | grep -q '"tier":"new"' \
   || fail "V6: новичок не held или маркер тира new отсутствует"
-# слот освобождается: тик доставки продолжения не должен спавнить новичка
+# слот освобождается: окно обязано содержать И тик доставки, И следующий
+# тик со спавном новичка (35 с ≈ 3.5 периода опроса — запас на медленный
+# первый тик); пустая точка — недействительное окно, не зелёный проход
 LB=$(wc -l < "$LOG_SRV")
 del_session() { curl -s --max-time 5 -X DELETE "http://127.0.0.1:$1/api/session/$2" >/dev/null; }
 del_session "$PORT_A" "$FA"
-wait_phase 25
+wait_phase 35
 W6="$RUN_DIR/window6.log"; awk -v s="$LB" 'NR>s' "$LOG_SRV" > "$W6"
 DEL6=$(grep -nE '"event":"wakeup.delivered","number":3450' "$W6" | head -1 | cut -d: -f1 || true)
 TICK6=$(awk -v d="$DEL6" 'NR>d && /tick.completed/{print NR; exit}' "$W6")
 DONE6=$(grep -nE '"event":"spawn.done","number":'"$NEW6" "$W6" | head -1 | cut -d: -f1 || true)
+# все три точки сценария обязательны: пустое — FAIL с точной причиной
 [ -n "$DEL6" ] || fail "V6: доставка будильника 3450 на свободном слоте нет"
-if [ -n "$DONE6" ] && [ -n "$TICK6" ] && [ "$DONE6" -lt "$TICK6" ]; then
+[ -n "$TICK6" ] || fail "V6: тик после доставки не завершился (tick.completed нет в окне) — сценарий недействителен"
+[ -n "$DONE6" ] || fail "V6: новичок $NEW6 не выехал после продолжения (spawn.done нет в окне) — вторая половина сценария (следующий слот) не проверена"
+# порядок по позициям: доставка продолжения строго раньше спавна новичка
+if [ "$DONE6" -lt "$DEL6" ]; then
   fail "V6: новичок $NEW6 обогнал продолжение 3450 в тике освобождения"
 fi
 say "V6 ок: слот у продолжения с поздней доски (del=$DEL6, tick=$TICK6, spawn=$DONE6); новичок ждёт следующего слота"
