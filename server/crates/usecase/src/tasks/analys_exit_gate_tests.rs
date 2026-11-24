@@ -48,10 +48,17 @@ impl TaskBoardRepo for GateBoard {
         Ok(Vec::new())
     }
 
-    async fn set_status(&self, _b: &str, n: u64, s: Status) -> UsecaseResult<()> {
+    async fn set_status(
+        &self,
+        _b: &str,
+        n: u64,
+        s: Status,
+    ) -> UsecaseResult<crate::ports::StatusDelivery> {
         self.writes.lock().expect("gate board").push((n, s));
         self.statuses.lock().expect("gate board").insert(n, s);
-        Ok(())
+        Ok(crate::ports::StatusDelivery::Confirmed {
+            actual: crate::naming::status_name(s).to_string(),
+        })
     }
 
     async fn row_exists(&self, _b: &str, _n: u64) -> UsecaseResult<bool> {

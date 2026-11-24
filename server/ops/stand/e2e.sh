@@ -890,6 +890,15 @@ printf '%s' "$EDIT_RESP" | grep -q '"isError":true' \
   || fail "task_edit(branch) на фантоме не отказал: $EDIT_RESP"
 printf '%s' "$EDIT_RESP" | grep -q 'was not confirmed' \
   || fail "текст отказа edit без вердикта контрольного чтения: $EDIT_RESP"
+# статусная ветка (#1437): phantom set_status → громкий отказ с вердиктом
+# контрольного чтения — врущая квитанция «обновлена» на статусе невозможна.
+# Ребро Analys → Review Analys — легальный выход из Analys (гейт #1280
+# пройден: create несёт явные приоритет/automerge)
+EDIT_STATUS_RESP=$(mcp task_edit "{\"number\":$PH_N,\"status\":\"Review Analys\"}")
+printf '%s' "$EDIT_STATUS_RESP" | grep -q '"isError":true' \
+  || fail "task_edit(status) на фантоме не отказал: $EDIT_STATUS_RESP"
+printf '%s' "$EDIT_STATUS_RESP" | grep -q 'not confirmed' \
+  || fail "текст отказа статусной записи без вердикта контрольного чтения: $EDIT_STATUS_RESP"
 CARRIER=$(mcp task_get "{\"number\":$PH_N}")
 printf '%s' "$CARRIER" | grep -q 'фантомное тело' \
   && fail "фантомная запись попала в носитель: $CARRIER"
@@ -917,6 +926,11 @@ printf '%s' "$HONEST" | grep -q 'delivery not confirmed' \
 HONEST_C=$(mcp task_comment "{\"number\":$H_N,\"text\":\"probe-ok\"}")
 printf '%s' "$HONEST_C" | grep -q 'comment posted to' \
   || fail "task_comment на честном носителе отказал: $HONEST_C"
+# статусная квитанция честного носителя (#1437): подтверждение в тексте.
+# Легальное ребро Analys → Review Analys (гейт #1280 пройден create'ом)
+HONEST_S=$(mcp task_edit "{\"number\":$H_N,\"status\":\"Review Analys\"}")
+printf '%s' "$HONEST_S" | grep -q 'carrier confirms' \
+  || fail "честная статусная запись без подтверждения в квитанции: $HONEST_S"
 kill "$SRV_PID" 2>/dev/null || true; wait "$SRV_PID" 2>/dev/null || true; SRV_PID=""
 sleep 1
 say "фаза 11 ок: фантом → громкий отказ, честный носитель → успех без маркера"

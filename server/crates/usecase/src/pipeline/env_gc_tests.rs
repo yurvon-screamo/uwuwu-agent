@@ -226,7 +226,12 @@ impl TaskBoardRepo for FakeBoard {
     async fn read_board(&self, _board: &str) -> UsecaseResult<Vec<Task>> {
         todo!("не используется проходом env-gc")
     }
-    async fn set_status(&self, _board: &str, _number: u64, _status: Status) -> UsecaseResult<()> {
+    async fn set_status(
+        &self,
+        _board: &str,
+        _number: u64,
+        _status: Status,
+    ) -> UsecaseResult<crate::ports::StatusDelivery> {
         todo!("не используется проходом env-gc")
     }
     async fn row_status(&self, _board: &str, number: u64) -> UsecaseResult<Option<Status>> {
