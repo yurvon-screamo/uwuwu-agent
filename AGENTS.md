@@ -25,6 +25,8 @@ Owner persona (`MCP uwuwu_person_show`) — read it at the start of work on a ta
 Before complicating a solution for a hypothetical race condition or a highly unlikely security scenario, first explain to the user what exactly the problem could be, how likely it is, and what the added complexity costs. Get their consent.
 Do not expand the task's scope merely for theoretical robustness.
 
+Statuses for the owner — concise, presented as a table, bullet points, or a list; he doesn’t read long technical reports ("Didn't understand a thing").
+
 ## MCP uwuwu — knowledge base
 
 > **Tool contracts come from the uwuwu MCP server's tools/list** (descriptions and argument schemas), not from memory and not from this doc. What is not in the tool list does not exist; a discrepancy — a server task.
