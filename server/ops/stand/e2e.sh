@@ -1209,7 +1209,9 @@ echo "$GC_FAIL_BATCH" | grep -q '^ENV-GC 990017 SWEPT$' \
 # внезапный abort строки: инъекция return ≠ 0 в копии скрипта (пин
 # структуры страховки — вызов под || ловит только явный return ≠ 0)
 GC_ABORT_COPY="$RUN_DIR/task-env-gc-abject.sh"
-sed 's/^sweep_one() {$/sweep_one() { [ "$1" = "990018" ] \&\& return 7;/' "$GC_SCRIPT" > "$GC_ABORT_COPY"
+ABORT_ROW=990018
+GC_INJECT="s/^sweep_one() {\$/sweep_one() { [ \"\$1\" = \"$ABORT_ROW\" ] \&\& return 7;/"
+sed "$GC_INJECT" "$GC_SCRIPT" > "$GC_ABORT_COPY"
 grep -q 'return 7' "$GC_ABORT_COPY" || fail "инъекция abort не легла в копию скрипта (пин структуры: sweep_one() { на отдельной строке)"
 git -C "$GC_FIX/checkout" worktree add -q -b work/task-990018 "$GC_FIX/envs/990018/repo"
 git -C "$GC_FIX/checkout" worktree add -q -b work/task-990019 "$GC_FIX/envs/990019/repo"
