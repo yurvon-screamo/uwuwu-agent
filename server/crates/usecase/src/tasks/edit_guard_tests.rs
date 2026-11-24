@@ -558,3 +558,52 @@ async fn stale_idempotent_lag_read_passes_as_legal_edge() {
         .expect("ребро In Progress → Ревью результата легально по свежему носителю");
     assert_eq!(board.writes(), vec![(11, Status::ReviewResult)]);
 }
+
+#[tokio::test]
+async fn stale_cache_rejection_verifies_fresh_carrier_passes_legal_edge() {
+    // #1615 (инстанс #1612, 25.11): wt-окно щита #1346 истекло, кеш-вид
+    // (REST items-индекс, read-лаг листа минутного масштаба) всё ещё
+    // отдаёт до-записный «Analys», носитель живёт «Review Analys».
+    // Легальное ребро Review Analys → Todo гард отвергал по кеш-виду —
+    // «Analys → Todo вне канона» три попытки подряд, вердикт ревьювера
+    // висел в воздухе. Отказная ветка обязана сверить current со свежим
+    // носителем (точечный GraphQL-рид #1437) и провести ребро по
+    // свежему значению — инвариант #1235 на канон-пути: чтение current
+    // гарда = носителю при любом возрасте последней статусной записи.
+    let board = Arc::new(StaleBoard {
+        snapshot: vec![StaleBoard::task(11, Status::Analys)],
+        carrier: vec![StaleBoard::task(11, Status::ReviewAnalys)],
+        cached: vec![StaleBoard::task(11, Status::Analys)],
+        writes: Mutex::new(vec![]),
+    });
+    edit_status(&board, 11, Status::Todo).await.expect(
+        "ребро Review Analys → Todo легально по свежему носителю — кеш-стейл не отказывает (#1615)",
+    );
+    assert_eq!(board.writes(), vec![(11, Status::Todo)]);
+}
+
+#[tokio::test]
+async fn rejection_stands_when_fresh_carrier_confirms_stale_cache() {
+    // Обратная сторона #1615: fresh-сверка подтвердила кеш-вид — носитель
+    // правда в Analys, ребро Analys → Todo вне канона, отказ честный
+    // (текст по свежему значению), мутации нет. Пин против обратного
+    // перегиба: отказная сверка не открывает незаконные рёбра.
+    let board = Arc::new(StaleBoard {
+        snapshot: vec![StaleBoard::task(11, Status::Analys)],
+        carrier: vec![StaleBoard::task(11, Status::Analys)],
+        cached: vec![StaleBoard::task(11, Status::Analys)],
+        writes: Mutex::new(vec![]),
+    });
+    let err = edit_status(&board, 11, Status::Todo)
+        .await
+        .expect_err("Analys → Todo вне канона — отказ по согласию кеш-вида и свежего носителя");
+    assert!(
+        err.to_string().contains("outside the pipeline canon"),
+        "текст отказа: {err}"
+    );
+    assert!(
+        board.writes().is_empty(),
+        "мутации не должно быть: {:?}",
+        board.writes()
+    );
+}

@@ -408,25 +408,7 @@ impl TaskWriter for TaskWriteUseCase {
         let mut want_automerge: Option<bool> = None;
         let mut status_delivery: Option<StatusDelivery> = None;
         if let Some(status) = patch.status {
-            let current = self.guard_current(&board, number, status).await?;
-            // direct-класс (#1357): ребро In Progress → Review открыто
-            // только строке с флагом — флаг добывается свежим чтением
-            // носителя (семейство стейл-багов #1258/#1346: снапшоту
-            // здесь не верим), остальным рёбрам флаг не нужен
-            let direct = self.carrier_direct(number, current, status).await;
-            if !uwuwu_domain::Status::can_transition_with(current, status, direct) {
-                tracing::warn!(
-                    event = "board.guard_rejected",
-                    number,
-                    from = %naming::status_name(current),
-                    to = %naming::status_name(status),
-                    "Гард канона: переход запрещён (fresh row_status)"
-                );
-                return Err(UsecaseError::Board(format!(
-                    "transition {:?} → {:?} outside the pipeline canon",
-                    current, status
-                )));
-            }
+            let current = self.guard_canon(&board, number, status).await?;
             // Гейт полноты полей на выходе из Analys (#1280): волна
             // аналитики обязана выпускать строки с явными Приоритетом
             // и Automerge — решение разбора, не пустота носителя.
@@ -1052,8 +1034,8 @@ impl TaskWriteUseCase {
     /// wt/items-кеш могли показать цель там, где носитель живёт другим
     /// статусом, и стейл-писец (повтор старого вердикта пробуждённой
     /// сессией) проводил запрещённый переход как «переустановку» поверх
-    /// кеш-лага. Нелегальные на вид рёбра wt-щитом #1346 не тронуты —
-    /// свежее чтение только здесь. None/непарсящееся — громкие отказы
+    /// кеш-лага. Отказные рёбра поверх этого сверяет guard_canon
+    /// (#1615). None/непарсящееся — громкие отказы
     /// (verifiable_current, контракт #1235/#1236).
     async fn guard_current(
         &self,
@@ -1071,6 +1053,56 @@ impl TaskWriteUseCase {
             number,
             self.board.fresh_row_status(board, number).await?,
         )
+    }
+
+    /// Гард канона перехода edit(): попытка по кеш-виду (wt-щит #1346,
+    /// fast path — fresh-рид не тратится на легальные переходы);
+    /// грядущий отказ сверяется со свежим носителем (#1615): кеш-вид за
+    /// пределами wt-окна мог отстать от носителя — REST items-индекс
+    /// пере-фетчится внутри wt-окна и при read-лаге листа минутного
+    /// масштаба несёт до-записный статус ещё минуты (инстанс #1612:
+    /// честный носитель «Review Analys», кеш показывал «Analys»,
+    /// легальное ребро Review Analys → Todo трижды умерло отказом
+    /// «вне канона», вердикт ревьювера висел в воздухе). Отказ
+    /// конвейерной стадии дорог (ложная эскалация живой строки) —
+    /// fresh совпал с кеш-видом: отказ настоящий, текст по свежему
+    /// значению; расходится: переход идёт по свежему чтению (событие
+    /// board.guard_stale_cache). Квотная дисциплина ADR-113/#1437:
+    /// точечный GraphQL-рид только на редкой отказной ветке.
+    async fn guard_canon(&self, board: &str, number: u64, status: Status) -> UsecaseResult<Status> {
+        let cached = self.guard_current(board, number, status).await?;
+        // direct-класс (#1357): ребро In Progress → Review открыто
+        // только строке с флагом — флаг добывается свежим чтением
+        // носителя (семейство стейл-багов #1258/#1346: снапшоту
+        // здесь не верим), остальным рёбрам флаг не нужен
+        let direct = self.carrier_direct(number, cached, status).await;
+        if uwuwu_domain::Status::can_transition_with(cached, status, direct) {
+            return Ok(cached);
+        }
+        let fresh =
+            verifiable_current(board, number, self.board.fresh_row_status(board, number).await?)?;
+        let direct = self.carrier_direct(number, fresh, status).await;
+        if !uwuwu_domain::Status::can_transition_with(fresh, status, direct) {
+            tracing::warn!(
+                event = "board.guard_rejected",
+                number,
+                from = %naming::status_name(fresh),
+                to = %naming::status_name(status),
+                "Гард канона: переход запрещён (свежий носитель подтвердил отказ)"
+            );
+            return Err(UsecaseError::Board(format!(
+                "transition {:?} → {:?} outside the pipeline canon",
+                fresh, status
+            )));
+        }
+        tracing::warn!(
+            event = "board.guard_stale_cache",
+            number,
+            cached = %naming::status_name(cached),
+            fresh = %naming::status_name(fresh),
+            "Кеш-вид гарда отстал от носителя — переход проведён по свежему чтению (#1615)"
+        );
+        Ok(fresh)
     }
 
     /// direct-флаг с носителя (#1357): ребро In Progress → Review гвардится
