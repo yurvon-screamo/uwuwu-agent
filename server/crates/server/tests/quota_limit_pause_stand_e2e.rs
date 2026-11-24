@@ -12,10 +12,10 @@
 //!   3. один громкий сигнал на окно (quota.limit_unnotified, cooldown —
 //!      повторные тики не дублируют);
 //!   4. спад процента (39): кэш снапшота истекает → проба меняет
+//!      вердикт → старая механика возвращается (soft ping уходит).
 //!
 //! Мок эндпоинта валидирует запрос (GET-строка с путём из [quota]
 //! и bearer из env) — контракт адаптер↔эндпоинт под тестом.
-//!      вердикт → старая механика возвращается (soft ping уходит).
 //!
 //! Запуск: UWUWU_E2E=1 cargo test -p uwuwu-server --test quota_limit_pause_stand_e2e
 //! Длительность ~6 мин: фаза возобновления ждёт истечения TTL кэша
@@ -202,7 +202,7 @@ async fn spawn_stand(dir: &Path, quota_url: &str) -> Stand {
         .env("UWUWU_SERVER_BEARER", bearer)
         .env("UWUWU_OPENCODE_PASSWORD", "e2e")
         .env("GH_TOKEN", "e2e-dummy-token")
-        .env("UWUWU_ZAI_API_KEY", E2E_QUOTA_KEY)
+        .env(KEY_ENV_STR, E2E_QUOTA_KEY)
         .env("UWUWU_MOCK_SEED", "stand:903:In Progress")
         .env("RUST_LOG", "info")
         .stdout(Stdio::from(
@@ -376,6 +376,12 @@ async fn limit_pause_holds_row_then_releases_when_window_drains() {
         if paused.is_some() && tick_ok {
             break;
         }
+        assert_eq!(
+            bad.load(Ordering::Relaxed),
+            0,
+            "мок ответил 401: адаптер ходит не тем GET/не с bearer — контракт адаптер↔эндпоинт нарушен\n{}",
+            log_tail(&server_log)
+        );
         assert!(
             Instant::now() < deadline,
             "лимитная пауза не наступила на исчерпанном окне\n{}",
@@ -455,6 +461,22 @@ async fn limit_pause_holds_row_then_releases_when_window_drains() {
         "после спада процента механика не возобновилась\n{}",
         log_tail(&server_log)
     );
+    // «ровно один» честно: счёт сверяется после ещё одного тика за
+    // возобновлением (soft-интервал 30 мин — второй пинг в окно не
+    // попадает), а не в момент первого появления события.
+    let ticks_at_resume = count_event(&server_log, EV_TICK);
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        if count_event(&server_log, EV_TICK) > ticks_at_resume {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "после возобновления тик не дожил\n{}",
+            log_tail(&server_log)
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
     assert_eq!(
         count_event(&server_log, EV_SIGNAL),
         1,
