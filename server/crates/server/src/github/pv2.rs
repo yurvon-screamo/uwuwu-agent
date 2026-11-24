@@ -331,6 +331,15 @@ impl Pv2Rest {
         self.fetch_status(board, number).await
     }
 
+    /// Откат write-through статуса: verify зафиксировал Mismatch —
+    /// возможно-ложное значение не доживает TTL-окно (ревью 1 Common-3:
+    /// инвариант «откат write-through» обязан покрывать и этот кеш;
+    /// #1437 — бюджет verify на GraphQL-риде ловит аномалии, откат
+    /// остаётся семантикой громкого отказа).
+    pub(crate) fn invalidate_status(&self, board: &str, number: u64) {
+        self.status_wt.invalidate(&format!("{board}#{number}"));
+    }
+
     /// PATCH Status + write-through. Возврат — raw-имя Status из ответа
     /// мутации (None — поле не отдалось, read-лаг): материал verify;
     /// write-through ставится до verify — мутация принята GitHub.
@@ -374,13 +383,6 @@ impl Pv2Rest {
         self.status_wt
             .put(&key, status_name.to_string(), std::time::Instant::now());
         Ok(parse_status_value(&resp.body["fields"]))
-    }
-
-    /// Откат write-through статуса: verify зафиксировал Mismatch —
-    /// возможно-ложное значение не доживает TTL-окно (ревью 1 Common-3:
-    /// инвариант «откат write-through» обязан покрывать и этот кеш).
-    pub(crate) fn invalidate_status(&self, board: &str, number: u64) {
-        self.status_wt.invalidate(&format!("{board}#{number}"));
     }
 
     /// Инвалидация meta-кэша доски (rename #1447): после мутации поля

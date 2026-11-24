@@ -19,6 +19,9 @@ use uwuwu_domain::{BranchName, Slot, Status, Task, TaskFields, UtcMinute};
 struct StaleBoard {
     snapshot: Vec<Task>,
     carrier: Vec<Task>,
+    /// Кеш-вид статуса (wt/индексный, может отставать от носителя):
+    /// row_status читает его, fresh_row_status (#1437) — носитель.
+    cached: Vec<Task>,
     /// Журнал записей set_status: (number, status) — «мутации нет»-пины.
     writes: Mutex<Vec<(u64, Status)>>,
 }
@@ -39,12 +42,29 @@ impl TaskBoardRepo for StaleBoard {
         Ok(self.snapshot.clone())
     }
 
-    async fn set_status(&self, _b: &str, n: u64, s: Status) -> UsecaseResult<()> {
+    async fn set_status(
+        &self,
+        _b: &str,
+        n: u64,
+        s: Status,
+    ) -> UsecaseResult<crate::ports::StatusDelivery> {
         self.writes.lock().unwrap().push((n, s));
-        Ok(())
+        Ok(crate::ports::StatusDelivery::Confirmed {
+            actual: crate::naming::status_name(s).to_string(),
+        })
     }
 
     async fn row_status(&self, _b: &str, n: u64) -> UsecaseResult<Option<Status>> {
+        Ok(self
+            .cached
+            .iter()
+            .find(|t| t.number() == n)
+            .map(|t| t.status()))
+    }
+
+    async fn fresh_row_status(&self, _b: &str, n: u64) -> UsecaseResult<Option<Status>> {
+        // #1437: свежее чтение носителя мимо кеш-вида — материал
+        // идемпотентного гарда edit().
         Ok(self
             .carrier
             .iter()
@@ -331,6 +351,7 @@ async fn edit_status(board: &Arc<StaleBoard>, number: u64, status: Status) -> Us
             },
         )
         .await
+        .map(|_| ())
 }
 
 #[tokio::test]
@@ -340,6 +361,7 @@ async fn guard_reads_fresh_carrier_not_stale_snapshot() {
     let board = Arc::new(StaleBoard {
         snapshot: vec![StaleBoard::task(11, Status::Analys)],
         carrier: vec![StaleBoard::task(11, Status::InProgress)],
+        cached: vec![StaleBoard::task(11, Status::InProgress)],
         writes: Mutex::new(vec![]),
     });
     // Агент волны: task_edit(Review Analys). На свежем носителе ребро
@@ -361,6 +383,7 @@ async fn legal_transition_on_fresh_status_writes() {
     let board = Arc::new(StaleBoard {
         snapshot: vec![StaleBoard::task(11, Status::Analys)],
         carrier: vec![StaleBoard::task(11, Status::Analys)],
+        cached: vec![StaleBoard::task(11, Status::Analys)],
         writes: Mutex::new(vec![]),
     });
     edit_status(&board, 11, Status::ReviewAnalys)
@@ -377,6 +400,7 @@ async fn dev_sends_to_testing_from_in_progress() {
     let board = Arc::new(StaleBoard {
         snapshot: vec![StaleBoard::task(11, Status::InProgress)],
         carrier: vec![StaleBoard::task(11, Status::InProgress)],
+        cached: vec![StaleBoard::task(11, Status::InProgress)],
         writes: Mutex::new(vec![]),
     });
     edit_status(&board, 11, Status::Testing)
@@ -392,6 +416,7 @@ async fn direct_row_finishes_to_review() {
     let board = Arc::new(StaleBoard {
         snapshot: vec![StaleBoard::task(11, Status::InProgress)],
         carrier: vec![StaleBoard::task(11, Status::InProgress)],
+        cached: vec![StaleBoard::task(11, Status::InProgress)],
         writes: Mutex::new(vec![]),
     });
     writer_with(board.clone(), Arc::new(DirectFields))
@@ -415,6 +440,7 @@ async fn ordinary_row_cannot_skip_to_review() {
     let board = Arc::new(StaleBoard {
         snapshot: vec![StaleBoard::task(11, Status::InProgress)],
         carrier: vec![StaleBoard::task(11, Status::InProgress)],
+        cached: vec![StaleBoard::task(11, Status::InProgress)],
         writes: Mutex::new(vec![]),
     });
     let res = writer_with(board.clone(), Arc::new(FilledFields))
@@ -441,6 +467,7 @@ async fn row_status_absent_is_fail_closed() {
     let board = Arc::new(StaleBoard {
         snapshot: vec![StaleBoard::task(11, Status::Analys)],
         carrier: vec![],
+        cached: vec![],
         writes: Mutex::new(vec![]),
     });
     let err = edit_status(&board, 11, Status::InProgress)
@@ -458,6 +485,7 @@ async fn unparseable_carrier_status_is_fail_closed() {
     let board = Arc::new(StaleBoard {
         snapshot: vec![StaleBoard::task(11, Status::Analys)],
         carrier: vec![StaleBoard::task(11, Status::Empty)],
+        cached: vec![StaleBoard::task(11, Status::Empty)],
         writes: Mutex::new(vec![]),
     });
     let err = edit_status(&board, 11, Status::ReviewAnalys)
@@ -476,10 +504,57 @@ async fn idempotent_same_status_still_writes() {
     let board = Arc::new(StaleBoard {
         snapshot: vec![StaleBoard::task(11, Status::InProgress)],
         carrier: vec![StaleBoard::task(11, Status::InProgress)],
+        cached: vec![StaleBoard::task(11, Status::InProgress)],
         writes: Mutex::new(vec![]),
     });
     edit_status(&board, 11, Status::InProgress)
         .await
         .expect("идемпотентная переустановка легальна");
     assert_eq!(board.writes(), vec![(11, Status::InProgress)]);
+}
+
+#[tokio::test]
+async fn stale_writer_idempotent_reinstall_is_rejected_by_fresh_carrier() {
+    // #1437, симптом 2 (фантомный Design): кеш-вид (wt/индекс) показывает
+    // «Design», носитель живёт «Needs attention». Стейл-писец (повтор
+    // старого вердикта пробуждённой сессией) зовёт task_edit(Design) —
+    // гард обязан свериться со свежим носителем и отвергнуть ребро
+    // Needs attention → Design, а не пропустить «переустановку»
+    // Design → Design.
+    let board = Arc::new(StaleBoard {
+        snapshot: vec![StaleBoard::task(11, Status::Design)],
+        carrier: vec![StaleBoard::task(11, Status::NeedsAttention)],
+        cached: vec![StaleBoard::task(11, Status::Design)],
+        writes: Mutex::new(vec![]),
+    });
+    let err = edit_status(&board, 11, Status::Design)
+        .await
+        .expect_err("стейл-писец отвергнут свежим чтением носителя");
+    assert!(
+        err.to_string().contains("outside the pipeline canon"),
+        "текст отказа: {err}"
+    );
+    assert!(
+        board.writes().is_empty(),
+        "мутации не должно быть: {:?}",
+        board.writes()
+    );
+}
+
+#[tokio::test]
+async fn stale_idempotent_lag_read_passes_as_legal_edge() {
+    // Легальный retry после своего write-through: кеш показывает цель,
+    // свежий носитель (в read-лаге) — прежний статус. Ребро
+    // прежний → цель легально, повтор применяется — retry-путь
+    // идемпотентных вызовов сохранён.
+    let board = Arc::new(StaleBoard {
+        snapshot: vec![StaleBoard::task(11, Status::InProgress)],
+        carrier: vec![StaleBoard::task(11, Status::InProgress)],
+        cached: vec![StaleBoard::task(11, Status::ReviewResult)],
+        writes: Mutex::new(vec![]),
+    });
+    edit_status(&board, 11, Status::ReviewResult)
+        .await
+        .expect("ребро In Progress → Ревью результата легально по свежему носителю");
+    assert_eq!(board.writes(), vec![(11, Status::ReviewResult)]);
 }

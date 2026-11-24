@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use uwuwu_domain::{PrUrl, Status, Task};
-use uwuwu_usecase::{CommentRef, Goal, GoalsRepo, IssueView, TaskBoardRepo};
+use uwuwu_usecase::{CommentRef, Goal, GoalsRepo, IssueView, StatusDelivery, TaskBoardRepo};
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 pub struct GitHubHub {
@@ -39,29 +39,43 @@ pub struct GitHubHub {
     last_rate_limit: std::sync::RwLock<Option<(u64, String)>>,
 }
 
-const QUERY: &str = r#"
-  query($owner:String!,$name:String!,$board:String!,$after:String){
-    rateLimit{ remaining resetAt }
+/// Доски хаба — id и тайтлы, без строк: первый шаг снимка. Доска
+/// резолвится по точному тайтлу на нашей стороне.
+const PROJECTS_QUERY: &str = r#"
+  query($owner:String!,$name:String!){
     repository(owner:$owner, name:$name){
-      projectsV2(first:20, query:$board){
-        nodes{
-          id title
-          field(name:"Status"){ ...on ProjectV2SingleSelectField{ id options{ id name } } }
-          items(first:100, after:$after){
-            pageInfo{ hasNextPage endCursor }
-            nodes{
-              id
-              content{ __typename ...on Issue{ number title state closedAt issueType{ name } } }
-              fieldValues(first:30){
-                nodes{ __typename
-                  ...on ProjectV2ItemFieldSingleSelectValue{
-                    name field{ ...on ProjectV2FieldCommon{ name } }
-                  }
-                  ...on ProjectV2ItemIssueFieldValue{
-                    field{ ...on ProjectV2FieldCommon{ name } }
-                    issueFieldValue{ __typename
-                      ...on IssueFieldSingleSelectValue{ name } }
-                  }
+      projectsV2(first:50){
+        nodes{ id title }
+      }
+    }
+  }"#;
+
+/// Одна страница строк одной доски — по id проекта. Инцидент 23.11: снимок
+/// шёл одним документом через `projectsV2(query:$board)`, а GitHub матчит
+/// проекты нестрого — по слову «Задачи» шли все открытые доски, `items`
+/// умножался на их число, документ переставал укладываться в лимит шлюза
+/// (около 10 с) и получал `502 Bad Gateway` на всех проектах разом.
+const BOARD_ITEMS_QUERY: &str = r#"
+  query($id:ID!,$first:Int!,$after:String){
+    rateLimit{ remaining resetAt }
+    node(id:$id){
+      ... on ProjectV2{
+        title
+        field(name:"Status"){ ...on ProjectV2SingleSelectField{ id options{ id name } } }
+        items(first:$first, after:$after){
+          pageInfo{ hasNextPage endCursor }
+          nodes{
+            id
+            content{ __typename ...on Issue{ number title state closedAt issueType{ name } } }
+            fieldValues(first:30){
+              nodes{ __typename
+                ...on ProjectV2ItemFieldSingleSelectValue{
+                  name field{ ...on ProjectV2FieldCommon{ name } }
+                }
+                ...on ProjectV2ItemIssueFieldValue{
+                  field{ ...on ProjectV2FieldCommon{ name } }
+                  issueFieldValue{ __typename
+                    ...on IssueFieldSingleSelectValue{ name } }
                 }
               }
             }
@@ -71,11 +85,18 @@ const QUERY: &str = r#"
     }
   }"#;
 
-const MAX_PAGES: usize = 10;
+/// Строк на страницу снимка. Страница держится в секундах — запас к
+/// лимиту шлюза на случай замедления бэкенда GitHub (замер 23.11:
+/// 100 строк — 2–3 с, шлюз обрывал документ на 10 с).
+const PAGE_SIZE: usize = 50;
+/// Потолок страниц на снимок — гард бесконечной пагинации. Вместе с
+/// PAGE_SIZE держит прежний потолок строк доски.
+const MAX_PAGES: usize = 20;
 
 /// TTL-кеш значений по ключу (#1243): цена обращения к GitHub GraphQL
-/// высока (полный снимок доски — сотни поинтов), а данные между тиками
-/// меняются редко. `now` прокидывается для тестируемости.
+/// высока (полный снимок доски — страница за страницей, без кеша доходило
+/// до 40 с), а данные между тиками меняются редко. `now` прокидывается
+/// для тестируемости.
 pub(crate) struct TtlCache<T> {
     ttl: std::time::Duration,
     cells: std::sync::RwLock<std::collections::HashMap<String, (std::time::Instant, Arc<T>)>>,
@@ -117,16 +138,30 @@ impl<T> TtlCache<T> {
     }
 }
 
-/// Исход verify-after-write (#1235, семья #1213).
+/// Исход verify-after-write (#1235, семья #1213): доказательство —
+/// только свежее чтение носителя мимо кешей (#1437); echo мутации
+/// материал лога, не квитанции.
 enum VerifyOutcome {
-    /// Чтение подтвердило запись.
-    Ok,
+    /// Свежее чтение подтвердило запись; String — raw-имя статуса носителя.
+    Ok(String),
     /// Rate limit: ретраи не продолжаем — мутация принята GitHub,
     /// write-through сохранён (окно возможно-ложного кэша ограничено TTL).
     SkippedRateLimited,
-    /// Три чтения не подтвердили запись — громкий отказ + откат write-through.
+    /// Бюджет свежих чтений исчерпан без применения — read-лаг Projects v2
+    /// (минутного масштаба, проба #1236) или мутация не применилась.
+    /// Квитанция Unverified (success не заявляется), write-through держит
+    /// записанное до TTL; ловля dropped-записи — контрольное чтение
+    /// носителя агентом и сталл-детект конвейера.
     Mismatch,
 }
+
+/// Бюджет verify статусной записи (#1437): попыток и пауз между ними.
+/// Точечный GraphQL-рид (issue → projectItems → fieldValues) сходится
+/// ~2с (проба S1: 1.96–2.33с) — 5×1с покрывает измеренный разброс с
+/// запасом; цена квоты — один точечный рид на попытку (квотная
+/// дисциплина ADR-113 держится: полные снапшоты досок verify не тянет).
+const VERIFY_GQL_ATTEMPTS: usize = 5;
+const VERIFY_GQL_PAUSE_MS: u64 = 1000;
 
 /// Единый тег классификации в тексте отказа gql-транспорта: kind —
 /// «RATE_LIMITED» (Core/Secondary и GraphQL-лимит) или «PERMISSION»
@@ -357,8 +392,18 @@ impl GitHubHub {
         if let Some(hit) = self.snap_cache.get(board, now) {
             return Ok(hit);
         }
+        let started = std::time::Instant::now();
         let fetched = self.snapshot_fetch(board).await?;
-        // бюджетная наблюдаемость: remaining несёт каждый снимок (QUERY)
+        // наблюдаемость пути снимка: тренд времени страницы против лимита
+        // шлюза GitHub (23.11: отказ стал постоянным незаметно — #1502)
+        tracing::info!(
+            event = "board.snapshot_fetched",
+            board = %board,
+            rows = fetched.0.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Снимок доски прочитан"
+        );
+        // бюджетная наблюдаемость: remaining несёт каждая страница строк
         if let Some(rl) = self.last_rate_limit.read().expect("rl lock").as_ref() {
             let remaining = rl.0;
             if remaining < 300 {
@@ -374,71 +419,27 @@ impl GitHubHub {
         Ok(arc)
     }
 
-    /// Полное чтение доски пагинацией (мимо кеша).
+    /// Полное чтение доски (мимо кеша): документы — через gql_retrying
+    /// (#1330), бюджетная наблюдаемость — с каждой страницы строк.
     async fn snapshot_fetch(&self, board: &str) -> UsecaseResult<(Vec<Task>, BoardMeta)> {
-        let (owner, name) = self.repo.split_once('/').ok_or_else(|| {
-            UsecaseError::Board(format!("repo in the owner/name form: {}", self.repo))
-        })?;
-        let mut meta = BoardMeta::default();
-        let mut rows: Vec<Task> = Vec::new();
-        let mut cursor: Option<String> = None;
-        for _ in 0..MAX_PAGES {
-            let data = self
-                .gql_retrying(
-                    QUERY,
-                    json!({ "owner": owner, "name": name, "board": board, "after": cursor }),
-                )
-                .await?;
-            // бюджет с каждого снимка (QUERY несёт rateLimit) — #1243
-            if let Some(rl) = data.get("rateLimit") {
-                if let Some(remaining) = rl["remaining"].as_u64() {
-                    let reset_at = rl["resetAt"].as_str().unwrap_or_default().to_string();
-                    *self.last_rate_limit.write().expect("rl lock") = Some((remaining, reset_at));
-                }
-            }
-            let nodes = data["repository"]["projectsV2"]["nodes"]
-                .as_array()
-                .ok_or_else(|| UsecaseError::Board("projectsV2.nodes is not an array".into()))?;
-            let project = nodes
-                .iter()
-                .find(|p| p["title"].as_str() == Some(board))
-                .ok_or_else(|| {
-                    UsecaseError::Board(format!(
-                        "board «{board}» not found among {} boards",
-                        nodes.len()
-                    ))
-                })?;
-            if meta.project_id.is_empty() {
-                meta.project_id = project["id"].as_str().unwrap_or_default().to_string();
-                meta.status_field_id = project["field"]["id"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string();
-                if let Some(options) = project["field"]["options"].as_array() {
-                    for o in options {
-                        if let (Some(id), Some(n)) = (o["id"].as_str(), o["name"].as_str()) {
-                            meta.options.insert(n.to_string(), id.to_string());
-                        }
-                    }
-                }
-                if meta.project_id.is_empty() {
-                    return Err(UsecaseError::Board(format!(
-                        "board «{board}»: no project id"
-                    )));
-                }
-            }
-            let items = &project["items"];
-            if let Some(page) = items["nodes"].as_array() {
-                rows.extend(parse_page(page, &mut meta));
-            }
-            if items["pageInfo"]["hasNextPage"].as_bool() != Some(true) {
-                return Ok((rows, meta));
-            }
-            cursor = items["pageInfo"]["endCursor"].as_str().map(String::from);
+        read_board_pages(&self.repo, board, |query, variables| async move {
+            let data = self.gql_retrying(query, variables).await?;
+            self.note_rate_limit(&data);
+            Ok(data)
+        })
+        .await
+    }
+
+    /// Бюджетная наблюдаемость: remaining/resetAt несёт каждая страница
+    /// строк (BOARD_ITEMS_QUERY) — контекст бэкоффа и гайд `gql.budget_low`.
+    fn note_rate_limit(&self, data: &Value) {
+        if let Some(remaining) = data["rateLimit"]["remaining"].as_u64() {
+            let reset_at = data["rateLimit"]["resetAt"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            *self.last_rate_limit.write().expect("rl lock") = Some((remaining, reset_at));
         }
-        Err(UsecaseError::Board(format!(
-            "board «{board}» exceeded the {MAX_PAGES} pages — the guard"
-        )))
     }
 
     /// Статус строки на доске (по номеру issue, через projectItems).
@@ -579,78 +580,180 @@ impl GitHubHub {
         self.snap_cache.put(board, (rows, meta), now);
     }
 
-    /// Контрольное чтение после мутации статуса (семья #1213): ответ
-    /// мутации с искомым значением — быстрый путь без доп. запросов;
-    /// иначе до 3 чтений НОСИТЕЛЯ (мимо write-through — иначе verify
-    /// самоподтверждался бы собственной записью) с паузой 1 с.
-    /// Rate limit — ретраи не продолжаются (мутация принята GitHub);
-    /// сетевой сбой и рассогласование — полный цикл, дальше громкий отказ.
-    async fn verify_status(
+    /// Парс raw-статуса носителя с терминальной резолюцией (#1403):
+    /// None/пустое — строка без читаемого поля (None); Done терминален
+    /// сразу (state не читаем, бюджет REST); иначе state-резолюция
+    /// guard_status. Оба чтения гарда — wt (row_status) и свежее
+    /// (fresh_row_status, #1437) — отвечают одной семантикой.
+    async fn resolve_carrier_status(
+        &self,
+        number: u64,
+        raw: Option<String>,
+    ) -> UsecaseResult<Option<Status>> {
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        if raw.trim().is_empty() {
+            return Ok(None);
+        }
+        let parsed = uwuwu_usecase::parse_status(&raw);
+        if parsed == Status::Done {
+            return Ok(Some(Status::Done));
+        }
+        let closed = match self.issue_state_closed(number).await {
+            Ok(closed) => Some(closed),
+            Err(e) => {
+                tracing::warn!(
+                    event = "row_status.state_unreadable",
+                    number,
+                    error = %e,
+                    "state issue не читался — гард отвечает парсом поля (#1403)"
+                );
+                None
+            }
+        };
+        Ok(Some(guard_status(parsed, closed)))
+    }
+
+    /// Свежее чтение статуса строки носителя мимо обоих кешей (wt и
+    /// items-индекс) (#1437): точечный GraphQL — issue → projectItems →
+    /// fieldValues, конвергенция ~2с (проба S1 #1437: 1.96–2.33с против
+    /// 14–22с листа REST и «навсегда» слепого GET item, #1236). Raw-имя
+    /// Status на доске `board` + closed issue (терминальная резолюция
+    /// #1403 в том же запросе — второе чтение не нужно). None — строки
+    /// на этой доске нет. Транспорт — gql_retrying (#1330): одиночный
+    /// флап не роняет гард/verify; окно first:100 с запасом против
+    /// измеренной кромки (максимум 6 полей на строке живой доски).
+    async fn gql_issue_status(
         &self,
         board: &str,
         number: u64,
-        expected: Status,
-        confirmed: Option<String>,
-    ) -> VerifyOutcome {
-        // сравнение доменное, не строковое: в окне merge→rename (#1383)
-        // носитель отвечает легаси-русским именем опции при английском каноне
-        if confirmed
-            .as_deref()
-            .is_some_and(|raw| uwuwu_usecase::parse_status(raw) == expected)
-        {
-            return VerifyOutcome::Ok;
+    ) -> UsecaseResult<Option<(String, Option<bool>)>> {
+        let meta = self.pv2.meta(board).await?;
+        let (owner, repo) = self
+            .repo
+            .split_once('/')
+            .ok_or_else(|| UsecaseError::Board(format!("repo: {}", self.repo)))?;
+        let data = self
+            .gql_retrying(
+                "query($owner:String!,$name:String!,$number:Int!){\
+                 repository(owner:$owner,name:$name){issue(number:$number){state \
+                 projectItems(first:100){nodes{project{number} \
+                 fieldValues(first:100){nodes{... on ProjectV2ItemFieldSingleSelectValue{name \
+                 field{... on ProjectV2SingleSelectField{name}}}}}}}}}}",
+                json!({ "owner": owner, "name": repo, "number": number }),
+            )
+            .await?;
+        // gql()/gql_retrying() возвращают body["data"] — envelope уже
+        // unwrapнут (багфикс дельты тест-раунда: двойной unwrap давал
+        // всегда None → каждая статусная запись отказывала на живом хабе)
+        let issue = &data["repository"]["issue"];
+        if issue.is_null() {
+            return Ok(None);
         }
-        for attempt in 0..3 {
-            if attempt > 0 {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let closed = Some(issue["state"] == "CLOSED");
+        for item in issue["projectItems"]["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if item["project"]["number"].as_u64() != Some(meta.project_number) {
+                continue;
             }
-            match self.pv2.fetch_status(board, number).await {
-                Ok(Some(raw)) if uwuwu_usecase::parse_status(&raw) == expected => {
-                    return VerifyOutcome::Ok;
+            let raw = item["fieldValues"]["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|v| v["field"]["name"] == "Status")
+                .and_then(|v| v["name"].as_str())
+                .unwrap_or_default()
+                .to_string();
+            return Ok(Some((raw, closed)));
+        }
+        Ok(None)
+    }
+
+    /// Контрольное чтение после мутации статуса (#1437): доказательство
+    /// применения — только точечный GraphQL-рид носителя мимо кешей;
+    /// echo мутации материал лога, не квитанции. Бюджет покрывает
+    /// измеренную конвергенцию ~2с (проба S1); исчерпание бюджета —
+    /// аномалия (лаг листа REST сюда не относится), громкий отказ.
+    /// Сравнение доменное (parse_status), не строковое: в окне
+    /// merge→rename (#1383) носитель отвечает легаси-русским именем
+    /// опции при английском каноне — raw в Confirmed может быть
+    /// легаси-русским, семантика равна.
+    async fn verify_status(&self, board: &str, number: u64, expected: Status) -> VerifyOutcome {
+        for attempt in 0..VERIFY_GQL_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(VERIFY_GQL_PAUSE_MS)).await;
+            }
+            match self.gql_issue_status(board, number).await {
+                Ok(Some((raw, _))) if uwuwu_usecase::parse_status(&raw) == expected => {
+                    return VerifyOutcome::Ok(raw);
                 }
                 Err(e) if is_rate_limited(&e) => return VerifyOutcome::SkippedRateLimited,
-                _ => {}
+                // не-rate-limited отказ (транспорт/парс) — не глотаем:
+                // диагностика бюджетных исходов вслепую стоила часа
+                // разбора тест-раунда (#1437)
+                Err(e) => tracing::warn!(
+                    event = "board.verify_attempt_failed",
+                    number,
+                    attempt = attempt + 1,
+                    error = %e,
+                    "попытка verify не сошлась (не rate limit) — ретрай в бюджете"
+                ),
+                Ok(other) => tracing::debug!(
+                    event = "board.verify_attempt_miss",
+                    number,
+                    attempt = attempt + 1,
+                    carrier = ?other.map(|(raw, _)| raw),
+                    "носитель прочитан, значение не совпало (read-лаг или no-op)"
+                ),
             }
         }
         VerifyOutcome::Mismatch
     }
 
-    /// Пост-мутационная гигиена кэша по исходу verify (код-ревью #1235
-    /// Common-3): write-through уже стоит — исход решает, остаётся ли он.
-    /// Ok/SkippedRateLimited → кэш держит записанное значение (окно
-    /// возможно-ложного значения при rate-limit ограничено TTL);
-    /// Mismatch → откат write-through (инвалидация) + громкий отказ —
-    /// не держим возможно-ложное значение дольше TTL wt (240 с, #1346;
-    /// семья #1213).
+    /// Пост-мутационная гигиена кэша по исходу verify (семья #1213/#1437)
+    /// и маппинг исхода в квитанцию — единая точка: Ok → Confirmed{actual};
+    /// rate-limit → честная Unverified (success не заявляется, write-through
+    /// сохранён — окно возможно-ложного значения ограничено TTL); Mismatch
+    /// после бюджета — аномалия (конвергенция GraphQL ~2с, проба S1): откат
+    /// write-through (инвалидация всех кешей) + громкий отказ.
     fn settle_write_through(
         &self,
         board: &str,
         number: u64,
-        outcome: VerifyOutcome,
+        outcome: &VerifyOutcome,
         status: Status,
-    ) -> UsecaseResult<()> {
+    ) -> UsecaseResult<StatusDelivery> {
         match outcome {
-            VerifyOutcome::Ok => {}
-            VerifyOutcome::SkippedRateLimited => tracing::warn!(
-                event = "board.verify_skipped",
-                number,
-                to = %uwuwu_usecase::status_name(status),
-                "verify пропущен (rate limit): мутация принята GitHub, write-through сохранён"
-            ),
+            VerifyOutcome::Ok(actual) => Ok(StatusDelivery::Confirmed {
+                actual: actual.clone(),
+            }),
+            VerifyOutcome::SkippedRateLimited => {
+                tracing::warn!(
+                    event = "board.verify_skipped",
+                    number,
+                    to = %uwuwu_usecase::status_name(status),
+                    "verify пропущен (rate limit): мутация принята GitHub, квитанция Unverified, write-through сохранён"
+                );
+                Ok(StatusDelivery::Unverified {
+                    reason: "GraphQL rate limit — confirmation not performed".into(),
+                })
+            }
             VerifyOutcome::Mismatch => {
                 self.invalidate_snapshot(board);
                 self.status_cache.invalidate(&number.to_string());
-                // write-through Pv2Rest — тот же инвариант: возможно-ложное
-                // значение не доживает TTL-окно (ревью 1 Common-3)
                 self.pv2.invalidate_status(board, number);
-                return Err(UsecaseError::Board(format!(
-                    "status #{number}: write «{}» not confirmed by read — \
-                     GitHub lag or mutation not applied; do not retry blindly",
+                Err(UsecaseError::Board(format!(
+                    "status #{number}: write \"{}\" not confirmed by fresh carrier read — \
+                     mutation not applied or carrier anomalous; do not retry blindly, \
+                     check the carrier",
                     uwuwu_usecase::status_name(status)
-                )));
+                )))
             }
         }
-        Ok(())
     }
 
     /// Комменты задачи: свежий хвост (direction=desc, последние 100),
@@ -691,6 +794,93 @@ impl GitHubHub {
         out.sort_by_key(|c| c.created_ms);
         Ok(out)
     }
+}
+
+/// Точный резолв доски по тайтлу среди досок хаба: GitHub ищет проекты
+/// нестрого, совпадение по слову — не совпадение по имени.
+fn board_id(nodes: &[Value], board: &str) -> UsecaseResult<String> {
+    nodes
+        .iter()
+        .find(|p| p["title"].as_str() == Some(board))
+        .and_then(|p| p["id"].as_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            UsecaseError::Board(format!(
+                "board «{board}» not found among {} boards",
+                nodes.len()
+            ))
+        })
+}
+
+/// Мета статусного поля доски (id поля + каталог опций) — из узла
+/// проекта, один раз на снимок.
+fn read_status_field(project: &Value, meta: &mut BoardMeta) {
+    meta.status_field_id = project["field"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    if let Some(options) = project["field"]["options"].as_array() {
+        for o in options {
+            if let (Some(id), Some(n)) = (o["id"].as_str(), o["name"].as_str()) {
+                meta.options.insert(n.to_string(), id.to_string());
+            }
+        }
+    }
+}
+
+/// Снимок доски по документам `gql`: список досок → точный тайтл →
+/// страницы строк по id проекта. Курсор передаётся дословно, стоп — на
+/// странице без `hasNextPage`; транспортные ретраи — за замыканием.
+async fn read_board_pages<F, Fut>(
+    repo: &str,
+    board: &str,
+    mut gql: F,
+) -> UsecaseResult<(Vec<Task>, BoardMeta)>
+where
+    F: FnMut(&'static str, Value) -> Fut,
+    Fut: std::future::Future<Output = UsecaseResult<Value>>,
+{
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or_else(|| UsecaseError::Board(format!("repo in the owner/name form: {repo}")))?;
+    let projects = gql(PROJECTS_QUERY, json!({ "owner": owner, "name": name })).await?;
+    let nodes = projects["repository"]["projectsV2"]["nodes"]
+        .as_array()
+        .ok_or_else(|| UsecaseError::Board("projectsV2.nodes is not an array".into()))?;
+    let mut meta = BoardMeta {
+        project_id: board_id(nodes, board)?,
+        ..BoardMeta::default()
+    };
+    let mut rows = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        let data = gql(
+            BOARD_ITEMS_QUERY,
+            json!({ "id": meta.project_id, "first": PAGE_SIZE, "after": cursor }),
+        )
+        .await?;
+        let project = &data["node"];
+        if project["items"].is_null() {
+            return Err(UsecaseError::Board(format!(
+                "board «{board}»: project not readable by id"
+            )));
+        }
+        if meta.status_field_id.is_empty() {
+            read_status_field(project, &mut meta);
+        }
+        let items = &project["items"];
+        if let Some(page) = items["nodes"].as_array() {
+            rows.extend(parse_page(page, &mut meta));
+        }
+        if items["pageInfo"]["hasNextPage"].as_bool() != Some(true) {
+            return Ok((rows, meta));
+        }
+        cursor = items["pageInfo"]["endCursor"].as_str().map(String::from);
+    }
+    Err(UsecaseError::Board(format!(
+        "board «{board}» exceeded the {MAX_PAGES} pages — the guard"
+    )))
 }
 
 /// Гард-резолюция статуса строки (#1403): закрытый issue терминален
@@ -856,7 +1046,12 @@ impl TaskBoardRepo for GitHubHub {
         Ok(self.snapshot(board).await?.0.clone())
     }
 
-    async fn set_status(&self, board: &str, number: u64, status: Status) -> UsecaseResult<()> {
+    async fn set_status(
+        &self,
+        board: &str,
+        number: u64,
+        status: Status,
+    ) -> UsecaseResult<StatusDelivery> {
         let name = uwuwu_usecase::status_name(status);
         // last-known статус строки — для ребра в логах (Low-2 код-ревью
         // #1235); источник — локальный статусный кеш, GraphQL не тратим
@@ -871,55 +1066,46 @@ impl TaskBoardRepo for GitHubHub {
         // read-лаг Projects v2 минутного масштаба не виден.
         self.write_through_status(board, number, status);
         self.write_through_status_cache(number, status);
-        // verify-after-write (семья #1213): ответ мутации — быстрый путь,
-        // иначе до 3 чтений носителя; rate limit — ретраи не продолжаются.
-        let outcome = self.verify_status(board, number, status, confirmed).await;
-        self.settle_write_through(board, number, outcome, status)?;
+        // verify-after-write (#1437): доказательство — только точечный
+        // GraphQL-рид носителя мимо кешей; echo мутации материал лога.
+        let outcome = self.verify_status(board, number, status).await;
+        let delivery = self.settle_write_through(board, number, &outcome, status)?;
         tracing::info!(
             event = "board.set_status",
             board,
             number,
             from = from.as_deref().unwrap_or("—"),
             to = %name,
-            "Статус строки обновлён и подтверждён чтением (from — last-known из кеша)"
+            confirmed_echo = confirmed.as_deref().unwrap_or("—"),
+            "Статусная запись: исход verify — в квитанции (from — last-known из кеша)"
         );
-        Ok(())
+        Ok(delivery)
     }
 
     async fn row_status(&self, board: &str, number: u64) -> UsecaseResult<Option<Status>> {
         // Pv2 REST (#1236): гард канона edit() больше не зависит от
         // GraphQL-бакета; project-фильтр — индекс этой доски (прочая
         // привязка строки — не наша строка, Low-1 код-ревью #1235)
-        match self.pv2.read_status(board, number).await? {
-            // Status-значения на носителе нет (строка не на доске /
-            // поле не задано / read-лаг); непустое непарсящееся — Some(Empty)
-            None => Ok(None),
-            Some(raw) if raw.trim().is_empty() => Ok(None),
-            Some(raw) => {
-                let parsed = uwuwu_usecase::parse_status(&raw);
-                if parsed == Status::Done {
-                    // поле уже терминально — state не читаем (бюджет REST)
-                    return Ok(Some(Status::Done));
-                }
-                // Терминальная резолюция (#1403): issue, закрытый мимо
-                // task_close, терминален независимо от отставшего поля —
-                // гард edit() режет фантомные переходы громкой канон-ошибкой
-                // вместо тихой записи в закрытый issue
-                let closed = match self.issue_state_closed(number).await {
-                    Ok(closed) => Some(closed),
-                    Err(e) => {
-                        tracing::warn!(
-                            event = "row_status.state_unreadable",
-                            number,
-                            error = %e,
-                            "state issue не читался — гард отвечает парсом поля (#1403)"
-                        );
-                        None
-                    }
-                };
-                Ok(Some(guard_status(parsed, closed)))
-            }
+        let raw = self.pv2.read_status(board, number).await?;
+        self.resolve_carrier_status(number, raw).await
+    }
+
+    async fn fresh_row_status(&self, board: &str, number: u64) -> UsecaseResult<Option<Status>> {
+        // Свежее чтение носителя мимо обоих кешей (#1437): точечный
+        // GraphQL-рид (~2с конвергенция, проба S1) — материал
+        // идемпотентного гарда edit(); state в том же запросе даёт
+        // терминальную резолюцию #1403 без второго чтения.
+        let Some((raw, closed)) = self.gql_issue_status(board, number).await? else {
+            return Ok(None);
+        };
+        if raw.trim().is_empty() {
+            return Ok(None);
         }
+        let parsed = uwuwu_usecase::parse_status(&raw);
+        if parsed == Status::Done {
+            return Ok(Some(Status::Done));
+        }
+        Ok(Some(guard_status(parsed, closed)))
     }
 
     async fn row_exists(&self, board: &str, number: u64) -> UsecaseResult<bool> {
@@ -2191,10 +2377,18 @@ mod tests {
     }
 
     #[test]
-    fn settle_ok_keeps_write_through() {
+    fn settle_ok_keeps_write_through_and_confirms() {
         let hub = hub_after_write_through("B", 7, Status::InProgress);
-        hub.settle_write_through("B", 7, VerifyOutcome::Ok, Status::InProgress)
-            .expect("Ok — кэш не трогается");
+        let outcome = VerifyOutcome::Ok("In Progress".to_string());
+        let delivery = hub
+            .settle_write_through("B", 7, &outcome, Status::InProgress)
+            .expect("Ok — кэш не трогается, квитанция Confirmed");
+        assert_eq!(
+            delivery,
+            uwuwu_usecase::StatusDelivery::Confirmed {
+                actual: "In Progress".to_string()
+            }
+        );
         let snap = hub
             .snap_cache
             .get("B", std::time::Instant::now())
@@ -2214,15 +2408,20 @@ mod tests {
     #[test]
     fn settle_rate_limit_skip_keeps_write_through() {
         // RATE_LIMITED: write-through сохраняем — окно возможно-ложного
-        // значения ограничено TTL, шуметь ошибкой на бюджетный отказ не надо
+        // значения ограничено TTL, квитанция честно Unverified (#1437)
         let hub = hub_after_write_through("B", 7, Status::InProgress);
-        hub.settle_write_through(
-            "B",
-            7,
-            VerifyOutcome::SkippedRateLimited,
-            Status::InProgress,
-        )
-        .expect("skip — не ошибка");
+        let delivery = hub
+            .settle_write_through(
+                "B",
+                7,
+                &VerifyOutcome::SkippedRateLimited,
+                Status::InProgress,
+            )
+            .expect("skip — не ошибка");
+        assert!(
+            matches!(delivery, uwuwu_usecase::StatusDelivery::Unverified { .. }),
+            "skip — честная Unverified-квитанция: {delivery:?}"
+        );
         assert!(
             hub.snap_cache.get("B", std::time::Instant::now()).is_some(),
             "write-through сохранён"
@@ -2231,14 +2430,17 @@ mod tests {
 
     #[test]
     fn settle_mismatch_rolls_back_write_through_and_errors() {
-        // Деликатная ветка: «success без эффекта» не должен держать ложный
-        // статус в кэше 60–120 с (#1213-семья, код-ревью Common-3)
+        // Бюджет verify на GraphQL-риде покрывает измеренную конвергенцию
+        // ~2с (проба S1 #1437) — исчерпание бюджета = аномалия: «success
+        // без эффекта» не должен держать ложный статус в кэше (#1213-
+        // семья, код-ревью Common-3) — откат + громкий отказ
         let hub = hub_after_write_through("B", 7, Status::InProgress);
         let err = hub
-            .settle_write_through("B", 7, VerifyOutcome::Mismatch, Status::InProgress)
+            .settle_write_through("B", 7, &VerifyOutcome::Mismatch, Status::InProgress)
             .expect_err("mismatch — громкая ошибка");
         assert!(
-            err.to_string().contains("not confirmed by read"),
+            err.to_string()
+                .contains("not confirmed by fresh carrier read"),
             "текст отказа: {err}"
         );
         assert!(
@@ -2427,6 +2629,196 @@ mod tests {
                 base_automerge,
                 "базлайн automerge восстановлен"
             );
+        });
+    }
+
+    // payload паники → текст (сводка, когда упало больше одного блока)
+    fn pin_panic_text(p: &(dyn std::any::Any + Send)) -> String {
+        if let Some(s) = p.downcast_ref::<String>() {
+            s.clone()
+        } else if let Some(s) = p.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else {
+            "нетекстовый payload паники".into()
+        }
+    }
+
+    // свежий рид носителя со строковым контекстом: падение рида или
+    // отсутствие строки — паника с номером строки пробы
+    async fn pin_fresh_status(
+        hub: &GitHubHub,
+        board: &str,
+        n: u64,
+        what: &str,
+    ) -> uwuwu_domain::Status {
+        hub.fresh_row_status(board, n)
+            .await
+            .unwrap_or_else(|e| panic!("#{n}: {what} упало: {e}"))
+            .unwrap_or_else(|| panic!("#{n}: {what} — строка не видна"))
+    }
+
+    // сводка исходов живого пина #1437: обе паники сообщаются, номер
+    // строки в каждом отказе (тест-ревью L2); одна паника при чистой
+    // уборке — resume с оригинальным panic-location
+    fn pin_report_outcome(
+        n: u64,
+        probe: Result<(), Box<dyn std::any::Any + Send>>,
+        cleanup: Result<(), Box<dyn std::any::Any + Send>>,
+        close_err: Option<UsecaseError>,
+    ) {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(p) = probe.as_ref().err() {
+            parts.push(format!("проба: {}", pin_panic_text(p.as_ref())));
+        }
+        if let Some(p) = cleanup.as_ref().err() {
+            parts.push(format!("восстановление: {}", pin_panic_text(p.as_ref())));
+        }
+        if let Some(e) = &close_err {
+            parts.push(format!("закрытие строки: {e}"));
+        }
+        match parts.len() {
+            // всё зелёное — строка закрыта
+            0 => {}
+            // ровно одна паника при чистой уборке — оригинальный
+            // panic-location сохраняется
+            1 if close_err.is_none() => {
+                if let Some(p) = probe.err().or_else(|| cleanup.err()) {
+                    std::panic::resume_unwind(p);
+                }
+                unreachable!("один отказ без close-ошибки — это паника");
+            }
+            _ => panic!(
+                "#{n}: строка пробы {}; отказы пина — {}",
+                if close_err.is_none() {
+                    "закрыта (close not_planned)"
+                } else {
+                    "НЕ закрыта — убрать руками, поиск по тайтлу [pin #1437]"
+                },
+                parts.join(" | ")
+            ),
+        }
+    }
+
+    /// #1437 живая проба (tester, тест-ревью C1/L1 + L2): честная квитанция
+    /// статусной записи на НАСТОЯЩЕМ ПЕРЕХОДЕ против реального носителя.
+    /// Фикстура строится пробой самой (зашитых номеров нет): create_issue
+    /// на доске sandbox, create-дефолт Analys (#1135), базлайн — свежий рид
+    /// носителя (create-конвергенция в бюджете verify 5×1с). Проба пишет
+    /// статус, ОТЛИЧНЫЙ от базлайна — запись того же значения квитанцию не
+    /// доказывает (носитель и до записи держит ожидаемое, Confirmed не
+    /// зависел бы ни от ухода PATCH, ни от чтения носителя). Контракт:
+    /// PATCH применился → квитанция Confirmed с raw-именем НОВОГО
+    /// значения + fresh_row_status (тот же gql_issue_status — путь
+    /// verify и идемпотентного гарда) видит переход.
+    ///
+    /// Уборка тотальна (тест-ревью L2): после успешного create строка
+    /// закрывается (close not_planned) на КАЖДОМ выходе — close идёт
+    /// независимо от исхода пробы, восстановления и их ассертов;
+    /// восстановление базлайна с контролем — в своём catch_unwind; при
+    /// двух паниках сообщаются обе; номер строки — в каждом сообщении
+    /// об отказе пина. Красный на класс бага раунда 1 (двойной unwrap
+    /// envelope в gql_issue_status): все риды дают Ok(None) → пин
+    /// краснеет на чтении базлайна (стадия фикстуры, строка при этом
+    /// всё равно закрывается), а не на Mismatch применённой записи;
+    /// на непосланном PATCH — громкий отказ Mismatch (носитель не
+    /// сдвинулся с базлайна).
+    #[test]
+    #[ignore] // живой прогон: GH_TOKEN + сеть к api.github.com; МУТАЦИЯ — настоящий переход с восстановлением базлайна
+    fn live_set_status_honest_receipt_on_real_carrier() {
+        use futures::FutureExt as _;
+        let repo =
+            std::env::var("UWUWU_HUB_REPO").unwrap_or_else(|_| "yurvon-screamo/uwuwu-hub".into());
+        let token = std::env::var("GH_TOKEN").expect("GH_TOKEN");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let board = "Задачи sandbox";
+            let hub = std::sync::Arc::new(GitHubHub::new(repo.clone(), token.clone()));
+            // 1. фикстура пробой самой: строка на sandbox, дефолт Analys
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_secs();
+            let title = format!("[pin #1437] честная квитанция: настоящий переход {stamp}");
+            let n = hub
+                .create_issue(
+                    board,
+                    "sandbox",
+                    &title,
+                    "живая проба тестера #1437 (честная квитанция статусной записи); \
+                     убирается за собой — close not_planned",
+                    None,
+                )
+                .await
+                .expect("фикстура: строка создана на доске sandbox");
+            // 2. базлайн свежим ридом носителя (create-конвергенция в бюджете
+            //    verify 5×1с) + 3. проба: настоящий переход In Progress ≠
+            //    Analys — под catch_unwind; base выносится наружу для отката
+            let mut base: Option<uwuwu_domain::Status> = None;
+            let probe = std::panic::AssertUnwindSafe(async {
+                for _ in 0..5u32 {
+                    base = hub
+                        .fresh_row_status(board, n)
+                        .await
+                        .unwrap_or_else(|e| panic!("#{n}: свежий рид после create упал: {e}"));
+                    if base.is_some() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+                let found = base.unwrap_or_else(|| {
+                    panic!("#{n}: фикстура не легла на доску за 5×1с — create-статус не прочитан")
+                });
+                base = Some(found);
+                assert_eq!(
+                    found,
+                    uwuwu_domain::Status::Analys,
+                    "#{n}: create-дефолт Analys (#1135) — иначе проба пишет мимо фикстуры"
+                );
+                let delivery = hub
+                    .set_status(board, n, uwuwu_domain::Status::InProgress)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "#{n}: применённая запись → честная квитанция Confirmed (#1437): {e}"
+                        )
+                    });
+                let uwuwu_usecase::StatusDelivery::Confirmed { actual } = delivery else {
+                    panic!("#{n}: квитанция без доказательства применения: {delivery:?}");
+                };
+                assert_eq!(
+                    uwuwu_usecase::parse_status(&actual),
+                    uwuwu_domain::Status::InProgress,
+                    "#{n}: raw-имя носителя = НОВОЕ значение перехода: {actual}"
+                );
+                // тот же путь чтения (gql_issue_status) в verify и гарде
+                let fresh = pin_fresh_status(&hub, board, n, "свежее чтение носителя").await;
+                assert_eq!(
+                    fresh,
+                    uwuwu_domain::Status::InProgress,
+                    "#{n}: носитель несёт переход"
+                );
+            })
+            .catch_unwind()
+            .await;
+            // 4. восстановление базлайна с контролем — в своём catch_unwind;
+            //    базлайн не прочитан — восстанавливать нечего, close ниже всё
+            //    равно закроет строку
+            let cleanup = std::panic::AssertUnwindSafe(async {
+                if let Some(b) = base {
+                    hub.set_status(board, n, b)
+                        .await
+                        .unwrap_or_else(|e| panic!("#{n}: восстановление базлайна упало: {e}"));
+                    let fresh = pin_fresh_status(&hub, board, n, "свежий рид после отката").await;
+                    assert_eq!(fresh, b, "#{n}: базлайн восстановлен на носителе");
+                }
+            })
+            .catch_unwind()
+            .await;
+            // 5. уборка тотальна (тест-ревью L2): close на каждом выходе —
+            //    независимо от исхода пробы, восстановления и ассертов
+            let close_err = hub.close_issue_ext(n, true).await.err();
+            // 6. сводка исходов
+            pin_report_outcome(n, probe, cleanup, close_err);
         });
     }
 
@@ -3216,3 +3608,10 @@ mod vcs_mapping_tests {
         assert!(f.branch().is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "hub_snapshot_stand.rs"]
+mod snapshot_stand;
+#[cfg(test)]
+#[path = "hub_snapshot_tests.rs"]
+mod snapshot_tests;

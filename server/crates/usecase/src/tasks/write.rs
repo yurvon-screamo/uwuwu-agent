@@ -4,7 +4,9 @@
 
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
-use crate::ports::{Clock, CommentRef, IssueFieldStore, TaskBoardRepo, TickStateStore};
+use crate::ports::{
+    Clock, CommentRef, IssueFieldStore, StatusDelivery, TaskBoardRepo, TickStateStore,
+};
 use crate::tasks::md_section;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -47,6 +49,16 @@ pub struct BodyWriteReceipt {
     pub verified: bool,
 }
 
+/// Квитанция edit (#1437): статусная запись несёт исход подтверждения
+/// носителем — текст ответа MCP task_edit строится из неё, не из факта
+/// отсутствия ошибки (echo мутации и серверные кеши доказательством
+/// не служат, инстансы 19–20.11).
+#[derive(Debug, Clone)]
+pub struct EditReceipt {
+    /// Some — патч нёс статус, исход подтверждения носителем.
+    pub status: Option<StatusDelivery>,
+}
+
 /// Квитанция секционной правки (#1152): исход + тело после записи.
 /// Полное тело не возвращается — сознательное сужение: возврат больших
 /// тел убивал бы экономию секционного пути; порча ловится точечным
@@ -71,9 +83,16 @@ pub trait TaskWriter: Send + Sync {
     /// Создание: Analys (create-дефолт #1135), лейбл proj:<project>,
     /// fm-скелет; дубль тайтла — ошибка.
     async fn create(&self, project: &str, spec: NewTask) -> UsecaseResult<u64>;
-    /// Правка: статус/ветка/PR/приоритет/тайтл (статус — поле доски,
-    /// ветка/PR/приоритет — нативные поля issue, тайтл — rename).
-    async fn edit(&self, project: &str, number: u64, patch: TaskPatch) -> UsecaseResult<()>;
+    /// Правка: статус/ветка/PR/приоритет/тайтл/тип (статус — поле доски,
+    /// ветка/PR/приоритет — нативные поля issue, тип — нативный issue
+    /// Type #1271, тайтл — rename). Статусная запись возвращает честную
+    /// квитанцию подтверждения носителем (#1437).
+    async fn edit(
+        &self,
+        project: &str,
+        number: u64,
+        patch: TaskPatch,
+    ) -> UsecaseResult<EditReceipt>;
     /// Заявка сессии в слот (dev — по умолчанию).
     async fn claim(&self, number: u64, session: &str, slot: Option<Slot>) -> UsecaseResult<()>;
     /// Коммент (reply — цитатный якорь).
@@ -105,6 +124,23 @@ pub trait TaskWriter: Send + Sync {
         content: &str,
         base_hash: &str,
     ) -> UsecaseResult<SectionEditReport>;
+}
+
+/// Option<Status> с носителя → верифицируемый current гарда: строки
+/// нет и значение непарсящееся — громкие отказы (контракт #1235/#1236),
+/// запись без верифицированного current запрещена. Оба чтения гарда —
+/// wt и свежее (#1437) — отвечают одной семантикой.
+fn verifiable_current(board: &str, number: u64, status: Option<Status>) -> UsecaseResult<Status> {
+    match status {
+        None => Err(UsecaseError::Board(format!(
+            "row #{number} is not on board «{board}» (no status on the carrier)"
+        ))),
+        Some(Status::Empty) => Err(UsecaseError::Board(format!(
+            "the carrier status of #{number} is unreadable — writing without a verified \
+             current is forbidden (the class of the triaged bug #1235), owner's triage"
+        ))),
+        Some(current) => Ok(current),
+    }
 }
 
 /// Точечная правка ячеек: None — не трогаем.
@@ -316,7 +352,12 @@ impl TaskWriter for TaskWriteUseCase {
         Ok(number)
     }
 
-    async fn edit(&self, project: &str, number: u64, patch: TaskPatch) -> UsecaseResult<()> {
+    async fn edit(
+        &self,
+        project: &str,
+        number: u64,
+        patch: TaskPatch,
+    ) -> UsecaseResult<EditReceipt> {
         let board = self.board_of(project);
         if board.is_empty() {
             return Err(UsecaseError::Board(format!(
@@ -336,27 +377,9 @@ impl TaskWriter for TaskWriteUseCase {
         let mut want_pr: Option<String> = None;
         let mut want_priority: Option<String> = None;
         let mut want_automerge: Option<bool> = None;
+        let mut status_delivery: Option<StatusDelivery> = None;
         if let Some(status) = patch.status {
-            // канон переходов — домен: запрещённое ребро = громкая ошибка.
-            // current — свежий статус носителя, не снапшот доски: стэйл-
-            // снапшот пропускал нелегальную перезапись как легальную,
-            // строка уезжала в Analys посреди конвейера (#1235)
-            let current = match self.board.row_status(&board, number).await? {
-                None => {
-                    return Err(UsecaseError::Board(format!(
-                        "row #{number} is not on board «{board}» \
-                         (no status on the carrier)"
-                    )))
-                }
-                Some(Status::Empty) => {
-                    return Err(UsecaseError::Board(format!(
-                        "the carrier status of #{number} is unreadable — writing without \
-                         a verified current is forbidden (the class of the triaged \
-                         bug #1235), owner's triage"
-                    )))
-                }
-                Some(current) => current,
-            };
+            let current = self.guard_current(&board, number, status).await?;
             // direct-класс (#1357): ребро In Progress → Review открыто
             // только строке с флагом — флаг добывается свежим чтением
             // носителя (семейство стейл-багов #1258/#1346: снапшоту
@@ -391,7 +414,7 @@ impl TaskWriter for TaskWriteUseCase {
                 to = %naming::status_name(status),
                 "Гард канона пропустил переход"
             );
-            self.board.set_status(&board, number, status).await?;
+            status_delivery = Some(self.board.set_status(&board, number, status).await?);
         }
         if let Some(title) = &patch.title {
             if rows
@@ -481,7 +504,10 @@ impl TaskWriter for TaskWriteUseCase {
                 kind: want_kind,
             },
         )
-        .await
+        .await?;
+        Ok(EditReceipt {
+            status: status_delivery,
+        })
     }
 
     async fn claim(&self, number: u64, session: &str, slot: Option<Slot>) -> UsecaseResult<()> {
@@ -831,6 +857,33 @@ impl EditExpectations {
 }
 
 impl TaskWriteUseCase {
+    /// Current для гарда канона edit(): wt-чтение носителя (свежее
+    /// против снапшота, #1235); идемпотентная переустановка (current ==
+    /// target) доверяет только свежему носителю (#1437, симптом 2) —
+    /// wt/items-кеш могли показать цель там, где носитель живёт другим
+    /// статусом, и стейл-писец (повтор старого вердикта пробуждённой
+    /// сессией) проводил запрещённый переход как «переустановку» поверх
+    /// кеш-лага. Нелегальные на вид рёбра wt-щитом #1346 не тронуты —
+    /// свежее чтение только здесь. None/непарсящееся — громкие отказы
+    /// (verifiable_current, контракт #1235/#1236).
+    async fn guard_current(
+        &self,
+        board: &str,
+        number: u64,
+        target: Status,
+    ) -> UsecaseResult<Status> {
+        let current =
+            verifiable_current(board, number, self.board.row_status(board, number).await?)?;
+        if current != target {
+            return Ok(current);
+        }
+        verifiable_current(
+            board,
+            number,
+            self.board.fresh_row_status(board, number).await?,
+        )
+    }
+
     /// direct-флаг с носителя (#1357): ребро In Progress → Review гвардится
     /// флагом — на этом ребре (и только на нём) флаг читается свежим
     /// fields.load, на остальных false. Отдельный метод: edit не несёт
@@ -1097,9 +1150,16 @@ mod tests {
             }
             Ok(())
         }
-        async fn set_status(&self, _b: &str, _n: u64, s: Status) -> UsecaseResult<()> {
+        async fn set_status(
+            &self,
+            _b: &str,
+            _n: u64,
+            s: Status,
+        ) -> UsecaseResult<crate::ports::StatusDelivery> {
             self.carrier.lock().expect("fake carrier").status = s;
-            Ok(())
+            Ok(crate::ports::StatusDelivery::Confirmed {
+                actual: naming::status_name(s).to_string(),
+            })
         }
         async fn set_session(&self, _b: &str, _n: u64, _slot: Slot, _s: &str) -> UsecaseResult<()> {
             Ok(())

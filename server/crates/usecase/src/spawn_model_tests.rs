@@ -179,8 +179,15 @@ impl TaskBoardRepo for RowsBoard {
     async fn read_board(&self, _b: &str) -> UsecaseResult<Vec<Task>> {
         Ok(self.rows.clone())
     }
-    async fn set_status(&self, _b: &str, _n: u64, _s: Status) -> UsecaseResult<()> {
-        Ok(())
+    async fn set_status(
+        &self,
+        _b: &str,
+        _n: u64,
+        _s: Status,
+    ) -> UsecaseResult<crate::ports::StatusDelivery> {
+        Ok(crate::ports::StatusDelivery::Confirmed {
+            actual: crate::naming::status_name(_s).to_string(),
+        })
     }
     async fn row_status(&self, _b: &str, _n: u64) -> UsecaseResult<Option<Status>> {
         Ok(None)
@@ -339,7 +346,7 @@ async fn analyst_review_spawn_carries_model_from_server_map() {
     assert_model(
         sessions.spec_of(),
         "ревью-спавн аналитики",
-        "zai-coding-plan/glm-5.3#high",
+        "zai-coding-plan/glm-5.3-flash#high",
     );
 }
 
@@ -413,8 +420,18 @@ async fn dreamer_spawn_carries_model_from_server_map() {
 
 #[tokio::test]
 async fn cron_run_carries_model_from_server_map() {
-    // Arrange
+    // Arrange: якорь первой встречи в прошлом (#1517) — файр состоялся,
+    // проверяется карта моделей рана, не якорная семантика.
     let sessions = CaptureSessions::new(vec![]);
+    let state = crate::crons::MemCronState::new();
+    use crate::ports::CronStateStore;
+    state.set_cron_row(
+        "Тест",
+        crate::ports::CronRow {
+            anchor_ms: Some(40 * 60_000 - 300_000),
+            ..crate::ports::CronRow::default()
+        },
+    );
     let u = CronUseCase::new(
         Arc::new(CronWiki),
         Arc::new(SessionRouter::uniform(sessions.clone())),
@@ -422,7 +439,7 @@ async fn cron_run_carries_model_from_server_map() {
         models(),
         std::collections::HashMap::from([("uwuwu".to_string(), "/tmp".to_string())]),
         7,
-        crate::crons::MemCronState::new(),
+        state,
         None,
     );
 

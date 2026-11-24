@@ -134,9 +134,16 @@ pub(super) async fn sweep_row(ctx: &RowCtx<'_>, task: &Task, out: &mut EnvGcOutc
         }
     }
     let row = number.to_string();
+    // args = только row: opencode резолвит шаблон команды, подставляя в
+    // $1 только первый токен args (argsRegex в session/prompt.ts), а
+    // шаблон task-env-gc.md несёт слово sweep литерально — «sweep <row>»
+    // в args делали $1 = "sweep", скрипт вердиктил чужой env
+    // «ENV-GC sweep ABSENT» и вердикт никогда не совпадал с маркером
+    // сервера (bug #1506, LIVE 22.11 — ретрай-цикл на Done-строках).
+    // Контракт единый с task-env: args = row, подкоманда живёт в шаблоне.
     if let Err(e) = ctx
         .sessions
-        .run_command(ctx.bootstrap, "task-env-gc", &format!("sweep {row}"))
+        .run_command(ctx.bootstrap, "task-env-gc", &row)
         .await
     {
         out.failed += 1;

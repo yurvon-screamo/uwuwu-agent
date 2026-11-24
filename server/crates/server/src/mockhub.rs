@@ -287,7 +287,24 @@ impl TaskBoardRepo for MemoryHub {
         })
     }
 
-    async fn set_status(&self, _board: &str, number: u64, status: Status) -> UsecaseResult<()> {
+    async fn set_status(
+        &self,
+        _board: &str,
+        number: u64,
+        status: Status,
+    ) -> UsecaseResult<uwuwu_usecase::StatusDelivery> {
+        // Fault-режим phantom-записей (#1331/#1437): «успех» без записи
+        // носителя — статусная ветка на живом хабе ловит это verify'ем
+        // (точечный GraphQL-рид, #1437) и отвечает громким отказом из
+        // settle; мок стенда воспроизводит наблюдаемый исход — тот же
+        // класс отказа, чтобы e2e-фаза 11 проверяла контракт целиком.
+        if phantom_writes() {
+            return Err(UsecaseError::Board(format!(
+                "status #{number}: write \"{}\" not confirmed by fresh carrier read — \
+                 not applied (stand phantom mode)",
+                uwuwu_usecase::status_name(status)
+            )));
+        }
         self.with_state(|state| {
             let task = state
                 .tasks
@@ -295,6 +312,9 @@ impl TaskBoardRepo for MemoryHub {
                 .ok_or_else(|| UsecaseError::Board(format!("mockhub: #{number} нет")))?;
             let _ = task.transition(status);
             Ok(())
+        })?;
+        Ok(uwuwu_usecase::StatusDelivery::Confirmed {
+            actual: uwuwu_usecase::status_name(status).to_string(),
         })
     }
 

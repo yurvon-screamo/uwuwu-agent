@@ -52,8 +52,15 @@ impl TaskBoardRepo for SweepBoard {
     async fn read_board(&self, _b: &str) -> UsecaseResult<Vec<Task>> {
         Ok(Vec::new())
     }
-    async fn set_status(&self, _b: &str, _n: u64, _s: Status) -> UsecaseResult<()> {
-        Ok(())
+    async fn set_status(
+        &self,
+        _b: &str,
+        _n: u64,
+        _s: Status,
+    ) -> UsecaseResult<crate::ports::StatusDelivery> {
+        Ok(crate::ports::StatusDelivery::Confirmed {
+            actual: crate::naming::status_name(_s).to_string(),
+        })
     }
     async fn row_status(&self, _b: &str, _n: u64) -> UsecaseResult<Option<Status>> {
         Ok(None)

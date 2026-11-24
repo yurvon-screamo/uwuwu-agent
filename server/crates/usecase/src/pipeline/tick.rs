@@ -6,7 +6,7 @@ use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
 use crate::ports::{
     Clock, DecisionJudge, JudgeCfg, JudgeContext, JudgeSessionTail, Liveness, PrGateway,
-    TaskBoardRepo, TickStateStore,
+    QuotaProbe, TaskBoardRepo, TickStateStore,
 };
 use crate::router::SessionRouter;
 use crate::spawn_models::SpawnModels;
@@ -133,6 +133,10 @@ pub struct TickOutcome {
     /// Строк, пропущенных тиком при отказе enrichment (#1163): решение
     /// по невидимым ячейкам — источник дублей, ждём следующий тик.
     pub enrich_skipped: usize,
+    /// Строк на лимитной паузе (#1477): гейт классифицировал тишину как
+    /// исчерпание окна подписки — пинги/эскалация не выполняются, сигнал
+    /// массовости — tick_loop (main.rs).
+    pub limit_paused: usize,
     /// Строк с недостоверной пробой активности исполнителя (Err): отказ
     /// сталл-прохода строки — без эскалации и записи каунтеров (#1281).
     pub probe_failed: usize,
@@ -178,6 +182,10 @@ enum StallAct {
     /// вердикт о тишине не может быть получен (#1281, срез честности
     /// пробы). Эскалация и запись каунтеров не выполняются.
     ProbeFailed,
+    /// Лимитная тишина (#1477): окно подписки исчерпано (проба квоты) —
+    /// простой классифицирован как лимитный: пинги/каунтеры/судья/
+    /// эскалация не выполняются, самовозобновление — пробой после спада.
+    LimitPaused,
 }
 
 /// Полоса отказов пробы за тик, при которой тик сигнализирует деградацию
@@ -211,6 +219,11 @@ pub struct TickUseCase {
     pub judge: Option<Arc<dyn DecisionJudge>>,
     /// Конфиг контура судьи (пороги/тримы/гвард — канон плана #1364).
     pub judge_cfg: JudgeCfg,
+    /// Проба квоты подписки провайдера (#1477): гейт лимитной тишины —
+    /// простой ходов из-за исчерпания окна не эскалируется. None — off
+    /// ([quota] нет в конфиге); Err пробы — старая механика немедленно
+    /// (проба улучшение, не зависимость).
+    pub quota: Option<Arc<dyn QuotaProbe>>,
 }
 
 /// Причина hold спавна: зрение недоступно или в env живая сестра.
@@ -555,6 +568,7 @@ impl TickUseCase {
             soft_pings = out.soft_pings,
             soft_pings_deferred = out.soft_pings_deferred,
             stall_flagged = out.stall_flagged,
+            limit_paused = out.limit_paused,
             review_flagged = out.review_flagged,
             session_lost_flagged = out.session_lost_flagged,
             observed = out.observed,
@@ -1022,6 +1036,9 @@ impl TickUseCase {
                 Ok(StallAct::Deferred) => out.soft_pings_deferred += 1,
                 Ok(StallAct::Flagged) => out.stall_flagged += 1,
                 Ok(StallAct::ProbeFailed) => out.probe_failed += 1,
+                // лимитная пауза учтена гейтом (out.limit_paused), сигнал
+                // массовости — tick_loop (main.rs)
+                Ok(StallAct::LimitPaused) => {}
                 // обе Err-ветки — путь доставки: классифицированная потеря
                 // маршрутизируется, прочие отказы логируются как раньше (#1288)
                 Err(e) => {
@@ -1224,10 +1241,11 @@ impl TickUseCase {
         cup: CupGate,
         out: &mut TickOutcome,
     ) -> UsecaseResult<StallAct> {
-        let Some(slot) = task.stage_slot() else {
-            return Ok(StallAct::None);
-        };
-        let Some(session) = task.session_of(slot).map(str::to_string) else {
+        // без слота или сессии на слоте сталл не определён — тихий пропуск
+        let Some((slot, session)) = task
+            .stage_slot()
+            .and_then(|slot| task.session_of(slot).map(|s| (slot, s.to_string())))
+        else {
             return Ok(StallAct::None);
         };
         // нет данных/ошибка чтения — не сталл (мёртвую сессию заберёт decide);
@@ -1308,6 +1326,12 @@ impl TickUseCase {
         if count > 0 && now.saturating_sub(last_ping) < every {
             return Ok(StallAct::None);
         }
+        // Лимитный гейт (#1477): до пингов/судьи — см. quota_gate.
+        if let Some(quota) = &self.quota {
+            if let Some(act) = self.quota_gate(quota, task, out).await {
+                return Ok(act);
+            }
+        }
         // Контур судьи (#1364): тот же гейтинг (тишина, раунд по статусу,
         // интервал повторов, рестарт-инвариант #1281), решение — вердикт
         // decision-модели вместо пингов/автопаркинга. Err вызова — fallback
@@ -1329,6 +1353,53 @@ impl TickUseCase {
         }
         self.stall_action(board, task, slot, &session, soft, silence, count, now, cup)
             .await
+    }
+
+    /// Лимитный гейт (#1477): исчерпание окна подписки — простой ходов
+    /// нормативный, не сбой сессии. Каунтеры раунда не пишутся
+    /// (пост-резетный пинг не задерживается), вердикт судьи на лимитной
+    /// тишине не сжигается. Err пробы — None: старая механика немедленно,
+    /// отказ пробы не парализует эскалацию сталл-детекта (проба —
+    /// улучшение, не зависимость).
+    async fn quota_gate(
+        &self,
+        quota: &Arc<dyn QuotaProbe>,
+        task: &Task,
+        out: &mut TickOutcome,
+    ) -> Option<StallAct> {
+        match quota.probe().await {
+            Ok(snapshot) if snapshot.exhausted => {
+                // пауза — норма контура (#1477): info, как stall.soft_pinged,
+                // а не уровень эскалации; атрибуты — значениями, не Debug
+                tracing::info!(
+                    event = "stall.limit_paused",
+                    number = task.number(),
+                    window_pct = snapshot
+                        .window_pct
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "none".into()),
+                    reset_at_ms = snapshot
+                        .reset_at_ms
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "none".into()),
+                    "Лимитная тишина: окно подписки исчерпано — строка на паузе \
+                     без эскалации, продолжит после спада процента"
+                );
+                out.limit_paused += 1;
+                Some(StallAct::LimitPaused)
+            }
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(
+                    event = "stall.quota_probe_err",
+                    number = task.number(),
+                    error = %e,
+                    "Проба квоты недоступна — лимитный гейт пропущен, \
+                     сталл-механика живёт как раньше"
+                );
+                None
+            }
+        }
     }
 
     /// Действие сталл-раунда: эскалация владельцу (пинги исчерпаны),

@@ -12,17 +12,53 @@ use uwuwu_domain::{
 pub type FmMutator =
     Box<dyn for<'a> FnOnce(&'a mut std::collections::BTreeMap<String, String>) + Send>;
 
+/// Исход статусной записи (#1437): честная квитанция — подтверждением
+/// служит только свежее чтение носителя (мимо write-through и
+/// индексного кеша). Текст ответа MCP task_edit строится из этого
+/// исхода, не из факта отсутствия ошибки.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusDelivery {
+    /// Носитель подтвердил запись свежим чтением; actual — raw-имя
+    /// статуса с носителя (может расходиться с каноническим
+    /// написанием псевдонимом — «Вейт», семантика равна).
+    Confirmed { actual: String },
+    /// GitHub принял мутацию, свежее чтение носителя в бюджете verify
+    /// применения не показало (read-лаг Projects v2 / rate limit):
+    /// success не заявляется, агенту предписано контрольное чтение
+    /// носителя.
+    Unverified { reason: String },
+}
+
 /// Доска задач: чтение строк + мутации носителя (поля+fm синхронны —
 /// инвариант «fm ≡ поля» держит реализация).
 #[async_trait]
 pub trait TaskBoardRepo: Send + Sync {
     async fn read_board(&self, board: &str) -> UsecaseResult<Vec<Task>>;
-    async fn set_status(&self, board: &str, number: u64, status: Status) -> UsecaseResult<()>;
+    /// Статусная запись с честным исходом (#1437): Ok несёт исход
+    /// подтверждения носителем — echo мутации и серверные кеши не
+    /// доказательство применения (инстансы 19–20.11: «обновлена» при
+    /// no-op на носителе). Err — мутация не принята (гард, HTTP,
+    /// носитель отказал).
+    async fn set_status(
+        &self,
+        board: &str,
+        number: u64,
+        status: Status,
+    ) -> UsecaseResult<StatusDelivery>;
     /// Свежий статус строки с носителя, мимо кэшей доски — гард канона
     /// edit() обязан сверяться с носителем, не со снапшотом (#1235).
     /// None — Status-значения на носителе нет (строки нет на доске /
     /// поле не задано); Some(Empty) — значение носителя непарсящееся.
     async fn row_status(&self, board: &str, number: u64) -> UsecaseResult<Option<Status>>;
+    /// Свежий статус строки с НОСИТЕЛЯ мимо всех серверных кешей
+    /// (write-through и индексный): доказательство идемпотентного
+    /// гарда edit() (#1437, симптом 2 — стейл-писец проводил
+    /// перезапись как «переустановку» поверх кеш-лага) и материал
+    /// verify статусной записи. Реализации без кешей могут не
+    /// переопределять — дефолт делегирует row_status.
+    async fn fresh_row_status(&self, board: &str, number: u64) -> UsecaseResult<Option<Status>> {
+        self.row_status(board, number).await
+    }
     /// Предикат присутствия строки на доске — независим от читаемости
     /// Status (строка без поля/в read-лаге всё ещё строка; close-поиск
     /// доски #1236).
@@ -390,12 +426,15 @@ pub struct CronRunTrack {
 
 /// Машинный учёт крона (state.json, секция `crons`, #1480 — снос журнала):
 /// last_fire — факт файра (источник is_due вместо журнальной строки),
+/// anchor — якорь первой встречи (None не файрит: крон без факта ждёт
+/// ближайшей плановой минуты, #1517 — класс масс-догона на потере state),
 /// run — незавершённый ран (детект тишины), deferred_since — файр due,
 /// но отложен (детект пропуска), fails — счётчик отказов (канон ADR-103
 /// «счётчики отказов — в state»).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CronRow {
     pub last_fire_ms: Option<u64>,
+    pub anchor_ms: Option<u64>,
     pub deferred_since_ms: Option<u64>,
     pub run: Option<CronRunTrack>,
     pub fails: u32,
@@ -507,6 +546,33 @@ pub struct JudgeContext {
 #[async_trait]
 pub trait DecisionJudge: Send + Sync {
     async fn decide(&self, ctx: &JudgeContext) -> UsecaseResult<uwuwu_domain::JudgeVerdict>;
+}
+
+/// Снимок окна подписки провайдера моделей (лимитный гейт сталл-детекта,
+/// #1477): факт «окно подписки исчерпано» — глобальный для подписки, не
+/// пер-сессионный.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuotaSnapshot {
+    /// Окно подписки исчерпано — ходы провайдера встают на паузу.
+    pub exhausted: bool,
+    /// Заполнение окна в процентах, если провайдер его отдал.
+    pub window_pct: Option<u8>,
+    /// Заявленный провайдером резет (epoch ms), если отдал; ядро резет
+    /// не вычисляет — пауза по факту повторных проб.
+    pub reset_at_ms: Option<u64>,
+}
+
+/// Проба квоты подписки провайдера моделей (#1477): гейт сталл-детекта
+/// классифицирует лимитную тишину (простой ходов из-за исчерпания окна
+/// подписки — не сбой сессии). Привязка к провайдеру — за трейтом
+/// (требование владельца 23.11.2026): ядро видит только факт окна;
+/// конкретный эндпоинт — адаптер сервера. Err — проба недоступна (сеть,
+/// дрейф формы; off — это отсутствие пробы, None): гейт пропускает,
+/// старая механика сталл-детекта живёт — проба улучшение, не зависимость
+/// (прецедент DecisionJudge).
+#[async_trait]
+pub trait QuotaProbe: Send + Sync {
+    async fn probe(&self) -> UsecaseResult<QuotaSnapshot>;
 }
 
 /// Нативные поля issue (сессии/ветка/PR/приоритет/тип): fm-зеркало снесено.
