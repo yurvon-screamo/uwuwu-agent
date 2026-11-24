@@ -32,88 +32,93 @@ pub struct ToolHub {
 /// Дефолтный проект для инструментов без явного project.
 pub const DEFAULT_PROJECT: &str = "uwuwu";
 
-/// Мутационная поверхность: разрешённые ключи аргументов по тула (схема
-/// тула + диспетчерский project; autodone — легально читаемый legacy-ключ
-/// task_create). Чужой ключ — громкий отказ до мутации (#1572): тихий
-/// strip деградировал вызов — find/replace в task_body_section молча
-/// отбрасывались, вызов с absent content уходил в очистку секции.
-/// Читающие тулы вне списка: лишний ключ чтения носитель не трогает.
-const MUTATION_ARG_KEYS: &[(&str, &[&str])] = &[
-    (
-        "task_create",
-        &[
-            "title",
-            "project",
-            "body",
-            "type",
-            "priority",
-            "automerge",
-            "direct",
-            "autodone",
-        ],
-    ),
-    (
-        "task_edit",
-        &[
-            "number",
-            "project",
-            "status",
-            "branch",
-            "pr",
-            "priority",
-            "title",
-            "type",
-            "automerge",
-        ],
-    ),
-    ("task_claim", &["number", "project", "session"]),
-    ("task_comment", &["number", "project", "text", "reply_to"]),
-    ("task_close", &["number", "project", "not_planned"]),
-    ("task_clean", &["ids", "project", "confirm", "ack"]),
-    ("task_undo", &["project", "journal"]),
-    ("board_status_rename", &["project", "from", "to"]),
-    ("task_body", &["number", "project", "body"]),
-    (
-        "task_body_section",
-        &[
-            "number",
-            "project",
-            "section",
-            "content",
-            "base_hash",
-            "confirm",
-        ],
-    ),
-    (
-        "blob_put",
-        &["filename", "data_base64", "number", "project"],
-    ),
-    ("docs_write", &["slug", "content", "message"]),
-    ("docs_append", &["slug", "line", "message"]),
+/// Мутационные тулы: имена — семантический факт «тул мутирует носитель»
+/// (в дескрипторах не кодируется). Новый мутационный тул — добавь имя
+/// сюда; ключи гард возьмёт из дескриптора сам. Тул из списка без
+/// дескриптора гардится громко (всё чужое) — дескриптор обязателен.
+const MUTATION_TOOLS: &[&str] = &[
+    "task_create",
+    "task_edit",
+    "task_claim",
+    "task_comment",
+    "task_close",
+    "task_clean",
+    "task_undo",
+    "board_status_rename",
+    "task_body",
+    "task_body_section",
+    "blob_put",
+    "docs_write",
+    "docs_append",
 ];
 
+/// Ключи диспетчера: легальны на любом тулe (канон «проект — канал
+/// вызова», читается диспетчером до хендлера), в текст отказа «the tool
+/// knows» не входят — рекламировать надо только ключи схемы (ревью #1572
+/// Common-2: project в списке task_comment рекламировал мёртвый ключ).
+const DISPATCHER_KEYS: &[&str] = &["project"];
+
+/// Legacy-ключи: читаются хендлерами, в схему не рекламируются —
+/// осознанное решение #1232 («legacy-ключ не рекламится (но читается)»,
+/// пин descriptors_expose_automerge). Единственное исключение из
+/// дескриптор-вывода, перечислено явно: (тул, ключ).
+const LEGACY_KEYS: &[(&str, &str)] = &[("task_create", "autodone")];
+
+/// Разрешённые ключи мутационного тула — из inputSchema дескриптора,
+/// единый носитель контракта «какие ключи принимает тул» (ревью #1572
+/// Common-2: рукописная копия схемы дрейфовала) + LEGACY_KEYS. Some(пусто)
+/// — тул из списка без дескриптора: гардится громко; None — не мутационный.
+fn mutation_allowed_keys(name: &str) -> Option<Vec<String>> {
+    if !MUTATION_TOOLS.contains(&name) {
+        return None;
+    }
+    let list = tool_descriptors();
+    let props = list
+        .as_array()?
+        .iter()
+        .find(|t| t["name"].as_str() == Some(name))
+        .map(|t| &t["inputSchema"]["properties"]);
+    let Some(props) = props else {
+        return Some(Vec::new());
+    };
+    let mut keys: Vec<String> = props
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    for (tool, key) in LEGACY_KEYS {
+        if *tool == name {
+            keys.push((*key).to_string());
+        }
+    }
+    Some(keys)
+}
+
 /// Гард чужих ключей мутационной поверхности (#1572, сценарий 2): вызов
-/// с ключами вне схемы — громкий отказ с перечнем чужих и известных
-/// ключей; носитель не трогается. Отказ вместо тихого strip (ADR-065:
-/// «стрип маскировал бы ошибку навсегда»).
+/// с ключами вне схемы — громкий отказ до мутации; носитель не трогается,
+/// контент не передан. Отказ вместо тихого strip (ADR-065: «стрип
+/// маскировал бы ошибку навсегда»); история деградации — вторым
+/// предложением (ревью #1572 Low: прошедшее время читалось как «прошло»).
 fn refuse_unknown_args(name: &str, args: &Value) -> Result<(), String> {
-    let Some((_, allowed)) = MUTATION_ARG_KEYS.iter().find(|(n, _)| *n == name) else {
+    let Some(allowed) = mutation_allowed_keys(name) else {
         return Ok(());
     };
     let mut unknown: Vec<&str> = Vec::new();
     if let Some(map) = args.as_object() {
         for key in map.keys() {
-            if !allowed.contains(&key.as_str()) {
-                unknown.push(key.as_str());
+            if DISPATCHER_KEYS.contains(&key.as_str()) || allowed.iter().any(|a| a == key) {
+                continue;
             }
+            unknown.push(key.as_str());
         }
     }
     if unknown.is_empty() {
         return Ok(());
     }
     Err(format!(
-        "unknown argument(s) {} for {name} — the tool knows: {}; unknown keys were silently \
-         ignored and degraded the call (bug #1572) — re-send with the schema keys",
+        "unknown argument(s) {} for {name} — the write is REFUSED, the carrier is untouched \
+         (no content was passed); the tool knows: {} — re-send with the schema keys (unknown \
+         keys used to be silently ignored and degraded the call to a partial write, \
+         bug #1572)",
         unknown.join(", "),
         allowed.join(", ")
     ))
@@ -319,7 +324,9 @@ pub fn tool_descriptors() -> Value {
                 "number": integer("task number"),
                 "project": string("project; default uwuwu"),
                 "body": string("full markdown body (no fm); ABSENT parameter is a loud \
-                              refusal (read via task_get); empty string — clear deliberately")
+                              refusal (read via task_get); empty or whitespace-only string — \
+                              clear deliberately; fm/task_get-header-only input is refused \
+                              (no effective content)")
             }))
         ),
         tool(
@@ -802,10 +809,19 @@ impl ToolHub {
             .set_body(project, number, body)
             .await
             .map_err(|e| e.to_string())?;
-        let mut msg = format!(
-            "body of #{number} replaced; {} bytes; body_hash: {}",
-            receipt.body_size, receipt.body_hash
-        );
+        // явная очистка названа актом (ревью #1572 Low): секционный путь
+        // тот же акт зовёт «cleared»
+        let mut msg = if receipt.body_size == 0 {
+            format!(
+                "body of #{number} cleared; 0 bytes; body_hash: {}",
+                receipt.body_hash
+            )
+        } else {
+            format!(
+                "body of #{number} replaced; {} bytes; body_hash: {}",
+                receipt.body_size, receipt.body_hash
+            )
+        };
         if !receipt.verified {
             msg.push_str(delivery_unverified_marker());
         }
@@ -1271,6 +1287,65 @@ mod tests {
             assert!(names.contains(&expected), "нет инструмента {expected}");
         }
         assert_eq!(names.len(), 24, "контракт поверхности: {names:?}");
+    }
+
+    /// Пин консистентности Common-2 (ревью #1572): allow-list гарда
+    /// выводится из дескрипторов — единый носитель контракта. Тест ловит
+    /// оба дрейфа: «ключ в схеме, гард отвергает» и «чужой ключ гард
+    /// пропускает», и требует от каждого мутационного тула дескриптора
+    /// (тул из списка без дескриптора гардится громко, не молча).
+    #[test]
+    fn mutation_guard_keys_match_descriptors() {
+        let list = tool_descriptors();
+        for name in MUTATION_TOOLS {
+            let tool = list
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"].as_str() == Some(name))
+                .unwrap_or_else(|| panic!("мутационный тул {name} вне каталога дескрипторов"));
+            let keys: Vec<&str> = tool["inputSchema"]["properties"]
+                .as_object()
+                .expect("inputSchema.properties")
+                .keys()
+                .map(String::as_str)
+                .chain(
+                    LEGACY_KEYS
+                        .iter()
+                        .filter(|(t, _)| *t == *name)
+                        .map(|(_, k)| *k),
+                )
+                .collect();
+            assert!(!keys.is_empty(), "{name}: дескриптор без ключей");
+            // схема-ключи + диспетчерский project легальны
+            let mut args = serde_json::Map::new();
+            for k in &keys {
+                args.insert((*k).to_string(), json!("x"));
+            }
+            args.insert("project".to_string(), json!("uwuwu"));
+            assert!(
+                refuse_unknown_args(name, &Value::Object(args.clone())).is_ok(),
+                "{name}: схема-ключи + project легальны"
+            );
+            // мусорный ключ — громкий отказ с перечнем известных
+            args.insert("__find__".to_string(), json!("x"));
+            let err = refuse_unknown_args(name, &Value::Object(args))
+                .expect_err("чужой ключ отвергается");
+            assert!(err.contains("__find__"), "{name}: чужой ключ назван: {err}");
+        }
+        // диспетчерский project не рекламируется в «the tool knows» —
+        // только ключи схемы (мёртвых ключей в отказе нет)
+        let err = refuse_unknown_args("task_comment", &json!({ "find": "x" })).expect_err("отказ");
+        assert!(
+            !err.contains("project"),
+            "project — канал диспетчера, не ключ схемы: {err}"
+        );
+        // project легален на любом мутационном тулe, даже не объявленном
+        assert!(refuse_unknown_args(
+            "task_comment",
+            &json!({ "number": 1, "text": "т", "project": "uwuwu" })
+        )
+        .is_ok());
     }
 
     #[test]

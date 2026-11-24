@@ -169,6 +169,13 @@ pub(crate) fn section_content_len(md: &str, section: &str) -> Option<usize> {
     }
 }
 
+/// Единая мера объёма контента — байты строк без переводов строк, пустые
+/// строки по нулям: «было» (мера SectionScan) и «стало» (квитанция и пол
+/// гарда) одной меры, числа сопоставимы (ревью #1572 Low).
+pub(crate) fn section_content_metric(s: &str) -> usize {
+    s.trim().lines().map(|l| l.len()).sum()
+}
+
 /// Твин-гард: громкий отказ с уровнем тёзки, байт-точной строкой (первой
 /// по порядку — детерминизм) и рецептом обхода; записи нет.
 fn twin_rejection(
@@ -243,8 +250,11 @@ impl<'a> SectionScan<'a> {
         if level == self.pin && text == self.want {
             if self.replaced {
                 self.duplicates_removed += 1;
-                // дубль: мера первой секции уже снята — не переснимаем
-                self.measuring = false;
+                // контент дубля тоже стирается — мера снятого копится
+                // дальше (симметрия с дельтой тела: иначе телесное плечо
+                // гарда сжатия стреляло бы с «ровными» числами секции,
+                // ревью #1572 Low)
+                self.measuring = true;
             } else {
                 push_heading_block(&mut self.out, line, self.content);
                 self.replaced = true;

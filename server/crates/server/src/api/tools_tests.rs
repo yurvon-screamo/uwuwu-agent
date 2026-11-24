@@ -1770,6 +1770,47 @@ async fn task_body_without_body_refuses_with_carrier_size_and_recipe() {
     );
 }
 
+/// Сценарий 1-бис (ревью #1572 Common-1): вход из одного fm-блока непуст
+/// как строка, но в носитель уходит нормализованное — strip срезает fm в
+/// пустоту, и запись без эффективного контента стирала носитель под
+/// квитанцию «replaced; 0 bytes» (тот же класс, прецедент копирования fm
+/// в тело #1151/#1331). Гард обязан судить по эффективному контенту.
+#[tokio::test]
+async fn task_body_with_fm_only_body_refuses_without_write() {
+    let (tools, memory) = hub();
+    let (number, _) = create_task(&tools, "t: fm-only", &big_body()).await;
+    for fm_only in [
+        "---\nbranch: work/task-1\n---\n",
+        "---\ntitle: x\nstatus: Done\n---\n",
+        "--- fm ---\nbranch: work/task-1\npr: —\nautomerge: true\ndirect: false\nbody_hash: abc\n",
+    ] {
+        let err = call(
+            &tools,
+            "task_body",
+            json!({ "number": number, "body": fm_only }),
+        )
+        .await
+        .expect_err("запись без эффективного контента отказывает");
+        assert!(
+            err.contains("effective content"),
+            "отказ называет отсутствие эффективного контента: {err}"
+        );
+        assert!(
+            err.contains("body: \"\""),
+            "рецепт осознанной очистки в отказе: {err}"
+        );
+    }
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert!(
+        stored.contains("строка наполнителя 119"),
+        "носитель цел — fm-only вход не стирает тело: {stored}"
+    );
+}
+
 /// Сценарий 1, развилка А (#1572): явный `body: ""` — осознанная очистка
 /// без confirm-параметра: пустая строка — уже явный акт, стоп-кран поверх
 /// явного действия не заводится (гран ADR-037). Транспорт доносит пустую
@@ -1782,7 +1823,10 @@ async fn task_body_with_explicit_empty_string_clears_carrier() {
     let receipt = call(&tools, "task_body", json!({ "number": number, "body": "" }))
         .await
         .expect("явная пустая строка — осознанная очистка");
-    assert!(receipt.contains("replaced"), "квитанция очистки: {receipt}");
+    assert!(
+        receipt.contains("cleared"),
+        "квитанция очистки называет акт: {receipt}"
+    );
     let stored = memory
         .read_issue("Задачи uwuwu", number)
         .await
@@ -1793,7 +1837,7 @@ async fn task_body_with_explicit_empty_string_clears_carrier() {
 
 /// Сценарий 2 (#1572, инстансы 23–24.11 дословно): task_body_section с
 /// контентом в чужих параметрах find/replace (в схеме их нет) — громкий
-/// отказ с перечнем чужих ключей; секция целa. Факт-механика: чужие ключи
+/// отказ с перечнем чужих ключей; секция цела. Факт-механика: чужие ключи
 /// молча strip'ились, вызов деградировал до очистки секции (квитанции
 /// «cleared», каждый обход — полная перезапись тела).
 #[tokio::test]
@@ -1826,7 +1870,7 @@ async fn task_body_section_with_foreign_find_replace_arguments_refuses_loud() {
         .body;
     assert!(
         stored.contains("Наблюдение: тело задачи"),
-        "секция целa — деградации до очистки нет: {stored}"
+        "секция цела — деградации до очистки нет: {stored}"
     );
     assert!(!stored.contains("Новое наблюдение"), "замены нет: {stored}");
 }
@@ -1872,7 +1916,7 @@ async fn legacy_autodone_argument_passes_unknown_guard() {
 }
 
 /// Сценарий 3 (#1572): task_body_section без content — громкий отказ с
-/// длиной текущей секции и рецептом; секция целa (тихая деградация до
+/// длиной текущей секции и рецептом; секция цела (тихая деградация до
 /// очистки закрыта). «Параметр отсутствует» ≠ «явно пустая строка».
 #[tokio::test]
 async fn task_body_section_without_content_refuses_with_section_size_and_recipe() {
@@ -1905,7 +1949,7 @@ async fn task_body_section_without_content_refuses_with_section_size_and_recipe(
         .body;
     assert!(
         stored.contains("Контракт секционного пути"),
-        "секция «План» целa — деградации до очистки нет: {stored}"
+        "секция «План» цела — деградации до очистки нет: {stored}"
     );
 }
 
@@ -1956,6 +2000,10 @@ async fn radical_section_shrink_refuses_with_lengths_without_write() {
     .expect_err("радикальное сжатие секции — громкий отказ");
     assert!(err.contains("radical shrink"), "природа отказа: {err}");
     assert!(
+        err.contains("a 1 KiB+ section was cut by 70%+"),
+        "секционное плечо называет своё правило (тело не срезано за треть): {err}"
+    );
+    assert!(
         err.contains("→"),
         "длины было→стало по телу и секции в отказе: {err}"
     );
@@ -1971,7 +2019,7 @@ async fn radical_section_shrink_refuses_with_lengths_without_write() {
         .body;
     assert!(
         stored.contains("строка отчёта хвоста 24"),
-        "секция целa — записи нет: {stored}"
+        "секция цела — записи нет: {stored}"
     );
 }
 

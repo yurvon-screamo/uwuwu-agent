@@ -153,7 +153,7 @@ fn replaces_first_and_removes_duplicate_sections() {
         edit,
         SectionEdit::Replaced {
             duplicates_removed: 1,
-            old_content_len: 31,
+            old_content_len: 62,
         }
     );
 }

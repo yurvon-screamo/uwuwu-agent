@@ -658,13 +658,36 @@ impl TaskWriter for TaskWriteUseCase {
                 current.body.len()
             )));
         };
-        // явная пустая/whitespace строка — осознанная очистка: пишется
-        // пустое тело, whitespace-мусор носителем не становится
-        let input = if input.trim().is_empty() { "" } else { input };
+        // явная пустая/whitespace строка — осознанная очистка (до стрипa:
+        // whitespace не даёт эффективного контента и не маскирует мусор);
+        // пишется пустое тело, whitespace-мусор носителем не становится
+        let explicit_clear = input.trim().is_empty();
         // инвариант на границе: тело без fm и без дисплей-шапки task_get
         // (агенты могут копировать старый канон — сервер держит «fm снесён»
         // сам, #1151; fm-стек инцидента #1331)
-        let clean = crate::fm_lite::strip(strip_task_get_header(input));
+        let clean = if explicit_clear {
+            ""
+        } else {
+            crate::fm_lite::strip(strip_task_get_header(input))
+        };
+        // Гард пустой записи судит по ЭФФЕКТИВНОМУ контенту — тому, что
+        // уйдёт в replace_body (ревью #1572 Common-1): fm-блок или шапка
+        // task_get непусты как строка, но strip срезает их в пустоту —
+        // иначе стирание носителя под квитанцию «replaced; 0 bytes». Такой
+        // вход — не осознанная очистка, а ошибка копирования: отказ с
+        // рецептом (ADR-065), очистка — только явной пустой строкой
+        // (задокументирована в дескрипторе, whitespace ей равна).
+        if !explicit_clear && clean.trim().is_empty() {
+            let current = self.board.read_issue(&board, number).await?;
+            return Err(UsecaseError::Board(format!(
+                "body of #{number}: write refused — the `body` parameter carries no effective \
+                 content (only fm/task_get-header wrapping, stripped on the boundary); \
+                 task_body REPLACES the whole carrier body (write, not read; current body: \
+                 {} bytes). Read the body via task_get; to clear deliberately pass \
+                 body: \"\"",
+                current.body.len()
+            )));
+        }
         self.board.replace_body(number, clean).await?;
         // контрольное чтение носителя: квитанция = факт доставки (#1331)
         let repo = self.board.clone();
@@ -773,9 +796,9 @@ impl TaskWriter for TaskWriteUseCase {
         // Гард радикального сжатия (#1409-класс, #1572 срез 3): секционная
         // дельта не срезает треть носителя / большую секцию; ошибочный
         // короткий контент стирал отчёты (инстанс #1277, 19.11: 19К → 1).
-        // Явная очистка (пустой content) — осознанный акт, гард не трогает
-        // (рецепт отказа полного task_body на неё опирается); append растит
-        // тело — мера секции 0, оба плеча молчат.
+        // Явная очистка (пустой/whitespace content) — осознанный акт, гард
+        // не трогает (рецепт отказа полного task_body на неё опирается);
+        // append растит тело — мера секции 0, оба плеча молчат.
         let body_was = current.body.len();
         let explicit_clear = content.trim().is_empty();
         let section_was = match edit {
@@ -784,6 +807,9 @@ impl TaskWriter for TaskWriteUseCase {
             } => old_content_len,
             md_section::SectionEdit::Appended => 0,
         };
+        // «стало» — той же мерой, что «было» (байты строк без переводов,
+        // ревью #1572 Low): числа квитанции сопоставимы
+        let section_now = md_section::section_content_metric(content);
         let confirmed = if explicit_clear {
             false
         } else {
@@ -794,7 +820,7 @@ impl TaskWriter for TaskWriteUseCase {
                     body_was,
                     body_now: next.len(),
                     section_was,
-                    section_now: content.trim().len(),
+                    section_now,
                     confirm,
                 },
             )?
@@ -813,11 +839,7 @@ impl TaskWriter for TaskWriteUseCase {
             body_was,
             body_size: receipt.body_size,
             section_was,
-            section_now: if explicit_clear {
-                0
-            } else {
-                content.trim().len()
-            },
+            section_now,
             confirmed,
             body_hash: receipt.body_hash,
             verified: receipt.verified,
@@ -838,7 +860,9 @@ struct ShrinkMeasures {
 /// Гард радикального сжатия (#1409-класс, #1572 срез 3): Err — громкий
 /// отказ с длинами было→стало и рецептом; Ok(true) — осознанное
 /// сокращение проведено (confirm); Ok(false) — гард молчит (дельта в
-/// норме, либо плечи не сработали: секция ниже пола, append).
+/// норме, либо плечи не сработали: секция ниже пола, append). Причина
+/// отказа называет фактическое плечо (ревью #1572 Low): правило тела и
+/// правило 1 KiB-секции — разные правила, текст не путает.
 fn shrink_guard(section: &str, number: u64, m: ShrinkMeasures) -> UsecaseResult<bool> {
     let body_shrunk = radical_shrink(m.body_was, m.body_now);
     let section_shrunk =
@@ -849,10 +873,19 @@ fn shrink_guard(section: &str, number: u64, m: ShrinkMeasures) -> UsecaseResult<
     if m.confirm {
         return Ok(true);
     }
+    let reason = match (body_shrunk, section_shrunk) {
+        (true, true) => {
+            "the body lost a third of its size and a 1 KiB+ section was cut by \
+                         70%+"
+        }
+        (true, false) => "the body lost a third of its size",
+        (false, true) => "a 1 KiB+ section was cut by 70%+",
+        (false, false) => unreachable!("заход в отказ без сработавшего плеча"),
+    };
     Err(UsecaseError::Board(format!(
-        "section edit «{section}» of #{number} refused: radical shrink — \
-         body {} → {} bytes, section {} → {} bytes; a section delta must not cut a third of \
-         the carrier; check the content, deliberate shrink — repeat with confirm: true",
+        "section edit «{section}» of #{number} refused: radical shrink ({reason}) — \
+         body {} → {} bytes, section {} → {} bytes; check the content, deliberate shrink — \
+         repeat with confirm: true",
         m.body_was, m.body_now, m.section_was, m.section_now
     )))
 }
@@ -2066,7 +2099,7 @@ mod tests {
     }
 
     /// Гард пустой записи (сценарий 3): set_body_section(None, …) — отказ
-    /// с мерой текущей секции; секция целa.
+    /// с мерой текущей секции; секция цела.
     #[tokio::test]
     async fn set_body_section_without_content_refuses_with_section_len() {
         let (u, board) = writecase(Arc::new(FakeFields::default()));
@@ -2228,6 +2261,90 @@ mod tests {
         assert!(report.confirmed, "квитанция помечает confirm");
         assert_eq!(report.section_was, 800, "было по секции");
         assert_eq!(report.section_now, 10, "стало по секции");
+    }
+
+    /// Числа гарда объясняют отказ при хилинге дублей (ревью #1572 Low):
+    /// контент дублей входит в меру «было» — отказ несёт весь снятый
+    /// объём (секция+дубль), «ровных» чисел по секции не бывает; дубль —
+    /// треть тела, правка секции без сжатия получает отказ с честными
+    /// числами и проходит через confirm.
+    #[tokio::test]
+    async fn duplicate_healing_volume_is_counted_in_section_was() {
+        let (u, _) = writecase(Arc::new(FakeFields::default()));
+        // секция 1000Б + дубль 3500Б (треть тела) + наполнитель: обычная
+        // правка секции 1000→950 стирает 4550Б (хилинг) — тело сжато за треть
+        let body = format!(
+            "## А\n{}\n\n## А\n{}\n\n## Б\n{}\n",
+            "a".repeat(1000),
+            "a".repeat(3500),
+            "b".repeat(5500)
+        );
+        u.set_body("uwuwu", 1, Some(&body)).await.unwrap();
+        let hash = md_section::body_hash(&body);
+        let err = u
+            .set_body_section(
+                "uwuwu",
+                1,
+                SectionWrite {
+                    section: "А",
+                    content: Some(&"z".repeat(950)),
+                    base_hash: &hash,
+                    confirm: false,
+                },
+            )
+            .await
+            .expect_err("срез снятого объёма с дублем — отказ");
+        let text = err.to_string();
+        assert!(
+            text.contains("section 4500 → 950 bytes"),
+            "мера «было» включает дубль — числа объясняют отказ: {text}"
+        );
+        // осознанная правка с хилингом — confirm проводит
+        let report = u
+            .set_body_section(
+                "uwuwu",
+                1,
+                SectionWrite {
+                    section: "А",
+                    content: Some(&"z".repeat(950)),
+                    base_hash: &hash,
+                    confirm: true,
+                },
+            )
+            .await
+            .expect("confirm проводит осознанную правку с хилингом");
+        assert!(report.confirmed, "квитанция помечает confirm");
+        assert_eq!(report.section_was, 4500, "весь снятый объём в квитанции");
+    }
+
+    /// «Было» и «стало» одной меры — байты строк без переводов строк
+    /// (ревью #1572 Low): многострочная правка не показывает фальшивый
+    /// рост на число строк.
+    #[tokio::test]
+    async fn receipt_measures_are_symmetric_on_multiline_section() {
+        let (u, _) = writecase(Arc::new(FakeFields::default()));
+        let body = "## А\naaa\nbbb\nccc\n\n## Б\nвторое\n";
+        u.set_body("uwuwu", 1, Some(body)).await.unwrap();
+        let hash = md_section::body_hash(body);
+        let report = u
+            .set_body_section(
+                "uwuwu",
+                1,
+                SectionWrite {
+                    section: "А",
+                    content: Some("x\ny"),
+                    base_hash: &hash,
+                    confirm: false,
+                },
+            )
+            .await
+            .expect("многострочная дельта");
+        assert_eq!(report.section_was, 9, "три строки по три байта");
+        assert_eq!(report.section_now, 2, "две строки по одному байту");
+        assert!(
+            report.section_now < report.section_was,
+            "без фальшивого роста"
+        );
     }
 
     /// Квитанция несёт было/стало по телу и по секции (контракт #1409)
