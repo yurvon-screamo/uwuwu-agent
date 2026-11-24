@@ -86,14 +86,16 @@ const READ_TOOLS: &[&str] = &[
 /// дескриптор-вывода, перечислено явно: (тул, ключ).
 const LEGACY_KEYS: &[(&str, &str)] = &[("task_create", "autodone")];
 
-/// Разрешённые ключи мутационного тула — из inputSchema дескриптора,
-/// единый носитель контракта «какие ключи принимает тул» (ревью #1572
-/// Common-2: рукописная копия схемы дрейфовала) + LEGACY_KEYS. Some(пусто)
+/// Разрешённые ключи мутационного тула: legal — что принимает хендлер
+/// (inputSchema дескриптора + LEGACY_KEYS), advertised — что отказ
+/// рекламирует в «the tool knows» (только схема: legacy-ключи и
+/// диспетчерский project легальны молча — пин решения #1232 «legacy-ключ
+/// не рекламится (но читается)», ревью #1572 дельта-раунд 3). Some(пусто)
 /// — тул из списка без дескриптора: гардится громко; None — не
 /// мутационный (читающий: принадлежность проверена пином
 /// catalog_partition_mutation_or_read_is_total — каждый тул каталога
 /// заявлен ровно в одном списке).
-fn mutation_allowed_keys(name: &str) -> Option<Vec<String>> {
+fn mutation_keys(name: &str) -> Option<(Vec<String>, Vec<String>)> {
     if !MUTATION_TOOLS.contains(&name) {
         return None;
     }
@@ -104,18 +106,19 @@ fn mutation_allowed_keys(name: &str) -> Option<Vec<String>> {
         .find(|t| t["name"].as_str() == Some(name))
         .map(|t| &t["inputSchema"]["properties"]);
     let Some(props) = props else {
-        return Some(Vec::new());
+        return Some((Vec::new(), Vec::new()));
     };
-    let mut keys: Vec<String> = props
+    let schema: Vec<String> = props
         .as_object()
         .map(|m| m.keys().cloned().collect())
         .unwrap_or_default();
+    let mut legal = schema.clone();
     for (tool, key) in LEGACY_KEYS {
         if *tool == name {
-            keys.push((*key).to_string());
+            legal.push((*key).to_string());
         }
     }
-    Some(keys)
+    Some((legal, schema))
 }
 
 /// Гард чужих ключей мутационной поверхности (#1572, сценарий 2): вызов
@@ -124,13 +127,13 @@ fn mutation_allowed_keys(name: &str) -> Option<Vec<String>> {
 /// маскировал бы ошибку навсегда»); история деградации — вторым
 /// предложением (ревью #1572 Low: прошедшее время читалось как «прошло»).
 fn refuse_unknown_args(name: &str, args: &Value) -> Result<(), String> {
-    let Some(allowed) = mutation_allowed_keys(name) else {
+    let Some((legal, advertised)) = mutation_keys(name) else {
         return Ok(());
     };
     let mut unknown: Vec<&str> = Vec::new();
     if let Some(map) = args.as_object() {
         for key in map.keys() {
-            if DISPATCHER_KEYS.contains(&key.as_str()) || allowed.iter().any(|a| a == key) {
+            if DISPATCHER_KEYS.contains(&key.as_str()) || legal.iter().any(|a| a == key) {
                 continue;
             }
             unknown.push(key.as_str());
@@ -145,7 +148,7 @@ fn refuse_unknown_args(name: &str, args: &Value) -> Result<(), String> {
          keys used to be silently ignored and degraded the call to a partial write, \
          bug #1572)",
         unknown.join(", "),
-        allowed.join(", ")
+        advertised.join(", ")
     ))
 }
 
@@ -1357,6 +1360,19 @@ mod tests {
             let err = refuse_unknown_args(name, &Value::Object(args))
                 .expect_err("чужой ключ отвергается");
             assert!(err.contains("__find__"), "{name}: чужой ключ назван: {err}");
+            // внесхемные легальные ключи не рекламируются в «the tool
+            // knows» (ревью #1572 дельта-раунд 3): project — канал
+            // диспетчера, legacy autodone — решение #1232
+            for legacy in LEGACY_KEYS
+                .iter()
+                .filter(|(t, _)| *t == *name)
+                .map(|(_, k)| *k)
+            {
+                assert!(
+                    !err.contains(legacy),
+                    "{name}: legacy-ключ {legacy} легален молча, в отказе его нет: {err}"
+                );
+            }
         }
         // диспетчерский project не рекламируется в «the tool knows» —
         // только ключи схемы (мёртвых ключей в отказе нет)
@@ -1373,8 +1389,8 @@ mod tests {
         .is_ok());
     }
 
-    /// Пин разбиения поверхности (ревью #1572 дельта-раунд 2, Common):
-    /// каждый тул каталога — либо мутационный (MUTATION_TOOLS), либо
+    /// Пин разбиения поверхности (ревью #1572, Common): каждый тул
+    /// каталога — либо мутационный (MUTATION_TOOLS), либо
     /// явно заявленный читающий (READ_TOOLS); третий статус красный.
     /// Направление дрейфа «новый мутационный тул с дескриптором, но без
     /// записи в списке» ловится: имя без принадлежности валит тест, а
