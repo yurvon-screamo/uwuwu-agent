@@ -658,7 +658,7 @@ impl TaskWriter for TaskWriteUseCase {
                 current.body.len()
             )));
         };
-        // явная пустая/whitespace строка — осознанная очистка (до стрипa:
+        // явная пустая/whitespace строка — осознанная очистка (до стрипа:
         // whitespace не даёт эффективного контента и не маскирует мусор);
         // пишется пустое тело, whitespace-мусор носителем не становится
         let explicit_clear = input.trim().is_empty();

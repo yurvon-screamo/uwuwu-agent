@@ -1875,7 +1875,7 @@ async fn task_body_section_with_foreign_find_replace_arguments_refuses_loud() {
     assert!(!stored.contains("Новое наблюдение"), "замены нет: {stored}");
 }
 
-/// Сценарий 2, обобщение (#1572): чужой ключ на мутационном тулe —
+/// Сценарий 2, обобщение (#1572): чужой ключ на мутационном туле —
 /// громкий отказ до мутации, не тихий strip (task_body с лишним «text»).
 #[tokio::test]
 async fn unknown_argument_on_task_body_refuses_loud() {
