@@ -164,8 +164,8 @@ pub fn tool_descriptors() -> Value {
         tool(
             "task_list",
             "JSON array of rows: number, status, priority, type, \
-             title; filter/aggregate in script — the full list may \
-             exceed the model-facing output window",
+             title; empty cells are null; filter/aggregate in script — \
+             the full list may exceed the model-facing output window",
             object(json!({ "project": string("project name; default uwuwu") }))
         ),
         tool(
@@ -505,7 +505,7 @@ impl ToolHub {
             out.push_str(&format!(
                 "\n\n--- comments (latest {} of {}) ---\n",
                 view.comments.len(),
-                card.comments_total
+                card.comments_fetched
             ));
             for c in &view.comments {
                 out.push_str(&format!(
@@ -1107,6 +1107,8 @@ fn ok_text(text: String) -> Result<Value, String> {
 /// null = «нет значения» в JSON-rows task_list (#1604): Empty-варианты
 /// статуса и приоритета — null, а не пустая строка/мусорное имя
 /// (канон native-null хвоста #1271; поля присутствуют всегда).
+/// Имена — из словаря MCP-поверхности (naming), не из Debug-формы:
+/// переименование варианта энума не меняет wire-значение.
 fn status_cell(status: uwuwu_domain::Status) -> Value {
     match status {
         uwuwu_domain::Status::Empty => Value::Null,
@@ -1117,7 +1119,7 @@ fn status_cell(status: uwuwu_domain::Status) -> Value {
 fn priority_cell(priority: uwuwu_domain::Priority) -> Value {
     match priority {
         uwuwu_domain::Priority::Empty => Value::Null,
-        known => json!(format!("{known:?}").to_lowercase()),
+        known => json!(uwuwu_usecase::priority_name(known)),
     }
 }
 

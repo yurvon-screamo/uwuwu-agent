@@ -4,8 +4,8 @@
 //! квитанция полного task_body. Мок-hub — в памяти, без GitHub.
 
 use super::test_support::{
-    blob_usecase, blob_usecase_missing, fm_hash, receipt_number, tool_hub, StubCronState,
-    StubSessions, StubState, StubWiki,
+    blob_usecase, blob_usecase_missing, fm_hash, receipt_number, tool_hub, tool_hub_on_board,
+    StubCronState, StubSessions, StubState, StubWiki,
 };
 use super::tools::{tool_descriptors, ToolHub};
 use crate::clock::SystemClock;
@@ -1075,7 +1075,6 @@ async fn task_list_returns_json_rows_with_two_word_status_intact() {
         .and_then(|s| s.split(' ').next())
         .and_then(|s| s.parse().ok())
         .expect("номер в ответе");
-    // прямой create → In Progress; двухсловный статус — легальным переходом
     call(
         &tools,
         "task_edit",
@@ -1195,6 +1194,98 @@ async fn task_get_comments_window_full_when_within_limit() {
         card.contains("--- comments (latest 2 of 2) ---"),
         "полное окно — без «усечённости»: {card}"
     );
+}
+
+/// #1604 (ревью Common-1): зеркало шапки (strip_task_get_header в фазе
+/// записи) живёт по строгому набору ключей рендера — пин собирается из
+/// РЕАЛЬНОГО рендера task_get, не из рукописной шапки: копия вывода
+/// карточки в task_body срезает шапку целиком (включая body_bytes),
+/// тело на носителе чистое (ADR-105); шапка без тела — отказ «нет
+/// эффективного контента» (#1572), носитель цел.
+#[tokio::test]
+async fn task_body_strips_the_real_render_header_and_refuses_header_only() {
+    let (tools, memory) = hub();
+    let body = "## Постановка\n\nчистое тело носителя.\n";
+    let (number, _) = create_task(&tools, "t: зеркало шапки", body).await;
+
+    // Реальный рендер: fm-блок вывода task_get + тело — ровно то, что
+    // агент копирует из карточки при переносе текста в запись.
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    let fm_start = card.find("--- fm ---").expect("fm-блок в выводе карточки");
+    let body_at = card.find(body).expect("тело в выводе карточки");
+    let copied = &card[fm_start..body_at + body.len()];
+
+    let receipt = call(
+        &tools,
+        "task_body",
+        json!({ "number": number, "body": copied }),
+    )
+    .await
+    .expect("task_body ок");
+    assert!(receipt.contains("replaced"), "квитанция: {receipt}");
+
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert_eq!(stored, body, "тело без шапки: {stored}");
+
+    // Шапка без тела — ошибка копирования, не осознанная очистка (#1572)
+    let header_only = &card[fm_start..body_at];
+    let err = call(
+        &tools,
+        "task_body",
+        json!({ "number": number, "body": header_only }),
+    )
+    .await
+    .expect_err("шапка без тела — отказ");
+    assert!(
+        err.contains("effective content"),
+        "отказ называет отсутствие эффективного контента: {err}"
+    );
+    let intact = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert_eq!(intact, body, "отказ записи не трогает носитель");
+}
+
+/// #1604 (ревью Low): null-хвост закреплён через хендлер task_list, не
+/// только юнит-тестом хелпера — сид-строка с Status::Empty,
+/// Priority::Empty и без типа даёт все три null-ячейки разом.
+#[tokio::test]
+async fn task_list_renders_null_cells_for_empty_status_priority_and_type() {
+    let memory = Arc::new(MemoryHub::with_seed(Some((7, uwuwu_domain::Status::Empty))));
+    let board: Arc<dyn uwuwu_usecase::TaskBoardRepo> = memory.clone();
+    let (tools, _aux) = tool_hub_on_board(
+        Arc::new(StubWiki),
+        blob_usecase(),
+        Arc::new(StubCronState::default()),
+        board,
+        memory,
+    );
+
+    let list = call(&tools, "task_list", json!({ "project": "uwuwu" }))
+        .await
+        .expect("list");
+    let rows: Value = serde_json::from_str(&list).expect("rows — JSON");
+    let row = rows
+        .as_array()
+        .expect("массив rows")
+        .iter()
+        .find(|r| r["number"] == json!(7))
+        .expect("сид-строка в списке");
+    assert_eq!(row["status"], Value::Null, "Status::Empty → null: {row}");
+    assert_eq!(
+        row["priority"],
+        Value::Null,
+        "Priority::Empty → null: {row}"
+    );
+    assert_eq!(row["type"], Value::Null, "тип отсутствует → null: {row}");
 }
 
 /// #1155 (поручение владельца): автомерж-ячейка живёт на mock-носителе —

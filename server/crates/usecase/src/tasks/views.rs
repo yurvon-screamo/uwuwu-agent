@@ -11,9 +11,11 @@ const CARD_COMMENTS: usize = 10;
 
 /// Карточка task_get (#1604): носитель + размер ленты комментов до среза
 /// хвоста — граница «latest shown of total» заявляется в самом выводе.
+/// `comments_fetched` — сколько комментов прочитано с носителя (страница
+/// фетча, ≤100; честная пагинация — отдельное решение, вне #1604).
 pub struct CardView {
     pub issue: IssueView,
-    pub comments_total: usize,
+    pub comments_fetched: usize,
 }
 
 pub struct TaskView {
@@ -45,7 +47,7 @@ impl TaskView {
         Ok(self.board.read_board(board).await?)
     }
 
-    /// Карточка task_get: агрегат + тело + хвост комментов. `comments_total`
+    /// Карточка task_get: агрегат + тело + хвост комментов. `comments_fetched`
     /// — размер ленты до среза: граница хвоста заявляется в выводе
     /// (`latest shown of total`, #1604). Один клиент — tools.rs task_get,
     /// поэтому обёртка здесь, а не поле в порте.
@@ -57,7 +59,7 @@ impl TaskView {
         if view.task.status() == uwuwu_domain::Status::Empty && view.body.is_empty() {
             return Err(ViewError::NotFound(format!("task #{number}")));
         }
-        let comments_total = view.comments.len();
+        let comments_fetched = view.comments.len();
         let comments = view
             .comments
             .into_iter()
@@ -67,7 +69,7 @@ impl TaskView {
             .collect();
         Ok(CardView {
             issue: IssueView { comments, ..view },
-            comments_total,
+            comments_fetched,
         })
     }
 }

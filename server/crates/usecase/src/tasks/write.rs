@@ -958,29 +958,64 @@ where
     }
 }
 
-/// Дисплей-шапка task_get («--- fm ---» + branch/pr/automerge/body_hash)
-/// — рендер MCP-карточки, не носитель: агенты копируют вывод task_get
-/// назад в task_body, и шапка наслаивалась в теле (fm-стек инцидента
-/// #1331). Срезается на границе записи: инвариант ADR-105 «тело — чистый
+/// Дисплей-шапка task_get («--- fm ---» + fm-ключи рендера) — рендер
+/// MCP-карточки, не носитель: агенты копируют вывод task_get назад в
+/// task_body, и шапка наслаивалась в теле (fm-стек инцидента #1331).
+/// Срезается на границе записи: инвариант ADR-105 «тело — чистый
 /// markdown» держит сервер, не дисциплина агента (прецедент #1151).
-/// Консервативно: строго набор/порядок ключей рендера, любой посторонний
-/// контент («--- fm ---» внутри текста) не трогается.
+/// Консервативно: строго набор/порядок ключей одного из рендеров,
+/// любой посторонний контент («--- fm ---» внутри текста) не трогается.
+/// Зеркало рендера (api/tools.rs task_get): рендер меняется — менять
+/// все формы здесь; пин в tools_tests собран из реального рендера и
+/// краснеет при расхождении (#1604: рендер добавил body_bytes).
 fn strip_task_get_header(md: &str) -> &str {
-    const KEYS: [&str; 5] = ["branch: ", "pr: ", "automerge: ", "direct: ", "body_hash: "];
+    // Актуальный рендер (#1604): branch/pr/automerge/direct/type/
+    // body_hash/body_bytes
+    const KEYS: [&str; 7] = [
+        "branch: ",
+        "pr: ",
+        "automerge: ",
+        "direct: ",
+        "type: ",
+        "body_hash: ",
+        "body_bytes: ",
+    ];
+    // Легаси-рендер до #1604 (#1271..): без body_bytes
+    const LEGACY_KEYS: [&str; 6] = [
+        "branch: ",
+        "pr: ",
+        "automerge: ",
+        "direct: ",
+        "type: ",
+        "body_hash: ",
+    ];
+    // Легаси-рендер до #1271: без type (старые выводы копируются
+    // агентами из старых сессий и статей опыта — срезаются тоже)
+    const LEGACY_KEYS_NO_TYPE: [&str; 5] =
+        ["branch: ", "pr: ", "automerge: ", "direct: ", "body_hash: "];
     let Some(rest) = md.strip_prefix("--- fm ---\n") else {
         return md;
     };
+    for keys in [&KEYS[..], &LEGACY_KEYS[..], &LEGACY_KEYS_NO_TYPE[..]] {
+        if let Some(stripped) = strip_header_keys(rest, keys) {
+            return stripped;
+        }
+    }
+    md
+}
+
+/// Строгое совпадение набора/порядка ключей одного рендера; частичные
+/// шапки и посторонний контент — None.
+fn strip_header_keys<'a>(rest: &'a str, keys: &[&str]) -> Option<&'a str> {
     let mut pos = rest;
-    for key in KEYS {
-        let Some(line_end) = pos.find('\n') else {
-            return md;
-        };
+    for key in keys {
+        let line_end = pos.find('\n')?;
         if !pos[..line_end].starts_with(key) {
-            return md;
+            return None;
         }
         pos = &pos[line_end + 1..];
     }
-    pos.trim_start_matches('\n')
+    Some(pos.trim_start_matches('\n'))
 }
 
 /// Ожидания контрольного чтения edit: Some — значение менялось и должно
@@ -1926,10 +1961,19 @@ mod tests {
 
     /// Дисплей-шапка task_get срезается на границе записи (fm-стек
     /// инцидента #1331: агент копирует вывод task_get назад в task_body).
+    /// Все три формы рендера — актуальная (#1604, с body_bytes) и две
+    /// легаси (#1271+, до #1271).
     #[test]
     fn task_get_display_header_is_stripped() {
-        let md = "--- fm ---\nbranch: work/task-1331\npr: —\nautomerge: true\ndirect: false\nbody_hash: 9de430c691c92328\n\n## Постановка\nтекст";
+        // актуальный рендер (#1604): 7 ключей с body_bytes
+        let md = "--- fm ---\nbranch: work/task-1604\npr: —\nautomerge: true\ndirect: false\ntype: bug\nbody_hash: 9de430c691c92328\nbody_bytes: 36\n\n## Постановка\nтекст";
         assert_eq!(strip_task_get_header(md), "## Постановка\nтекст");
+        // легаси до #1604: 6 ключей, без body_bytes
+        let md_legacy6 = "--- fm ---\nbranch: x\npr: —\nautomerge: true\ndirect: false\ntype: bug\nbody_hash: h\n\n## Т";
+        assert_eq!(strip_task_get_header(md_legacy6), "## Т");
+        // легаси до #1271: 5 ключей, без type
+        let md_legacy5 = "--- fm ---\nbranch: work/task-1331\npr: —\nautomerge: true\ndirect: false\nbody_hash: 9de430c691c92328\n\n## Постановка\nтекст";
+        assert_eq!(strip_task_get_header(md_legacy5), "## Постановка\nтекст");
     }
 
     #[test]
@@ -1954,6 +1998,10 @@ mod tests {
         // валидный fm старого канона — это fm_lite, не дисплей-шапка
         let md3 = "---\ntitle: x\n---\nтекст";
         assert_eq!(strip_task_get_header(md3), md3);
+        // лишний посторонний ключ в наборе — не рендер (7-ключевая форма
+        // с чужой строкой между type и body_hash)
+        let md4 = "--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\ntype: bug\nслучайная строка\nbody_hash: h\nbody_bytes: 1\n\n## Т";
+        assert_eq!(strip_task_get_header(md4), md4);
     }
 
     // --- Честные квитанции: контрольное чтение носителя (#1331) ---
