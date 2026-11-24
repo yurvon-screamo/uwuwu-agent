@@ -2624,22 +2624,95 @@ mod tests {
         });
     }
 
-    /// #1437 живая проба (tester, тест-ревью C1/L1): честная квитанция
+    // payload паники → текст (сводка, когда упало больше одного блока)
+    fn pin_panic_text(p: &(dyn std::any::Any + Send)) -> String {
+        if let Some(s) = p.downcast_ref::<String>() {
+            s.clone()
+        } else if let Some(s) = p.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else {
+            "нетекстовый payload паники".into()
+        }
+    }
+
+    // свежий рид носителя со строковым контекстом: падение рида или
+    // отсутствие строки — паника с номером строки пробы
+    async fn pin_fresh_status(
+        hub: &GitHubHub,
+        board: &str,
+        n: u64,
+        what: &str,
+    ) -> uwuwu_domain::Status {
+        hub.fresh_row_status(board, n)
+            .await
+            .unwrap_or_else(|e| panic!("#{n}: {what} упало: {e}"))
+            .unwrap_or_else(|| panic!("#{n}: {what} — строка не видна"))
+    }
+
+    // сводка исходов живого пина #1437: обе паники сообщаются, номер
+    // строки в каждом отказе (тест-ревью L2); одна паника при чистой
+    // уборке — resume с оригинальным panic-location
+    fn pin_report_outcome(
+        n: u64,
+        probe: Result<(), Box<dyn std::any::Any + Send>>,
+        cleanup: Result<(), Box<dyn std::any::Any + Send>>,
+        close_err: Option<UsecaseError>,
+    ) {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(p) = probe.as_ref().err() {
+            parts.push(format!("проба: {}", pin_panic_text(p.as_ref())));
+        }
+        if let Some(p) = cleanup.as_ref().err() {
+            parts.push(format!("восстановление: {}", pin_panic_text(p.as_ref())));
+        }
+        if let Some(e) = &close_err {
+            parts.push(format!("закрытие строки: {e}"));
+        }
+        match parts.len() {
+            // всё зелёное — строка закрыта
+            0 => {}
+            // ровно одна паника при чистой уборке — оригинальный
+            // panic-location сохраняется
+            1 if close_err.is_none() => {
+                if let Some(p) = probe.err().or_else(|| cleanup.err()) {
+                    std::panic::resume_unwind(p);
+                }
+                unreachable!("один отказ без close-ошибки — это паника");
+            }
+            _ => panic!(
+                "#{n}: строка пробы {}; отказы пина — {}",
+                if close_err.is_none() {
+                    "закрыта (close not_planned)"
+                } else {
+                    "НЕ закрыта — убрать руками, поиск по тайтлу [pin #1437]"
+                },
+                parts.join(" | ")
+            ),
+        }
+    }
+
+    /// #1437 живая проба (tester, тест-ревью C1/L1 + L2): честная квитанция
     /// статусной записи на НАСТОЯЩЕМ ПЕРЕХОДЕ против реального носителя.
     /// Фикстура строится пробой самой (зашитых номеров нет): create_issue
-    /// на доске sandbox, create-дефолт Analys (#1135). Проба пишет статус,
-    /// ОТЛИЧНЫЙ от базлайна — запись того же значения квитанцию не
+    /// на доске sandbox, create-дефолт Analys (#1135), базлайн — свежий рид
+    /// носителя (create-конвергенция в бюджете verify 5×1с). Проба пишет
+    /// статус, ОТЛИЧНЫЙ от базлайна — запись того же значения квитанцию не
     /// доказывает (носитель и до записи держит ожидаемое, Confirmed не
     /// зависел бы ни от ухода PATCH, ни от чтения носителя). Контракт:
     /// PATCH применился → квитанция Confirmed с raw-именем НОВОГО
     /// значения + fresh_row_status (тот же gql_issue_status — путь
-    /// verify и идемпотентного гарда) видит переход. Восстановление
-    /// базлайна не зависит от исхода ассертов (catch_unwind), за строкой
-    /// проба убирается (close not_planned). Красный на момент пробы
-    /// 22.11: gql_issue_status разворачивала envelope дважды (gql() уже
-    /// возвращает body["data"], функция читала data["data"]) — все
-    /// verify-риды дают Ok(None) → Mismatch → громкий отказ ПРИМЕНЁННОЙ
-    /// записи; на непосланном PATCH — тот же Mismatch (носитель не
+    /// verify и идемпотентного гарда) видит переход.
+    ///
+    /// Уборка тотальна (тест-ревью L2): после успешного create строка
+    /// закрывается (close not_planned) на КАЖДОМ выходе — close идёт
+    /// независимо от исхода пробы, восстановления и их ассертов;
+    /// восстановление базлайна с контролем — в своём catch_unwind; при
+    /// двух паниках сообщаются обе; номер строки — в каждом сообщении
+    /// об отказе пина. Красный на класс бага раунда 1 (двойной unwrap
+    /// envelope в gql_issue_status): все риды дают Ok(None) → пин
+    /// краснеет на чтении базлайна (стадия фикстуры, строка при этом
+    /// всё равно закрывается), а не на Mismatch применённой записи;
+    /// на непосланном PATCH — громкий отказ Mismatch (носитель не
     /// сдвинулся с базлайна).
     #[test]
     #[ignore] // живой прогон: GH_TOKEN + сеть к api.github.com; МУТАЦИЯ — настоящий переход с восстановлением базлайна
@@ -2669,77 +2742,75 @@ mod tests {
                 )
                 .await
                 .expect("фикстура: строка создана на доске sandbox");
-            // 2. базлайн свежим ридом носителя; create-конвергенция — в
-            //    бюджете verify (5×1с, измеренные ~2с)
-            let mut seen: Option<uwuwu_domain::Status> = None;
-            for _ in 0..5u32 {
-                seen = hub
-                    .fresh_row_status(board, n)
-                    .await
-                    .expect("свежий рид после create");
-                if seen.is_some() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            }
-            let base = seen.expect("фикстура легла на доску: статус не пуст");
-            assert_eq!(
-                base,
-                uwuwu_domain::Status::Analys,
-                "create-дефолт Analys (#1135) — иначе проба пишет мимо фикстуры"
-            );
-            // 3. проба: настоящий переход In Progress ≠ Analys; ассерты
-            //    под catch_unwind — восстановление ниже не зависит от исхода
+            // 2. базлайн свежим ридом носителя (create-конвергенция в бюджете
+            //    verify 5×1с) + 3. проба: настоящий переход In Progress ≠
+            //    Analys — под catch_unwind; base выносится наружу для отката
+            let mut base: Option<uwuwu_domain::Status> = None;
             let probe = std::panic::AssertUnwindSafe(async {
+                for _ in 0..5u32 {
+                    base = hub
+                        .fresh_row_status(board, n)
+                        .await
+                        .unwrap_or_else(|e| panic!("#{n}: свежий рид после create упал: {e}"));
+                    if base.is_some() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+                let found = base.unwrap_or_else(|| {
+                    panic!("#{n}: фикстура не легла на доску за 5×1с — create-статус не прочитан")
+                });
+                base = Some(found);
+                assert_eq!(
+                    found,
+                    uwuwu_domain::Status::Analys,
+                    "#{n}: create-дефолт Analys (#1135) — иначе проба пишет мимо фикстуры"
+                );
                 let delivery = hub
                     .set_status(board, n, uwuwu_domain::Status::InProgress)
                     .await
-                    .expect("применённая запись → честная квитанция Confirmed (#1437)");
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "#{n}: применённая запись → честная квитанция Confirmed (#1437): {e}"
+                        )
+                    });
                 let uwuwu_usecase::StatusDelivery::Confirmed { actual } = delivery else {
-                    panic!("квитанция без доказательства применения: {delivery:?}");
+                    panic!("#{n}: квитанция без доказательства применения: {delivery:?}");
                 };
                 assert_eq!(
                     uwuwu_usecase::parse_status(&actual),
                     uwuwu_domain::Status::InProgress,
-                    "raw-имя носителя = НОВОЕ значение перехода: {actual}"
+                    "#{n}: raw-имя носителя = НОВОЕ значение перехода: {actual}"
                 );
                 // тот же путь чтения (gql_issue_status) в verify и гарде
-                let fresh = hub
-                    .fresh_row_status(board, n)
-                    .await
-                    .expect("свежее чтение носителя отвечает")
-                    .expect("строка пробы на доске по свежему GraphQL-риду");
+                let fresh = pin_fresh_status(&hub, board, n, "свежее чтение носителя").await;
                 assert_eq!(
                     fresh,
                     uwuwu_domain::Status::InProgress,
-                    "носитель несёт переход"
+                    "#{n}: носитель несёт переход"
                 );
             })
             .catch_unwind()
             .await;
-            // 4. восстановление базлайна + уборка — при любом исходе пробы
+            // 4. восстановление базлайна с контролем — в своём catch_unwind;
+            //    базлайн не прочитан — восстанавливать нечего, close ниже всё
+            //    равно закроет строку
             let cleanup = std::panic::AssertUnwindSafe(async {
-                hub.set_status(board, n, base)
-                    .await
-                    .expect("восстановление базлайна");
-                let fresh = hub
-                    .fresh_row_status(board, n)
-                    .await
-                    .expect("свежий рид после отката")
-                    .expect("строка пробы жива после отката");
-                assert_eq!(fresh, base, "базлайн восстановлен на носителе");
-                hub.close_issue_ext(n, true)
-                    .await
-                    .expect("строка пробы закрыта (за собой, not_planned)");
+                if let Some(b) = base {
+                    hub.set_status(board, n, b)
+                        .await
+                        .unwrap_or_else(|e| panic!("#{n}: восстановление базлайна упало: {e}"));
+                    let fresh = pin_fresh_status(&hub, board, n, "свежий рид после отката").await;
+                    assert_eq!(fresh, b, "#{n}: базлайн восстановлен на носителе");
+                }
             })
             .catch_unwind()
             .await;
-            if let Err(panic) = probe {
-                std::panic::resume_unwind(panic);
-            }
-            if let Err(panic) = cleanup {
-                std::panic::resume_unwind(panic);
-            }
+            // 5. уборка тотальна (тест-ревью L2): close на каждом выходе —
+            //    независимо от исхода пробы, восстановления и ассертов
+            let close_err = hub.close_issue_ext(n, true).await.err();
+            // 6. сводка исходов
+            pin_report_outcome(n, probe, cleanup, close_err);
         });
     }
 
