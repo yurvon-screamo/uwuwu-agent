@@ -4,7 +4,8 @@
 //! квитанция полного task_body. Мок-hub — в памяти, без GitHub.
 
 use super::test_support::{
-    blob_usecase, blob_usecase_missing, tool_hub, StubCronState, StubSessions, StubState, StubWiki,
+    blob_usecase, blob_usecase_missing, fm_hash, receipt_number, tool_hub, StubCronState,
+    StubSessions, StubState, StubWiki,
 };
 use super::tools::{tool_descriptors, ToolHub};
 use crate::clock::SystemClock;
@@ -53,16 +54,6 @@ fn big_body() -> String {
     )
 }
 
-/// body_hash из fm-блока вывода task_get.
-fn fm_hash(task_get: &str) -> String {
-    task_get
-        .lines()
-        .find_map(|l| l.strip_prefix("body_hash: "))
-        .unwrap_or_default()
-        .trim()
-        .to_string()
-}
-
 async fn create_task(tools: &ToolHub, title: &str, body: &str) -> (u64, String) {
     let text = call(
         tools,
@@ -71,13 +62,7 @@ async fn create_task(tools: &ToolHub, title: &str, body: &str) -> (u64, String) 
     )
     .await
     .expect("create");
-    let number: u64 = text
-        .trim_start_matches("task #")
-        .split(' ')
-        .next()
-        .unwrap()
-        .parse()
-        .expect("number");
+    let number = receipt_number(&text);
     let get = call(tools, "task_get", json!({ "number": number }))
         .await
         .expect("get");

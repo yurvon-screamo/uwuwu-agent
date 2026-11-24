@@ -133,12 +133,15 @@ fn json_error(id: Option<Value>, code: i64, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::test_support::{blob_usecase, tool_hub, StubCronState, StubWiki};
+    use crate::api::test_support::{
+        blob_usecase, fm_hash, receipt_number, tool_hub, StubCronState, StubWiki,
+    };
+    use crate::mockhub::MemoryHub;
     use tower::ServiceExt;
     use uwuwu_usecase::TaskBoardRepo;
 
-    fn app() -> Router {
-        let (tools, _memory) = tool_hub(
+    fn app_with_hub() -> (Router, Arc<MemoryHub>) {
+        let (tools, memory) = tool_hub(
             Arc::new(StubWiki),
             blob_usecase(),
             Arc::new(StubCronState::default()),
@@ -147,7 +150,11 @@ mod tests {
             bearer: Arc::new("test-bearer".to_string()),
             tools,
         });
-        router(state)
+        (router(state), memory)
+    }
+
+    fn app() -> Router {
+        app_with_hub().0
     }
 
     /// Лимит тела отрезает на extractor'е: тело сверх BODY_LIMIT_BYTES —
@@ -192,19 +199,13 @@ mod tests {
     /// без контента (task_body без body) и с контентом в чужих параметрах
     /// (task_body_section find/replace — дословный инстанс foilcap #31)
     /// приезжают HTTP 200 без jsonrpc-ошибки, но с isError: true и текстом
-    /// отказа (длина носителя, рецепт хода, перечень чужих ключей); носитель
-    /// цел следующим чтением по тому же проводу и в самом хабе.
+    /// отказа (точная длина носителя, рецепт хода, перечень чужих ключей);
+    /// носитель цел следующим чтением по тому же проводу и в самом хабе —
+    /// оракул точный: body_hash fm-шапки не изменился, снимок хаба
+    /// байт-в-байт (тест-ревью #1572 Low-1/3).
     #[tokio::test]
     async fn contentless_mutations_refuse_loudly_over_the_wire_and_carrier_survives() {
-        let (tools, memory) = tool_hub(
-            Arc::new(StubWiki),
-            blob_usecase(),
-            Arc::new(StubCronState::default()),
-        );
-        let app = router(Arc::new(McpState {
-            bearer: Arc::new("test-bearer".to_string()),
-            tools,
-        }));
+        let (app, memory) = app_with_hub();
 
         async fn call_tool(
             app: &Router,
@@ -254,13 +255,23 @@ mod tests {
         let created_text = created["result"]["content"][0]["text"]
             .as_str()
             .unwrap_or_default();
-        let number: u64 = created_text
-            .trim_start_matches("task #")
-            .split(' ')
-            .next()
-            .expect("номер в квитанции")
-            .parse()
-            .expect("номер парсится");
+        let number = receipt_number(created_text);
+
+        // Оракулы «носитель цел» снимаются до отказов: fm-hash по проводу
+        // и байтовый снимок носителя в хабе — сверяются после (тест-ревью
+        // #1572 Low-1: contains-маркеры не ловят тихую дописку/подмену).
+        let (_, before) = call_tool(&app, "task_get", json!({ "number": number })).await;
+        let hash = fm_hash(
+            before["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default(),
+        );
+        assert!(!hash.is_empty(), "fm-шапка card несёт body_hash: {before}");
+        let carrier_before = memory
+            .read_issue("Задачи uwuwu", number)
+            .await
+            .expect("read")
+            .body;
 
         // Сценарий 1: task_body без body — громкий отказ в isError-конверте
         let (status, refused) = call_tool(&app, "task_body", json!({ "number": number })).await;
@@ -282,8 +293,8 @@ mod tests {
             "природа отказа названа: {err_text}"
         );
         assert!(
-            err_text.contains("bytes"),
-            "длина текущего носителя в отказе: {err_text}"
+            err_text.contains(&format!("{} bytes", carrier_before.len())),
+            "точная длина текущего носителя в отказе — агент сверяет, что ничего не стёрто: {err_text}"
         );
         assert!(err_text.contains("task_get"), "рецепт чтения: {err_text}");
         assert!(
@@ -292,16 +303,6 @@ mod tests {
         );
 
         // Сценарий 2: контент в чужих параметрах — отказ с перечнем до носителя
-        let (_, card) = call_tool(&app, "task_get", json!({ "number": number })).await;
-        let hash = card["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap_or_default()
-            .lines()
-            .find_map(|l| l.strip_prefix("body_hash: "))
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        assert!(!hash.is_empty(), "fm-шапка card несёт body_hash: {card}");
         let (status, unknown) = call_tool(
             &app,
             "task_body_section",
@@ -336,20 +337,30 @@ mod tests {
             "прямая фраза «носитель не тронут»: {unknown_text}"
         );
 
-        // Носитель цел следующим чтением по тому же проводу и в самом хабе
+        // Носитель цел следующим чтением по тому же проводу и в самом хабе:
+        // fm-hash не изменился (отказы — no-write), маркеры секций на месте
         let (_, intact) = call_tool(&app, "task_get", json!({ "number": number })).await;
-        let carrier = intact["result"]["content"][0]["text"]
+        let intact_text = intact["result"]["content"][0]["text"]
             .as_str()
             .unwrap_or_default();
+        assert_eq!(
+            fm_hash(intact_text),
+            hash,
+            "body_hash не изменился после отказов: {intact}"
+        );
         assert!(
-            carrier.contains("Держатель массы тела"),
-            "носитель цел: {carrier}"
+            intact_text.contains("Держатель массы тела"),
+            "носитель цел: {intact_text}"
         );
         let stored = memory
             .read_issue("Задачи uwuwu", number)
             .await
             .expect("read")
             .body;
+        assert_eq!(
+            stored, carrier_before,
+            "носитель в хабе байт-в-байт как до отказов"
+        );
         assert!(
             stored.contains("Наполнитель пробы"),
             "носитель в хабе цел: {stored}"
