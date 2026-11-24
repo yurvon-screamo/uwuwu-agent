@@ -1955,7 +1955,11 @@ async fn radical_section_shrink_refuses_with_lengths_without_write() {
     .await
     .expect_err("радикальное сжатие секции — громкий отказ");
     assert!(err.contains("radical shrink"), "природа отказа: {err}");
-    assert!(err.contains("(was"), "длины было/стало в отказе: {err}");
+    assert!(
+        err.contains("→"),
+        "длины было→стало по телу и секции в отказе: {err}"
+    );
+    assert!(err.contains("bytes"), "длины в байтах: {err}");
     assert!(
         err.contains("confirm: true"),
         "рецепт осознанного преодоления: {err}"
@@ -2004,12 +2008,21 @@ async fn radical_shrink_with_confirm_writes_and_receipt_carries_lengths() {
     )
     .await
     .expect("confirm-запись проходит");
-    assert!(receipt.contains("confirm"), "квитанция помечает confirm: {receipt}");
-    assert!(receipt.contains("(was"), "было/стало по телу и секции: {receipt}");
+    assert!(
+        receipt.contains("confirm"),
+        "квитанция помечает confirm: {receipt}"
+    );
+    assert!(
+        receipt.contains("(was"),
+        "было/стало по телу и секции: {receipt}"
+    );
     let stored = memory
         .read_issue("Задачи uwuwu", number)
         .await
         .expect("read")
         .body;
-    assert!(stored.contains("короткий хвост"), "контент записан: {stored}");
+    assert!(
+        stored.contains("короткий хвост"),
+        "контент записан: {stored}"
+    );
 }

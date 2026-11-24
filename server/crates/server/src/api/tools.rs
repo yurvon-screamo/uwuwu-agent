@@ -32,6 +32,93 @@ pub struct ToolHub {
 /// Дефолтный проект для инструментов без явного project.
 pub const DEFAULT_PROJECT: &str = "uwuwu";
 
+/// Мутационная поверхность: разрешённые ключи аргументов по тула (схема
+/// тула + диспетчерский project; autodone — легально читаемый legacy-ключ
+/// task_create). Чужой ключ — громкий отказ до мутации (#1572): тихий
+/// strip деградировал вызов — find/replace в task_body_section молча
+/// отбрасывались, вызов с absent content уходил в очистку секции.
+/// Читающие тулы вне списка: лишний ключ чтения носитель не трогает.
+const MUTATION_ARG_KEYS: &[(&str, &[&str])] = &[
+    (
+        "task_create",
+        &[
+            "title",
+            "project",
+            "body",
+            "type",
+            "priority",
+            "automerge",
+            "direct",
+            "autodone",
+        ],
+    ),
+    (
+        "task_edit",
+        &[
+            "number",
+            "project",
+            "status",
+            "branch",
+            "pr",
+            "priority",
+            "title",
+            "type",
+            "automerge",
+        ],
+    ),
+    ("task_claim", &["number", "project", "session"]),
+    ("task_comment", &["number", "project", "text", "reply_to"]),
+    ("task_close", &["number", "project", "not_planned"]),
+    ("task_clean", &["ids", "project", "confirm", "ack"]),
+    ("task_undo", &["project", "journal"]),
+    ("board_status_rename", &["project", "from", "to"]),
+    ("task_body", &["number", "project", "body"]),
+    (
+        "task_body_section",
+        &[
+            "number",
+            "project",
+            "section",
+            "content",
+            "base_hash",
+            "confirm",
+        ],
+    ),
+    (
+        "blob_put",
+        &["filename", "data_base64", "number", "project"],
+    ),
+    ("docs_write", &["slug", "content", "message"]),
+    ("docs_append", &["slug", "line", "message"]),
+];
+
+/// Гард чужих ключей мутационной поверхности (#1572, сценарий 2): вызов
+/// с ключами вне схемы — громкий отказ с перечнем чужих и известных
+/// ключей; носитель не трогается. Отказ вместо тихого strip (ADR-065:
+/// «стрип маскировал бы ошибку навсегда»).
+fn refuse_unknown_args(name: &str, args: &Value) -> Result<(), String> {
+    let Some((_, allowed)) = MUTATION_ARG_KEYS.iter().find(|(n, _)| *n == name) else {
+        return Ok(());
+    };
+    let mut unknown: Vec<&str> = Vec::new();
+    if let Some(map) = args.as_object() {
+        for key in map.keys() {
+            if !allowed.contains(&key.as_str()) {
+                unknown.push(key.as_str());
+            }
+        }
+    }
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "unknown argument(s) {} for {name} — the tool knows: {}; unknown keys were silently \
+         ignored and degraded the call (bug #1572) — re-send with the schema keys",
+        unknown.join(", "),
+        allowed.join(", ")
+    ))
+}
+
 impl ToolHub {
     pub fn descriptors(&self) -> Value {
         tool_descriptors()
@@ -226,26 +313,33 @@ pub fn tool_descriptors() -> Value {
         tool(
             "task_body",
             "Full replacement of the task body (fm is not written into the body — fields are \
-             native; edit large bodies sectionally via task_body_section)",
+             native; edit large bodies sectionally via task_body_section). Write, not read: \
+             without the body parameter — loud refusal; explicit empty string clears the body",
             object(json!({
                 "number": integer("task number"),
                 "project": string("project; default uwuwu"),
-                "body": string("full markdown body (no fm)")
+                "body": string("full markdown body (no fm); ABSENT parameter is a loud \
+                              refusal (read via task_get); empty string — clear deliberately")
             }))
         ),
         tool(
             "task_body_section",
             "Sectional edit of the task body: a section delta instead of the full body \
-             (large bodies — this path only); freshness — base_hash",
+             (large bodies — this path only); freshness — base_hash; radical shrink (a third \
+             of the carrier or a big section cut) refuses — deliberate shrink repeats with \
+             confirm: true",
             object(json!({
                 "number": integer("task number"),
                 "project": string("project; default uwuwu"),
                 "section": string("section heading; ATX prefix pins the level \
                                   («### X» — h3), bare/«## X» — default h2"),
-                "content": string("new section content without the heading; empty \
-                                  string — clear the section"),
+                "content": string("new section content without the heading; ABSENT \
+                                  parameter is a loud refusal (write, not read); empty \
+                                  string — clear the section deliberately"),
                 "base_hash": string("body_hash of the body at read time (fm block of \
-                                    task_get or a prior receipt); required")
+                                    task_get or a prior receipt); required"),
+                "confirm": json!({"type":"boolean","description":"true — deliberately \
+                                  re-run a write refused by the shrink guard"})
             }))
         ),
         tool(
@@ -280,6 +374,8 @@ impl ToolHub {
     pub async fn call(&self, msg: &Value) -> Result<Value, String> {
         let name = msg["params"]["name"].as_str().unwrap_or_default();
         let args = &msg["params"]["arguments"];
+        // чужие ключи мутаций — отказ до разбора и до носителя (#1572)
+        refuse_unknown_args(name, args)?;
         let project = {
             let p = arg_str(args, "project");
             if p.is_empty() {
@@ -698,13 +794,12 @@ impl ToolHub {
 
     async fn task_body(&self, project: &str, args: &Value) -> Result<Value, String> {
         let number = need_number(args)?;
-        let body = arg_str(args, "body");
-        if body.trim().is_empty() {
-            return Err("empty body".into());
-        }
+        // «параметр отсутствует» ≠ «явно пустая строка» (#1572): Option-разбор
+        // на границе; отказ с длиной носителя и рецептом строит юзкейс
+        let body = args.get("body").and_then(|v| v.as_str());
         let receipt = self
             .writer
-            .set_body(project, number, &body)
+            .set_body(project, number, body)
             .await
             .map_err(|e| e.to_string())?;
         let mut msg = format!(
@@ -720,8 +815,14 @@ impl ToolHub {
     async fn task_body_section(&self, project: &str, args: &Value) -> Result<Value, String> {
         let number = need_number(args)?;
         let section = arg_str(args, "section");
-        let content = arg_str(args, "content");
+        let content = args.get("content").and_then(|v| v.as_str());
         let base_hash = arg_str(args, "base_hash");
+        // confirm (#1409): осознанное проведение радикального сжатия мимо
+        // гарда; без него гард отвечает отказом с длинами было/стало
+        let confirm = args
+            .get("confirm")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         if section.trim().is_empty() {
             return Err("section is required (the section heading)".into());
         }
@@ -730,7 +831,7 @@ impl ToolHub {
         }
         let report = self
             .writer
-            .set_body_section(project, number, &section, &content, &base_hash)
+            .set_body_section(project, number, &section, content, &base_hash, confirm)
             .await
             .map_err(|e| e.to_string())?;
         ok_text(render_section_report(&section, &report))
@@ -886,9 +987,10 @@ fn arg_numbers(args: &Value, key: &str) -> Result<Vec<u64>, String> {
         .collect()
 }
 
-/// Квитанция секционной правки для агента: исход + новое тело (хэш/размер).
-/// Компактно — полное тело не возвращается (сознательное сужение #1152:
-/// возврат больших тел убивал бы экономию секционного пути).
+/// Квитанция секционной правки для агента: исход + длины было/стало по
+/// телу и по секции (#1409: сверка без второго GET) + новое тело
+/// (хэш/размер). Компактно — полное тело не возвращается (сознательное
+/// сужение #1152: возврат больших тел убивал бы экономию секционного пути).
 fn render_section_report(section: &str, report: &uwuwu_usecase::SectionEditReport) -> String {
     use uwuwu_usecase::SectionAction;
     let mut verdict = match (report.action, report.cleared) {
@@ -902,16 +1004,23 @@ fn render_section_report(section: &str, report: &uwuwu_usecase::SectionEditRepor
             report.duplicates_removed
         ));
     }
-    format!(
-        "{verdict}; body {} bytes; body_hash: {}{}",
+    let mut out = format!(
+        "{verdict}; body {} bytes (was {}); section {} bytes (was {}); body_hash: {}{}",
         report.body_size,
+        report.body_was,
+        report.section_now,
+        report.section_was,
         report.body_hash,
         if report.verified {
             String::new()
         } else {
             delivery_unverified_marker().to_string()
         }
-    )
+    );
+    if report.confirmed {
+        out.push_str("; shrink passed with confirm: true");
+    }
+    out
 }
 
 /// Маркер деградированной квитанции (#1331): контрольное чтение носителя

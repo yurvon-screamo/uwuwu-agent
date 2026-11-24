@@ -66,8 +66,14 @@ pub(crate) fn toggles_fence(line: &str) -> bool {
 /// Исход секционной замены.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SectionEdit {
-    /// Секция заменена; одноимённые дубли на уровне пина сняты (хилинг).
-    Replaced { duplicates_removed: usize },
+    /// Секция заменена; одноимённые дубли на уровне пина сняты (хилинг);
+    /// `old_content_len` — байт-объём контента первой найденной секции
+    /// (строки до границы, без заголовка; пустые строки по нулям) — мера
+    /// гарда радикального сжатия и честных длин квитанции (#1409, #1572).
+    Replaced {
+        duplicates_removed: usize,
+        old_content_len: usize,
+    },
     /// Секции не было (пин h2) — добавлена в конец.
     Appended,
 }
@@ -101,6 +107,8 @@ pub fn replace_md_section(
         dropping: false, // контент секции/дубля до границы не копируется
         replaced: false,
         duplicates_removed: 0usize,
+        old_content_len: 0usize,
+        measuring: false,
         twin: None,
     };
     for line in md.lines() {
@@ -111,6 +119,7 @@ pub fn replace_md_section(
             scan.out,
             SectionEdit::Replaced {
                 duplicates_removed: scan.duplicates_removed,
+                old_content_len: scan.old_content_len,
             },
         ));
     }
@@ -145,6 +154,21 @@ pub fn replace_md_section(
     Ok((out, SectionEdit::Appended))
 }
 
+/// Объём контента секции в байтах (масштаб для честных длин отказа
+/// «content не передан», #1572): None — матчабельной секции на пине нет
+/// (отсутствующая, твин, не-h2 пин — для текста отказа этого достаточно).
+pub(crate) fn section_content_len(md: &str, section: &str) -> Option<usize> {
+    match replace_md_section(md, section, "") {
+        Ok((
+            _,
+            SectionEdit::Replaced {
+                old_content_len, ..
+            },
+        )) => Some(old_content_len),
+        _ => None,
+    }
+}
+
 /// Твин-гард: громкий отказ с уровнем тёзки, байт-точной строкой (первой
 /// по порядку — детерминизм) и рецептом обхода; записи нет.
 fn twin_rejection(
@@ -163,8 +187,10 @@ fn twin_rejection(
 }
 
 /// Один шаг прохода по строке: строки секции/дубля до границы не
-/// копируются; тёзка чужого уровня собирается в тот же проход (гард
-/// стреляет только если матча не было; первая по порядку — детерминизм).
+/// копируются; объём снятых строк первой найденной секции копится в
+/// old_content_len (мера гарда сжатия, #1572); тёзка чужого уровня
+/// собирается в тот же проход (гард стреляет только если матча не было;
+/// первая по порядку — детерминизм).
 struct SectionScan<'a> {
     want: &'a str,
     pin: usize,
@@ -174,6 +200,11 @@ struct SectionScan<'a> {
     dropping: bool,
     replaced: bool,
     duplicates_removed: usize,
+    /// байт-объём снятых строк первой найденной секции (до границы;
+    /// пустые строки по нулям, '\n' не считается — мера контента).
+    old_content_len: usize,
+    /// копление меры открыто: от первой найденной секции до её границы.
+    measuring: bool,
     twin: Option<(usize, &'a str)>,
 }
 
@@ -183,32 +214,42 @@ impl<'a> SectionScan<'a> {
         self.out.push('\n');
     }
 
-    fn copy_if_not_dropping(&mut self, line: &str) {
+    /// Строка внутри секции/дубля: не копируется; мера первой найденной
+    /// секции копится до границы.
+    fn drop_or_copy(&mut self, line: &str) {
         if !self.dropping {
             self.copy(line);
+            return;
+        }
+        if self.measuring {
+            self.old_content_len += line.len();
         }
     }
 
     fn step(&mut self, line: &'a str) {
         if toggles_fence(line) {
             self.fenced = !self.fenced;
-            self.copy_if_not_dropping(line);
+            self.drop_or_copy(line);
             return;
         }
         if self.fenced {
-            self.copy_if_not_dropping(line);
+            self.drop_or_copy(line);
             return;
         }
         let Some((level, text)) = heading_of(line) else {
-            self.copy_if_not_dropping(line);
+            self.drop_or_copy(line);
             return;
         };
         if level == self.pin && text == self.want {
             if self.replaced {
                 self.duplicates_removed += 1;
+                // дубль: мера первой секции уже снята — не переснимаем
+                self.measuring = false;
             } else {
                 push_heading_block(&mut self.out, line, self.content);
                 self.replaced = true;
+                self.measuring = true;
+                self.old_content_len = 0;
             }
             self.dropping = true;
             return;
@@ -218,11 +259,12 @@ impl<'a> SectionScan<'a> {
         }
         if level <= self.pin {
             self.dropping = false;
+            self.measuring = false;
             push_blank_line(&mut self.out);
             self.copy(line);
             return;
         }
-        self.copy_if_not_dropping(line);
+        self.drop_or_copy(line);
     }
 }
 
