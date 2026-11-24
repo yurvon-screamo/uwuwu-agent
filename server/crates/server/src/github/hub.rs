@@ -2889,7 +2889,9 @@ mod tests {
     #[ignore] // живой прогон: GH_TOKEN + сеть; МУТАЦИЯ — настоящие переходы, строка убирается за собой (≈5 мин: пауза wt-окна)
     fn live_edit_guard_passes_review_analys_to_todo_edge_after_wt_window() {
         use futures::FutureExt as _;
-        use uwuwu_usecase::{StatusDelivery, TaskPatch, TaskWriteUseCase, TaskWriter, UsecaseError};
+        use uwuwu_usecase::{
+            StatusDelivery, TaskPatch, TaskWriteUseCase, TaskWriter, UsecaseError,
+        };
         let repo =
             std::env::var("UWUWU_HUB_REPO").unwrap_or_else(|_| "yurvon-screamo/uwuwu-hub".into());
         let token = std::env::var("GH_TOKEN").expect("GH_TOKEN");

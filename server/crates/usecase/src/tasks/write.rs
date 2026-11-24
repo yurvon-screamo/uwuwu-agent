@@ -1079,8 +1079,11 @@ impl TaskWriteUseCase {
         if uwuwu_domain::Status::can_transition_with(cached, status, direct) {
             return Ok(cached);
         }
-        let fresh =
-            verifiable_current(board, number, self.board.fresh_row_status(board, number).await?)?;
+        let fresh = verifiable_current(
+            board,
+            number,
+            self.board.fresh_row_status(board, number).await?,
+        )?;
         let direct = self.carrier_direct(number, fresh, status).await;
         if !uwuwu_domain::Status::can_transition_with(fresh, status, direct) {
             tracing::warn!(
