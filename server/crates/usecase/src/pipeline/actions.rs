@@ -740,11 +740,6 @@ fn session_title(task: &Task, slot: Slot) -> String {
 /// фрагментам (импортирует константу — правка стадии через этот массив,
 /// расхождение источника и мока ловится тестом
 /// `stage_prompts_spawned_per_slot`).
-/// Бюджет команды task-env (мс): один снос env укладывается — носитель
-/// числа, бывший общий таймаут клиента адаптера (opencode.rs); батч
-/// env-gc носит свой бюджет прохода (env_gc.rs). #1526.
-pub const TASK_ENV_COMMAND_BUDGET_MS: u64 = 20_000;
-
 pub const STAGE_PROMPTS: &[(Slot, &str)] = &[
     (
         Slot::Design,
@@ -820,3 +815,8 @@ pub(crate) fn spawn_prompt(board: &BoardPlan, task: &Task, slot: Slot) -> String
         project = board.project,
     )
 }
+
+/// Бюджет команды task-env (мс): подготовка env одного спавна укладывается —
+/// носитель числа, бывший общий таймаут клиента адаптера (opencode.rs);
+/// батч env-gc носит свой бюджет прохода (env_gc.rs). #1526.
+pub const TASK_ENV_COMMAND_BUDGET_MS: u64 = 20_000;

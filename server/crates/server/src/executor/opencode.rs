@@ -592,9 +592,13 @@ impl AgentSessionGateway for OpencodeClient {
         }))
     }
 
-    /// Канал вердиктов env-gc (#1431): поллинг user-ленты с паузами —
-    /// токенов не жжёт (bootstrap-реплай агента не участвует), паузы —
-    /// tokio-сны воркера, не блокировка потока.
+    /// Канал вердиктов env-gc (#1431/#1526): поллинг user-ленты с паузами
+    /// — токенов не жжёт (bootstrap-реплай агента не участвует), паузы —
+    /// tokio-сны воркера, не блокировка потока. Транспортные Err опроса
+    /// ретраятся внутри цикла с той же паузой до дедлайна (#1526, ревью
+    /// кода Common-2: юзкейс-слой без сна — веер мгновенных ретраев не
+    /// покрывал эпизоды длиннее пары RTT); исход — Ok(Some(text)) при
+    /// маркере, Ok(None) по дедлайну; Err наружу не выходит.
     async fn wait_user_message(
         &self,
         session: &str,
@@ -603,9 +607,20 @@ impl AgentSessionGateway for OpencodeClient {
     ) -> UsecaseResult<Option<String>> {
         let started = std::time::Instant::now();
         loop {
-            if let Some(text) = self.last_user_message_text(session).await? {
-                if text.contains(marker) {
-                    return Ok(Some(text));
+            match self.last_user_message_text(session).await {
+                Ok(Some(text)) => {
+                    if text.contains(marker) {
+                        return Ok(Some(text));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        event = "env.verdict_poll_retry",
+                        session,
+                        error = %e,
+                        "Опрос ленты упал — ретрай до дедлайна"
+                    );
                 }
             }
             if started.elapsed().as_millis() as u64 >= deadline_ms {

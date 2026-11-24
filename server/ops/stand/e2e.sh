@@ -1123,12 +1123,16 @@ grep -q 'task-env-gc' "$LOG_MOCK" \
 say "14a ок: observe показал кандидата, команд нет"
 
 # 14b: live — батч-диспатч (#1526): ОДНА команда task-env-gc со всеми
-# строками-кандидатами, вердикты обеих через мок, свежая строка не тронута
+# строками-кандидатами, вердикты обеих через мок, свежая строка не тронута.
+# MOCK_CMD_DELAY_MS=25000 — команда держится дольше общего клиентского
+# таймаута 20с: per-request бюджет прохода должен её довезти (закрытие
+# High-2 ревью плана — ревью кода Common-3), цикл переживает медленную
+# команду.
 kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
 wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
 SRV_PID=""; MOCK_PID=""
 rm -f "$STATE"
-MOCK_MODE=idle MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=100 \
+MOCK_MODE=idle MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=100 MOCK_CMD_DELAY_MS=25000 \
   "$BIN_MOCK" >"$LOG_MOCK" 2>&1 &
 MOCK_PID=$!
 sleep 1
@@ -1137,12 +1141,12 @@ UWUWU_SERVER_CONFIG="$CONFIG_EGC" UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
   UWUWU_MOCK_SEED="$EGC_SEED" RUST_LOG=info "$BIN_SRV" >"$LOG_SRV_EGC" 2>&1 &
 SRV_PID=$!
 SEEN=0
-while [ $SEEN -lt 15 ]; do
+while [ $SEEN -lt 45 ]; do
   SEEN=$((SEEN + 1)); sleep 4
   grep -q '"event":"env.gc.completed"' "$LOG_SRV_EGC" && break
 done
 grep -q '"event":"env.gc.completed"' "$LOG_SRV_EGC" \
-  || fail "live-env-gc не дошёл до completed за 60с"
+  || fail "live-env-gc не дошёл до completed за 180с (медленная команда 25с не доехала — per-request бюджет не работает?)"
 CMDS=$(grep -c '"event":"mock.command".*task-env-gc' "$LOG_MOCK")
 [ "$CMDS" = "1" ] || fail "команд task-env-gc за проход: $CMDS, ждём ровно одну (батч #1526)"
 grep -q '"event":"env.swept"' "$LOG_SRV_EGC" \
@@ -1219,10 +1223,10 @@ echo "$GC_FAIL_BATCH" | grep -q '^ENV-GC 990016 FAIL (worktree remove)$' \
   || fail "заблокированный ворктри не FAIL: «$GC_FAIL_BATCH»"
 echo "$GC_FAIL_BATCH" | grep -q '^ENV-GC 990017 SWEPT$' \
   || fail "цикл не продолжился после FAIL строки: «$GC_FAIL_BATCH»"
-[ -d "$GC_FIX/envs/990017" ] && fail "последняя строка батча снесена после FAIL соседа (цикл прерван)"
+[ -d "$GC_FIX/envs/990017" ] && fail "последняя строка батча 990017 не снесена — FAIL соседа прервал цикл"
 # внезапный abort строки: инъекция return ≠ 0 в копии скрипта (пин
 # структуры страховки — вызов под || ловит только явный return ≠ 0)
-GC_ABORT_COPY="$RUN_DIR/task-env-gc-abject.sh"
+GC_ABORT_COPY="$RUN_DIR/task-env-gc-abort-inject.sh"
 ABORT_ROW=990018
 GC_INJECT="s/^sweep_one() {\$/sweep_one() { [ \"\$1\" = \"$ABORT_ROW\" ] \&\& return 7;/"
 sed "$GC_INJECT" "$GC_SCRIPT" > "$GC_ABORT_COPY"

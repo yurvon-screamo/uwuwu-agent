@@ -143,9 +143,11 @@ pub(super) async fn preflight_row<'a>(
 
 /// Перепроба статуса готовой строки непосредственно перед диспатчем
 /// (#1526, ревью раунд 3): pre-flight — N последовательных проб, stalled
-/// проба устаревает ранние строки; перепроба сужает окно «проба → снос»
-/// до длительности последнего цикла. Живое чтение носителя — кеш не
-/// выдаёт своё же старое. Возрождённая строка выбывает из батча.
+/// проба устаревает ранние строки; перепроба сужает окно «проба → снос».
+/// Свежее чтение носителя мимо write-through-кеша и items-индекса
+/// (`fresh_row_status`, #1437): обычная проба до истечения ITEMS_TTL
+/// возвращает кеш-ячейку, ревайв между циклами остался бы невидим
+/// (ревью кода раунд 1, Common-4). Возрождённая строка выбывает из батча.
 pub(super) async fn revalidate_row<'a>(
     board: &dyn crate::ports::TaskBoardRepo,
     board_name: &str,
@@ -154,7 +156,7 @@ pub(super) async fn revalidate_row<'a>(
     batch: &mut Vec<&'a Task>,
 ) {
     let number = task.number();
-    match board.row_status(board_name, number).await {
+    match board.fresh_row_status(board_name, number).await {
         Ok(Some(st)) if st.is_terminal() => batch.push(task),
         Ok(Some(_)) => {
             out.revoked += 1;
@@ -182,18 +184,38 @@ pub(super) async fn revalidate_row<'a>(
 /// Сбор вердиктов батча: одно wait_user_message по маркеру-префиксу
 /// «ENV-GC » (матчится любой вердикт-строкой) со страх-дедлайном, затем
 /// parse-all по готовым строкам. POST /command синхронен — на Ok команды
-/// сообщение уже в ленте; три исхода ожидания (пин Design #1526):
-/// Ok(Some) → parse-all (недостающие — failed); Ok(None) → все failed;
-/// Err (опрос упал транспортом) → ретрай до страх-дедлайна, исчерпан —
-/// все failed + env.verdict_read_failed (транспортный отказ чтения не
-/// подмешивается в «снос не доведён» — класс #1506).
+/// сообщение уже в ленте; исходы ожидания (пин Design #1526):
+/// Ok(Some) → parse-all (недостающие — failed, каждый WARN env.gc_fail);
+/// Ok(None) — страх-дедлайн истёк без маркера (снос идёт, исходы не
+/// читаются — подпись класса дрейфа носителя, вскрывшего #1506) → все
+/// failed + WARN env.verdict_read_failed + per-row WARN env.gc_fail;
+/// Err опроса — транспортный отказ чтения → все failed + WARN
+/// env.verdict_read_failed (не подмешивается в «снос не доведён»).
+/// Ретрай транспортных Err опроса живёт в адаптере (цикл
+/// wait_user_message с паузой USER_MSG_POLL до дедлайна) — юзкейс
+/// получает только исход.
 pub(super) async fn collect_verdicts(
     sessions: &Gateway,
     bootstrap: &str,
+    board_name: &str,
     targets: &[&Task],
     out: &mut EnvGcOutcome,
 ) {
     let Some(text) = wait_feed(sessions, bootstrap).await else {
+        tracing::warn!(
+            event = "env.verdict_read_failed",
+            board = board_name,
+            batch = targets.len(),
+            "Лента батч-команды не дала маркера за страх-дедлайн — вердикты не собраны"
+        );
+        for t in targets {
+            tracing::warn!(
+                event = "env.gc_fail",
+                board = board_name,
+                number = t.number(),
+                "Вердикта нет за страх-дедлайн — переедет следующим проходом"
+            );
+        }
         out.failed += targets.len();
         return;
     };
@@ -202,12 +224,18 @@ pub(super) async fn collect_verdicts(
         match parse_verdict(&text, &row) {
             Some(Verdict::Swept) => {
                 out.swept += 1;
-                tracing::info!(event = "env.swept", number = t.number(), "env снесён");
+                tracing::info!(
+                    event = "env.swept",
+                    board = board_name,
+                    number = t.number(),
+                    "env снесён"
+                );
             }
             Some(Verdict::Dirty) => {
                 out.dirty += 1;
                 tracing::info!(
                     event = "env.dirty",
+                    board = board_name,
                     number = t.number(),
                     "env грязный — не снесён, разбор владельца по логам"
                 );
@@ -216,6 +244,7 @@ pub(super) async fn collect_verdicts(
                 out.norepo += 1;
                 tracing::info!(
                     event = "env.norepo",
+                    board = board_name,
                     number = t.number(),
                     "env без repo — не снесён, ручной разбор"
                 );
@@ -224,6 +253,7 @@ pub(super) async fn collect_verdicts(
                 out.foreign += 1;
                 tracing::info!(
                     event = "env.foreign",
+                    board = board_name,
                     number = t.number(),
                     "env не принадлежит чекауту проекта — не снесён"
                 );
@@ -232,6 +262,7 @@ pub(super) async fn collect_verdicts(
                 out.absent += 1;
                 tracing::info!(
                     event = "env.absent",
+                    board = board_name,
                     number = t.number(),
                     "env уже отсутствует"
                 );
@@ -240,6 +271,7 @@ pub(super) async fn collect_verdicts(
                 out.failed += 1;
                 tracing::warn!(
                     event = "env.gc_fail",
+                    board = board_name,
                     number = t.number(),
                     "Снос не доведён (FAIL или вердикта нет в батч-сообщении) — переедет следующим проходом"
                 );
@@ -249,23 +281,15 @@ pub(super) async fn collect_verdicts(
 }
 
 /// Ожидание батч-сообщения: wait_user_message с маркером «ENV-GC » и
-/// страх-дедлайном; Err опроса (адаптер возвращает его немедленно) —
-/// ретрай до страх-дедлайна и/или капа попыток. Пауза между ретраями в
-/// юзкейсе недоступна (слой зависит только от домена, tokio — dev-dep):
-/// ограничителем служит кап попыток, при живом носителе первая же
-/// попытка возвращает ленту. None — страх-дедлайн исчерпан (Ok(None)
-/// или Err-исчерпание).
+/// страх-дедлайном. Транспортные Err опроса ретраит адаптер (цикл с
+/// паузой USER_MSG_POLL до дедлайна) — сюда доходит только исход.
+/// None — маркера нет за страх-дедлайн (Ok(None)) либо Err-исчерпание.
 async fn wait_feed(sessions: &Gateway, bootstrap: &str) -> Option<String> {
     let started = Instant::now();
     let mut retries = 0usize;
     loop {
         let remaining = VERDICT_READ_GRACE_MS.saturating_sub(started.elapsed().as_millis() as u64);
         if remaining == 0 || retries > VERDICT_READ_MAX_RETRIES {
-            tracing::warn!(
-                event = "env.verdict_read_failed",
-                retries,
-                "Лента батч-команды не прочитана (страх-дедлайн/кап ретраев) — вердикты не собраны"
-            );
             return None;
         }
         match sessions

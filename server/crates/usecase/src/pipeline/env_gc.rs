@@ -163,9 +163,10 @@ pub async fn sweep_envs(ctx: &EnvGcCtx<'_>, policy: EnvGcPolicy) -> UsecaseResul
     // Пустой батч (все строки pre-flight/перепробой сняты) — bootstrap
     // не создаётся, команды нет.
     let boot_model = ctx.models.for_default();
-    let bootstrap = match batch.is_empty() {
-        true => None,
-        false => match ctx
+    let bootstrap = if batch.is_empty() {
+        None
+    } else {
+        match ctx
             .sessions
             .create_session(&SessionSpec {
                 directory: ctx.checkout.to_string(),
@@ -188,7 +189,7 @@ pub async fn sweep_envs(ctx: &EnvGcCtx<'_>, policy: EnvGcPolicy) -> UsecaseResul
                 );
                 None
             }
-        },
+        }
     };
     // Одна команда на проход: строки батча через пробел; скрипт циклит
     // сам и печатает вердикт на каждую (tail-join $1 шаблона — проба #1526).
@@ -206,7 +207,7 @@ pub async fn sweep_envs(ctx: &EnvGcCtx<'_>, policy: EnvGcPolicy) -> UsecaseResul
         {
             Ok(()) => {
                 out.dispatched = batch.len();
-                collect_verdicts(ctx.sessions, bootstrap, &batch, &mut out).await;
+                collect_verdicts(ctx.sessions, bootstrap, ctx.board_name, &batch, &mut out).await;
             }
             Err(e) => {
                 // Транспортный отказ: обрыв запроса убивает скрипт посреди

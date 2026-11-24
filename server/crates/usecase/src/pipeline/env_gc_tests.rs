@@ -189,6 +189,9 @@ struct FakeBoard {
     /// Номер → сколько вызовов row_status уже было; на n-м вызове строки
     /// возвращает In Progress (ревайв на перепробе).
     revive_on_call: Mutex<HashMap<u64, usize>>,
+    /// Номер → с какого вызова row_status возвращает Err (перепроба
+    /// отказывает при живом pre-flight).
+    fail_from_call: Mutex<HashMap<u64, usize>>,
     calls: Mutex<HashMap<u64, usize>>,
 }
 
@@ -198,6 +201,7 @@ impl FakeBoard {
             statuses: Mutex::new(HashMap::new()),
             row_status_fails: false,
             revive_on_call: Mutex::new(HashMap::new()),
+            fail_from_call: Mutex::new(HashMap::new()),
             calls: Mutex::new(HashMap::new()),
         })
     }
@@ -206,6 +210,7 @@ impl FakeBoard {
             statuses: Mutex::new(HashMap::from([(row, status)])),
             row_status_fails: false,
             revive_on_call: Mutex::new(HashMap::new()),
+            fail_from_call: Mutex::new(HashMap::new()),
             calls: Mutex::new(HashMap::new()),
         })
     }
@@ -216,6 +221,18 @@ impl FakeBoard {
             statuses: Mutex::new(HashMap::new()),
             row_status_fails: false,
             revive_on_call: Mutex::new(HashMap::from([(row, 2)])),
+            fail_from_call: Mutex::new(HashMap::new()),
+            calls: Mutex::new(HashMap::new()),
+        })
+    }
+    /// Строка доступна на pre-flight (1-й вызов), перепроба отказывает
+    /// (2-й и далее) — «не знаю» ≠ «можно сносить» на перепробе.
+    fn with_fail_from_call(row: u64, from: usize) -> Arc<Self> {
+        Arc::new(Self {
+            statuses: Mutex::new(HashMap::new()),
+            row_status_fails: false,
+            revive_on_call: Mutex::new(HashMap::new()),
+            fail_from_call: Mutex::new(HashMap::from([(row, from)])),
             calls: Mutex::new(HashMap::new()),
         })
     }
@@ -243,6 +260,13 @@ impl TaskBoardRepo for FakeBoard {
         *call += 1;
         let nth = *call;
         drop(calls);
+        if let Some(&from) = self.fail_from_call.lock().unwrap().get(&number) {
+            if nth >= from {
+                return Err(UsecaseError::Session(
+                    "перепроба статуса недоступна (мок)".into(),
+                ));
+            }
+        }
         if let Some(&from) = self.revive_on_call.lock().unwrap().get(&number) {
             if nth >= from {
                 return Ok(Some(Status::InProgress));
@@ -717,6 +741,21 @@ async fn no_ready_rows_means_no_bootstrap_and_no_command() {
 }
 
 #[tokio::test]
+async fn revalidate_failure_skips_the_row_fail_safe() {
+    // Перепроба отказала при живом pre-flight (Low-5 ревью кода):
+    // «не знаю» на перепробе — строка не входит в батч, команды нет
+    let board = FakeBoard::with_fail_from_call(1431, 2);
+    let gw = fake(Vec::new());
+    verdict_default(&gw, "SWEPT");
+    let tasks = [done_closed(1431, THREE_DAYS, NOW)];
+    let out = run(&tasks, &gw, &board, NOW, false).await;
+    assert_eq!(out.failed, 1);
+    assert_eq!(out.dispatched, 0);
+    assert!(gw.commands.lock().unwrap().is_empty());
+    assert!(gw.created.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn status_probe_failure_skips_the_row_fail_safe() {
     // «Не знаю» ≠ «можно сносить» (ADR-058): недоступная проба статуса —
     // строка переезжает, диспатча нет
@@ -724,6 +763,7 @@ async fn status_probe_failure_skips_the_row_fail_safe() {
         statuses: Mutex::new(HashMap::new()),
         row_status_fails: true,
         revive_on_call: Mutex::new(HashMap::new()),
+        fail_from_call: Mutex::new(HashMap::new()),
         calls: Mutex::new(HashMap::new()),
     });
     let gw = fake(Vec::new());

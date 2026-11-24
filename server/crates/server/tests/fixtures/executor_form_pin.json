@@ -1,51 +1,26 @@
 {
-  "opencode_version": "2.3",
+  "opencode_version": "2.3.2",
   "probed_at": "2026-11-24",
-  "source": "живая проба #1249 (дельта-раунд 17.11, basic-auth) + пин-семя PR #381 + ось user-сообщения из пробы #1526",
+  "source": "живая проба #1249 (дельта-раунд 17.11, basic-auth) + пин-семя PR #381 + ось user-сообщения из пробы #1526 (feed3.json + прод-БД)",
   "rule": "пин = дефолтная форма исполнителя; env-ручки-режимы стенда вне контракта",
   "refresh": "после апгрейда opencode — повторная проба по ранбуку «Проба формы executor-API (пин-файл)»",
   "message_tail": {
     "wrapper": "data",
-    "forbidden_time_fields": [
-      "updated"
-    ],
-    "assistant_final_time": [
-      "completed",
-      "created",
-      "firstToken",
-      "streamed"
-    ],
-    "assistant_streaming_time": [
-      "created",
-      "firstToken",
-      "streamed"
-    ],
-    "idle_time": [
-      "created"
-    ]
+    "forbidden_time_fields": ["updated"],
+    "assistant_final_time": ["completed", "created", "firstToken", "streamed"],
+    "assistant_streaming_time": ["created", "firstToken", "streamed"],
+    "idle_time": ["created"]
+  },
+  "user_message": {
+    "form": "top-level text",
+    "forbidden_keys": ["content"],
+    "probe": "проба #1526 (scratch/probe-1526/feed3.json) + прод-БД: user-сообщения env-gc после мерджа #497 — 34/34 с text+time, без content"
   },
   "session_list": {
     "wrapper": "data",
     "cursor": true,
-    "item_time": [
-      "busy",
-      "created",
-      "idle",
-      "updated"
-    ],
-    "default_session": {
-      "agent_key": "absent",
-      "outcome": "null"
-    },
-    "role_session": {
-      "agent_key": "string"
-    }
-  },
-  "user_message": {
-    "form": "top-level text",
-    "forbidden_keys": [
-      "content"
-    ],
-    "probe": "проба #1526 (scratch/probe-1526/feed3.json) + прод-БД: user-сообщения env-gc после мерджа #497 — 34/34 с text+time, без content"
+    "item_time": ["busy", "created", "idle", "updated"],
+    "default_session": {"agent_key": "absent", "outcome": "null"},
+    "role_session": {"agent_key": "string"}
   }
 }
