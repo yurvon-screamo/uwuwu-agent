@@ -45,15 +45,30 @@ pub(crate) fn tool_hub(
 ) -> (Arc<ToolHub>, Arc<MemoryHub>) {
     let memory = Arc::new(MemoryHub::from_env());
     let board: Arc<dyn uwuwu_usecase::TaskBoardRepo> = memory.clone();
-    let fields: Arc<dyn uwuwu_usecase::IssueFieldStore> = memory.clone();
-    let clean_repo: Arc<dyn uwuwu_usecase::CleanBoardRepo> = memory.clone();
+    tool_hub_on_board(wiki, blobs, crons_state, board, memory.clone())
+}
+
+/// Та же сборка с подменённой доской (пин квитанции Unverified #1437,
+/// тест-ревью C2): tasks/writer смотрят на поданный носитель, остальные
+/// армы — на aux. Исход set_status фейка доходит до поверхности MCP
+/// сквозь настоящий TaskWriteUseCase; возвращается aux — носитель
+/// остальных армов (при дефолтной сборке он же и доска, как прежде).
+pub(crate) fn tool_hub_on_board(
+    wiki: Arc<dyn WikiRepo>,
+    blobs: Arc<uwuwu_usecase::BlobUseCase>,
+    crons_state: Arc<dyn uwuwu_usecase::CronStateStore>,
+    board: Arc<dyn uwuwu_usecase::TaskBoardRepo>,
+    aux: Arc<MemoryHub>,
+) -> (Arc<ToolHub>, Arc<MemoryHub>) {
+    let fields: Arc<dyn uwuwu_usecase::IssueFieldStore> = aux.clone();
+    let clean_repo: Arc<dyn uwuwu_usecase::CleanBoardRepo> = aux.clone();
     let tools = Arc::new(ToolHub {
         tasks: Arc::new(TaskView::new(
             board.clone(),
             vec![("uwuwu".to_string(), "Задачи uwuwu".to_string())],
         )),
         goals: Arc::new(uwuwu_usecase::GoalsView::new(
-            memory.clone(),
+            aux.clone(),
             vec!["uwuwu".to_string()],
             "https://github.com/acme/hub/milestones".into(),
         )),
@@ -73,7 +88,7 @@ pub(crate) fn tool_hub(
             clock: Arc::new(SystemClock),
         }),
         status: Arc::new(uwuwu_usecase::BoardStatusRenameUseCase {
-            repo: memory.clone() as Arc<dyn uwuwu_usecase::BoardStatusRepo>,
+            repo: aux.clone() as Arc<dyn uwuwu_usecase::BoardStatusRepo>,
             journal: Arc::new(StubPreImages),
             boards: vec![("uwuwu".to_string(), "Задачи uwuwu".to_string())],
             clock: Arc::new(SystemClock),
@@ -97,7 +112,7 @@ pub(crate) fn tool_hub(
             None,
         )),
     });
-    (tools, memory)
+    (tools, aux)
 }
 
 #[async_trait]

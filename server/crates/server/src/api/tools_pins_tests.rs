@@ -532,7 +532,7 @@ async fn status_wait_edit_reads_back_canon_wait() {
     )
     .await
     .expect("edit Wait");
-    assert_eq!(edited, "task #1 updated");
+    assert_eq!(edited, "task #1 updated, carrier confirms: \"Wait\"");
     let get = call(&tools, "task_get", json!({ "number": 1 }))
         .await
         .expect("get");
@@ -560,7 +560,7 @@ async fn status_weit_alias_sets_canon_wait() {
     )
     .await
     .expect("edit алиасом");
-    assert_eq!(edited, "task #1 updated");
+    assert_eq!(edited, "task #1 updated, carrier confirms: \"Wait\"");
     let get = call(&tools, "task_get", json!({ "number": 1 }))
         .await
         .expect("get");
@@ -725,4 +725,243 @@ async fn board_status_rename_project_outside_config_refuses() {
     .await
     .expect_err("отказ");
     assert!(err.contains("not in config"), "{err}");
+}
+
+// ---- Форма квитанции Unverified на поверхности MCP (тест-ревью C2 #1437) ----
+
+/// Причина фейка — каноничный текст Unverified из hub.rs: rate limit на
+/// verify-риде (единственная ветка, где задача принята, а применения
+/// свежие чтения не показали).
+const UNVERIFIED_REASON: &str = "GraphQL rate limit — confirmation not performed";
+
+/// Фейк доски пина: всё делегирует MemoryHub, кроме set_status — запись
+/// ПРИМЕНЯЕТСЯ (носитель сдвинулся, write-through жив — как PATCH на
+/// бою), а исход отвечает Unverified. Точная имитация rate-limit ветки
+/// verify (#1437): GitHub принял, квитанция успеха не заявляет.
+struct UnverifiedStatusBoard {
+    inner: Arc<crate::mockhub::MemoryHub>,
+}
+
+#[async_trait::async_trait]
+impl uwuwu_usecase::TaskBoardRepo for UnverifiedStatusBoard {
+    async fn read_board(
+        &self,
+        board: &str,
+    ) -> uwuwu_usecase::UsecaseResult<Vec<uwuwu_domain::Task>> {
+        self.inner.read_board(board).await
+    }
+
+    async fn set_status(
+        &self,
+        board: &str,
+        number: u64,
+        status: uwuwu_domain::Status,
+    ) -> uwuwu_usecase::UsecaseResult<uwuwu_usecase::StatusDelivery> {
+        self.inner.set_status(board, number, status).await?;
+        Ok(uwuwu_usecase::StatusDelivery::Unverified {
+            reason: UNVERIFIED_REASON.into(),
+        })
+    }
+
+    async fn row_status(
+        &self,
+        board: &str,
+        number: u64,
+    ) -> uwuwu_usecase::UsecaseResult<Option<uwuwu_domain::Status>> {
+        self.inner.row_status(board, number).await
+    }
+
+    async fn row_exists(&self, board: &str, number: u64) -> uwuwu_usecase::UsecaseResult<bool> {
+        self.inner.row_exists(board, number).await
+    }
+
+    async fn set_session(
+        &self,
+        board: &str,
+        number: u64,
+        slot: uwuwu_domain::Slot,
+        session: &str,
+    ) -> uwuwu_usecase::UsecaseResult<()> {
+        self.inner.set_session(board, number, slot, session).await
+    }
+
+    async fn set_branch(
+        &self,
+        board: &str,
+        number: u64,
+        branch: &uwuwu_domain::BranchName,
+    ) -> uwuwu_usecase::UsecaseResult<()> {
+        self.inner.set_branch(board, number, branch).await
+    }
+
+    async fn set_board_cells(
+        &self,
+        board: &str,
+        number: u64,
+        priority: Option<&str>,
+        automerge: Option<bool>,
+        direct: Option<bool>,
+    ) -> uwuwu_usecase::UsecaseResult<()> {
+        self.inner
+            .set_board_cells(board, number, priority, automerge, direct)
+            .await
+    }
+
+    async fn clear_session(
+        &self,
+        board: &str,
+        number: u64,
+        slot: uwuwu_domain::Slot,
+    ) -> uwuwu_usecase::UsecaseResult<()> {
+        self.inner.clear_session(board, number, slot).await
+    }
+
+    async fn post_comment(&self, number: u64, body: &str) -> uwuwu_usecase::UsecaseResult<String> {
+        self.inner.post_comment(number, body).await
+    }
+
+    async fn close_issue(&self, number: u64) -> uwuwu_usecase::UsecaseResult<()> {
+        self.inner.close_issue(number).await
+    }
+
+    async fn latest_comments(
+        &self,
+        number: u64,
+    ) -> uwuwu_usecase::UsecaseResult<Vec<uwuwu_usecase::CommentRef>> {
+        self.inner.latest_comments(number).await
+    }
+
+    async fn read_issue(
+        &self,
+        board: &str,
+        number: u64,
+    ) -> uwuwu_usecase::UsecaseResult<uwuwu_usecase::IssueView> {
+        self.inner.read_issue(board, number).await
+    }
+
+    async fn issue_fields(
+        &self,
+        number: u64,
+    ) -> uwuwu_usecase::UsecaseResult<uwuwu_domain::TaskFields> {
+        self.inner.issue_fields(number).await
+    }
+
+    async fn create_issue(
+        &self,
+        board: &str,
+        project: &str,
+        title: &str,
+        body: &str,
+        kind_name: Option<&str>,
+    ) -> uwuwu_usecase::UsecaseResult<u64> {
+        self.inner
+            .create_issue(board, project, title, body, kind_name)
+            .await
+    }
+
+    async fn set_issue_type(
+        &self,
+        number: u64,
+        kind_name: &str,
+    ) -> uwuwu_usecase::UsecaseResult<()> {
+        self.inner.set_issue_type(number, kind_name).await
+    }
+
+    async fn rename_issue(&self, number: u64, title: &str) -> uwuwu_usecase::UsecaseResult<()> {
+        self.inner.rename_issue(number, title).await
+    }
+
+    async fn patch_cells(
+        &self,
+        number: u64,
+        mutate: uwuwu_usecase::FmMutator,
+    ) -> uwuwu_usecase::UsecaseResult<()> {
+        self.inner.patch_cells(number, mutate).await
+    }
+
+    async fn close_issue_ext(
+        &self,
+        number: u64,
+        not_planned: bool,
+    ) -> uwuwu_usecase::UsecaseResult<()> {
+        self.inner.close_issue_ext(number, not_planned).await
+    }
+
+    async fn archive_row(&self, board: &str, number: u64) -> uwuwu_usecase::UsecaseResult<()> {
+        self.inner.archive_row(board, number).await
+    }
+
+    async fn issues_with_title(&self, title: &str) -> uwuwu_usecase::UsecaseResult<Vec<u64>> {
+        self.inner.issues_with_title(title).await
+    }
+
+    async fn replace_body(&self, number: u64, body_md: &str) -> uwuwu_usecase::UsecaseResult<()> {
+        self.inner.replace_body(number, body_md).await
+    }
+}
+
+/// Диспетчер на подменённой доске: сборка фабрики та же, writer/tasks
+/// смотрят на UnverifiedStatusBoard; aux — та же память, что под фейком
+/// (носитель, куда фейк применяет запись).
+fn hub_unverified() -> Arc<ToolHub> {
+    let memory = Arc::new(crate::mockhub::MemoryHub::from_env());
+    let board: Arc<dyn uwuwu_usecase::TaskBoardRepo> = Arc::new(UnverifiedStatusBoard {
+        inner: memory.clone(),
+    });
+    let (tools, _aux) = super::test_support::tool_hub_on_board(
+        Arc::new(crate::mockhub::MemoryHub::from_env()),
+        blob_usecase(),
+        Arc::new(StubCronState::default()),
+        board,
+        memory,
+    );
+    tools
+}
+
+/// Форма квитанции Unverified (тест-ревью C2 #1437): статусная запись
+/// принята GitHub (носитель сдвинулся), свежее чтение применение не
+/// подтвердило (rate limit на verify-риде). Ответ MCP НЕ заявляет
+/// success: «did NOT confirm» + предписание контрольного чтения
+/// НОСИТЕЛЯ, слепой ретрай осуждён. Сквозь настоящий TaskWriteUseCase
+/// (исход проходит write.rs насквозь до текста тула). Второй смысл
+/// пина: «accepted, not confirmed» ≠ «не применено» — носитель несёт
+/// записанный статус.
+#[tokio::test]
+async fn task_edit_status_unverified_receipt_does_not_claim_success() {
+    let tools = hub_unverified();
+    let created = call(
+        &tools,
+        "task_create",
+        json!({ "title": "unverified-прогон", "direct": true }),
+    )
+    .await
+    .expect("create direct");
+    assert_eq!(
+        created,
+        "direct task #1 created (In Progress) on the uwuwu board"
+    );
+    let edited = call(
+        &tools,
+        "task_edit",
+        json!({ "number": 1, "status": "Wait" }),
+    )
+    .await
+    .expect("edit Wait — исход Unverified не Err, задача принята");
+    assert_eq!(
+        edited,
+        format!(
+            "task #1: status accepted by GitHub, carrier read did NOT confirm \
+             ({UNVERIFIED_REASON}) — verify the CARRIER (gh, board) yourself, do not retry blindly"
+        )
+    );
+    // write-through жив: носитель (внутренность фейка) несёт Wait —
+    // «accepted, not confirmed» ≠ «не применено»; task_get идёт через
+    // TaskView → фейк → тот же носитель, куда писала запись
+    let get = call(&tools, "task_get", json!({ "number": 1 }))
+        .await
+        .expect("get");
+    assert!(
+        get.starts_with("#1 unverified-прогон — Wait"),
+        "запись применена несмотря на Unverified: {get}"
+    );
 }

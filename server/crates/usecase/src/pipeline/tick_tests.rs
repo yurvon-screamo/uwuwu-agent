@@ -40,12 +40,19 @@ impl TaskBoardRepo for FakeBoard {
     async fn read_board(&self, _board: &str) -> UsecaseResult<Vec<Task>> {
         Ok(self.rows.lock().unwrap().clone())
     }
-    async fn set_status(&self, _b: &str, n: u64, s: Status) -> UsecaseResult<()> {
+    async fn set_status(
+        &self,
+        _b: &str,
+        n: u64,
+        s: Status,
+    ) -> UsecaseResult<crate::ports::StatusDelivery> {
         if self.status_fails.load(Ordering::Relaxed) {
             return Err(UsecaseError::Session("set_status недоступен (мок)".into()));
         }
         self.log.lock().unwrap().push(format!("status#{n}={s:?}"));
-        Ok(())
+        Ok(crate::ports::StatusDelivery::Confirmed {
+            actual: crate::naming::status_name(s).to_string(),
+        })
     }
     async fn row_status(&self, _b: &str, n: u64) -> UsecaseResult<Option<Status>> {
         Ok(self
@@ -1549,8 +1556,15 @@ impl TaskBoardRepo for CommentBoard {
     async fn read_board(&self, _board: &str) -> UsecaseResult<Vec<Task>> {
         Ok(Vec::new())
     }
-    async fn set_status(&self, _b: &str, _n: u64, _s: Status) -> UsecaseResult<()> {
-        Ok(())
+    async fn set_status(
+        &self,
+        _b: &str,
+        _n: u64,
+        _s: Status,
+    ) -> UsecaseResult<crate::ports::StatusDelivery> {
+        Ok(crate::ports::StatusDelivery::Confirmed {
+            actual: crate::naming::status_name(_s).to_string(),
+        })
     }
     async fn set_board_cells(
         &self,
@@ -5957,9 +5971,16 @@ impl TaskBoardRepo for FakeMultiBoard {
             .map(|(_, rows)| rows.clone())
             .unwrap_or_default())
     }
-    async fn set_status(&self, _b: &str, n: u64, s: Status) -> UsecaseResult<()> {
+    async fn set_status(
+        &self,
+        _b: &str,
+        n: u64,
+        s: Status,
+    ) -> UsecaseResult<crate::ports::StatusDelivery> {
         self.log.lock().unwrap().push(format!("status#{n}={s:?}"));
-        Ok(())
+        Ok(crate::ports::StatusDelivery::Confirmed {
+            actual: crate::naming::status_name(s).to_string(),
+        })
     }
     async fn row_status(&self, board: &str, n: u64) -> UsecaseResult<Option<Status>> {
         Ok(self
@@ -6391,14 +6412,21 @@ impl TaskBoardRepo for CloseBoard {
             .map(|n| Task::new(*n, format!("строка {n}"), Status::Todo))
             .collect())
     }
-    async fn set_status(&self, b: &str, n: u64, s: Status) -> UsecaseResult<()> {
+    async fn set_status(
+        &self,
+        b: &str,
+        n: u64,
+        s: Status,
+    ) -> UsecaseResult<crate::ports::StatusDelivery> {
         if !self.board_of(b)?.contains(&n) {
             return Err(crate::error::UsecaseError::Board(format!(
                 "строка #{n} не на доске «{b}»"
             )));
         }
         self.log.lock().unwrap().push(format!("status#{n}={s:?}"));
-        Ok(())
+        Ok(crate::ports::StatusDelivery::Confirmed {
+            actual: crate::naming::status_name(s).to_string(),
+        })
     }
     async fn row_status(&self, board: &str, n: u64) -> UsecaseResult<Option<Status>> {
         Ok(self.board_of(board)?.contains(&n).then_some(Status::Todo))

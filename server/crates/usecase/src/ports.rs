@@ -12,17 +12,53 @@ use uwuwu_domain::{
 pub type FmMutator =
     Box<dyn for<'a> FnOnce(&'a mut std::collections::BTreeMap<String, String>) + Send>;
 
+/// Исход статусной записи (#1437): честная квитанция — подтверждением
+/// служит только свежее чтение носителя (мимо write-through и
+/// индексного кеша). Текст ответа MCP task_edit строится из этого
+/// исхода, не из факта отсутствия ошибки.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusDelivery {
+    /// Носитель подтвердил запись свежим чтением; actual — raw-имя
+    /// статуса с носителя (может расходиться с каноническим
+    /// написанием псевдонимом — «Вейт», семантика равна).
+    Confirmed { actual: String },
+    /// GitHub принял мутацию, свежее чтение носителя в бюджете verify
+    /// применения не показало (read-лаг Projects v2 / rate limit):
+    /// success не заявляется, агенту предписано контрольное чтение
+    /// носителя.
+    Unverified { reason: String },
+}
+
 /// Доска задач: чтение строк + мутации носителя (поля+fm синхронны —
 /// инвариант «fm ≡ поля» держит реализация).
 #[async_trait]
 pub trait TaskBoardRepo: Send + Sync {
     async fn read_board(&self, board: &str) -> UsecaseResult<Vec<Task>>;
-    async fn set_status(&self, board: &str, number: u64, status: Status) -> UsecaseResult<()>;
+    /// Статусная запись с честным исходом (#1437): Ok несёт исход
+    /// подтверждения носителем — echo мутации и серверные кеши не
+    /// доказательство применения (инстансы 19–20.11: «обновлена» при
+    /// no-op на носителе). Err — мутация не принята (гард, HTTP,
+    /// носитель отказал).
+    async fn set_status(
+        &self,
+        board: &str,
+        number: u64,
+        status: Status,
+    ) -> UsecaseResult<StatusDelivery>;
     /// Свежий статус строки с носителя, мимо кэшей доски — гард канона
     /// edit() обязан сверяться с носителем, не со снапшотом (#1235).
     /// None — Status-значения на носителе нет (строки нет на доске /
     /// поле не задано); Some(Empty) — значение носителя непарсящееся.
     async fn row_status(&self, board: &str, number: u64) -> UsecaseResult<Option<Status>>;
+    /// Свежий статус строки с НОСИТЕЛЯ мимо всех серверных кешей
+    /// (write-through и индексный): доказательство идемпотентного
+    /// гарда edit() (#1437, симптом 2 — стейл-писец проводил
+    /// перезапись как «переустановку» поверх кеш-лага) и материал
+    /// verify статусной записи. Реализации без кешей могут не
+    /// переопределять — дефолт делегирует row_status.
+    async fn fresh_row_status(&self, board: &str, number: u64) -> UsecaseResult<Option<Status>> {
+        self.row_status(board, number).await
+    }
     /// Предикат присутствия строки на доске — независим от читаемости
     /// Status (строка без поля/в read-лаге всё ещё строка; close-поиск
     /// доски #1236).
