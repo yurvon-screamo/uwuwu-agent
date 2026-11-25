@@ -276,6 +276,8 @@ struct FakeSessions {
     abort_fails: AtomicBool,
     /// Бюджетная проба spawn_allowed (false — преемпшен не начинается).
     spawn_probe: AtomicBool,
+    /// Журнал нативных компактов (#1626): re-entry доставки мастер-сессий.
+    compacted: Mutex<Vec<String>>,
 }
 
 /// Слепок живой сессии в фейке: (id, agent, directory, outcome, updated).
@@ -313,6 +315,7 @@ impl FakeSessions {
             switched: Mutex::default(),
             abort_fails: AtomicBool::new(false),
             spawn_probe: AtomicBool::new(true),
+            compacted: Mutex::default(),
         }
     }
     fn with_live(agent: &str) -> Self {
@@ -391,6 +394,10 @@ impl AgentSessionGateway for FakeSessions {
             .lock()
             .unwrap()
             .push(format!("{session}|{text}"));
+        Ok(())
+    }
+    async fn compact_session(&self, session: &str) -> UsecaseResult<()> {
+        self.compacted.lock().unwrap().push(session.to_string());
         Ok(())
     }
     async fn run_command(&self, _s: &str, _n: &str, _a: &str) -> UsecaseResult<()> {
@@ -577,6 +584,8 @@ struct MemStateInner {
     lost: Vec<(u64, Status)>,
     /// mark_spawn-журнал: (number, slot, ms) — кулдаун-сценарии (#1163)
     spawn_ms: Vec<(u64, Slot, u64)>,
+    /// Pending раунд-промпт мастер-сессии (#1626): number-журнал
+    round_reentry: Vec<u64>,
     /// реестр серверных постов (own-тест self-эха #1204)
     own: BTreeMap<String, u64>,
 }
@@ -668,6 +677,18 @@ impl TickStateStore for MemState {
             .unwrap()
             .spawn_ms
             .retain(|(num, slot, _)| !(*num == n && *slot == s));
+    }
+    fn round_reentry_pending(&self, _b: &str, n: u64) -> bool {
+        self.0.lock().unwrap().round_reentry.contains(&n)
+    }
+    fn set_round_reentry_pending(&self, _b: &str, n: u64) {
+        let mut g = self.0.lock().unwrap();
+        if !g.round_reentry.contains(&n) {
+            g.round_reentry.push(n);
+        }
+    }
+    fn clear_round_reentry_pending(&self, _b: &str, n: u64) {
+        self.0.lock().unwrap().round_reentry.retain(|num| *num != n);
     }
     fn last_analys_ms(&self, b: &str, n: u64) -> Option<u64> {
         self.0
@@ -1374,6 +1395,7 @@ fn wake_usecase(
         aborted: Mutex::default(),
         abort_fails: AtomicBool::new(false),
         spawn_probe: AtomicBool::new(true),
+        compacted: Mutex::default(),
     });
     let u = TickUseCase {
         board,
@@ -3141,9 +3163,11 @@ async fn plan_review_loop_escalates_by_same_cap() {
 }
 
 #[tokio::test]
-async fn stage_transition_gives_fresh_eyes_to_review() {
-    // Канон сессий: ревью-сессии всегда новые — переход в стадию ревью
-    // снимает прошлую сессию слота, спавнится свежий ревьюер
+async fn stage_reentry_keeps_review_master_session_and_prompts_round() {
+    // Канон мастер-сессий (#1626): re-entry в ревью-стадию при живой
+    // сессии — та же сессия сохраняется (никакого fresh-eyes-спавна),
+    // новый цикл доставляется в неё же: pending-маркер → wakeup-путь
+    // несёт компакт и раунд-промпт одним тиком с переходом
     let state = Arc::new(MemState(Mutex::default()));
     let mut t = task(30, Status::ReviewResult);
     let mut f = TaskFields::default();
@@ -3163,15 +3187,252 @@ async fn stage_transition_gives_fresh_eyes_to_review() {
         .unwrap()
         .statuses
         .push((30, Status::InProgress));
-    let (u, board, sessions, _) = usecase_with_state(vec![t], PrState::Missing, state.clone());
+    // ход сессии завершён (idle) — доставка раунд-промпта в этом же тике
+    let mut fake = FakeSessions::new();
+    fake.idle_reply = true;
+    let (u, board, sessions, _) =
+        usecase_with_sessions(vec![t], PrState::Missing, fake, state.clone());
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     let log = board.log.lock().unwrap();
     assert!(
-        log.iter().any(|l| l.starts_with("clear#30=")),
-        "ревью-сессия снята при переходе: {log:?}"
+        !log.iter().any(|l| l.starts_with("clear#30=")),
+        "живая мастер-сессия не снимается при re-entry: {log:?}"
     );
-    assert_eq!(out.spawns_done, 1, "свежий ревьюер заспавнен");
-    assert!(!sessions.spawned.lock().unwrap().is_empty());
+    assert_eq!(out.spawns_done, 0, "спавна нет — сессия та же");
+    assert_eq!(out.wakeups, 1, "раунд-промпт доставлен wakeup-путём");
+    let compacted = sessions.compacted.lock().unwrap();
+    assert_eq!(
+        compacted.as_slice(),
+        ["ses_old_reviewer"],
+        "компакт admitted в мастер-сессию перед новым циклом: {compacted:?}"
+    );
+    let prompts = sessions.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1, "одна доставка: {prompts:?}");
+    assert!(
+        prompts[0].starts_with("ses_old_reviewer|"),
+        "раунд-промпт уходит в ту же сессию: {prompts:?}"
+    );
+    assert!(
+        prompts[0].contains("Task #30"),
+        "промпт — спавн-промпт стадии: {prompts:?}"
+    );
+    assert!(
+        !state.round_reentry_pending("B", 30),
+        "маркер погашен доставкой"
+    );
+}
+
+#[tokio::test]
+async fn stage_reentry_dev_family_stays_silent() {
+    // Дев-семья (Design/Dev): re-entry без разворота маркера — прежняя
+    // семантика (живая едина, доставки wakeup-пути не получает промпт
+    // перехода), #1626 меняет только ревью-слоты
+    let state = Arc::new(MemState(Mutex::default()));
+    let mut t = task(34, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dev_live").unwrap(),
+    );
+    t.apply_fields(f);
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((34, Status::ReviewResult));
+    let mut fake = FakeSessions::new();
+    fake.idle_reply = true;
+    let (u, board, sessions, _) = usecase_with_sessions(vec![t], PrState::Missing, fake, state);
+    u.run(&plan(Mode::Live, 7)).await.unwrap();
+    let log = board.log.lock().unwrap();
+    assert!(
+        !log.iter().any(|l| l.starts_with("clear#34=")),
+        "живая дев-сессия не снимается: {log:?}"
+    );
+    assert!(
+        sessions.compacted.lock().unwrap().is_empty(),
+        "дев-семья без компактов перехода"
+    );
+    assert!(
+        sessions.prompts.lock().unwrap().is_empty(),
+        "дев-семья без раунд-промптов перехода"
+    );
+}
+
+#[tokio::test]
+async fn review_stages_isolated_master_sessions() {
+    // Изоляция этапов (UC-2 #1626, п.1 постановки: «важно чтобы ревьювер
+    // плана, ревьювер кода, ревьювер тестов были разными сессиями»):
+    // вход в ResultReview с живой план-ревью сессией — результат-ревью
+    // спавнится свежим, план-сессия не трогается
+    let state = Arc::new(MemState(Mutex::default()));
+    let mut t = task(35, Status::ReviewResult);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::PlanReview,
+        uwuwu_domain::SessionRef::parse("ses_plan_rev").unwrap(),
+    );
+    t.apply_fields(f);
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((35, Status::ReviewPlan));
+    let (u, board, sessions, _) = usecase_with_state(vec![t], PrState::Missing, state);
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    let log = board.log.lock().unwrap();
+    assert!(
+        !log.iter().any(|l| l.starts_with("clear#35=")),
+        "чужая (план-)сессия при входе в другую стадию не снимается: {log:?}"
+    );
+    assert_eq!(out.spawns_done, 1, "результат-ревью — свежая сессия");
+    assert!(
+        sessions.compacted.lock().unwrap().is_empty(),
+        "первое вхождение в стадию — без компакта (компактить нечего, сессии нет)"
+    );
+}
+
+#[tokio::test]
+async fn stage_transition_clears_dead_review_cell() {
+    // Мёртвая ячейка ревью-слота снимается переходом — спавн несёт новый
+    // промпт (мастер-сессия умерла: контекст cycles утерян со смертью,
+    // респавн — единственный путь, dead-путь прежний)
+    let state = Arc::new(MemState(Mutex::default()));
+    let mut t = task(36, Status::ReviewResult);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::ResultReview,
+        uwuwu_domain::SessionRef::parse("ses_dead_rev").unwrap(),
+    );
+    t.apply_fields(f);
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((36, Status::InProgress));
+    let (u, board, sessions, _) = usecase_with_state(vec![t], PrState::Missing, state);
+    sessions
+        .dead_sessions
+        .lock()
+        .unwrap()
+        .push("ses_dead_rev".into());
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    let log = board.log.lock().unwrap();
+    assert!(
+        log.iter().any(|l| l.starts_with("clear#36=")),
+        "мёртвая ревью-ячейка снята: {log:?}"
+    );
+    assert_eq!(out.spawns_done, 1, "свежая сессия заспавнена");
+    assert!(
+        sessions.compacted.lock().unwrap().is_empty(),
+        "мёртвую сессию не компактим"
+    );
+}
+
+#[tokio::test]
+async fn test_slot_still_cleared_on_reentry_scope_1607() {
+    // Тест-слот — прежний канон: свежая сессия тестировщика на каждом
+    // входе в Testing (мастер-сессии тестера — скоуп #1607, не #1626).
+    // Пин защищает базу #1607 от случайного перевода на мастер-семантику
+    let state = Arc::new(MemState(Mutex::default()));
+    let mut t = task(38, Status::Testing);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Test,
+        uwuwu_domain::SessionRef::parse("ses_tester_live").unwrap(),
+    );
+    t.apply_fields(f);
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((38, Status::ReviewResult));
+    let (u, board, _, _) = usecase_with_state(vec![t], PrState::Missing, state);
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    let log = board.log.lock().unwrap();
+    assert!(
+        log.iter().any(|l| l.starts_with("clear#38=")),
+        "тест-слот снят при входе в Testing (прежний канон): {log:?}"
+    );
+    assert_eq!(out.spawns_done, 1, "свежий тестировщик заспавнен");
+}
+
+#[tokio::test]
+async fn review_reentry_cycle_one_session_two_rounds() {
+    // Приёмочный цикл (#1626): In Progress → ReviewResult → In Progress →
+    // ReviewResult — ревьювер один, два раунд-промпта, ноль ревью-спавнов
+    let state = Arc::new(MemState(Mutex::default()));
+    let mut t = task(37, Status::ReviewResult);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::ResultReview,
+        uwuwu_domain::SessionRef::parse("ses_rev_cycle").unwrap(),
+    );
+    t.apply_fields(f);
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((37, Status::InProgress));
+    let mut fake = FakeSessions::new();
+    fake.idle_reply = true;
+    let (u, board, sessions, _) =
+        usecase_with_sessions(vec![t], PrState::Missing, fake, state.clone());
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.wakeups, 1, "раунд 1 доставлен в ту же сессию");
+    assert_eq!(out.spawns_done, 0, "раунд 1 без спавна");
+
+    // request_changes: ревьювер вернул строку в работу — дев-стадия
+    // без ячейки: спавн исполнителя (к ревьюверу отношения не имеет)
+    board.rows.lock().unwrap().clear();
+    board
+        .rows
+        .lock()
+        .unwrap()
+        .push(task(37, Status::InProgress));
+    let _ = u.run(&plan(Mode::Live, 7)).await.unwrap();
+
+    // дев готов — снова на ревью результата: та же сессия, второй промпт
+    let mut t = task(37, Status::ReviewResult);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::ResultReview,
+        uwuwu_domain::SessionRef::parse("ses_rev_cycle").unwrap(),
+    );
+    t.apply_fields(f);
+    board.rows.lock().unwrap().clear();
+    board.rows.lock().unwrap().push(t);
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.wakeups, 1, "раунд 2 доставлен в ту же сессию");
+    assert_eq!(out.spawns_done, 0, "раунд 2 без спавна");
+    let round_prompts = sessions
+        .prompts
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|p| p.starts_with("ses_rev_cycle|"))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        round_prompts.len(),
+        2,
+        "два раунд-промпта в одну сессию за цикл: {round_prompts:?}"
+    );
+    assert!(
+        round_prompts.iter().all(|p| p.contains("Task #37")),
+        "оба промпта — спавн-промпты стадии: {round_prompts:?}"
+    );
+    let compacted = sessions.compacted.lock().unwrap();
+    assert_eq!(
+        compacted.as_slice(),
+        ["ses_rev_cycle", "ses_rev_cycle"],
+        "детерминированный компакт на каждом re-entry: {compacted:?}"
+    );
 }
 
 #[tokio::test]
@@ -3301,6 +3562,7 @@ async fn dead_stage_and_candidate_hold_blind_when_list_unavailable() {
         aborted: Mutex::default(),
         abort_fails: AtomicBool::new(false),
         spawn_probe: AtomicBool::new(true),
+        compacted: Mutex::default(),
     };
     let (u, _, _, _) = usecase_with_sessions(
         vec![dead, candidate],
@@ -4013,6 +4275,7 @@ async fn undelivered_comment_is_not_marked_seen() {
             aborted: Mutex::default(),
             abort_fails: AtomicBool::new(false),
             spawn_probe: AtomicBool::new(true),
+            compacted: Mutex::default(),
         });
         let prs = Arc::new(FakePrs {
             state: PrState::Missing,
@@ -4089,6 +4352,7 @@ async fn undelivered_comment_is_not_marked_seen() {
         aborted: Mutex::default(),
         abort_fails: AtomicBool::new(false),
         spawn_probe: AtomicBool::new(true),
+        compacted: Mutex::default(),
     });
     let u2 = TickUseCase {
         board: board.clone(),
@@ -4175,6 +4439,7 @@ async fn multi_comment_tail_delivered_together() {
         aborted: Mutex::default(),
         abort_fails: AtomicBool::new(false),
         spawn_probe: AtomicBool::new(true),
+        compacted: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -8235,7 +8500,12 @@ fn env_repo_dir_formula_is_pinned() {
 /// round_stale + пинг; +30 мин тик 2: второй пинг (не эскалация);
 /// +30 мин тик 3: эскалация с «автопингов в раунде: 2».
 #[tokio::test]
-async fn round_stale_reset_gives_true_fresh_round_two_pings_before_escalation() {
+async fn stale_round_survives_restart_bootstrap_ping_then_escalation() {
+    // #1585 (ветка А — санкция владельца 24.11: «Рестарт не должен
+    // приводить к потерям») на инварианте #1281: сталый раунд НЕ сбрасывается
+    // (никаких round_stale-сбросов), но эскалация требует пинга, доставленного
+    // текущим процессом: тик 1 — бутстрап-пинг поверх сталого счётчика,
+    // тик 2 — эскалация с честным счётчиком раунда (2 до рестарта + 1)
     const BOOT: u64 = 100_000_000;
     struct SettableClock(Arc<Mutex<u64>>);
     impl Clock for SettableClock {
@@ -8292,24 +8562,31 @@ async fn round_stale_reset_gives_true_fresh_round_two_pings_before_escalation() 
         judge_cfg: Default::default(),
         quota: None,
     };
-    // тик 1 (сразу после рестарта): раунд чужой — сброс + свежий пинг
+    // тик 1 (сразу после рестарта): раунд переживает рестарт без сброса —
+    // бутстрап-пинг доказывает доставку в этом процессе
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.stall_flagged, 0, "тик 1 не эскалирует");
-    assert_eq!(out.soft_pings, 1, "тик 1: свежий пинг раунда");
-    // тик 2 (+30 мин): раунд уже текущего процесса — второй пинг, не эскалация
+    assert_eq!(out.soft_pings, 1, "тик 1: бутстрап-пинг сталого раунда");
+    {
+        let log = board.log.lock().unwrap();
+        assert!(
+            !log.iter().any(|l| l.contains("round_stale")),
+            "сброс сталого раунда снесён (#1585): {log:?}"
+        );
+    }
+    // счётчик раунда персистится без сброса: 2 до рестарта + 1 бутстрап
+    let (_, _, count) = u.state.stall_ping("B", 64).expect("раунд жив");
+    assert_eq!(
+        count, 3,
+        "раунд продолжен из state: сталые пинги не вычеркнуты"
+    );
+    // тик 2 (+30 мин): доставка доказана (бутстрап в этом процессе) —
+    // эскалация с честным счётчиком
     *now.lock().unwrap() = BOOT + 30 * 60_000;
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(
-        out.stall_flagged, 0,
-        "тик 2: в процессе доставлен только один пинг — эскалации нет"
-    );
-    assert_eq!(out.soft_pings, 1, "тик 2: второй пинг свежего раунда");
-    // тик 3 (+30 мин): два пинга доставлены, тишина продолжается — эскалация
-    *now.lock().unwrap() = BOOT + 60 * 60_000;
-    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
-    assert_eq!(
         out.stall_flagged, 1,
-        "тик 3: два доставленных пинга исчерпаны — эскалация"
+        "тик 2: бутстрап-пинг доставлен, тишина продолжается — эскалация"
     );
     let log = board.log.lock().unwrap();
     let comment = log
@@ -8317,8 +8594,8 @@ async fn round_stale_reset_gives_true_fresh_round_two_pings_before_escalation() 
         .find(|l| l.starts_with("comment#64="))
         .expect("эскалация постит коммент");
     assert!(
-        comment.contains("auto-pings in the round: 2"),
-        "подпись считает пинги ТЕКУЩЕГО процесса (2), а не persisted-мусор: {comment}",
+        comment.contains("auto-pings in the round: 3"),
+        "подпись несёт полный счётчик раунда (2 до рестарта + бутстрап): {comment}",
     );
 }
 #[tokio::test]

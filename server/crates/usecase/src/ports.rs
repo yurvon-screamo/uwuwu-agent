@@ -650,8 +650,17 @@ pub trait TickStateStore: Send + Sync {
     fn lost_session(&self, board: &str, number: u64) -> Option<(Status, u32)>;
     fn mark_lost_session(&self, board: &str, number: u64, status: Status);
     fn clear_lost_session(&self, board: &str, number: u64);
-    /// Новый раунд слота (fresh-eyes): кулдаун прошлого раунда не переносится.
+    /// Сброс кулдауна спавна слота: ячейка снята переходом — новый спавн
+    /// раунда не ждёт кулдаун прошлого.
     fn clear_spawn_ms(&self, board: &str, number: u64, slot: Slot);
+    /// Pending раунд-промпт мастер-сессии ревьювера (#1626): строка вошла
+    /// в ревью-стадию с живой сессией — новый цикл доставляется в неё же
+    /// (компакт + раунд-промпт) wakeup-путём; маркер переживает тик,
+    /// пока пик/CUP/ход сессии держат доставку. Чистится доставкой
+    /// (wakeup) и спавном свежей сессии (spawn_stage — промпт унесён).
+    fn round_reentry_pending(&self, board: &str, number: u64) -> bool;
+    fn set_round_reentry_pending(&self, board: &str, number: u64);
+    fn clear_round_reentry_pending(&self, board: &str, number: u64);
     /// Аналитика (#1135, замена триажа): кулдауны волн/ревью и цикл-гвард.
     fn last_analys_ms(&self, board: &str, number: u64) -> Option<u64>;
     fn mark_analys_spawn(&self, board: &str, number: u64, at_ms: u64);
