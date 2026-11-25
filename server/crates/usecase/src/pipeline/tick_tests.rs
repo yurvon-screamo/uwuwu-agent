@@ -7083,7 +7083,7 @@ async fn analyst_wave_one_session_for_all_rows() {
     );
     assert_eq!(
         specs[0].model,
-        uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.3-flash#high")
+        uwuwu_domain::SpawnModel::parse("opencode-go/hy4-flash-free#high")
             .unwrap()
             .model,
         "модель аналитика — карта сервера (#1154)"
@@ -7631,7 +7631,7 @@ async fn reviewer_recreates_on_model_divergence() {
         "analyst-reviewer",
         "p",
         "ses_old",
-        "zai-coding-plan/glm-5.3-flash#high",
+        "opencode-go/hy4-flash-free#high",
         "/tmp/checkout",
     );
     let sessions = Arc::new(FakeSessions::new());
@@ -9579,7 +9579,7 @@ async fn stage_spawn_carries_model_from_server_map() {
     assert_eq!(out.spawns_done, 1, "спавн стадии состоялся");
     let specs = sessions.specs.lock().unwrap();
     assert_eq!(specs.len(), 2, "bootstrap + work");
-    let want = uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.3-flash#high").unwrap();
+    let want = uwuwu_domain::SpawnModel::parse("opencode-go/hy4-flash-free#high").unwrap();
     for spec in specs.iter() {
         assert_eq!(spec.model, want.model, "модель спавна = default карты");
         assert_eq!(spec.variant, want.variant, "default — вариант карты");
@@ -9602,11 +9602,7 @@ async fn review_and_test_spawns_carry_map_models_per_agent() {
             "code-quality-reviewer",
             "zai-coding-plan/glm-5.4#high",
         ),
-        (
-            Status::Testing,
-            "tester",
-            "zai-coding-plan/glm-5.3-flash#high",
-        ),
+        (Status::Testing, "tester", "opencode-go/hy4-flash-free#high"),
     ];
     for (status, agent_name, raw) in cases {
         let (u, _, sessions, _) = usecase(vec![task(5, status)], PrState::Missing);

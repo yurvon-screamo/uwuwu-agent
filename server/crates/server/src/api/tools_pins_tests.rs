@@ -238,7 +238,7 @@ async fn docs_write_creates_canonical_header_with_quoted_title_on_colon() {
 async fn docs_write_keeps_fm_from_payload_verbatim() {
     let tools = hub();
     let slug = "bot/Помощник/README";
-    let payload = "---\ntitle: uwuwu-помощник\nenabled: true\nmodel: zai-coding-plan/glm-5.3-flash\ntoken_env: UWUWU_BOT_TOKEN_HELPER\nowner: yurvon_screamo\n---\n\nметодичка\n";
+    let payload = "---\ntitle: uwuwu-помощник\nenabled: true\nmodel: opencode-go/hy4-flash-free\ntoken_env: UWUWU_BOT_TOKEN_HELPER\nowner: yurvon_screamo\n---\n\nметодичка\n";
     let answer = call(
         &tools,
         "docs_write",

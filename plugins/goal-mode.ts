@@ -30,7 +30,7 @@ import {
 
 const LOG_PATH = join(homedir(), ".local/share/opencode/log/goal-mode.log")
 const GOAL_KEY = "goal-mode:goals"
-const JUDGE_MODEL = { providerID: "zai-coding-plan", id: "glm-5.3-flash" } as const
+const JUDGE_MODEL = { providerID: "opencode-go", id: "hy4-flash-free" } as const
 const JUDGE_TIMEOUT_MS = 10 * 60_000
 const TRANSCRIPT_CAP = 60_000
 const RESUBSCRIBE_MS = 5_000

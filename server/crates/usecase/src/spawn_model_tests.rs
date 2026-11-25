@@ -399,7 +399,7 @@ async fn analyst_spawn_carries_model_from_server_map() {
     assert_model(
         sessions.spec_of(),
         "аналитик-спавн",
-        "zai-coding-plan/glm-5.3-flash#high",
+        "opencode-go/hy4-flash-free#high",
     );
 }
 
@@ -433,7 +433,7 @@ async fn dreamer_spawn_carries_model_from_server_map() {
     assert_model(
         sessions.spec_of(),
         "дример-спавн",
-        "zai-coding-plan/glm-5.3-flash#high",
+        "opencode-go/hy4-flash-free#high",
     );
 }
 
@@ -471,6 +471,6 @@ async fn cron_run_carries_model_from_server_map() {
     assert_model(
         sessions.spec_of(),
         "крон-спавн",
-        "zai-coding-plan/glm-5.3-flash#high",
+        "opencode-go/hy4-flash-free#high",
     );
 }
