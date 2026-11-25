@@ -240,7 +240,7 @@ what was expected (an instruction, the canon, an owner quote) → what came out 
 (an execution miss or a defect of the instruction/mechanics).
 
 **The registry** — the Experience article «Инцидент-реестр конвейера» (the slug
-`platform/Инцидент-реестр конвейера`; if the read did not match — find it via
+`Experience/platform/Инцидент-реестр конвейера`; if the read did not match — find it via
 `MCP uwuwu_search "Инцидент-реестр"`): a flat dated log, one record =
 one incident instance.
 
@@ -253,7 +253,7 @@ The label — a short canonical wording of the cause («агент не дожд
 verbatim — the duplicate search matches by label. A new label — only when none fits:
 append it to the «Метки:» line (`uwuwu_docs_write` — re-read the registry, fix
 the labels line, write in full; the incident record itself — `uwuwu_docs_append` of one line).
-No doc — create one (`uwuwu_docs_write` with the slug `platform/Инцидент-реестр конвейера`;
+No doc — create one (`uwuwu_docs_write` with the slug `Experience/platform/Инцидент-реестр конвейера`;
 the header and record format — as described here). Do not duplicate your own past
 analysis: a search by rowId — the verdicts of past rounds of a reopened
 task are already analyzed (the dedup boundary is stated in the prompt).
