@@ -214,6 +214,11 @@ pub struct TaskFields {
     /// (канон «high продолжают работать»; инцидент #1170 — приоритет
     /// не мапился вовсе, пик морозил даже high).
     priority: Priority,
+    /// Флаг direct (#1357): прямое поручение владельца. Единственный
+    /// прод-продюсер — загрузчик носителя (REST issue_field_values,
+    /// честен на любой доске); Pv2-скан ненадёжен — колонка Direct не
+    /// прилинкована ни к одной доске (#1616).
+    direct: bool,
 }
 
 /// VCS-состояние задачи: без ветки → ветка → PR. Кодовый инвариант:
@@ -241,6 +246,7 @@ impl Default for TaskFields {
             assignments: std::collections::BTreeMap::new(),
             vcs: Vcs::Local,
             priority: Priority::Empty,
+            direct: false,
         }
     }
 }
@@ -251,17 +257,29 @@ impl TaskFields {
         assignments: std::collections::BTreeMap<Slot, SessionRef>,
         vcs: Vcs,
         priority: Priority,
+        direct: bool,
     ) -> Self {
         Self {
             assignments,
             vcs,
             priority,
+            direct,
         }
     }
 
     /// Приоритет с носителя (гейт пика читает его).
     pub fn priority(&self) -> Priority {
         self.priority
+    }
+
+    /// Флаг direct с носителя (decide/гарды спавна читают его).
+    pub fn direct(&self) -> bool {
+        self.direct
+    }
+
+    /// Запись флага с носителя (мутации инкапсулирует сущность).
+    pub fn set_direct(&mut self, direct: bool) {
+        self.direct = direct;
     }
 
     /// Сессия слота (None — слот не назначен: явная пустота карты).
@@ -421,7 +439,9 @@ pub struct Task {
     /// Прямое поручение владельца (#1357): строка рождается сразу в
     /// In Progress и финализируется агентом в Review, мимо фабричных
     /// стадий. По образцу automerge: пишется на носитель явно (create),
-    /// читается с колонки доски.
+    /// читается из REST issue_field_values через enrichment тика —
+    /// Pv2-колонка факультативна, скан доски без неё несёт false
+    /// (дыра дубль-спавна #1616).
     direct: bool,
     /// Укороченный пайп (#1631): строка без Design и без тестирования —
     /// только In Progress → Result review → Review. Create-only, immutable
@@ -630,6 +650,11 @@ impl Task {
         if fields.priority != Priority::Empty {
             self.priority = fields.priority;
         }
+        // direct — безусловная перезапись (#1616): скановое значение
+        // ненадёжно (колонка Direct не прилинкована ни к одной доске —
+        // всегда false), REST-носитель каноничен; Pv2-колонка, если
+        // когда-нибудь прилинкуют, — проекция того же issue-поля
+        self.direct = fields.direct;
         self.fields = fields;
     }
 
@@ -1082,6 +1107,7 @@ mod tests {
             assignments,
             Vcs::Branch(BranchName::parse("work/task-3").unwrap()),
             Priority::Empty,
+            false,
         );
         t.apply_fields(fields);
         assert_eq!(t.session_of(Slot::PlanReview), Some("ses_r"));
@@ -1098,6 +1124,7 @@ mod tests {
             std::collections::BTreeMap::new(),
             Vcs::Local,
             Priority::High,
+            false,
         );
         t.apply_fields(fields);
         assert_eq!(t.priority(), Priority::High);
@@ -1114,6 +1141,7 @@ mod tests {
             std::collections::BTreeMap::new(),
             Vcs::Local,
             Priority::Empty,
+            false,
         ));
         assert_eq!(t.priority(), Priority::High);
     }

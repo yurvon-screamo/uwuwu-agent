@@ -162,6 +162,10 @@ impl TaskBoardRepo for FakeBoard {
                         f.set_artifact(p);
                     }
                 }
+                // direct тоже переносим (#1616): apply_fields перезаписывает
+                // флаг безусловно — фейк без него молча сбрасывал бы
+                // set_direct снапшота на каждом enrichment
+                f.set_direct(t.direct());
                 f
             })
             .unwrap_or_default())
@@ -3804,6 +3808,123 @@ async fn kick_unfreezes_dead_dev_session() {
         "мёртвая дев-сессия снята при кике: {log:?}"
     );
     assert_eq!(out.spawns_done, 1, "свежий исполнитель заспавнен");
+}
+
+#[tokio::test]
+async fn direct_row_with_dead_session_is_never_respawned() {
+    // #1616 (срез 4): контракт #1357 безусловен — direct-строке фабрика
+    // никого не спавнит, включая респавн по мёртвой сессии; строка тихо
+    // ждёт владельца: ячейка не чистится, эскалаций нет
+    let state = Arc::new(MemState(Mutex::default()));
+    let mut t = task(50, Status::InProgress);
+    // флаг едет в полях носителя (#1616): apply_fields перезаписывает
+    // direct безусловно — set_direct до enrichment затёрся бы
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_direct_dead").unwrap(),
+    );
+    f.set_direct(true);
+    t.apply_fields(f);
+    // тот же раунд (prev=In Progress) — респавн-путь, не кик-разморозка
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((50, Status::InProgress));
+    let (u, board, sessions, _) = usecase_with_state(vec![t], PrState::Missing, state);
+    sessions
+        .dead_sessions
+        .lock()
+        .unwrap()
+        .push("ses_direct_dead".into());
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.spawns_done, 0, "direct-строка не респавнится");
+    let log = board.log.lock().unwrap();
+    assert!(
+        !log.iter().any(|l| l.starts_with("clear#50=")),
+        "ячейку direct-строки конвейер не чистит: {log:?}"
+    );
+}
+
+#[tokio::test]
+async fn direct_row_with_lost_session_is_never_resurrected() {
+    // #1616 (срез 4, тестировщик): lost-resurrection-рука — тоже спавн;
+    // direct-строке запрещён контрактом #1357 безусловно. Гард стоит до
+    // hold/policy/resurrection: исход LostAct::Counted — тихий no-op,
+    // строка ждёт владельца (ни create, ни эскалации, ни чистки ячейки).
+    // Дифференциал от T2 (#1288): без гарда resurrection предпринимается
+    // на первом тике (create проходит) — тест падает.
+    let mut t = task(51, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_direct_lost").unwrap(),
+    );
+    f.set_direct(true);
+    t.apply_fields(f);
+    let mut sessions = FakeSessions::new();
+    // исполнитель подтвердил потерю: доставка 404 при пустом списке —
+    // маршрутизация уходит в lost-руку (не десинк, не blind)
+    sessions.prompt_lost_all = true;
+    let board = Arc::new(FakeBoard {
+        rows: std::sync::Mutex::new(vec![t]),
+        log: Mutex::default(),
+        comments: foreign_comment(),
+        fields_fails: false,
+        set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
+        clear_session_fails: AtomicBool::new(false),
+        status_fails: AtomicBool::new(false),
+    });
+    let prs = Arc::new(FakePrs {
+        state: PrState::Missing,
+        merges: Mutex::default(),
+        merge_fails: AtomicBool::new(false),
+        probes: Mutex::default(),
+        url: Mutex::default(),
+    });
+    let sessions = Arc::new(sessions);
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        prs,
+        clock: Arc::new(FixedClock),
+        state: Arc::new(MemState(Mutex::default())),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        boot_ms: 0,
+        judge: None,
+        judge_cfg: Default::default(),
+        quota: None,
+    };
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.spawns_done, 0,
+        "resurrection direct-строки не предпринята"
+    );
+    assert!(
+        sessions.spawned.lock().unwrap().is_empty(),
+        "гард lost-руки: create не вызывался (LostAct::Counted до resurrection)"
+    );
+    assert!(
+        sessions.deleted.lock().unwrap().is_empty(),
+        "сирота-зачистки нет: спавн не начинался"
+    );
+    assert_eq!(
+        out.session_lost_flagged, 0,
+        "эскалаций нет — строка тихо ждёт владельца"
+    );
+    assert_eq!(
+        out.lost_deferred, 0,
+        "исход Counted, не Deferred — гард раньше policy-гейта"
+    );
+    assert_eq!(out.held_live, 0, "гард раньше hold по живой сестре");
+    let log = board.log.lock().unwrap();
+    assert!(
+        !log.iter().any(|l| l.starts_with("clear#51=")),
+        "ячейку direct-строки конвейер не чистит: {log:?}"
+    );
 }
 
 #[tokio::test]
@@ -9580,6 +9701,40 @@ async fn cup_no_preempt_of_medium_active() {
     assert_eq!(out.spawns_done, 0);
     assert!(sessions.deleted.lock().unwrap().is_empty());
     assert!(sessions.aborted.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn cup_preempt_never_kills_direct_row() {
+    // #1616 (срез 5): direct-строка — не жертва преемпшена. Гашение —
+    // фабричный «мув» по direct-строке (abort+delete сессии + снятие
+    // клейма), потенциально чужой — владельческой; контракт #1357
+    // безусловен («никаких мувов/проверок»). Direct-жертва даже более
+    // «выгодна» пику до фикса (Empty предпочитается Low) — гасится
+    // только ordinary
+    let mut direct = row_with_session(1, "ses_direct_owner", Priority::Empty);
+    direct.set_direct(true);
+    let ordinary = row_with_session(2, "ses_v2", Priority::Low);
+    let mut waiter = task(3, Status::InProgress);
+    waiter.set_priority(Priority::High);
+    let (u, _, sessions, _) = usecase(vec![direct, ordinary, waiter], PrState::Missing);
+    live_busy(&sessions, "ses_direct_owner");
+    live_busy(&sessions, "ses_v2");
+    let out = u.run(&plan(Mode::Live, 2)).await.unwrap();
+    assert_eq!(out.preempts, 1, "жертва ровно одна — ordinary empty");
+    let deleted = sessions.deleted.lock().unwrap();
+    assert!(
+        !deleted.iter().any(|d| d == "ses_direct_owner"),
+        "сессия direct-строки не гасится: {deleted:?}"
+    );
+    assert_eq!(
+        deleted
+            .iter()
+            .filter(|d| d.starts_with("ses_v"))
+            .cloned()
+            .collect::<Vec<_>>(),
+        ["ses_v2"],
+        "гасится ровно ordinary-жертва, несмотря на ранг"
+    );
 }
 
 #[tokio::test]

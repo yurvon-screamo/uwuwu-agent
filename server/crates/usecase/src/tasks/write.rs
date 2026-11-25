@@ -1424,6 +1424,7 @@ mod tests {
                 Default::default(),
                 vcs,
                 priority,
+                false,
             ));
             task.set_kind(self.kind);
             task.set_automerge(self.automerge);

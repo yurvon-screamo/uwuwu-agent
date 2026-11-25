@@ -480,6 +480,13 @@ impl TickUseCase {
                 if !t.status().is_active() {
                     continue;
                 }
+                // #1616 (срез 5): direct-строка — не жертва преемпшена.
+                // Гашение (abort+delete сессии + снятие клейма) — фабричный
+                // «мув» по direct-строке, контракту #1357 противоречит;
+                // сессия в ячейке может быть владельческой (claim)
+                if t.direct() {
+                    continue;
+                }
                 let Some(slot) = t.stage_slot() else { continue };
                 let Some(session) = t.session_of(slot) else {
                     continue;
