@@ -2060,12 +2060,33 @@ mod tests {
         assert_eq!(out.matches("## Постановка").count(), 1);
     }
 
+    #[test]
+    fn create_body_strips_full_card_header() {
+        // #1632: task_create идёт через тот же гард — копия карточки
+        // task_get (тайтл-строка + fm) в body_md срезается на границе
+        let card_copy = "#1526 t — In Progress\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\n\n## Постановка\n\nТекст.";
+        let out = render_create_body(&spec(card_copy));
+        assert!(!out.contains("--- fm ---"), "шапка вырезана: {out}");
+        assert!(!out.contains("#1526"), "тайтл-строка вырезана: {out}");
+        assert_eq!(out, "## Постановка\n\nТекст.\n");
+    }
+
     /// Дисплей-шапка task_get срезается на границе записи (fm-стек
     /// инцидента #1331: агент копирует вывод task_get назад в task_body).
     #[test]
     fn task_get_display_header_is_stripped() {
         let md = "--- fm ---\nbranch: work/task-1331\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: —\nbody_hash: 9de430c691c92328\n\n## Постановка\nтекст";
         assert_eq!(strip_task_get_header(md), "## Постановка\nтекст");
+    }
+
+    /// fm-стек из чистых fm-блоков, без тайтл-строк (#1331): форма A
+    /// тоже применяется циклически — срезаются все слои, не только
+    /// первый.
+    #[test]
+    fn task_get_stacked_fm_blocks_are_stripped() {
+        let fm = "--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\n\n";
+        let md = format!("{fm}{fm}## Постановка\nтело");
+        assert_eq!(strip_task_get_header(&md), "## Постановка\nтело");
     }
 
     /// Полная копия карточки (#1632): тайтл-строка рендера + пустая
