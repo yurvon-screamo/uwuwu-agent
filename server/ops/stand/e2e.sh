@@ -1468,8 +1468,8 @@ ANALY_REUSE_SESS=$(grep -o '"event":"analys.reused"[^}]*' "$LOG_SRV_1607" | head
 python3 - "$STATE" "$ANALY_SPAWN_SESS" <<'PY' || fail "привязка мастер-сессии в state.json неверна"
 import json, sys
 st = json.load(open(sys.argv[1]))
-bound = (st.get("analyst_masters") or {}).get("analyst:uwuwu")
-assert bound, f"привязки analyst:uwuwu нет: {list((st.get('analyst_masters') or {}).keys())}"
+bound = (st.get("master") or {}).get("analyst:uwuwu")
+assert bound, f"привязки analyst:uwuwu нет: {list((st.get('master') or {}).keys())}"
 assert bound["session"] == sys.argv[2], f"привязка указывает не туда: {bound}"
 assert bound.get("model", "").startswith("zai-coding-plan/glm-5.4"), f"модель рождения не 5.4: {bound}"
 print(f"[e2e] привязка analyst:uwuwu → {bound['session']} на {bound.get('model')}")
@@ -1487,9 +1487,9 @@ grep -q '"event":"analys.compacted"' "$LOG_SRV_1607" \
 python3 - "$STATE" <<'PY' || fail "метка коулдауна компакт-прохода не выставлена"
 import json, sys
 st = json.load(open(sys.argv[1]))
-bound = (st.get("analyst_masters") or {}).get("analyst:uwuwu")
-assert bound and bound.get("last_compact_ms", 0) > 0, f"метки нет: {bound}"
-print(f"[e2e] коулдаун выставлен: last_compact_ms={bound['last_compact_ms']}")
+bound = (st.get("master") or {}).get("analyst:uwuwu")
+assert bound and (bound.get("compact_ms") or 0) > 0, f"метки нет: {bound}"
+print(f"[e2e] коулдаун выставлен: compact_ms={bound['compact_ms']}")
 PY
 kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
 wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
