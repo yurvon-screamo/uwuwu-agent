@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # task-env — подготовка окружения задачи на исполнителе (сервер вызывает
 # через slash-команду task-env: shell-блок исполняется ДО промпта, без LLM).
-# Идемпотентен: существующий ворктри переиспользуется (pull + ff).
+# Идемпотентен: существующий env переиспользуется — рефсы origin подтягиваются,
+# рабочее состояние ворктри не трогается. Рефреш кода — руками агента.
 # Схема канона: ~/agents-env/<row>/{repo,scratch,logs}, ветка work/task-<row>.
 set -euo pipefail
 
@@ -16,7 +17,8 @@ branch="work/task-$safe"
 
 mkdir -p "$env_dir/scratch" "$env_dir/logs"
 
-if [ -d "$repo/.git" ]; then
+# .git — файл у ворктри, каталог у чекаута: проверяем наличие git-носителя.
+if [ -e "$repo/.git" ] && git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   # переиспользование: подтянуть рефсы, не трогая рабочее состояние
   git -C "$repo" fetch -q origin || true
 else
