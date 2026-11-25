@@ -44,11 +44,11 @@
 //!   11–12. нормализация слага («docs/…», «….md») — ответ называет
 //!      нормализованный слаг с разделителем «…»; финальный blob-набор
 //!      исключает двойника «….md.md» и сырые пути.
-//!   13. #1653: после записи ждём видимости файла в дереве (предусловие
-//!      свидетеля), затем повтор без fm → Carried и append → строка в
-//!      конце; сверка тела отличает свежую базу от предыдущей версии.
-//!      Прогон печатает, проявился ли лаг Contents (был ли упражнён
-//!      путь свидетеля).
+//!   13. #1653: перед каждым verdict ждём видимости нужного коммита в
+//!      дереве (сначала путь, перед append — новый sha blob'а), затем
+//!      повтор без fm → Carried и append → строка в конце; сверка тела
+//!      отличает свежую базу от предыдущей версии. Прогон печатает
+//!      статус Contents (404 / 200 / прочее) и, упражнён ли witness.
 //!
 //! Гейты: UWUWU_E2E=1; GH_TOKEN со scope repo (создание/запись) и delete_repo.
 //! Внешнее репо не требуется: риг создаёт сам тест.
@@ -573,6 +573,59 @@ impl RigGithub {
         }
     }
 
+    /// SHA blob'а по пути в свежем дереве: None — путь ещё не виден либо
+    /// ответ транзиентный (тогда поллинг продолжится).
+    async fn tree_blob_sha(&self, path: &str) -> Option<String> {
+        let (status, body) = api_call_retry(
+            &self.http,
+            &self.token,
+            reqwest::Method::GET,
+            &format!("/repos/{}/git/trees/{}?recursive=1", self.repo, self.branch),
+        )
+        .await;
+        if !status.is_success() || body["truncated"].as_bool() == Some(true) {
+            return None;
+        }
+        body["tree"]
+            .as_array()?
+            .iter()
+            .find(|e| e["path"].as_str() == Some(path) && e["type"].as_str() == Some("blob"))?
+            ["sha"]
+            .as_str()
+            .map(str::to_string)
+    }
+
+    /// Ждать, пока дерево увидит НОВЫЙ blob по пути (коммит перезаписи),
+    /// а не только сам путь от первой записи.
+    async fn wait_tree_sha(&self, path: &str, previous: &str) {
+        let deadline = tokio::time::Instant::now() + WAIT_TIMEOUT;
+        loop {
+            if let Some(sha) = self.tree_blob_sha(path).await {
+                if sha != previous {
+                    return;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "дерево не увидело новый blob {path} за {WAIT_TIMEOUT:?}"
+            );
+            tokio::time::sleep(POLL_STEP).await;
+        }
+    }
+
+    /// Статус raw contents: отличать 404 (лаг) от 5xx/429 (замер ненадёжен).
+    async fn contents_status(&self, path: &str) -> reqwest::StatusCode {
+        let (status, _) = api_call(
+            &self.http,
+            &self.token,
+            reqwest::Method::GET,
+            &self.contents_path(path),
+            None,
+        )
+        .await;
+        status
+    }
+
     /// Положительное чтение после записи поллингом: contents отдаёт 404 до
     /// ~20 с после git-data-коммита. Возвращает прочитанное после грэйса
     /// (страховка до серверного чтения); грэйс тоже поллится — 5xx в нём
@@ -843,9 +896,9 @@ async fn run_scenario(dir: PathBuf, rig: RigGithub, stamp: String) {
         "тело заменено полностью: {content}"
     );
 
-    // --- #1653: вердикты сразу после commit'а, без паузы между записями.
-    // Contents ещё может не видеть свежий файл; fm-шапка и append обязаны
-    // опираться на дерево, а не на устаревшее чтение.
+    // --- #1653: вердикты проверяются при выполненном предусловии фикса:
+    // дерево видит нужный коммит, Contents может ещё отставать. Ожидание
+    // перед каждым шагом держит проверку вне остаточного окна.
     let fresh = format!("Experience/rig{stamp}/fresh");
     let (err, text) = write(
         fresh.clone(),
@@ -853,22 +906,21 @@ async fn run_scenario(dir: PathBuf, rig: RigGithub, stamp: String) {
     )
     .await;
     assert!(!err, "свежая запись с fm: {text}");
-    // Предусловие фикса: дерево уже видит коммит. Без этого ожидания
-    // проверка попадала бы в остаточное окно и краснела вне контракта #1653.
     let fresh_path = format!("docs/{fresh}.md");
     rig.wait_tree(std::slice::from_ref(&fresh_path)).await;
-    let lag = rig.read_file(&fresh_path).await.is_none();
+    let first_sha = rig
+        .tree_blob_sha(&fresh_path)
+        .await
+        .expect("blob первой записи в дереве");
+    let status = rig.contents_status(&fresh_path).await;
     println!(
-        "блок #1653: Contents {} — путь свидетеля {}",
-        if lag {
-            "ещё 404"
+        "блок #1653 перед повторной записью: Contents {status} — {}",
+        if status.as_u16() == 404 {
+            "лаг проявился, путь свидетеля упражнён"
+        } else if status.is_success() {
+            "лага нет, путь свидетеля не упражнён"
         } else {
-            "уже видит файл"
-        },
-        if lag {
-            "упражнён"
-        } else {
-            "не упражнён (лага нет)"
+            "статус не 200/404 — замер лага недостоверен"
         }
     );
     let (err, text) = write(fresh.clone(), "second body\n".into()).await;
@@ -877,8 +929,22 @@ async fn run_scenario(dir: PathBuf, rig: RigGithub, stamp: String) {
         text.contains("fm header carried over"),
         "в окне лага ожидался Carried, а не Created: {text}"
     );
+    // Для append важен коммит перезаписи: одного наличия пути в дереве
+    // недостаточно — дерево может хранить blob первой версии.
+    rig.wait_tree_sha(&fresh_path, &first_sha).await;
+    let status = rig.contents_status(&fresh_path).await;
+    println!(
+        "блок #1653 перед append: Contents {status} — {}",
+        if status.as_u16() == 404 {
+            "лаг проявился, путь свидетеля упражнён"
+        } else if status.is_success() {
+            "лага нет, путь свидетеля не упражнён"
+        } else {
+            "статус не 200/404 — замер лага недостоверен"
+        }
+    );
     let (err, text) = append(fresh.clone()).await;
-    assert!(!err, "append сразу после commit'а: {text}");
+    assert!(!err, "append после коммита перезаписи: {text}");
     assert!(
         text.contains("appended to"),
         "ложный append-nonexistent в окне лага: {text}"
@@ -894,7 +960,7 @@ async fn run_scenario(dir: PathBuf, rig: RigGithub, stamp: String) {
     );
     assert!(
         !content.contains("first body"),
-        "append updatил старое тело вместо свежего: {content}"
+        "append обновил старое тело вместо свежего: {content}"
     );
     assert!(
         content.trim_end().ends_with("e2e probe line"),
