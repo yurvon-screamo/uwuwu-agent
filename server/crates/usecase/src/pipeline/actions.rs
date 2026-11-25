@@ -247,7 +247,8 @@ impl TickUseCase {
             .prompt(
                 session,
                 &format!(
-                    "Repeat testing round for task #{}: run the delta per Delta mode (agents/tester.md) — verdict only after a real delta run.",
+                    "Repeat testing round for task #{}: run the delta per Delta mode (agents/tester.md) — verdict only after a real delta run. \
+                     If the owner answered a Needs attention question, fix the reply verbatim in the body/thread and pass owner_answer when clearing it.",
                     task.number()
                 ),
             )
@@ -1098,6 +1099,10 @@ pub(crate) fn spawn_prompt(board: &BoardPlan, task: &Task, slot: Slot) -> String
          «Needs attention».\n\
          «Worked and went silent» = the row hangs until the pipeline auto-ping\n\
          (15 min after a finished turn, up to 60 min while the turn is in progress).\n\
+         \n\
+         After the owner answers a question in Needs attention: fix the verbatim\n\
+         reply in the body or thread, then call uwuwu_task_edit with owner_answer\n\
+         set to that reply and the source status — the gate requires it.\n\
          \n\
          The platform goes through the uwuwu server MCP tools (Code Mode: tools.uwuwu.*):\n\
          - task body and comments: uwuwu_task_get {{number: {number}}}\n\

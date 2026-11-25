@@ -9,6 +9,15 @@ use uwuwu_domain::Task;
 /// Сколько последних комментов несёт карточка задачи.
 const CARD_COMMENTS: usize = 10;
 
+/// Карточка task_get (#1604): носитель + `comments_fetched` — сколько
+/// комментов прочитано с носителя до среза хвоста (страница фетча, ≤100;
+/// честная пагинация — отдельное решение, вне #1604). Заголовок хвоста
+/// «latest shown of total» рендерится из пары этих чисел.
+pub struct CardView {
+    pub issue: IssueView,
+    pub comments_fetched: usize,
+}
+
 pub struct TaskView {
     board: Arc<dyn TaskBoardRepo>,
     boards: Vec<(String, String)>, // (project, board)
@@ -38,8 +47,10 @@ impl TaskView {
         Ok(self.board.read_board(board).await?)
     }
 
-    /// Карточка задачи: агрегат + тело + хвост комментов.
-    pub async fn card(&self, project: &str, number: u64) -> Result<IssueView, ViewError> {
+    /// Карточка task_get: агрегат + тело + хвост комментов. Один клиент —
+    /// tools.rs task_get, поэтому обёртка здесь, а не поле в порте
+    /// (ревью #1604: без риппла по конструкторам IssueView).
+    pub async fn card(&self, project: &str, number: u64) -> Result<CardView, ViewError> {
         let board = self.board_of(project).ok_or_else(|| {
             ViewError::NotFound(format!("project «{project}» is not in the config"))
         })?;
@@ -47,15 +58,17 @@ impl TaskView {
         if view.task.status() == uwuwu_domain::Status::Empty && view.body.is_empty() {
             return Err(ViewError::NotFound(format!("task #{number}")));
         }
-        Ok(IssueView {
-            comments: view
-                .comments
-                .into_iter()
-                .rev()
-                .take(CARD_COMMENTS)
-                .rev()
-                .collect(),
-            ..view
+        let comments_fetched = view.comments.len();
+        let comments = view
+            .comments
+            .into_iter()
+            .rev()
+            .take(CARD_COMMENTS)
+            .rev()
+            .collect();
+        Ok(CardView {
+            issue: IssueView { comments, ..view },
+            comments_fetched,
         })
     }
 }
@@ -135,7 +148,9 @@ impl PersonView {
 }
 
 /// Слаг-гигиена: без ведущего docs/, без ../, без .md-суффикса.
-fn sanitize_slug(slug: &str) -> String {
+/// Публична с #1613: write-пути нормализуют таргет тем же кодом, что
+/// read/ls (асимметрия адресаций — окно семьи «запись не туда»).
+pub fn sanitize_slug(slug: &str) -> String {
     let mut s = slug.trim().trim_start_matches("docs/").trim_matches('/');
     if let Some(stripped) = s.strip_suffix(".md") {
         s = stripped;

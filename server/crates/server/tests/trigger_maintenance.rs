@@ -44,7 +44,7 @@ use async_trait::async_trait;
 use search::semantic::Embedder;
 use search::semantic_backend::LanceSemanticBackend;
 use search::support::{lance_dir, FixedEmbedder, TempDirGuard};
-use uwuwu_usecase::{AppendDocOutcome, SemanticBackend, UsecaseResult, WikiRepo};
+use uwuwu_usecase::{SemanticBackend, UsecaseResult, WikiRepo};
 
 const DOCS: usize = 3;
 const SLUGS: [&str; DOCS] = ["doc/a", "doc/b", "doc/c"];
@@ -116,16 +116,8 @@ impl WikiRepo for ChurnWiki {
         Ok(())
     }
 
-    async fn append_doc(
-        &self,
-        _slug: &str,
-        _line: &str,
-        _message: &str,
-    ) -> UsecaseResult<AppendDocOutcome> {
-        Ok(AppendDocOutcome {
-            created: false,
-            lines: 0,
-        })
+    async fn append_doc(&self, _slug: &str, _line: &str, _message: &str) -> UsecaseResult<usize> {
+        Ok(0)
     }
 }
 

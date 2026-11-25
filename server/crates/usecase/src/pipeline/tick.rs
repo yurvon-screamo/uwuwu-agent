@@ -2204,7 +2204,9 @@ impl TickUseCase {
                     "⏰ Soft ping: the turn has finished without the status transition — \
                      row #{} is stalled. Close the transaction per the turn contract: \
                      uwuwu_task_edit {{number: {}, status: <next stage>}} \
-                     or ask the owner in a comment + Needs attention.",
+                     or ask the owner in a comment + Needs attention. \
+                     After an owner reply, fix it verbatim in the body/thread and pass \
+                     owner_answer with the source status when clearing Needs attention.",
                     task.number(),
                     task.number()
                 ),

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use uwuwu_usecase::{AppendDocOutcome, UsecaseResult, WikiRepo};
+use uwuwu_usecase::{UsecaseResult, WikiRepo};
 
 use super::semantic::{Embedder, EMBED_MODEL_DIMS};
 
@@ -43,16 +43,8 @@ impl WikiRepo for FakeWiki {
         Ok(())
     }
 
-    async fn append_doc(
-        &self,
-        _slug: &str,
-        _line: &str,
-        _message: &str,
-    ) -> UsecaseResult<AppendDocOutcome> {
-        Ok(AppendDocOutcome {
-            created: false,
-            lines: 0,
-        })
+    async fn append_doc(&self, _slug: &str, _line: &str, _message: &str) -> UsecaseResult<usize> {
+        Ok(0)
     }
 }
 

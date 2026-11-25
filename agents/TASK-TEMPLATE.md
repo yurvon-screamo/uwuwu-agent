@@ -35,11 +35,23 @@ Body sections themselves stay Russian: task bodies are user-facing content the o
 - **feature** (and every type of the feature pipeline: docs, other, refactoring, legacy, qa,
   infrastructure): `## Итог` (the first section; appears at final stages — written
   by the developer in the final report, updated on their rounds; not part of the create skeleton,
-  the template below) → `## Постановка` (context → what to do) → `## План` (at the finish the agent
+  the template below) → `## Постановка` (context → what to do; for feature-type rows it also carries
+  the requirement records — see the records rule below) → `## План` (at the finish the agent
   grows it into `## Решение` — how it is built and why) → `## Юзкейсы` (opt.) →
   `## Сиквенсы` (opt.) → `## Проверка` (required) → `## Отчёт инженера` (the final phase
   of the task's life) → `## Смежное` (opt.). Optional sections are not part of the create skeleton —
   we do not breed empty stubs.
+- **Requirement records (uwuwu#1630, 25.11.2026)**: the analyst formulates the requirements as
+  US/UC/NFT records in the task body — a table in `## Постановка` (local ID · frame · source · class).
+  Each record carries a source: (а) a verbatim owner quote covering the formulation; (б) a link to an
+  existing spec record («реализует US-0X» — no duplicate minted); (в) a canon doc (ADR/README/spec)
+  with the canon mark when derived. Local IDs — Latin per the spec form (US-1, UC-2, NFT-3; no
+  Cyrillic doubles); the dreamer assigns global IDs at transfer. Rows that left analytics before the
+  rule (before the merge of PR uwuwu-agent#517) go as is — no table is not a defect. Direct/fast-track rows: the session
+  formulates records from the owner's verbatim order (source = the order itself).
+- **Records by type**: feature — the table is mandatory (proportionality inside); bug/spike — no
+  records (the type's frames only: BDD scenario / hypothesis); docs/other/refactoring/legacy/qa/
+  infrastructure — records only when the task carries a new or changed requirement.
 - **Отчёт инженера** — the legal final H2 section of a feature body; the inside — H3 subsections per
   §«Шаблон отчёта» of `agents/developer.md` (the only source of the report's inside — this
   document does not duplicate it).
@@ -92,6 +104,10 @@ in a comment next to it; the body is not a log, «Итог» is updated only by 
 ## Постановка
 
 <контекст → что сделать; ссылки на доки и ADR>
+
+<таблица записей требований: локальный ID · рамка · источник · класс — (а) цитата
+владельца / (б) существующая запись спеки / (в) канон-док; у записи, покрытой
+цитатой частично, пометки по частям (интерпретация / вывод из <doc>)>
 
 ## План
 
