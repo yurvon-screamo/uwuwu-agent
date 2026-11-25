@@ -658,6 +658,9 @@ impl TickStateStore for MemTickState {
         0
     }
     fn set_master_compact_ms(&self, _: &str, _: &str, _: u64) {}
+    fn prune_master_role(&self, _: &str, _: &std::collections::HashSet<String>) -> bool {
+        false
+    }
     fn save(&self) -> UsecaseResult<()> {
         Ok(())
     }

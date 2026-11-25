@@ -65,6 +65,19 @@ impl AnalystReviewUseCase {
                 "Ревью аналитики: часть исполнителей недоступна - волна по живому union"
             );
         }
+        // Гигиена привязок (Low-1 ревью): проекты, ушедшие из конфига,
+        // не держат сирот в state.json. Вне компакт-прохода: работает
+        // и при выключенной секции [compact].
+        let live_projects: std::collections::HashSet<String> =
+            self.boards.iter().map(|b| b.project.clone()).collect();
+        if self
+            .state
+            .prune_master_role(reviewer_role(), &live_projects)
+        {
+            if let Err(e) = self.state.save() {
+                tracing::warn!(event = "analys_review.prune_save_failed", error = %e, "Гигиена привязок не персистится");
+            }
+        }
         // Компакт-проход мастер-сессий - до busy/CUP-гардов: idle-привязки
         // других проектов компактируются даже когда волна ждет.
         if let Some(policy) = self.compact {
@@ -279,10 +292,22 @@ impl AnalystReviewUseCase {
         Ok(delivered)
     }
 
+    /// Сессия потеряна исполнителем (404-класс): liveness Dead против
+    /// транспортного Unknown — пропуск только по Dead, Unknown завершает
+    /// проход пробой (эталон — бот-супервизор).
+    async fn session_gone(&self, project: &str, session: &str) -> bool {
+        matches!(
+            self.sessions.project(project).liveness(session).await,
+            crate::ports::Liveness::Dead
+        )
+    }
+
     /// Компакт-проход мастер-сессий ревьювера (#1634 срез 3, матрица
     /// bots/compact): idle + занятость окна модели рождения + коулдаун.
-    /// Потерянная сессия (Dead) - мимо, транспорт Unknown - пропуск
-    /// привязки, соседи продолжаются. CUP-гейт: при полном капе проход
+    /// Семантика проб — по эталону бот-супервизора: потерянная сессия
+    /// (Dead) — warn + пропуск привязки, соседи продолжаются; прочий
+    /// отказ пробы (транспорт/гейт) — warn + завершение прохода, чтобы
+    /// не долбить упавший исполнитель. CUP-гейт: при полном капе проход
     /// откладывается целиком (как у мастер-аналитика #1607).
     async fn compact_pass(&self, policy: &CompactPolicy, scan: &[SessionInfo]) {
         if crate::router::busy_count(scan) >= self.cup {
@@ -322,11 +347,29 @@ impl AnalystReviewUseCase {
                 .unwrap_or(false);
             let idle_ms = match gateway.last_activity_ms(&session).await {
                 Ok(ms) => ms.map(|ms| now.saturating_sub(ms)),
-                Err(_) => continue,
+                Err(e) => {
+                    if self.session_gone(project, &session).await {
+                        tracing::warn!(event = "analys_review.compact_session_gone", project = %project,
+                            session = %session, "Сессия потеряна исполнителем - привязка пропущена");
+                        continue;
+                    }
+                    tracing::warn!(event = "analys_review.compact_probe_failed", project = %project,
+                        error = %e, "Проба активности не удалась - компакт-проход завершён");
+                    return;
+                }
             };
             let usage_pct = match gateway.context_usage_pct(&session, &model.model).await {
                 Ok(u) => u,
-                Err(_) => continue,
+                Err(e) => {
+                    if self.session_gone(project, &session).await {
+                        tracing::warn!(event = "analys_review.compact_session_gone", project = %project,
+                            session = %session, "Сессия потеряна исполнителем - привязка пропущена");
+                        continue;
+                    }
+                    tracing::warn!(event = "analys_review.compact_probe_failed", project = %project,
+                        error = %e, "Проба занятости не удалась - компакт-проход завершён");
+                    return;
+                }
             };
             let facts = CompactFacts {
                 busy,
@@ -389,7 +432,7 @@ impl AnalystReviewUseCase {
             .post_comment(
                 task.number(),
                 &format!(
-                    "Analytics review loop guard: {repeats} reviewer spawns without status \
+                    "⚠︎ Analytics review loop guard: {repeats} reviewer spawns without status \
                      progress (the row waits in Review Analys). The row moved to \
                      Needs attention - owner's triage."
                 ),

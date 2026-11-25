@@ -709,5 +709,12 @@ pub trait TickStateStore: Send + Sync {
     /// переживает рестарт; 0 - не было).
     fn master_compact_ms(&self, role: &str, project: &str) -> u64;
     fn set_master_compact_ms(&self, role: &str, project: &str, ms: u64);
+    /// Гигиена привязок (Low-1 ревью #1634): снести записи роли, чьи
+    /// проекты ушли из конфига. Возвращает true, если что-то снесено.
+    fn prune_master_role(
+        &self,
+        role: &str,
+        live_projects: &std::collections::HashSet<String>,
+    ) -> bool;
     fn save(&self) -> UsecaseResult<()>;
 }

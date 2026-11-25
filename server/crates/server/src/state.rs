@@ -815,6 +815,30 @@ impl TickStateStore for JsonStateStore {
             .compact_ms = Some(ms);
     }
 
+    fn prune_master_role(
+        &self,
+        role: &str,
+        live_projects: &std::collections::HashSet<String>,
+    ) -> bool {
+        let prefix = format!("{role}:");
+        let mut guard = self.state.lock().expect("state lock");
+        let dead: Vec<String> = guard
+            .master
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .filter(|k| {
+                k.strip_prefix(&prefix)
+                    .is_none_or(|p| !live_projects.contains(p))
+            })
+            .cloned()
+            .collect();
+        let pruned = !dead.is_empty();
+        for k in dead {
+            guard.master.remove(&k);
+        }
+        pruned
+    }
+
     fn save(&self) -> UsecaseResult<()> {
         self.save_now()
     }
