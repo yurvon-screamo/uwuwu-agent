@@ -1592,4 +1592,99 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn master_binding_persists_across_restart_and_prunes_orphans() {
+        // #1634 (тестер-пин, интеграция): привязка роль:проект и метка
+        // компакта — факты носителя (не процесса): переживают рестарт;
+        // prune сносит только сирот своей роли.
+        let dir = std::env::temp_dir().join(format!("uwuwu-state-master-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        {
+            let s = store(path.clone());
+            s.set_master_binding(
+                "analyst-reviewer",
+                "uwuwu",
+                "ses_live",
+                "zai-coding-plan/glm-5.4#high",
+                "/tmp/checkout",
+            );
+            s.set_master_compact_ms("analyst-reviewer", "uwuwu", 123_456);
+            s.set_master_binding("analyst-reviewer", "gone", "ses_gone", "m", "/c");
+            s.set_master_binding("analyst", "gone", "ses_a", "m", "/c");
+            TickStateStore::save(&s).unwrap();
+        }
+        let s = store(path.clone());
+        assert_eq!(
+            s.master_binding("analyst-reviewer", "uwuwu"),
+            Some((
+                "ses_live".to_string(),
+                "zai-coding-plan/glm-5.4#high".to_string(),
+                "/tmp/checkout".into()
+            )),
+            "рестарт восстанавливает тройку привязки"
+        );
+        assert_eq!(
+            s.master_compact_ms("analyst-reviewer", "uwuwu"),
+            123_456,
+            "метка компакта переживает рестарт"
+        );
+        assert_eq!(
+            s.master_compact_ms("analyst-reviewer", "нет-такой"),
+            0,
+            "нет записи — метка ноль"
+        );
+        let mut live = std::collections::HashSet::new();
+        live.insert("uwuwu".to_string());
+        assert!(
+            s.prune_master_role("analyst-reviewer", &live),
+            "сирота есть — prune докладывает"
+        );
+        assert!(
+            !s.prune_master_role("analyst-reviewer", &live),
+            "второй проход чист — prune молчит"
+        );
+        TickStateStore::save(&s).unwrap();
+        let s = store(path.clone());
+        assert_eq!(
+            s.master_binding("analyst-reviewer", "gone"),
+            None,
+            "сирота своей роли снесена"
+        );
+        assert!(
+            s.master_binding("analyst-reviewer", "uwuwu").is_some(),
+            "живой проект цел"
+        );
+        assert!(
+            s.master_binding("analyst", "gone").is_some(),
+            "чужая роль не тронута"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn master_binding_reads_legacy_file_without_section() {
+        // #1634: state.json, записанный до мастер-привязок (без master),
+        // читается — serde-дефолт пустой карты, рестарт не падает.
+        let dir = std::env::temp_dir().join(format!("uwuwu-state-mlegacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(&path, r#"{"rows":{},"bots":{}}"#).unwrap();
+        let s = store(path.clone());
+        assert_eq!(
+            s.master_binding("analyst-reviewer", "uwuwu"),
+            None,
+            "легаси-файл — привязок нет"
+        );
+        assert_eq!(s.master_compact_ms("analyst-reviewer", "uwuwu"), 0);
+        s.set_master_binding("analyst-reviewer", "uwuwu", "ses_1", "m", "/c");
+        TickStateStore::save(&s).unwrap();
+        let s = store(path.clone());
+        assert!(
+            s.master_binding("analyst-reviewer", "uwuwu").is_some(),
+            "привязка доезжает после легаси-чтения"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
