@@ -3202,6 +3202,55 @@ mod tests {
         assert!(item_values(&item).direct);
     }
 
+    /// Строковый контракт FactTrack на тик-пути снапшота (#1631, тестировщик):
+    /// тот же issue-backed шейп, что у Direct — «on» поднимает флаг, «off»
+    /// и чужая опция — нет; отсутствие поля — обычная строка. Сломанный
+    /// парс (чужое имя поля/опции) убивает укороченный пайп тихо: гард
+    /// на REST fields.load отвечает отказом на ReviewResult → Review,
+    /// а тесты юзкейса на моках остаются зелёными — пин здесь.
+    #[test]
+    fn item_values_fact_track_flag_string_contract() {
+        let item = |fact_track: &str| {
+            json!({
+                "content": { "__typename": "Issue", "number": 1631, "title": "t", "state": "open" },
+                "fieldValues": { "nodes": [
+                    { "__typename": "ProjectV2ItemIssueFieldValue",
+                      "field": { "__typename": "ProjectV2SingleSelectField", "name": "FactTrack" },
+                      "issueFieldValue": {
+                          "__typename": "IssueFieldSingleSelectValue",
+                          "name": fact_track, "value": fact_track, "optionId": "IFSSO_f"
+                      } },
+                ]}
+            })
+        };
+        assert!(item_values(&item("on")).fact_track, "«on» — флаг поднят");
+        assert!(!item_values(&item("off")).fact_track, "«off» — флаг опущен");
+        assert!(
+            !item_values(&item("true")).fact_track,
+            "чужая опция флаг не поднимает (парсинг строгий)"
+        );
+        let bare = json!({
+            "content": { "__typename": "Issue", "number": 1, "title": "t", "state": "open" },
+            "fieldValues": { "nodes": [
+                { "name": "In Progress", "field": { "name": "Status" } },
+            ]}
+        });
+        assert!(!item_values(&bare).fact_track, "нет поля — обычная строка");
+    }
+
+    /// Pv2-own шейп (значение на верхнем уровне узла): FactTrack=on
+    /// читается и оттуда — шейп колонок доски (#1631, тестировщик).
+    #[test]
+    fn item_values_fact_track_board_column_shape() {
+        let item = json!({
+            "content": { "__typename": "Issue", "number": 2, "title": "t", "state": "open" },
+            "fieldValues": { "nodes": [
+                { "name": "on", "field": { "name": "FactTrack" } },
+            ]}
+        });
+        assert!(item_values(&item).fact_track);
+    }
+
     #[test]
     fn item_values_parses_issue_backed_cells() {
         // #1174: поля каталога /user/issue-fields («Приоритет», «Autodone»)
