@@ -2291,13 +2291,49 @@ mod tests {
         assert_eq!(strip_task_get_header(&md), "## Постановка\nтело");
     }
 
-    /// Смешанный стек: внешний слой актуального рендера + внутренний
-    /// легаси (6 ключей, без fact_track/body_bytes) — срезаются ОБА:
-    /// легаси-наборы приземлились с #506 (#1604 в мастере), страж
-    /// границы перевёрнут (решение 6 плана #1632).
+    /// Смешанный стек: внешний слой легаси-7 (fact_track без
+    /// body_bytes) + внутренний легаси-6 (без fact_track) — срезаются
+    /// ОБА: легаси-наборы приземлились с #506 (#1604 в мастере), страж
+    /// границы перевёрнут (решение 6 плана #1632). Актуальная
+    /// восьмиключевая форма — в пинах ниже.
     #[test]
     fn task_get_stacked_mixed_render_and_legacy_layers_are_stripped() {
         let fresh = "#1 t — In Progress\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\n\n";
+        let legacy = "#2 t — Todo\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\ntype: bug\nbody_hash: h\n\n";
+        let md = format!("{fresh}{legacy}## Тело");
+        assert_eq!(strip_task_get_header(&md), "## Тело");
+    }
+
+    /// Карточка актуального рендера (#1604+#1631): восемь ключей,
+    /// `body_bytes` последним. Прежние фикстуры формы B — легаси-7;
+    /// без этого пина актуальная форма держится только tools-зеркалом.
+    fn card_copy_fresh_with_title(title: &str) -> String {
+        format!(
+            "{title}\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: \
+             false\nfact_track: false\ntype: bug\nbody_hash: h\nbody_bytes: 42\n\n## Постановка\nтекст"
+        )
+    }
+
+    #[test]
+    fn task_get_fresh_render_card_copy_is_stripped() {
+        let md = card_copy_fresh_with_title("#1632 t — In Progress");
+        assert_eq!(strip_task_get_header(&md), "## Постановка\nтекст");
+    }
+
+    /// Терминатор «конец входа» (#1604) в форме B: шапка актуального
+    /// рендера без хвостового переноса срезается в пустоту — на границе
+    /// записи это отказ #1572.
+    #[test]
+    fn task_get_fresh_render_card_without_newline_strips_to_empty() {
+        let md = "#1632 t — In Progress\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\nbody_bytes: 42";
+        assert_eq!(strip_task_get_header(md), "");
+    }
+
+    /// Стек: внешний слой актуального рендера (8 ключей) + внутренний
+    /// легаси-6 — срез циклом, на носителе тело.
+    #[test]
+    fn task_get_stacked_fresh_render_and_legacy_layers_are_stripped() {
+        let fresh = "#1 t — In Progress\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\nbody_bytes: 42\n\n";
         let legacy = "#2 t — Todo\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\ntype: bug\nbody_hash: h\n\n";
         let md = format!("{fresh}{legacy}## Тело");
         assert_eq!(strip_task_get_header(&md), "## Тело");
