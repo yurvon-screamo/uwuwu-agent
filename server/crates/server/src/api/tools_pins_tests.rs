@@ -129,11 +129,12 @@ async fn docs_append_refuses_removed_cron_journal() {
 #[tokio::test]
 async fn docs_write_refuses_removed_cron_journal() {
     let tools = hub();
+    let slug = "cron/Sentry-ночной-просмотр/Журнал";
     let err = call(
         &tools,
         "docs_write",
         json!({
-            "slug": "cron/Sentry-ночной-просмотр/Журнал",
+            "slug": slug,
             "content": "---\ntitle: X\ndate: 2026-11-25\n---\nПРОБА #1576",
         }),
     )
@@ -143,6 +144,100 @@ async fn docs_write_refuses_removed_cron_journal() {
         err.contains("writing refused") && err.contains("#1576"),
         "отказ без причины: {err}"
     );
+    // refill #1576 (тест-ревью Low-1): «отказ до мутации» для docs_write
+    // закреплён так же, как для docs_append — гард не должен переехать
+    // после write_doc и оставить созданный файл при громком отказе.
+    let err_read = call(&tools, "docs_read", json!({ "slug": slug }))
+        .await
+        .expect_err("журнал не должен создаться заново через docs_write");
+    assert!(
+        err_read.contains("not found"),
+        "неожиданный док: {err_read}"
+    );
+}
+
+/// #1576 приёмка на проводе MCP: то, что видит живой агент-писатель —
+/// оба мутационных тула вики отвечают isError с текстом гарда, и носитель
+/// цел (тем же проводом journal-слаг не читается). Уровень выше диспетчера,
+/// по образцу пина #1572 `contentless_mutations_refuse_loudly_over_the_wire`.
+#[tokio::test]
+async fn removed_cron_journal_refuses_loudly_over_mcp_wire() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let tools = hub();
+    let state = Arc::new(super::McpState {
+        bearer: Arc::new("t-bearer".into()),
+        tools,
+    });
+    let app = super::mcp_router(state);
+
+    async fn call_tool(app: &axum::Router, name: &str, args: Value) -> Value {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": args }
+        });
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("authorization", "Bearer t-bearer")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    for (name, args, slug) in [
+        (
+            "docs_append",
+            json!({"slug": "cron/Loop-надёжность-конвейера/Журнал", "line": "провода"}),
+            "cron/Loop-надёжность-конвейера/Журнал",
+        ),
+        (
+            "docs_write",
+            json!({
+                "slug": "cron/Sentry-ночной-просмотр/Журнал",
+                "content": "---\ntitle: X\ndate: 2026-11-25\n---\nпровода",
+            }),
+            "cron/Sentry-ночной-просмотр/Журнал",
+        ),
+    ] {
+        let answer = call_tool(&app, name, args).await;
+        assert_eq!(
+            answer["result"]["isError"],
+            Value::Bool(true),
+            "{name}: {answer}"
+        );
+        let text = answer["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            text.contains("writing refused") && text.contains("#1576"),
+            "{name}: {text}"
+        );
+        let read = call_tool(&app, "docs_read", json!({ "slug": slug })).await;
+        assert_eq!(
+            read["result"]["isError"],
+            Value::Bool(true),
+            "журнал создан: {read}"
+        );
+        let read_text = read["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(read_text.contains("not found"), "{read_text}");
+    }
 }
 
 #[tokio::test]
