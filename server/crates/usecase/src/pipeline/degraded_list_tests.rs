@@ -1,15 +1,18 @@
 //! Ролевые пины деградации списка сессий (#1609): отказ одного исполнителя
 //! не роняет волну analyst / analyst_review / dreamer — спавн идёт через
-//! живого, событие `<role>.list_degraded` пишется. Уровень роутера уже
-//! покрыт router_tests::reachable_union_degrades_when_executor_down — здесь
-//! проверяется реакция самого юзкейса, а не слияние списков.
+//! живого, событие `<role>.list_degraded` пишется. Сверка с существующим
+//! покрытием (ревью #1609): слияние списков — router_tests::
+//! reachable_union_degrades_when_executor_down, поведение волны аналитика —
+//! tick_tests::analyst_wave_degrades_on_partial_outage. Поэтому analyst-тест
+//! здесь пинит только событие роли, не дублируя поведенческие ассерты.
 //! dreamer-тест дополнительно пинит отложенный prune при частичном зрении.
 
 use super::degraded_list_support::{
-    assert_degraded, dreamer_target, router, trap_events, DreamClock, RecordingGw,
+    assert_degraded, dreamer_target, router, trap_events, RecordingGw,
 };
-use crate::pipeline::analyst::{AnalystBoard, AnalystUseCase};
+use crate::pipeline::analyst::AnalystUseCase;
 use crate::pipeline::analyst_review::AnalystReviewUseCase;
+use crate::pipeline::cup_pins_tests::{analyst_boards, DreamerClock};
 use crate::pipeline::dreamer::DreamerUseCase;
 use crate::pipeline::tick_tests::{board_with_rows, empty_tick_state, FixedClock};
 use crate::ports::{DreamerMark, TickStateStore};
@@ -18,14 +21,6 @@ use crate::spawn_models::SpawnModels;
 use std::sync::Arc;
 use uwuwu_domain::{Status, Task};
 
-fn boards() -> Vec<AnalystBoard> {
-    vec![AnalystBoard {
-        project: "uwuwu".into(),
-        board: "Задачи uwuwu".into(),
-        checkout: "/tmp/checkout".into(),
-    }]
-}
-
 fn analyst(sessions: Arc<SessionRouter>) -> AnalystUseCase {
     AnalystUseCase {
         board: board_with_rows(vec![Task::new(
@@ -33,7 +28,7 @@ fn analyst(sessions: Arc<SessionRouter>) -> AnalystUseCase {
             "волна аналитики".into(),
             Status::Analys,
         )]),
-        boards: boards(),
+        boards: analyst_boards(),
         sessions,
         state: empty_tick_state(),
         clock: Arc::new(FixedClock),
@@ -49,7 +44,7 @@ fn analyst_review(sessions: Arc<SessionRouter>) -> AnalystReviewUseCase {
             "волна ревью".into(),
             Status::ReviewAnalys,
         )]),
-        boards: boards(),
+        boards: analyst_boards(),
         sessions,
         state: empty_tick_state(),
         clock: Arc::new(FixedClock),
@@ -63,24 +58,26 @@ fn dreamer(sessions: Arc<SessionRouter>, state: Arc<dyn TickStateStore>) -> Drea
     DreamerUseCase {
         sessions,
         state,
-        clock: Arc::new(DreamClock),
+        clock: Arc::new(DreamerClock),
         models: Arc::new(SpawnModels::canonical()),
         checkout: "/tmp/checkout".into(),
         cup: 7,
     }
 }
 
+/// Поведение волны при частичном отказе уже пинится в
+/// tick_tests::analyst_wave_degrades_on_partial_outage; здесь — только событие роли.
 #[tokio::test]
-async fn analyst_wave_spawns_on_live_union_and_logs_degradation() {
-    let live = RecordingGw::new(false, Vec::new());
+async fn analyst_wave_logs_degradation() {
     let (guard, records) = trap_events();
-    let spawned = analyst(router(live.clone(), RecordingGw::new(true, Vec::new())))
-        .tick()
-        .await
-        .expect("отказ чужого исполнителя не роняет волну");
+    analyst(router(
+        RecordingGw::new(false, Vec::new()),
+        RecordingGw::new(true, Vec::new()),
+    ))
+    .tick()
+    .await
+    .expect("отказ чужого исполнителя не роняет волну");
     drop(guard);
-    assert_eq!(spawned, 1, "волна ушла живому исполнителю");
-    assert_eq!(live.created.lock().unwrap().len(), 1);
     assert_degraded(&records.lock().unwrap(), "analys.list_degraded");
 }
 

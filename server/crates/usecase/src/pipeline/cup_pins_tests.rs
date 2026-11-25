@@ -19,7 +19,7 @@ use uwuwu_domain::{Status, Task, UtcMinute};
 
 /// Часы с большим now_ms — филлеры updated_ms=0 дозревают до idle-кандидатов
 /// дримера (IDLE_MS 30 мин) при фиксированном времени.
-struct DreamerClock;
+pub(crate) struct DreamerClock;
 impl Clock for DreamerClock {
     fn utc_minute(&self) -> UtcMinute {
         UtcMinute {
@@ -38,7 +38,7 @@ fn wave_row(n: u64, status: Status) -> Task {
     Task::new(n, format!("волна #{n}"), status)
 }
 
-fn analyst_boards() -> Vec<AnalystBoard> {
+pub(crate) fn analyst_boards() -> Vec<AnalystBoard> {
     vec![AnalystBoard {
         project: "uwuwu".into(),
         board: "Задачи uwuwu".into(),

@@ -2,6 +2,7 @@
 //! ловушка tracing-событий и кандидат дримера. Только in-memory, без сети.
 
 use crate::error::UsecaseResult;
+use crate::pipeline::cup_pins_tests::DreamerClock;
 use crate::ports::{
     AgentSessionGateway, AssistantReply, Clock, Liveness, SessionInfo, SessionSpec,
 };
@@ -10,7 +11,6 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tracing::dispatcher::DefaultGuard;
-use uwuwu_domain::UtcMinute;
 
 /// Гейтвей с памятью зовов: отказ list_sessions у одного исполнителя,
 /// живой спавн/delivery у другого.
@@ -89,28 +89,16 @@ pub(crate) fn router(live: Arc<RecordingGw>, down: Arc<RecordingGw>) -> Arc<Sess
     ))
 }
 
-/// Часы дримера: idle-порог 30 мин, now = 100_000_000.
-pub(crate) struct DreamClock;
-impl Clock for DreamClock {
-    fn utc_minute(&self) -> UtcMinute {
-        UtcMinute {
-            minute_of_day: 100,
-            weekday: 3,
-        }
-    }
-    fn now_ms(&self) -> u64 {
-        100_000_000
-    }
-}
-
 /// Idle-кандидат дримера: финал есть, токены > 0, активность старше порога.
+/// Часы — общие с cup_pins_tests (дубля фикстуры нет).
 pub(crate) fn dreamer_target() -> SessionInfo {
+    let now = DreamerClock.now_ms();
     SessionInfo {
         id: "ses_target".into(),
         title: String::new(),
         agent: String::new(),
         directory: String::new(),
-        updated_ms: 100_000_000 - 31 * 60_000,
+        updated_ms: now - 31 * 60_000,
         outcome: "succeeded".into(),
         total_tokens: 700,
         busy: false,
@@ -118,22 +106,19 @@ pub(crate) fn dreamer_target() -> SessionInfo {
 }
 
 /// Ловушка tracing: thread-local dispatcher, каждый tokio::test — свой поток.
+/// Поля одного события склеиваются в одну запись: имя отказа должно лежать
+/// в том же событии, что и `event=<role>.list_degraded`, иначе ассерт ловит
+/// чужой `executor=down` из роутера.
 struct EventTrap(Arc<Mutex<Vec<String>>>);
 
-struct TrapFields(Arc<Mutex<Vec<String>>>);
+struct TrapFields<'a>(&'a mut Vec<String>);
 
-impl tracing::field::Visit for TrapFields {
+impl tracing::field::Visit for TrapFields<'_> {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        self.0
-            .lock()
-            .expect("trap lock")
-            .push(format!("{}={}", field.name(), value));
+        self.0.push(format!("{}={}", field.name(), value));
     }
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.0
-            .lock()
-            .expect("trap lock")
-            .push(format!("{}={:?}", field.name(), value));
+        self.0.push(format!("{}={:?}", field.name(), value));
     }
 }
 
@@ -147,7 +132,9 @@ impl tracing::Subscriber for EventTrap {
     fn record(&self, _span: &tracing::Id, _values: &tracing::span::Record<'_>) {}
     fn record_follows_from(&self, _follows: &tracing::Id, _span: &tracing::Id) {}
     fn event(&self, event: &tracing::Event<'_>) {
-        event.record(&mut TrapFields(Arc::clone(&self.0)));
+        let mut fields = Vec::new();
+        event.record(&mut TrapFields(&mut fields));
+        self.0.lock().expect("trap lock").push(fields.join(" | "));
     }
     fn enter(&self, _span: &tracing::Id) {}
     fn exit(&self, _span: &tracing::Id) {}
@@ -163,12 +150,12 @@ pub(crate) fn trap_events() -> (DefaultGuard, Arc<Mutex<Vec<String>>>) {
 pub(crate) fn assert_degraded(records: &[String], event: &str) {
     let plain = format!("event={event}");
     let quoted = format!("event=\"{event}\"");
-    let has_event = records
-        .iter()
-        .any(|r| r.as_str() == plain.as_str() || r.as_str() == quoted.as_str());
-    let has_executor = records.iter().any(|r| r.contains("down"));
     assert!(
-        has_event && has_executor,
-        "нет {event} с именем отказа: {records:?}"
+        records.iter().any(|r| {
+            (r.contains(&plain) || r.contains(&quoted))
+                && r.contains("executors=")
+                && r.contains("down")
+        }),
+        "нет {event} с полем executors=[down] в той же записи: {records:?}"
     );
 }
