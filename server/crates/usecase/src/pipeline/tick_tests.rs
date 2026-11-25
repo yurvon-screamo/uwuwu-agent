@@ -8495,6 +8495,40 @@ async fn cup_no_preempt_of_medium_active() {
 }
 
 #[tokio::test]
+async fn cup_preempt_never_kills_direct_row() {
+    // #1616 (срез 5): direct-строка — не жертва преемпшена. Гашение —
+    // фабричный «мув» по direct-строке (abort+delete сессии + снятие
+    // клейма), потенциально чужой — владельческой; контракт #1357
+    // безусловен («никаких мувов/проверок»). Direct-жертва даже более
+    // «выгодна» пику до фикса (Empty предпочитается Low) — гасится
+    // только ordinary
+    let mut direct = row_with_session(1, "ses_direct_owner", Priority::Empty);
+    direct.set_direct(true);
+    let ordinary = row_with_session(2, "ses_v2", Priority::Low);
+    let mut waiter = task(3, Status::InProgress);
+    waiter.set_priority(Priority::High);
+    let (u, _, sessions, _) = usecase(vec![direct, ordinary, waiter], PrState::Missing);
+    live_busy(&sessions, "ses_direct_owner");
+    live_busy(&sessions, "ses_v2");
+    let out = u.run(&plan(Mode::Live, 2)).await.unwrap();
+    assert_eq!(out.preempts, 1, "жертва ровно одна — ordinary empty");
+    let deleted = sessions.deleted.lock().unwrap();
+    assert!(
+        !deleted.iter().any(|d| d == "ses_direct_owner"),
+        "сессия direct-строки не гасится: {deleted:?}"
+    );
+    assert_eq!(
+        deleted
+            .iter()
+            .filter(|d| d.starts_with("ses_v"))
+            .cloned()
+            .collect::<Vec<_>>(),
+        ["ses_v2"],
+        "гасится ровно ordinary-жертва, несмотря на ранг"
+    );
+}
+
+#[tokio::test]
 async fn cup_preempt_skipped_when_budget_exhausted() {
     // Контракт порядка (круг 1): бюджетная проба ДО гашения — жертва
     // зря не гибнет, кандидат остаётся held до свободного бюджета
