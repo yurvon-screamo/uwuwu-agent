@@ -458,7 +458,7 @@ impl AnalystReviewUseCase {
     }
 }
 
-fn analyst_review_prompt(project: &str, rows: &[&Task]) -> String {
+pub(crate) fn analyst_review_prompt(project: &str, rows: &[&Task]) -> String {
     let marker = ANALYST_REVIEW_WAVE_MARKER.replace("{project}", project);
     let mut list = String::new();
     for t in rows {
@@ -476,6 +476,8 @@ fn analyst_review_prompt(project: &str, rows: &[&Task]) -> String {
          3. Verdicts: approve → uwuwu_task_edit {{number, status: \"Todo\"}};\n\
             request_changes → uwuwu_task_edit {{number, status: \"Analys\"}} + remarks in comments\n\
             (the round guard counts the rounds); a real problem → Needs attention.\n\
+         After an owner reply in chat, fix it verbatim in the body/thread and pass\n\
+         owner_answer with the source status when clearing Needs attention.\n\
          The report — one comment per row (verdict + brief reason); no\n\
          separate wave summary posts beyond those comments."
     )
