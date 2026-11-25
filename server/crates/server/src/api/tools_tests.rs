@@ -1196,16 +1196,111 @@ async fn task_get_comments_window_full_when_within_limit() {
     );
 }
 
-/// Тестировщик #1604: body_bytes — байты UTF-8, а не символы. Астральный
-/// эмодзи разводит все три единицы: 🚀 — 4 байта UTF-8, 1 char, 2 единицы
-/// JS `.length`; потребитель сверяет через TextEncoder (байты), поэтому
-/// `chars().count()` здесь — тихая рассинхронизация того же класса.
+/// #1604 (тест-ревью Common-3): слово «latest» в заголовке хвоста —
+/// обещание состава и порядка: при переполнении окна под ним лежат
+/// именно последние N комментов в хронологическом порядке, старейшие
+/// остаются за границей.
+#[tokio::test]
+async fn task_get_comments_tail_carries_latest_ten_in_chronological_order() {
+    let (tools, _memory) = hub();
+    let (number, _) = create_task(&tools, "t: хвост latest", "## П\n\nx.\n").await;
+    for i in 0..12 {
+        call(
+            &tools,
+            "task_comment",
+            json!({ "number": number, "text": format!("коммент {i} из 12") }),
+        )
+        .await
+        .expect("comment");
+    }
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    let tail_at = card
+        .find("--- comments (latest 10 of 12) ---")
+        .expect("граница хвоста заявлена");
+    let tail = &card[tail_at..];
+    assert!(
+        !tail.contains("коммент 0 из 12"),
+        "старейший 0 за границей окна: {tail}"
+    );
+    assert!(
+        !tail.contains("коммент 1 из 12"),
+        "старейший 1 за границей окна: {tail}"
+    );
+    let mut at = 0;
+    for i in 2..12 {
+        let marker = format!("коммент {i} из 12");
+        let found = tail[at..]
+            .find(&marker)
+            .unwrap_or_else(|| panic!("{marker} в хвосте после предыдущего: {}", &tail[at..]));
+        at += found;
+    }
+}
+
+/// #1604 (тест-ревью Common-2): сериализация компактная — одна строка;
+/// pretty парсится так же и тесты проходят, но на большой доске съедает
+/// окно показа финального результата.
+#[tokio::test]
+async fn task_list_json_is_single_line_compact() {
+    let (tools, _memory) = hub();
+    create_task(&tools, "t: компакт", "## П\n\nx.\n").await;
+
+    let list = call(&tools, "task_list", json!({ "project": "uwuwu" }))
+        .await
+        .expect("list");
+    assert!(
+        !list.contains('\n'),
+        "компактный JSON — одна строка: {list}"
+    );
+    let rows: Value = serde_json::from_str(&list).expect("одна строка — валидный JSON");
+    assert!(
+        rows.as_array()
+            .expect("массив rows")
+            .iter()
+            .any(|r| r["title"] == "t: компакт"),
+        "строка в списке: {list}"
+    );
+}
+
+/// #1604 (тест-ревью Common-3): опечатка в проекте — громкий отказ
+/// с именем проекта для обоих тулов чтения, не тихий пустой список
+/// (симптом #1548) и не карточка чужой доски с тем же номером.
+#[tokio::test]
+async fn unknown_project_is_a_loud_error_for_list_and_get() {
+    let (tools, _memory) = hub();
+    let (number, _) = create_task(&tools, "t: опечатка в проекте", "## П\n\nx.\n").await;
+
+    let list_err = call(&tools, "task_list", json!({ "project": "опечатка" }))
+        .await
+        .expect_err("неизвестный проект — отказ");
+    assert!(
+        list_err.contains("опечатка"),
+        "имя проекта в отказе: {list_err}"
+    );
+    let get_err = call(
+        &tools,
+        "task_get",
+        json!({ "number": number, "project": "опечатка" }),
+    )
+    .await
+    .expect_err("неизвестный проект — отказ");
+    assert!(
+        get_err.contains("опечатка"),
+        "имя проекта в отказе: {get_err}"
+    );
+}
+
+/// #1604 (срез 2): body_bytes — байты UTF-8, а не символы. Проба несёт
+/// астральный эмодзи: только он разводит все три единицы — байты (4),
+/// chars (1) и UTF-16-единицы JS `.length` (2); без астральности третья
+/// единица совпадает с chars и проверка слепа.
 #[tokio::test]
 async fn task_get_body_bytes_counts_utf8_bytes_not_chars_on_astral_emoji() {
     let (tools, _memory) = hub();
     // Носитель нормализует хвостовой перенос — входную строку create не
-    // считаем; сверяем срез тела как он реально лежит в выводе (как и
-    // потребитель: TextEncoder над срезом между fm и хвостом комментов).
+    // считаем; сверяем срез тела как он реально лежит в выводе.
     let (number, _) = create_task(
         &tools,
         "t: байты, не символы",
@@ -1216,6 +1311,12 @@ async fn task_get_body_bytes_counts_utf8_bytes_not_chars_on_astral_emoji() {
     let card = call(&tools, "task_get", json!({ "number": number }))
         .await
         .expect("get");
+    // Комментов у карточки нет — секции хвоста нет и срез тела идёт до
+    // конца вывода; иначе в срез попал бы чужой контент.
+    assert!(
+        !card.contains("--- comments"),
+        "секции хвоста нет, срез до конца вывода: {card}"
+    );
     let start = card.find("body_bytes: ").expect("fm несёт body_bytes") + "body_bytes: ".len();
     let line_end = start + card[start..].find('\n').expect("конец строки body_bytes");
     let declared: usize = card[start..line_end].parse().expect("body_bytes — целое");
@@ -1223,23 +1324,23 @@ async fn task_get_body_bytes_counts_utf8_bytes_not_chars_on_astral_emoji() {
     assert_ne!(
         slice.chars().count(),
         slice.len(),
-        "проба обязана разводить символы и байты (🚀: 4 байта, 1 char)"
+        "проба обязана разводить символы и байты: {slice}"
     );
     assert_eq!(
         declared,
         slice.len(),
-        "заявлены байты UTF-8 (TextEncoder), не chars: {card}"
+        "заявлены байты UTF-8, не chars: {card}"
     );
     assert_ne!(
-        declared,
+        slice.encode_utf16().count(),
         slice.chars().count(),
-        "chars-вариант отвергнут (Common-3): на 🚀 разъедется с TextEncoder"
+        "эмодзи астральный: единицы UTF-16 и chars расходятся"
     );
 }
 
-/// Тестировщик #1604: карточка без комментов не несёт секцию хвоста
-/// вообще — заголовок «latest 0 of 0» вводил бы в заблуждение так же,
-/// как молчаливый сброс сверх 10 до среза 2.
+/// #1604 (срез 2): карточка без комментов не несёт секцию хвоста —
+/// заголовок «latest 0 of 0» вводил бы в заблуждение так же, как
+/// молчаливый сброс сверх 10 до среза 2.
 #[tokio::test]
 async fn task_get_without_comments_carries_no_comments_section() {
     let (tools, _memory) = hub();
