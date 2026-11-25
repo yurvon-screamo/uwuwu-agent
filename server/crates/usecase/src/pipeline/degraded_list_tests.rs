@@ -19,7 +19,7 @@ use crate::ports::{DreamerMark, TickStateStore};
 use crate::router::SessionRouter;
 use crate::spawn_models::SpawnModels;
 use std::sync::Arc;
-use uwuwu_domain::{Status, Task};
+use uwuwu_domain::{PeakWindow, Status, Task};
 
 fn analyst(sessions: Arc<SessionRouter>) -> AnalystUseCase {
     AnalystUseCase {
@@ -34,6 +34,14 @@ fn analyst(sessions: Arc<SessionRouter>) -> AnalystUseCase {
         clock: Arc::new(FixedClock),
         models: Arc::new(SpawnModels::canonical()),
         cup: 7,
+        // Ревью #1609 раунд 2: контракт #1607 — peak/compact обязательны;
+        // безопасные дефолты (механика off) не влияют на деградацию list.
+        peak: PeakWindow {
+            enabled: false,
+            start_min: 0,
+            end_min: 0,
+        },
+        compact: None,
     }
 }
 

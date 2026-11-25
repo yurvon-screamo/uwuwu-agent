@@ -107,8 +107,8 @@ pub(crate) fn dreamer_target() -> SessionInfo {
 
 /// Ловушка tracing: thread-local dispatcher, каждый tokio::test — свой поток.
 /// Поля одного события склеиваются в одну запись: имя отказа должно лежать
-/// в том же событии, что и `event=<role>.list_degraded`, иначе ассерт ловит
-/// чужой `executor=down` из роутера.
+/// в том же событии, что и `event=<role>.list_degraded`, и ровно такой
+/// список: иначе ассерт ловит чужой `executor=down` из роутера или superset.
 struct EventTrap(Arc<Mutex<Vec<String>>>);
 
 struct TrapFields<'a>(&'a mut Vec<String>);
@@ -150,12 +150,11 @@ pub(crate) fn trap_events() -> (DefaultGuard, Arc<Mutex<Vec<String>>>) {
 pub(crate) fn assert_degraded(records: &[String], event: &str) {
     let plain = format!("event={event}");
     let quoted = format!("event=\"{event}\"");
+    const FAILED: &str = "executors=[\"down\"]";
     assert!(
-        records.iter().any(|r| {
-            (r.contains(&plain) || r.contains(&quoted))
-                && r.contains("executors=")
-                && r.contains("down")
-        }),
-        "нет {event} с полем executors=[down] в той же записи: {records:?}"
+        records
+            .iter()
+            .any(|r| (r.contains(&plain) || r.contains(&quoted)) && r.contains(FAILED)),
+        "нет {event} с точным полем {FAILED} в той же записи: {records:?}"
     );
 }
