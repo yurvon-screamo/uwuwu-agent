@@ -329,8 +329,22 @@ impl AnalystReviewUseCase {
             let gateway = self.sessions.project(project);
             match gateway.liveness(&session).await {
                 crate::ports::Liveness::Alive => {}
-                crate::ports::Liveness::Dead => continue,
-                crate::ports::Liveness::Unknown => continue,
+                crate::ports::Liveness::Dead => {
+                    tracing::debug!(
+                        event = "analys_review.compact_dead_skip",
+                        project = %project,
+                        "Мертвая привязка компактом не трогается"
+                    );
+                    continue;
+                }
+                crate::ports::Liveness::Unknown => {
+                    tracing::debug!(
+                        event = "analys_review.compact_unknown_skip",
+                        project = %project,
+                        "Состояние привязки неизвестно - компакт пропущен"
+                    );
+                    continue;
+                }
             }
             let Ok(model) = SpawnModel::parse(&bound_model) else {
                 tracing::warn!(
