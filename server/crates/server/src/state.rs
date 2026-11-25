@@ -22,7 +22,8 @@ struct RowState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_comment_id: Option<String>,
     /// Последний статус, виденный тиком (детект переходов стадии —
-    /// канон сессий: ревью/тест-раунды всегда со свежей сессией).
+    /// канон сессий: переход стадии = раунд слота; мастер-сессии
+    /// ревьюверов переживают циклы, #1626).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_status: Option<String>,
     /// Сталл-детект: (статус раунда, ms пинга, счётчик) — смена статуса
@@ -33,6 +34,10 @@ struct RowState {
     /// смена статуса = новый раунд; успех доставки сбрасывает.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lost: Option<(String, u32)>,
+    /// Pending раунд-промпт мастер-сессии ревьювера (#1626): re-entry в
+    /// ревью-стадию с живой сессией ждёт доставки (компакт + промпт).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    round_reentry: bool,
 }
 
 /// Состояние бота (секция `bots`): вечная сессия + offset апдейтов ТГ.
@@ -590,6 +595,33 @@ impl TickStateStore for JsonStateStore {
         );
     }
 
+    fn round_reentry_pending(&self, board: &str, number: u64) -> bool {
+        self.state
+            .lock()
+            .expect("state lock")
+            .rows
+            .get(&Self::key(board, number))
+            .map(|r| r.round_reentry)
+            .unwrap_or(false)
+    }
+
+    fn set_round_reentry_pending(&self, board: &str, number: u64) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .rows
+            .entry(Self::key(board, number))
+            .or_default()
+            .round_reentry = true;
+    }
+
+    fn clear_round_reentry_pending(&self, board: &str, number: u64) {
+        let mut guard = self.state.lock().expect("state lock");
+        if let Some(row) = guard.rows.get_mut(&Self::key(board, number)) {
+            row.round_reentry = false;
+        }
+    }
+
     fn last_analys_ms(&self, board: &str, number: u64) -> Option<u64> {
         self.state
             .lock()
@@ -1087,6 +1119,49 @@ mod tests {
         // сброс: успешная доставка / парковка
         TickStateStore::clear_lost_session(&s, "Задачи uwuwu", 7);
         assert_eq!(TickStateStore::lost_session(&s, "Задачи uwuwu", 7), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn round_reentry_persists_across_restart_without_noise() {
+        // #1626 (тестер-пин, интеграция): pending-маркер раунд-промпта —
+        // факт носителя: переживает рестарт сервера; снятый маркер не
+        // шумит в state.json (skip_serializing_if-конвенция RowState,
+        // дельта-фикс ревью).
+        let dir = std::env::temp_dir().join(format!("uwuwu-state-reentry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        {
+            let s = store(path.clone());
+            s.set_round_reentry_pending("Задачи uwuwu", 9);
+            TickStateStore::save(&s).unwrap();
+        }
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("round_reentry"),
+            "взведённый маркер персистентен в носителе"
+        );
+        let s = store(path.clone());
+        assert!(
+            s.round_reentry_pending("Задачи uwuwu", 9),
+            "рестарт восстанавливает pending-маркер (факт носителя)"
+        );
+        assert!(
+            !s.round_reentry_pending("Задачи uwuwu", 10),
+            "чужая строка без маркера"
+        );
+        s.clear_round_reentry_pending("Задачи uwuwu", 9);
+        TickStateStore::save(&s).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("round_reentry"),
+            "снятый маркер не шумит в носителе"
+        );
+        let s = store(path.clone());
+        assert!(
+            !s.round_reentry_pending("Задачи uwuwu", 9),
+            "снятие переживает рестарт"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

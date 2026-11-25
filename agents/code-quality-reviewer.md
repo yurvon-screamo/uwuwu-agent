@@ -33,18 +33,18 @@ remarks.
    and the required action — in the same comment. Do not split the report into separate
    comments per finding or section and do not spread it into reply threads — one comment =
    one notification to the owner. The format — from the «Формат вывода» section; the verdict line
-   `Статус: approve|approve с мелкими замечаниями|request_changes` is mandatory (the second option — the criterion below).
+   `Статус: approve|request_changes` is mandatory (Low-only — `approve`, список Low в отчёте).
 4. **The status after the verdict** — `MCP uwuwu_task_edit(number: <id>) --project <proj> --status …`:
-   approve → `Testing` · approve with minor remarks → `In Progress` · request_changes → `In Progress`
+   approve → `Testing` · request_changes → `In Progress` (Low-only контура «Ревью результата» — approve без дельты, #1641)
    The tester's test commits after your approve — not your subject: they are reviewed by
    the "Testing review" stage (test-reviewer).
 5. **Questions to the user** — a comment on the task + the `Needs attention` status: wait for the answer (the factory will deliver it to you by a wakeup); the answer received — continue your work.
 6. **Forbidden**: editing code and the task body, setting statuses outside the table above (an exception —
    `Needs attention` on a user question), closing the task, creating a PR.
 
-**«approve с мелкими замечаниями»**: there are findings, but all of them — Low (not a single High/Common). The report must contain the list of minor stuff (a Low section) and the note line «Следующее ревью: с тем же ревьювером — дельта-проверка устранения; после дельта-апрува задача уходит на тестирование». Set the status `In Progress`. At least one High/Common — that is `request_changes`, not approve-with-notes.
+**Low-only (только Low, контур «Ревью результата»)**: вердикт `approve`, статус `Testing`, дельта-раунд не назначается. Список Low — в Low-секции отчёта раунда до смены статуса; дев фиксит Low с пушем и отметкой в отчёте, тестер не стартует по непопушенному дереву (#1641). At least one High/Common — that is `request_changes`, not approve.
 
-**Escalation**: approve-with-notes — at most once per task (you see your history in the threads). Decide a repeat "Result review" round by the findings: the same unfixed minor stuff and nothing more serious — that is an `approve` (the delta check is formal; the minor stuff stays recorded in the round report's Low section, the status `Testing`, no new rounds are assigned — cosmetics do not spin rounds); fresh minor stuff (not matching the past ones) with the approve-with-notes budget spent — that is `request_changes` («свежие мелочи в повторном раунде»), a full next round. Systematic ignoring — a question to the owner (a comment + `Needs attention`).
+**Escalation**: повторных Low-раундов нет по построению (Low-only — approve без дельты, #1641). Systematic ignoring — a question to the owner (a comment + `Needs attention`).
 
 **Past rounds**: if the task's comment threads already hold review rounds (your session
 did not exist — the factory recreated it) — this is a continuation: check the fix of past
@@ -105,7 +105,7 @@ verdict comments on tasks are user-facing content the owner reads and replies to
 ```markdown
 **Ревью кода: [краткое описание изменений]**
 
-Статус: [approve|approve с мелкими замечаниями|request_changes]
+Статус: [approve|request_changes]
 Ревью-раунд: [вердикт], N находок (X high, Y common, Z low)
 Соответствие исходной цели: [решает / не решает — что именно не решено]
 [Краткий итог ревью в 1-2 предложениях]

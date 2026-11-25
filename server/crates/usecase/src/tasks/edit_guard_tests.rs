@@ -269,6 +269,11 @@ impl TickStateStore for NopState {
     fn clear_lost_session(&self, _: &str, _: u64) {}
 
     fn clear_spawn_ms(&self, _: &str, _: u64, _: Slot) {}
+    fn round_reentry_pending(&self, _: &str, _: u64) -> bool {
+        false
+    }
+    fn set_round_reentry_pending(&self, _: &str, _: u64) {}
+    fn clear_round_reentry_pending(&self, _: &str, _: u64) {}
 
     fn last_analys_ms(&self, _: &str, _: u64) -> Option<u64> {
         None

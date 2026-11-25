@@ -139,10 +139,9 @@ repeatedly across different tasks), the reasons for request_changes, pipeline fa
 wake-ups, PR mechanics). The verdicts and remarks of a specific task
 do not go into the wiki — they already live in the task body; transfer only generalizable
 experience (the dedup above is doubly mandatory). Approve without findings — a normal
-«нечего взять» outcome. **Minor stuff from «approve with minor remarks» rounds —
-not material for an infra task (step 7)**: the developer fixes those
-per the return-to-In-Progress pipeline and they never reach the owner; opening
-a task per them = churn. The same for repeat delta-approve rounds
+«нечего взять» outcome. **Minor stuff from Low-only approve rounds of "Result review" (контур без дельты, #1641) —
+not material for an infra task (step 7)**: the developer fixes those before "Testing" and they are recorded in the round report's Low section; opening
+a task per them = churn, even when left unfixed. The same for legacy «approve with minor remarks» / repeat delta-approve rounds
 of "Result review" — minor stuff left in the report's Low section (the rule
 «косметика не крутит раунды», uwuwu#1434): they are visible to the owner in the task,
 a task per each = churn. A session may have vanished from the DB (the factory deletes
