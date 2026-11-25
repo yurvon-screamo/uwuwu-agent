@@ -17,7 +17,7 @@ use crate::router::SessionRouter;
 use crate::spawn_models::SpawnModels;
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
-use uwuwu_domain::{Slot, SpawnModel, Status, Task};
+use uwuwu_domain::{PeakWindow, Slot, SpawnModel, Status, Task};
 
 /// Канон-карта владельца (единственный механизм моделей — #1154).
 fn models() -> Arc<SpawnModels> {
@@ -389,6 +389,12 @@ async fn analyst_spawn_carries_model_from_server_map() {
         clock: Arc::new(TestClock),
         models: models(),
         cup: 7,
+        peak: PeakWindow {
+            enabled: false,
+            start_min: 0,
+            end_min: 0,
+        },
+        compact: None,
     };
 
     // Act

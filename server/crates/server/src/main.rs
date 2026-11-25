@@ -586,6 +586,19 @@ async fn run(
             }),
         });
     }
+    // Автокомпакт (#1221 + #1607 срез 4): секция [compact] конфига;
+    // отсутствует — off (safe default). Пороги — ms-арифметика поверх
+    // минутных полей секции. Одна политика — два потребителя: проход
+    // ботов и проход мастер-сессий аналитики (доля 62% — санкция
+    // владельца 25.11 в #1607: flash ~298k, 5.4 ~484k).
+    let compact_policy: Option<uwuwu_usecase::bots::CompactPolicy> =
+        cfg.compact
+            .clone()
+            .map(|c| uwuwu_usecase::bots::CompactPolicy {
+                idle_ms: c.idle_min * 60_000,
+                min_context_pct: c.min_context_pct,
+                cooldown_ms: c.cooldown_min * 60_000,
+            });
     {
         // аналитика (#1135, замена триажа): волны со всех досок; дример — чекаут первой
         let analyst_boards: Vec<uwuwu_usecase::AnalystBoard> = boards_info
@@ -606,6 +619,8 @@ async fn run(
             clock: clock.clone(),
             models: spawn_models.clone(),
             cup: plan.policy.cup,
+            peak: plan.policy.peak,
+            compact: compact_policy,
         });
         let analyst_review = Arc::new(uwuwu_usecase::AnalystReviewUseCase {
             board: board.clone(),
@@ -690,17 +705,8 @@ async fn run(
                     as Arc<dyn uwuwu_usecase::bots::TelegramGateway>
             }),
         );
-        // Автокомпакт вечных сессий (#1221): секция [compact] конфига;
-        // отсутствует — off (safe default). Пороги — ms-арифметика поверх
-        // минутных полей секции.
-        bot_supervisor.compact = cfg
-            .compact
-            .clone()
-            .map(|c| uwuwu_usecase::bots::CompactPolicy {
-                idle_ms: c.idle_min * 60_000,
-                min_context_pct: c.min_context_pct,
-                cooldown_ms: c.cooldown_min * 60_000,
-            });
+        // Политика построена выше (общая для ботов и аналитики, #1607).
+        bot_supervisor.compact = compact_policy;
         let bot_supervisor = Arc::new(bot_supervisor);
         sidecars.push(Sidecar {
             name: "bots".into(),

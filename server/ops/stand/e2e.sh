@@ -31,6 +31,10 @@
 #     task-env-gc.sh на фикстурах (батч-вызов, FAIL/abort-изоляция строки).
 #   фаза 15 (судья #1364): wake без переноса на шуме, паркинг вердиктом,
 #     fallback на старую механику при отказе decision-API.
+#   фаза 16 (#1607): мастер-сессия тестера (1 спавн + re-entry wake в ту же
+#     сессию, без компакта) + мастер-сессия аналитика (волна пачкой →
+#     привязка в state.json → вторая волна reuse) + компакт-проход
+#     (адмиссия idle-сессии + метка коулдауна).
 #
 # Запуск: server/ops/stand/e2e.sh   (из каталога server; cargo build сам)
 # Выход: 0 — ок; 1 — провал с диагнозом. Логи/state/config — mktemp-рандир
@@ -1379,4 +1383,118 @@ if [ -n "$MOCK_JUDGE_PID" ]; then kill "$MOCK_JUDGE_PID" 2>/dev/null || true; fi
 sleep 1
 say "фаза 15 ок: judge wake без переноса + паркинг вердиктом + fallback при отказе API"
 
-say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри и семейство-непрерывностью сессий #1237 + мульти-экзекьютор + гард #1163 + self-эхо в прод-геометрии #1237 + слепой hold #1263 + преемпшен CUP #1259 + давка-волна #1412 + клин #1293 + дример #1306 + phantom-квитанции #1331 + lost-сессия #1288: десинк-парковка + lost-resurrection + env-gc #1431 + судья #1364); логи: $RUN_DIR"
+say "фаза 16: мастер-сессии тестера/аналитика + компакт-проход (#1607)"
+# Свой стек: свежий мок (test:hold — тестер отрабатывает ход, но строку
+# не двигает: повторный вход управляется стендом детерминированно),
+# свежий state. Тестер: Testing → In Progress → Testing — один спавн,
+# вход доставляет re-entry wake в ту же сессию. Аналитик: волна пачкой —
+# одна сессия + привязка в state.json; вторая волна (свежая строка мимо
+# кулдауна) — reuse той же сессии; компакт-проход — адмиссия idle-сессии
+# (пороги стенда нулевые: idle 0 / pct 0).
+kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+SRV_PID=""; MOCK_PID=""
+sleep 1
+rm -f "$STATE"
+LOG_SRV_1607="$RUN_DIR/server-1607.log"
+MOCK_MODE=agent MOCK_PORT=$PORT_MOCK MOCK_MCP_URL="http://127.0.0.1:$PORT_SRV" \
+  MOCK_MCP_TOKEN="$BEARER" MOCK_STEP_MS=300 \
+  MOCK_VERDICTS="test:hold;dev:hold" \
+  "$BIN_MOCK" >"$LOG_MOCK" 2>&1 &
+MOCK_PID=$!
+sleep 1
+UWUWU_SERVER_CONFIG=$CONFIG UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
+  UWUWU_SERVER_MODE=live \
+  UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
+  UWUWU_MOCK_SEED="2060:Testing;2061:Analys;2062:Analys" \
+  RUST_LOG=info "$BIN_SRV" >"$LOG_SRV_1607" 2>&1 &
+SRV_PID=$!
+# ждём спавн тестера и волну аналитика (2 тика+)
+SEEN=0
+while [ $SEEN -lt 24 ]; do
+  SEEN=$((SEEN + 1))
+  sleep 5
+  grep -q '"event":"spawn.done","number":2060,"slot":"Test"' "$LOG_SRV_1607" 2>/dev/null && \
+  grep -q '"event":"analys.spawned"' "$LOG_SRV_1607" 2>/dev/null && break
+done
+grep -q '"event":"spawn.done","number":2060,"slot":"Test"' "$LOG_SRV_1607" \
+  || fail "тестер 2060 не заспавнен (spawn.done Test нет)"
+grep -q '"event":"analys.spawned"' "$LOG_SRV_1607" \
+  || fail "волна аналитика не заспавнилась (analys.spawned нет)"
+# повторный вход тестера ведёт стенд: Testing → In Progress → Testing
+mcp task_edit '{"number":2060,"project":"uwuwu","status":"In Progress"}' | grep -q '"isError":false' \
+  || fail "task_edit 2060 → In Progress не применился"
+sleep 12  # тик: переход сохраняет живую ячейку, взводит маркер
+mcp task_edit '{"number":2060,"project":"uwuwu","status":"Testing"}' | grep -q '"isError":false' \
+  || fail "task_edit 2060 → Testing не применился"
+SEEN=0
+while [ $SEEN -lt 24 ]; do
+  SEEN=$((SEEN + 1))
+  sleep 5
+  grep -q '"event":"wakeup.tester_reentry_delivered"' "$LOG_SRV_1607" 2>/dev/null && break
+done
+grep -q '"event":"wakeup.tester_reentry_delivered"' "$LOG_SRV_1607" \
+  || fail "re-entry wake тестера не доставлен"
+TEST_SPAWNS=$(grep -c '"event":"spawn.done","number":2060,"slot":"Test"' "$LOG_SRV_1607" || true)
+[ "$TEST_SPAWNS" -eq 1 ] || fail "мастер-сессия тестера не едина (спавнов Test: $TEST_SPAWNS, ожидается 1)"
+TEST_SESS=$(grep -o '"event":"spawn.done","number":2060,"slot":"Test"[^}]*' "$LOG_SRV_1607" | head -1 | grep -o '"session":"[^"]*"' | head -1 | sed 's/"session":"//;s/"//' || true)
+REENTRY_SESS=$(grep -o '"event":"wakeup.tester_reentry_delivered"[^}]*' "$LOG_SRV_1607" | head -1 | grep -o '"session":"[^"]*"' | head -1 | sed 's/"session":"//;s/"//' || true)
+[ -n "$TEST_SESS" ] && [ "$TEST_SESS" = "$REENTRY_SESS" ] \
+  || fail "re-entry ушёл не в ту сессию (spawn: $TEST_SESS, re-entry: $REENTRY_SESS)"
+grep '"event":"mock.session_compacted"' "$LOG_MOCK" 2>/dev/null | grep -q "\"id\":\"$TEST_SESS\"" \
+  && fail "тестер $TEST_SESS попал под компакт (мастер-тестер компактит только нативный порог, не проход)"
+say "16a ок: тестер 2060 — один спавн, re-entry wake в ту же сессию ($TEST_SESS), без компакта"
+# вторая волна аналитика — свежая строка мимо кулдауна: reuse привязанной
+NEW_ROW=$(mcp task_create '{"title":"волна два 1607","project":"uwuwu"}' | python3 -c "
+import json,sys
+d = json.load(sys.stdin)
+t = d['result']['content'][0]['text']
+import re
+m = re.search(r'#(\d+)', t)
+print(m.group(1) if m else '')" 2>/dev/null)
+[ -n "$NEW_ROW" ] || fail "task_create второй волны не удался"
+SEEN=0
+while [ $SEEN -lt 24 ]; do
+  SEEN=$((SEEN + 1))
+  sleep 5
+  grep -q '"event":"analys.reused"' "$LOG_SRV_1607" 2>/dev/null && break
+done
+grep -q '"event":"analys.reused"' "$LOG_SRV_1607" \
+  || fail "вторая волна не поехала в мастер-сессию (analys.reused нет)"
+ANALY_SPAWN_SESS=$(grep -o '"event":"analys.spawned"[^}]*' "$LOG_SRV_1607" | head -1 | grep -o '"session":"[^"]*"' | head -1 | sed 's/"session":"//;s/"//' || true)
+ANALY_REUSE_SESS=$(grep -o '"event":"analys.reused"[^}]*' "$LOG_SRV_1607" | head -1 | grep -o '"session":"[^"]*"' | head -1 | sed 's/"session":"//;s/"//' || true)
+[ -n "$ANALY_SPAWN_SESS" ] && [ "$ANALY_SPAWN_SESS" = "$ANALY_REUSE_SESS" ] \
+  || fail "вторая волна уехала не в ту сессию (spawn: $ANALY_SPAWN_SESS, reuse: $ANALY_REUSE_SESS)"
+python3 - "$STATE" "$ANALY_SPAWN_SESS" <<'PY' || fail "привязка мастер-сессии в state.json неверна"
+import json, sys
+st = json.load(open(sys.argv[1]))
+bound = (st.get("master") or {}).get("analyst:uwuwu")
+assert bound, f"привязки analyst:uwuwu нет: {list((st.get('master') or {}).keys())}"
+assert bound["session"] == sys.argv[2], f"привязка указывает не туда: {bound}"
+assert bound.get("model", "").startswith("opencode-go/hy4-flash-free"), f"модель рождения не flash-free (#1628): {bound}"
+print(f"[e2e] привязка analyst:uwuwu → {bound['session']} на {bound.get('model')}")
+PY
+say "16b ок: вторая волна reuse в ту же сессию ($ANALY_REUSE_SESS), привязка в state.json"
+# компакт-проход: пороги стенда нулевые — idle-сессия ужимается
+SEEN=0
+while [ $SEEN -lt 36 ]; do
+  SEEN=$((SEEN + 1))
+  sleep 5
+  grep -q '"event":"analys.compacted"' "$LOG_SRV_1607" 2>/dev/null && break
+done
+grep -q '"event":"analys.compacted"' "$LOG_SRV_1607" \
+  || fail "компакт-проход не выстрелил по idle мастер-сессии (analys.compacted нет)"
+python3 - "$STATE" <<'PY' || fail "метка коулдауна компакт-прохода не выставлена"
+import json, sys
+st = json.load(open(sys.argv[1]))
+bound = (st.get("master") or {}).get("analyst:uwuwu")
+assert bound and (bound.get("compact_ms") or 0) > 0, f"метки нет: {bound}"
+print(f"[e2e] коулдаун выставлен: compact_ms={bound['compact_ms']}")
+PY
+kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+SRV_PID=""; MOCK_PID=""
+sleep 1
+say "фаза 16 ок: мастер-тестер (1 спавн + re-entry wake) + мастер-аналитик (spawn/bind/reuse) + компакт-проход"
+
+say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри и семейство-непрерывностью сессий #1237 + мульти-экзекьютор + гард #1163 + self-эхо в прод-геометрии #1237 + слепой hold #1263 + преемпшен CUP #1259 + давка-волна #1412 + клин #1293 + дример #1306 + phantom-квитанции #1331 + lost-сессия #1288: десинк-парковка + lost-resurrection + env-gc #1431 + судья #1364 + мастер-сессии и компакт #1607); логи: $RUN_DIR"

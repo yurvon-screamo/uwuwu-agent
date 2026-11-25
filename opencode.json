@@ -42,6 +42,22 @@
       "tokens": 100000
     }
   },
+  "providers": {
+    "zai-coding-plan": {
+      "models": {
+        "glm-5.3-flash": {
+          "limit": {
+            "context": 480000
+          }
+        },
+        "glm-5.4": {
+          "limit": {
+            "context": 780000
+          }
+        }
+      }
+    }
+  },
   "default_agent": "developer",
   "lsp": true,
   "permissions": [

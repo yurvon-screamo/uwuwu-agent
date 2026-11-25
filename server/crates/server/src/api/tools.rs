@@ -163,12 +163,15 @@ pub fn tool_descriptors() -> Value {
     json!([
         tool(
             "task_list",
-            "Project board rows: number, status, priority, title",
+            "JSON array of rows: number, status, priority, type, \
+             title; empty cells are null; filter/aggregate in script — \
+             the full list may exceed the model-facing output window",
             object(json!({ "project": string("project name; default uwuwu") }))
         ),
         tool(
             "task_get",
-            "Full task card: fm fields, issue body, latest comments",
+            "Full task card: fm fields (incl. body_bytes), issue body, \
+             latest comments (shown/total declared)",
             object(json!({ "number": integer("task number (row-id)"),
                          "project": string("project; default uwuwu") }))
         ),
@@ -453,25 +456,32 @@ impl ToolHub {
 
     async fn task_list(&self, project: &str) -> Result<Value, String> {
         let rows = self.tasks.list(project).await.map_err(view_err)?;
-        let mut out = String::new();
-        for t in rows {
-            out.push_str(&format!(
-                "{:>6}  {:<14} {:<7} {:<15} {}\n",
-                t.number(),
-                uwuwu_usecase::status_name(t.status()),
-                format!("{:?}", t.priority()).to_lowercase(),
-                t.kind().map(uwuwu_usecase::task_type_name).unwrap_or(""),
-                t.title()
-            ));
-        }
+        let rows: Vec<Value> = rows
+            .iter()
+            .map(|t| {
+                json!({
+                    "number": t.number(),
+                    "status": status_cell(t.status()),
+                    "priority": priority_cell(t.priority()),
+                    "type": t.kind().map(uwuwu_usecase::task_type_name),
+                    "title": t.title(),
+                })
+            })
+            .collect();
+        // Компактный JSON: машина-потребитель Code Mode получает объект
+        // (транспорт авто-парсит текст с «[»); pretty сразу съедает окно
+        // показа финального результата (#1604, Common-1)
+        let out =
+            serde_json::to_string(&rows).map_err(|e| format!("task_list: rows serialise: {e}"))?;
         ok_text(out)
     }
 
     async fn task_get(&self, project: &str, args: &Value) -> Result<Value, String> {
         let number = need_number(args)?;
-        let view = self.tasks.card(project, number).await.map_err(view_err)?;
+        let card = self.tasks.card(project, number).await.map_err(view_err)?;
+        let view = card.issue;
         let mut out = format!(
-            "#{} {} — {}\n\n--- fm ---\nbranch: {}\npr: {}\nautomerge: {}\ndirect: {}\nfact_track: {}\ntype: {}\nbody_hash: {}\n\n",
+            "#{} {} — {}\n\n--- fm ---\nbranch: {}\npr: {}\nautomerge: {}\ndirect: {}\nfact_track: {}\ntype: {}\nbody_hash: {}\nbody_bytes: {}\n\n",
             view.task.number(),
             view.task.title(),
             uwuwu_usecase::status_name(view.task.status()),
@@ -487,10 +497,18 @@ impl ToolHub {
                 .map(uwuwu_usecase::task_type_name)
                 .unwrap_or("—"),
             uwuwu_usecase::body_hash(&view.body),
+            // состав вывода заявлен (#1604): тело отдельно от хвоста
+            // комментов; потребитель сверяет TextEncoder'ом — байты UTF-8,
+            // те же единицы, что в квитанциях write-path
+            view.body.len(),
         );
         out.push_str(&view.body);
         if !view.comments.is_empty() {
-            out.push_str("\n\n--- comments (latest) ---\n");
+            out.push_str(&format!(
+                "\n\n--- comments (latest {} of {}) ---\n",
+                view.comments.len(),
+                card.comments_fetched
+            ));
             for c in &view.comments {
                 out.push_str(&format!(
                     "---\n{}\n{}\n",
@@ -1097,6 +1115,25 @@ fn ok_text(text: String) -> Result<Value, String> {
     Ok(json!([{ "type": "text", "text": text }]))
 }
 
+/// null = «нет значения» в JSON-rows task_list (#1604): Empty-варианты
+/// статуса и приоритета — null, а не пустая строка/мусорное имя
+/// (канон native-null хвоста #1271; поля присутствуют всегда).
+/// Имена — из словаря MCP-поверхности (naming), не из Debug-формы:
+/// переименование варианта энума не меняет wire-значение.
+fn status_cell(status: uwuwu_domain::Status) -> Value {
+    match status {
+        uwuwu_domain::Status::Empty => Value::Null,
+        known => json!(uwuwu_usecase::status_name(known)),
+    }
+}
+
+fn priority_cell(priority: uwuwu_domain::Priority) -> Value {
+    match priority {
+        uwuwu_domain::Priority::Empty => Value::Null,
+        known => json!(uwuwu_usecase::priority_name(known)),
+    }
+}
+
 /// Метка коммента в выводе task_get (#1432): created_ms → ISO 8601 UTC
 /// (формат-контракт для тайминг-разборов агентов). ms вне часов chrono
 /// (в т.ч. > i64::MAX — до приведения типов) — «—» по конвенции пустых ячеек.
@@ -1264,6 +1301,21 @@ fn integer(desc: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_and_priority_cells_map_empty_to_null() {
+        assert_eq!(status_cell(uwuwu_domain::Status::Empty), Value::Null);
+        assert_eq!(
+            status_cell(uwuwu_domain::Status::NeedsAttention),
+            json!("Needs attention")
+        );
+        assert_eq!(priority_cell(uwuwu_domain::Priority::Empty), Value::Null);
+        assert_eq!(priority_cell(uwuwu_domain::Priority::High), json!("high"));
+        assert_eq!(
+            priority_cell(uwuwu_domain::Priority::Medium),
+            json!("medium")
+        );
+    }
 
     #[test]
     fn iso_utc_stamp_renders_iso8601_utc() {

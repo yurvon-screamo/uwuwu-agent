@@ -1059,6 +1059,9 @@ async fn work_like_agent(
     };
     let (stage, mut status, mut verdict) =
         stage_action_of_prompt(&prompt_text).unwrap_or(("other", "", "сводка (мок)"));
+    // test:hold — тихий ход (#1607): пост в ленту не пишется, статус не
+    // двигается; флаг — мимо безусловного task_comment ниже.
+    let mut silent_hold = false;
     // wakeup: стадию из промпта не извлечь — действуем по текущему
     // статусу строки (дев дорабатывает, ревью подтверждают)
     if stage == "other" && prompt_text.starts_with("Wakeup") {
@@ -1122,7 +1125,26 @@ async fn work_like_agent(
             // ревью тестирования (#1413 — гиркин «без тестовых коммитов»)
             status = "Review";
             verdict = "тест pass, без тест-коммитов (мок)";
+        } else if stage == "test" && v == "test:hold" {
+            // строка остаётся в Testing без единого поста: тестер
+            // отработал ход (idle), вердикт не двигает статус и не пишет
+            // в ленту — детерминированный стенд повторного входа (#1607:
+            // хвост пуст, вход доставляет re-entry wake, не wakeup).
+            // Статус не трогаем (дефолт стадии не применяется —
+            // silent_hold выходит до task_edit).
+            silent_hold = true;
+        } else if stage == "dev" && v == "dev:hold" {
+            // строка остаётся в In Progress без единого поста: дев
+            // отработал ход, вердикт не двигает статус — стенд
+            // повторного входа тестера (#1607): между двумя ручными
+            // переключениями статуса мок-акторы молчат.
+            silent_hold = true;
         }
+    }
+    if silent_hold {
+        // тихий ход: завершён, постов нет — будить нечем, выходим до
+        // task_comment/task_edit (лента и статус не тронуты).
+        return;
     }
     if wave_numbers(&prompt_text).is_empty() {
         if let Some(number) = task_number_of(&session.title) {
