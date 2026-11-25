@@ -28,6 +28,9 @@ struct StaleBoard {
     /// на вызов edit» (Low дельта-раунда #1615 — двойной рид на
     /// идемпотентной отказной ветке).
     fresh_reads: Mutex<usize>,
+    /// Транспортный отказ fresh-рида: пин fail-closed на отказной
+    /// ветке канон-гарда (#1615 — fresh-сверка перед отказом).
+    fresh_err: bool,
 }
 
 impl StaleBoard {
@@ -74,6 +77,11 @@ impl TaskBoardRepo for StaleBoard {
         // #1437: свежее чтение носителя мимо кеш-вида — материал
         // идемпотентного гарда edit().
         *self.fresh_reads.lock().unwrap() += 1;
+        if self.fresh_err {
+            return Err(crate::error::UsecaseError::Board(format!(
+                "row #{n}: fresh carrier read failed (fixture transport)"
+            )));
+        }
         Ok(self
             .carrier
             .iter()
@@ -373,6 +381,7 @@ async fn guard_reads_fresh_carrier_not_stale_snapshot() {
         cached: vec![StaleBoard::task(11, Status::InProgress)],
         writes: Mutex::new(vec![]),
         fresh_reads: Mutex::new(0),
+        fresh_err: false,
     });
     // Агент волны: task_edit(Review Analys). На свежем носителе ребро
     // In Progress → Review Analys вне канона — громкий отказ, мутации нет.
@@ -396,6 +405,7 @@ async fn legal_transition_on_fresh_status_writes() {
         cached: vec![StaleBoard::task(11, Status::Analys)],
         writes: Mutex::new(vec![]),
         fresh_reads: Mutex::new(0),
+        fresh_err: false,
     });
     edit_status(&board, 11, Status::ReviewAnalys)
         .await
@@ -414,6 +424,7 @@ async fn dev_sends_to_testing_from_in_progress() {
         cached: vec![StaleBoard::task(11, Status::InProgress)],
         writes: Mutex::new(vec![]),
         fresh_reads: Mutex::new(0),
+        fresh_err: false,
     });
     edit_status(&board, 11, Status::Testing)
         .await
@@ -431,6 +442,7 @@ async fn direct_row_finishes_to_review() {
         cached: vec![StaleBoard::task(11, Status::InProgress)],
         writes: Mutex::new(vec![]),
         fresh_reads: Mutex::new(0),
+        fresh_err: false,
     });
     writer_with(board.clone(), Arc::new(DirectFields))
         .edit(
@@ -456,6 +468,7 @@ async fn ordinary_row_cannot_skip_to_review() {
         cached: vec![StaleBoard::task(11, Status::InProgress)],
         writes: Mutex::new(vec![]),
         fresh_reads: Mutex::new(0),
+        fresh_err: false,
     });
     let res = writer_with(board.clone(), Arc::new(FilledFields))
         .edit(
@@ -484,6 +497,7 @@ async fn row_status_absent_is_fail_closed() {
         cached: vec![],
         writes: Mutex::new(vec![]),
         fresh_reads: Mutex::new(0),
+        fresh_err: false,
     });
     let err = edit_status(&board, 11, Status::InProgress)
         .await
@@ -503,6 +517,7 @@ async fn unparseable_carrier_status_is_fail_closed() {
         cached: vec![StaleBoard::task(11, Status::Empty)],
         writes: Mutex::new(vec![]),
         fresh_reads: Mutex::new(0),
+        fresh_err: false,
     });
     let err = edit_status(&board, 11, Status::ReviewAnalys)
         .await
@@ -523,6 +538,7 @@ async fn idempotent_same_status_still_writes() {
         cached: vec![StaleBoard::task(11, Status::InProgress)],
         writes: Mutex::new(vec![]),
         fresh_reads: Mutex::new(0),
+        fresh_err: false,
     });
     edit_status(&board, 11, Status::InProgress)
         .await
@@ -544,6 +560,7 @@ async fn stale_writer_idempotent_reinstall_is_rejected_by_fresh_carrier() {
         cached: vec![StaleBoard::task(11, Status::Design)],
         writes: Mutex::new(vec![]),
         fresh_reads: Mutex::new(0),
+        fresh_err: false,
     });
     let err = edit_status(&board, 11, Status::Design)
         .await
@@ -574,6 +591,7 @@ async fn stale_idempotent_lag_read_passes_as_legal_edge() {
         cached: vec![StaleBoard::task(11, Status::ReviewResult)],
         writes: Mutex::new(vec![]),
         fresh_reads: Mutex::new(0),
+        fresh_err: false,
     });
     edit_status(&board, 11, Status::ReviewResult)
         .await
@@ -598,6 +616,7 @@ async fn stale_cache_rejection_verifies_fresh_carrier_passes_legal_edge() {
         cached: vec![StaleBoard::task(11, Status::Analys)],
         writes: Mutex::new(vec![]),
         fresh_reads: Mutex::new(0),
+        fresh_err: false,
     });
     edit_status(&board, 11, Status::Todo).await.expect(
         "ребро Review Analys → Todo легально по свежему носителю — кеш-стейл не отказывает (#1615)",
@@ -620,6 +639,7 @@ async fn unreadable_cache_view_falls_back_to_fresh_carrier() {
         cached: vec![],
         writes: Mutex::new(vec![]),
         fresh_reads: Mutex::new(0),
+        fresh_err: false,
     });
     edit_status(&board, 11, Status::Todo).await.expect(
         "ребро Review Analys → Todo проходит при нечитаемом кеш-виде — fresh решает (#1615)",
@@ -640,6 +660,7 @@ async fn divergent_rejection_text_names_fresh_carrier_not_cache_view() {
         cached: vec![StaleBoard::task(11, Status::Draft)],
         writes: Mutex::new(vec![]),
         fresh_reads: Mutex::new(0),
+        fresh_err: false,
     });
     let err = edit_status(&board, 11, Status::Design)
         .await
@@ -673,6 +694,7 @@ async fn rejection_stands_when_fresh_carrier_confirms_stale_cache() {
         cached: vec![StaleBoard::task(11, Status::Analys)],
         writes: Mutex::new(vec![]),
         fresh_reads: Mutex::new(0),
+        fresh_err: false,
     });
     let err = edit_status(&board, 11, Status::Todo)
         .await
@@ -680,6 +702,40 @@ async fn rejection_stands_when_fresh_carrier_confirms_stale_cache() {
     assert!(
         err.to_string().contains("outside the pipeline canon"),
         "текст отказа: {err}"
+    );
+    assert!(
+        board.writes().is_empty(),
+        "мутации не должно быть: {:?}",
+        board.writes()
+    );
+}
+
+#[tokio::test]
+async fn fresh_transport_failure_on_rejection_branch_fails_closed() {
+    // Отказная ветка #1615 с упавшим транспортом: кеш-вид зовёт отказ,
+    // fresh-сверка падает — edit обязан отказать ГРОМКО транспортной
+    // ошибкой (контракт #1235/#1236: мутация либо применяется и видна
+    // следующим чтением, либо громкая ошибка), не тихим пропуском и не
+    // канон-отказом по непроверенному кеш-виду. Мутации нет.
+    let board = Arc::new(StaleBoard {
+        snapshot: vec![StaleBoard::task(11, Status::Analys)],
+        carrier: vec![StaleBoard::task(11, Status::ReviewAnalys)],
+        cached: vec![StaleBoard::task(11, Status::Analys)],
+        writes: Mutex::new(vec![]),
+        fresh_reads: Mutex::new(0),
+        fresh_err: true,
+    });
+    let err = edit_status(&board, 11, Status::Todo)
+        .await
+        .expect_err("транспортный отказ fresh-рида — громкий fail-closed отказ edit");
+    let text = err.to_string();
+    assert!(
+        text.contains("fresh carrier read failed"),
+        "транспортная ошибка дошла до агента, не проглочена: {text}"
+    );
+    assert!(
+        !text.contains("outside the pipeline canon"),
+        "канон-отказ по непроверенному кеш-виду маскирует сбой носителя: {text}"
     );
     assert!(
         board.writes().is_empty(),
