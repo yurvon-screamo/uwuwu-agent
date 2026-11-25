@@ -19,8 +19,12 @@ a finding.
   (feature-type rows — TASK-TEMPLATE) each carry a source: a verbatim owner
   quote covering the formulation, a link to an existing spec record, or a canon
   doc with the canon mark. A record without a source of any class =
-  request_changes; the records optic does not apply to rows without records
-  (bug/spike, pre-rule rows — TASK-TEMPLATE).
+  request_changes; a record covered by a quote only in part keeps per-part
+  attribution and the marks (интерпретация / вывод из <doc>) — mixed
+  attribution is not smoothed into a full-quote source. The records optic does
+  not apply to rows without records by type or transition policy (bug/spike,
+  pre-rule rows — TASK-TEMPLATE); a post-rule feature row without the records
+  table = request_changes (the table is mandatory — TASK-TEMPLATE).
 - **Form/dedup:** a title — specificity; the body — per the type's
   TASK-TEMPLATE skeleton; `search` over the wiki/boards — a duplicate of a live
   row = request_changes.
