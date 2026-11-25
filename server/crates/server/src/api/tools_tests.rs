@@ -1564,6 +1564,48 @@ async fn task_body_strips_the_real_render_header_and_refuses_header_only() {
     assert_eq!(intact, body, "оба отказа не трогают носитель");
 }
 
+/// #1604 (ревью раунда 5, Low-2): строгость зеркала держится и на
+/// актуальной 8-ключевой форме (fact_track + body_bytes после слива
+/// #1631) — чужая строка между type и body_hash ломает срез, и вся
+/// копия карточки пишется телом целиком. Пин собран из реального
+/// рендера, не из призрачной 6-ключевой фикстуры md4 в write.rs.
+#[tokio::test]
+async fn task_body_keeps_real_render_header_with_foreign_line() {
+    let (tools, memory) = hub();
+    let body = "## Постановка\n\nчистое тело.\n";
+    let (number, _) = create_task(&tools, "t: чужая строка в шапке", body).await;
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    let fm_start = card.find("--- fm ---").expect("fm-блок");
+    let body_at = card.find(body).expect("тело в выводе карточки");
+    let header = &card[fm_start..body_at];
+
+    let at = header.find("body_hash: ").expect("body_hash в шапке");
+    let poisoned = format!("{}чужой ключ: x\n{}", &header[..at], &header[at..]);
+    let payload = format!("{poisoned}{body}");
+
+    let receipt = call(
+        &tools,
+        "task_body",
+        json!({ "number": number, "body": &payload }),
+    )
+    .await
+    .expect("task_body ок");
+    assert!(receipt.contains("replaced"), "квитанция: {receipt}");
+
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert_eq!(
+        stored, payload,
+        "чужой ключ ломает срез — копия карточки пишется целиком: {stored}"
+    );
+}
+
 /// #1604 (ревью Low): null-хвост закреплён через хендлер task_list, не
 /// только юнит-тестом хелпера — сид-строка с Status::Empty,
 /// Priority::Empty и без типа даёт все три null-ячейки разом.
