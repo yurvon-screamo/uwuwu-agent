@@ -139,6 +139,39 @@ impl Status {
             || (fact_track && from == S::ReviewResult && to == S::UserReview)
             || Self::can_transition(from, to)
     }
+
+    /// Стадии, из которых агент уходил в Needs attention с вопросом.
+    /// Возврат по ответу владельца открыт только в них (#1619).
+    pub fn can_resume_after_answer(to: Self) -> bool {
+        use Status as S;
+        matches!(
+            to,
+            S::Analys
+                | S::ReviewAnalys
+                | S::Design
+                | S::ReviewPlan
+                | S::InProgress
+                | S::ReviewResult
+                | S::Testing
+                | S::ReviewTesting
+                | S::UserReview
+        )
+    }
+
+    /// Канон + факт ответа владельца (#1619): возврат из Needs attention
+    /// в стадию-источник открыт только при непустом ответе. Базовый
+    /// канон не расширяется — существующие пины остаются в силе.
+    pub fn can_transition_with_answer(
+        from: Self,
+        to: Self,
+        direct: bool,
+        fact_track: bool,
+        owner_answer: Option<&str>,
+    ) -> bool {
+        let answered = owner_answer.is_some_and(|text| !text.trim().is_empty());
+        Self::can_transition_with(from, to, direct, fact_track)
+            || (from == Self::NeedsAttention && answered && Self::can_resume_after_answer(to))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -984,6 +1017,79 @@ mod tests {
             S::ReviewResult,
             "запрещённый переход не мутировал"
         );
+    }
+
+    #[test]
+    fn owner_answer_opens_source_stage_from_needs_attention() {
+        use Status as S;
+        // Новые рёбра: без ответа закрыты, с ответом открыты (#1619).
+        for source in [
+            S::ReviewAnalys,
+            S::Design,
+            S::ReviewPlan,
+            S::ReviewResult,
+            S::Testing,
+            S::ReviewTesting,
+            S::UserReview,
+        ] {
+            assert!(
+                S::can_resume_after_answer(source),
+                "{source:?} — источник вопроса"
+            );
+            assert!(
+                !S::can_transition(S::NeedsAttention, source),
+                "базовый канон без ответа не расширен: {source:?}"
+            );
+            assert!(
+                !S::can_transition_with_answer(S::NeedsAttention, source, false, false, None),
+                "нет ответа — снятие NA закрыто: {source:?}"
+            );
+            assert!(
+                !S::can_transition_with_answer(
+                    S::NeedsAttention,
+                    source,
+                    false,
+                    false,
+                    Some("   ")
+                ),
+                "пробелы не считаются ответом: {source:?}"
+            );
+            assert!(
+                S::can_transition_with_answer(
+                    S::NeedsAttention,
+                    source,
+                    false,
+                    false,
+                    Some("владелец: делай так")
+                ),
+                "ответ открывает возврат в {source:?}"
+            );
+        }
+        // Прежние рёбра работают без ответа.
+        for target in [S::InProgress, S::Analys] {
+            assert!(
+                S::can_transition_with_answer(S::NeedsAttention, target, false, false, None),
+                "{target:?} — прежнее ребро"
+            );
+        }
+        // Стадии вне белого списка не открываются даже с ответом.
+        for closed in [S::Draft, S::Todo, S::Done, S::Deleted, S::Empty] {
+            assert!(
+                !S::can_resume_after_answer(closed),
+                "{closed:?} не источник вопроса"
+            );
+            assert!(
+                !S::can_transition_with_answer(
+                    S::NeedsAttention,
+                    closed,
+                    false,
+                    false,
+                    Some("ответ")
+                ),
+                "{closed:?} не открыт даже с ответом"
+            );
+        }
+        assert!(!S::can_resume_after_answer(S::Wait), "Wait — не вопрос");
     }
 
     #[test]
