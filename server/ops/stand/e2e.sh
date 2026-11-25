@@ -1471,7 +1471,7 @@ st = json.load(open(sys.argv[1]))
 bound = (st.get("master") or {}).get("analyst:uwuwu")
 assert bound, f"привязки analyst:uwuwu нет: {list((st.get('master') or {}).keys())}"
 assert bound["session"] == sys.argv[2], f"привязка указывает не туда: {bound}"
-assert bound.get("model", "").startswith("zai-coding-plan/glm-5.4"), f"модель рождения не 5.4: {bound}"
+assert bound.get("model", "").startswith("opencode-go/hy4-flash-free"), f"модель рождения не flash-free (#1628): {bound}"
 print(f"[e2e] привязка analyst:uwuwu → {bound['session']} на {bound.get('model')}")
 PY
 say "16b ок: вторая волна reuse в ту же сессию ($ANALY_REUSE_SESS), привязка в state.json"
