@@ -226,7 +226,8 @@ pub fn tool_descriptors() -> Value {
                 "priority": string("high|medium|low"),
                 "title": string("new title"),
                 "type": string(&(type_enum_list() + "; empty — leave untouched")),
-                "automerge": json!({"type":"boolean","description":"automerge on/off (back-tagging old rows)"})
+                "automerge": json!({"type":"boolean","description":"automerge on/off (back-tagging old rows)"}),
+                "owner_answer": string("verbatim owner reply; required when clearing Needs attention to the source stage (fix the reply in the body/thread first). Ignored with a note when the row is not in Needs attention")
             }))
         ),
         tool(
@@ -776,14 +777,23 @@ impl ToolHub {
     async fn task_edit(&self, project: &str, args: &Value) -> Result<Value, String> {
         let number = need_number(args)?;
         let kind = parse_type_arg(&arg_str(args, "type"))?;
+        let owner_answer = args
+            .get("owner_answer")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let status = str_arg(args, "status");
+        if owner_answer.is_some() && status.is_none() {
+            return Err("owner_answer requires a status transition out of Needs attention".into());
+        }
         let patch = uwuwu_usecase::TaskPatch {
-            status: str_arg(args, "status").map(|s| uwuwu_usecase::parse_status(&s)),
+            status: status.map(|s| uwuwu_usecase::parse_status(&s)),
             kind,
             branch: str_arg(args, "branch"),
             pr: str_arg(args, "pr"),
             priority: str_arg(args, "priority"),
             title: str_arg(args, "title"),
             automerge: args.get("automerge").and_then(|v| v.as_bool()),
+            owner_answer,
         };
         if patch.is_empty() {
             return Err("empty patch: set at least one field".into());
@@ -797,7 +807,7 @@ impl ToolHub {
             .edit(project, number, patch)
             .await
             .map_err(|e| e.to_string())?;
-        ok_text(match receipt.status {
+        let mut text = match receipt.status {
             Some(uwuwu_usecase::StatusDelivery::Confirmed { actual }) => {
                 format!("task #{number} updated, carrier confirms: \"{actual}\"")
             }
@@ -806,7 +816,11 @@ impl ToolHub {
                  ({reason}) — verify the CARRIER (gh, board) yourself, do not retry blindly"
             ),
             None => format!("task #{number} updated"),
-        })
+        };
+        if receipt.owner_answer_ignored {
+            text.push_str("; owner_answer ignored: the row was not in Needs attention");
+        }
+        ok_text(text)
     }
 
     async fn task_claim(&self, args: &Value) -> Result<Value, String> {

@@ -746,6 +746,24 @@ fn descriptors_expose_fact_track_create_only() {
     );
 }
 
+/// #1619: ключ ответа владельца объявлен на task_edit — гард #1572
+/// принимает его как легальный, агент видит аргумент в tools/list.
+#[test]
+fn descriptor_exposes_owner_answer_on_task_edit() {
+    let list = tool_descriptors();
+    let edit = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"].as_str() == Some("task_edit"))
+        .expect("task_edit на поверхности")["inputSchema"]["properties"]
+        .clone();
+    assert!(
+        edit.get("owner_answer").is_some(),
+        "edit рекламит owner_answer: {edit:?}"
+    );
+}
+
 /// Legacy-ключ `autodone` читается как automerge (back-compat MCP-клиентов
 /// 14.11); выключенный automerge создаёт строку без ошибок.
 #[tokio::test]
@@ -2662,4 +2680,238 @@ async fn radical_shrink_with_confirm_writes_and_receipt_carries_lengths() {
         stored.contains("короткий хвост"),
         "контент записан: {stored}"
     );
+}
+
+/// Строка в Needs attention для проб #1619: вопрос ушёл из Design.
+async fn needs_attention_task(tools: &ToolHub) -> u64 {
+    needs_attention_named(tools, "ответ через чат").await
+}
+
+/// Та же фикстура с явным тайтлом: в одном тесте строк несколько, а
+/// дубли тайтлов на доске запрещены.
+async fn needs_attention_named(tools: &ToolHub, title: &str) -> u64 {
+    let created = call(tools, "task_create", json!({ "title": title, "body": "б" }))
+        .await
+        .expect("create ок");
+    let n = receipt_number(&created);
+    call(
+        tools,
+        "task_edit",
+        json!({ "number": n, "priority": "medium", "automerge": true }),
+    )
+    .await
+    .expect("поля разбора заполнены");
+    for status in ["In Progress", "Needs attention"] {
+        call(tools, "task_edit", json!({ "number": n, "status": status }))
+            .await
+            .expect("ход к Needs attention легален");
+    }
+    n
+}
+
+/// #1619, красный тест: агент держит дословный ответ владельца и не может
+/// вернуть строку в стадию-источник — гард отказывает ребро
+/// Needs attention → Design (инцидент #1607).
+#[tokio::test]
+async fn task_edit_owner_answer_reopens_needs_attention() {
+    let (tools, _memory) = hub();
+    let n = needs_attention_task(&tools).await;
+    let receipt = call(
+        &tools,
+        "task_edit",
+        json!({
+            "number": n,
+            "status": "Design",
+            "owner_answer": "владелец: делай так, как в чате",
+        }),
+    )
+    .await
+    .expect("ответ владельца открывает возврат в стадию-источник");
+    assert!(
+        receipt.contains("Design"),
+        "квитанция подтверждает возврат: {receipt}"
+    );
+}
+
+/// Без факта ответа снятие Needs attention остаётся запрещено; отказ
+/// называет ключ — самообучающий текст доходит до живого агента (#1619).
+#[tokio::test]
+async fn task_edit_needs_attention_without_answer_still_refused() {
+    let (tools, _memory) = hub();
+    let n = needs_attention_task(&tools).await;
+    for answer in [None, Some("   ")] {
+        let mut args = json!({ "number": n, "status": "Design" });
+        if let Some(text) = answer {
+            args["owner_answer"] = json!(text);
+        }
+        let err = call(&tools, "task_edit", args)
+            .await
+            .expect_err("нет ответа — отказ");
+        assert!(err.contains("owner_answer"), "отказ учит ключу: {err}");
+    }
+}
+
+/// Ключ без смены статуса — не мутация и не generic «empty patch» (#1619).
+#[tokio::test]
+async fn task_edit_owner_answer_requires_status() {
+    let (tools, _memory) = hub();
+    let n = needs_attention_task(&tools).await;
+    let err = call(
+        &tools,
+        "task_edit",
+        json!({ "number": n, "owner_answer": "владелец: ок" }),
+    )
+    .await
+    .expect_err("ключ без статуса — громкий отказ");
+    assert!(
+        err.contains("requires a status transition"),
+        "отказ объясняет причину: {err}"
+    );
+}
+
+/// Повтор после успешной записи — идемпотентная квитанция, а не ложный
+/// «переход запрещён»; ключ на обычном ходе вне NA — с припиской (#1619/#1437).
+#[tokio::test]
+async fn task_edit_owner_answer_retry_outside_needs_attention_is_noted() {
+    let (tools, _memory) = hub();
+    let n = needs_attention_task(&tools).await;
+    call(
+        &tools,
+        "task_edit",
+        json!({ "number": n, "status": "Design", "owner_answer": "владелец: ок" }),
+    )
+    .await
+    .expect("первый вызов принят");
+    // current == target: идемпотентная переустановка с тем же ключом.
+    let retry = call(
+        &tools,
+        "task_edit",
+        json!({ "number": n, "status": "Design", "owner_answer": "владелец: ок" }),
+    )
+    .await
+    .expect("повтор после успеха не лжёт");
+    assert!(
+        retry.contains("carrier confirms"),
+        "повтор не лжёт о статусе: {retry}"
+    );
+    // Обычный ход на строке, которая никогда не была в NA, — канон не
+    // меняется, ключ помечен как проигнорированный.
+    let created = call(
+        &tools,
+        "task_create",
+        json!({ "title": "обычный ход с ключом", "body": "б" }),
+    )
+    .await
+    .expect("create ок");
+    let other = receipt_number(&created);
+    call(
+        &tools,
+        "task_edit",
+        json!({ "number": other, "priority": "medium", "automerge": true }),
+    )
+    .await
+    .expect("поля разбора заполнены");
+    let next = call(
+        &tools,
+        "task_edit",
+        json!({ "number": other, "status": "In Progress", "owner_answer": "владелец: ок" }),
+    )
+    .await
+    .expect("fast-track легален");
+    assert!(
+        next.contains("owner_answer ignored"),
+        "приписка вне NA: {next}"
+    );
+}
+
+/// #1619 (тестер): ответ владельца не открывает произвольные стадии —
+/// белый список источников вопроса остаётся гейтом, носитель не тронут.
+#[tokio::test]
+async fn task_edit_owner_answer_keeps_whitelist_closed() {
+    let (tools, memory) = hub();
+    let n = needs_attention_task(&tools).await;
+    for target in ["Done", "Todo"] {
+        let err = call(
+            &tools,
+            "task_edit",
+            json!({
+                "number": n,
+                "status": target,
+                "owner_answer": "владелец: ответил, но не про это",
+            }),
+        )
+        .await
+        .expect_err("ответ не открывает стадию вне списка");
+        assert!(
+            err.contains("outside the pipeline canon"),
+            "отказ по канону, а не по ключу: {err}"
+        );
+    }
+    let card = call(&tools, "task_get", json!({ "number": n }))
+        .await
+        .expect("card после отказов");
+    assert!(
+        card.lines()
+            .next()
+            .is_some_and(|l| l.ends_with("Needs attention")),
+        "отказ не сдвинул строку: {card}"
+    );
+    let board = memory.read_board("Задачи uwuwu").await.expect("борд");
+    let row = board
+        .iter()
+        .find(|t| t.number() == n)
+        .expect("строка в борде");
+    assert_eq!(
+        row.status(),
+        uwuwu_domain::Status::NeedsAttention,
+        "носитель не тронут отказом"
+    );
+}
+
+/// #1619 (тестер): ключ не сужает прежние рёбра и возврат реально
+/// приземляется в носителе — квитанция «carrier confirms» обязана
+/// подтверждаться task_get, а не только событием гарда.
+#[tokio::test]
+async fn task_edit_owner_answer_lands_on_carrier() {
+    let (tools, memory) = hub();
+    let n = needs_attention_task(&tools).await;
+    let receipt = call(
+        &tools,
+        "task_edit",
+        json!({
+            "number": n,
+            "status": "Design",
+            "owner_answer": "владелец: возвращайся в Design",
+        }),
+    )
+    .await
+    .expect("ответ открывает возврат");
+    assert!(receipt.contains("carrier confirms"), "{receipt}");
+    let card = call(&tools, "task_get", json!({ "number": n }))
+        .await
+        .expect("card после записи");
+    assert!(
+        card.lines().next().is_some_and(|l| l.ends_with("Design")),
+        "task_get видит записанный возврат: {card}"
+    );
+    let board = memory.read_board("Задачи uwuwu").await.expect("борд");
+    let row = board
+        .iter()
+        .find(|t| t.number() == n)
+        .expect("строка в борде");
+    assert_eq!(
+        row.status(),
+        uwuwu_domain::Status::Design,
+        "носитель зафиксировал возврат"
+    );
+    // Прежнее ребро NA → InProgress работает и без ответа — новое ребро
+    // не заменило старое.
+    let other = needs_attention_named(&tools, "прежнее ребро без ключа").await;
+    call(
+        &tools,
+        "task_edit",
+        json!({ "number": other, "status": "In Progress" }),
+    )
+    .await
+    .expect("прежнее ребро без ключа");
 }
