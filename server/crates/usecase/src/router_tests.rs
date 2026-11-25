@@ -23,6 +23,7 @@ impl FakeGw {
                 ids.iter()
                     .map(|id| SessionInfo {
                         id: (*id).to_string(),
+                        title: String::new(),
                         agent: String::new(),
                         directory: String::new(),
                         updated_ms: 0,
@@ -56,7 +57,7 @@ impl AgentSessionGateway for FakeGw {
     async fn prompt(&self, _s: &str, _t: &str) -> UsecaseResult<()> {
         Ok(())
     }
-    async fn run_command(&self, _s: &str, _n: &str, _a: &str) -> UsecaseResult<()> {
+    async fn run_command(&self, _s: &str, _n: &str, _a: &str, _b: u64) -> UsecaseResult<()> {
         Ok(())
     }
     async fn liveness(&self, _s: &str) -> Liveness {

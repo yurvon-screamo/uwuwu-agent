@@ -52,7 +52,7 @@ impl AgentSessionGateway for CaptureSessions {
     async fn prompt(&self, _session: &str, _text: &str) -> UsecaseResult<()> {
         Ok(())
     }
-    async fn run_command(&self, _s: &str, _n: &str, _a: &str) -> UsecaseResult<()> {
+    async fn run_command(&self, _s: &str, _n: &str, _a: &str, _b: u64) -> UsecaseResult<()> {
         Ok(())
     }
     async fn liveness(&self, _s: &str) -> Liveness {
@@ -408,6 +408,7 @@ async fn dreamer_spawn_carries_model_from_server_map() {
     // Arrange: уснувшая dev-сессия с финалом и реальной работой
     let sessions = CaptureSessions::new(vec![SessionInfo {
         id: "ses_dev1".into(),
+        title: String::new(),
         agent: "developer".into(),
         directory: String::new(),
         updated_ms: 0,

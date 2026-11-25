@@ -1,7 +1,7 @@
 {
-  "opencode_version": "2.3",
-  "probed_at": "2026-11-17",
-  "source": "живая проба #1249 (дельта-раунд 17.11, basic-auth) + пин-семя PR #381",
+  "opencode_version": "2.3.2",
+  "probed_at": "2026-11-25",
+  "source": "живая проба #1249 (дельта-раунд 17.11, basic-auth) + пин-семя PR #381 + ось shell-сообщения из throwaway-пробы #1526 (POST shell → 204, в ленте type shell; user-сообщений и assistant-поворота нет)",
   "rule": "пин = дефолтная форма исполнителя; env-ручки-режимы стенда вне контракта",
   "refresh": "после апгрейда opencode — повторная проба по ранбуку «Проба формы executor-API (пин-файл)»",
   "message_tail": {
@@ -11,11 +11,16 @@
     "assistant_streaming_time": ["created", "firstToken", "streamed"],
     "idle_time": ["created"]
   },
+  "shell_message": {
+    "form": "type shell with command/status/output.output",
+    "forbidden_keys": ["content"],
+    "probe": "throwaway-проба #1526 (25.11): POST /api/session/:id/shell {command} → 204; хвост — одно сообщение type shell, command/status/exit/output.output, без content; user- и assistant-сообщений команда не создаёт"
+  },
   "session_list": {
     "wrapper": "data",
     "cursor": true,
     "item_time": ["busy", "created", "idle", "updated"],
-    "default_session": { "agent_key": "absent", "outcome": "null" },
-    "role_session": { "agent_key": "string" }
+    "default_session": {"agent_key": "absent", "outcome": "null"},
+    "role_session": {"agent_key": "string"}
   }
 }

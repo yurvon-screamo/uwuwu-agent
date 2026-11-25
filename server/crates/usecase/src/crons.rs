@@ -616,7 +616,7 @@ mod tests {
         async fn prompt(&self, _: &str, _: &str) -> UsecaseResult<()> {
             Ok(())
         }
-        async fn run_command(&self, _: &str, _: &str, _: &str) -> UsecaseResult<()> {
+        async fn run_command(&self, _: &str, _: &str, _: &str, _: u64) -> UsecaseResult<()> {
             Ok(())
         }
         async fn liveness(&self, _: &str) -> crate::ports::Liveness {
@@ -849,7 +849,7 @@ mod tests {
         async fn prompt(&self, _s: &str, _t: &str) -> UsecaseResult<()> {
             Ok(())
         }
-        async fn run_command(&self, _s: &str, _n: &str, _a: &str) -> UsecaseResult<()> {
+        async fn run_command(&self, _s: &str, _n: &str, _a: &str, _b: u64) -> UsecaseResult<()> {
             Ok(())
         }
         async fn liveness(&self, _s: &str) -> crate::ports::Liveness {
@@ -871,6 +871,7 @@ mod tests {
             Ok((0..self.busy.load(std::sync::atomic::Ordering::SeqCst))
                 .map(|n| crate::ports::SessionInfo {
                     id: format!("ses_busy_{n}"),
+                    title: String::new(),
                     agent: String::new(),
                     directory: String::new(),
                     updated_ms: 0,
@@ -894,6 +895,7 @@ mod tests {
             let id = format!("ses_new_{}", self.0.lock().unwrap().len() + 1);
             self.0.lock().unwrap().push(crate::ports::SessionInfo {
                 id: id.clone(),
+                title: String::new(),
                 agent: String::new(),
                 directory: String::new(),
                 updated_ms: 0,
@@ -906,7 +908,7 @@ mod tests {
         async fn prompt(&self, _s: &str, _t: &str) -> UsecaseResult<()> {
             Ok(())
         }
-        async fn run_command(&self, _s: &str, _n: &str, _a: &str) -> UsecaseResult<()> {
+        async fn run_command(&self, _s: &str, _n: &str, _a: &str, _b: u64) -> UsecaseResult<()> {
             Ok(())
         }
         async fn liveness(&self, _s: &str) -> crate::ports::Liveness {
@@ -1262,6 +1264,7 @@ mod tests {
     fn sess(id: &str, outcome: &str, busy: bool) -> crate::ports::SessionInfo {
         crate::ports::SessionInfo {
             id: id.into(),
+            title: String::new(),
             agent: String::new(),
             directory: String::new(),
             updated_ms: 0,

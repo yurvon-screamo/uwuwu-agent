@@ -92,7 +92,12 @@ impl TickUseCase {
         slot: Slot,
     ) -> UsecaseResult<String> {
         sessions
-            .run_command(bootstrap, "task-env", &task.number().to_string())
+            .run_command(
+                bootstrap,
+                "task-env",
+                &task.number().to_string(),
+                TASK_ENV_COMMAND_BUDGET_MS,
+            )
             .await?;
         // Фабрика пишет Branch-ячейку: env готов, ветка work/task-N
         // существует (ADR-041 «ячейки доски пишет фабрика»); без неё PR
@@ -997,3 +1002,8 @@ pub(crate) fn spawn_prompt(board: &BoardPlan, task: &Task, slot: Slot) -> String
         project = board.project,
     )
 }
+
+/// Бюджет команды task-env (мс): подготовка env одного спавна укладывается —
+/// носитель числа, бывший общий таймаут клиента адаптера (opencode.rs);
+/// батч env-gc носит свой бюджет прохода (env_gc.rs). #1526.
+pub const TASK_ENV_COMMAND_BUDGET_MS: u64 = 20_000;
