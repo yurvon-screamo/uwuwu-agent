@@ -3436,6 +3436,221 @@ async fn review_reentry_cycle_one_session_two_rounds() {
 }
 
 #[tokio::test]
+async fn round_prompt_held_when_cup_full_marker_persists() {
+    // #1626 срез 2 (тестер-пин): доставка раунд-промпта — тот же
+    // CUP-контур, что у будильника. Кап полон — промпт откладывается
+    // (Deferred), компакт не выполняется, pending-маркер persists:
+    // доставка ретраится на свободном тике, цикл не теряется.
+    let state = Arc::new(MemState(Mutex::default()));
+    let mut t = task(40, Status::ReviewResult);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::ResultReview,
+        uwuwu_domain::SessionRef::parse("ses_rev_cup").unwrap(),
+    );
+    t.apply_fields(f);
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((40, Status::InProgress));
+    let mut fake = FakeSessions::new();
+    fake.idle_reply = true;
+    let (u, board, sessions, _) =
+        usecase_with_sessions(vec![t], PrState::Missing, fake, state.clone());
+    // чужой ход в полёте — единый кап занят
+    sessions
+        .extra
+        .lock()
+        .unwrap()
+        .push(crate::ports::SessionInfo {
+            id: "ses_other_busy".into(),
+            agent: String::new(),
+            directory: String::new(),
+            updated_ms: 0,
+            outcome: String::new(),
+            total_tokens: 0,
+            busy: true,
+        });
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert!(
+        sessions.compacted.lock().unwrap().is_empty(),
+        "при полном капе компакт не выполняется"
+    );
+    assert!(
+        sessions.prompts.lock().unwrap().is_empty(),
+        "при полном капе раунд-промпт не доставляется"
+    );
+    assert_eq!(out.wakeups, 0, "доставки нет");
+    assert_eq!(out.wakeups_deferred, 1, "доставка отложена, не потеряна");
+    assert!(
+        state.round_reentry_pending("B", 40),
+        "маркер persists — ретрай на свободном тике"
+    );
+    assert!(
+        !board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("clear#40=")),
+        "ячейка не снята — сессия та же"
+    );
+    assert_eq!(out.spawns_done, 0, "спавна нет");
+}
+
+#[tokio::test]
+async fn round_prompt_retries_from_marker_on_free_tick() {
+    // #1626 срез 2 (тестер-пин): висячий pending-маркер (прошлый тик
+    // упёрся в CUP/пик/занятость) доставляется следующим свободным
+    // тиком без нового перехода — маркер переживает тик, повторный
+    // компакт/промпт идут в ту же сессию, маркер гаснет доставкой.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_round_reentry_pending("B", 42);
+    let mut t = task(42, Status::ReviewResult);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::ResultReview,
+        uwuwu_domain::SessionRef::parse("ses_rev_retry").unwrap(),
+    );
+    t.apply_fields(f);
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((42, Status::ReviewResult));
+    let mut fake = FakeSessions::new();
+    fake.idle_reply = true;
+    let (u, board, sessions, _) =
+        usecase_with_sessions(vec![t], PrState::Missing, fake, state.clone());
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.spawns_done, 0, "спавна нет — сессия та же");
+    assert_eq!(out.wakeups, 1, "висячий маркер доставлен свободным тиком");
+    assert_eq!(
+        sessions.compacted.lock().unwrap().as_slice(),
+        ["ses_rev_retry"],
+        "ретрай компактит ту же сессию"
+    );
+    let prompts = sessions.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1, "одна доставка: {prompts:?}");
+    assert!(
+        prompts[0].starts_with("ses_rev_retry|"),
+        "раунд-промпт уходит в ту же сессию: {prompts:?}"
+    );
+    assert!(
+        !state.round_reentry_pending("B", 42),
+        "маркер погашен доставкой"
+    );
+    assert!(
+        !board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("clear#42=")),
+        "ячейка не снята — сессия та же"
+    );
+}
+
+#[tokio::test]
+async fn round_prompt_waits_for_idle_session_marker_persists() {
+    // #1626 срез 2 (тестер-пин): ход мастер-сессии в полёте — доставка
+    // ждёт ответа (без компакта/промпта, маркер persists); тик не
+    // падает и ячейку не трогает — следующий тик после ответа доставит.
+    let state = Arc::new(MemState(Mutex::default()));
+    let mut t = task(41, Status::ReviewResult);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::ResultReview,
+        uwuwu_domain::SessionRef::parse("ses_rev_busy").unwrap(),
+    );
+    t.apply_fields(f);
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((41, Status::InProgress));
+    // idle_reply=false — ход в полёте (сессия не idle)
+    let (u, board, sessions, _) = usecase_with_sessions(
+        vec![t],
+        PrState::Missing,
+        FakeSessions::new(),
+        state.clone(),
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert!(
+        sessions.compacted.lock().unwrap().is_empty(),
+        "занятую сессию не компактим"
+    );
+    assert!(
+        sessions.prompts.lock().unwrap().is_empty(),
+        "в занятую сессию промпт не доставляем"
+    );
+    assert_eq!(out.wakeups, 0, "доставки нет — ход в полёте");
+    assert_eq!(out.spawns_done, 0, "спавна нет");
+    assert!(
+        state.round_reentry_pending("B", 41),
+        "маркер persists — доставка после ответа сессии"
+    );
+    assert!(
+        !board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("clear#41=")),
+        "ячейка не снята — сессия та же"
+    );
+}
+
+#[tokio::test]
+async fn fresh_spawn_clears_pending_round_marker_no_double_delivery() {
+    // #1626 срез 2 (тестер-пин): мёртвая мастер-ячейка снимается
+    // переходом, спавн несёт промпт сам — висячий pending-маркер
+    // гасится спавном, иначе свежая сессия получила бы чужой
+    // раунд-промпт дублем.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_round_reentry_pending("B", 43);
+    let mut t = task(43, Status::ReviewResult);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::ResultReview,
+        uwuwu_domain::SessionRef::parse("ses_rev_dead").unwrap(),
+    );
+    t.apply_fields(f);
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((43, Status::InProgress));
+    let (u, board, sessions, _) = usecase_with_state(vec![t], PrState::Missing, state.clone());
+    sessions
+        .dead_sessions
+        .lock()
+        .unwrap()
+        .push("ses_rev_dead".into());
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    let log = board.log.lock().unwrap();
+    assert!(
+        log.iter().any(|l| l.starts_with("clear#43=")),
+        "мёртвая ячейка снята: {log:?}"
+    );
+    assert_eq!(out.spawns_done, 1, "свежая сессия заспавнена");
+    assert!(
+        sessions.compacted.lock().unwrap().is_empty(),
+        "мёртвую сессию не компактим"
+    );
+    assert!(
+        !state.round_reentry_pending("B", 43),
+        "маркер погашен спавном — дубля раунд-промпта не будет"
+    );
+}
+
+#[tokio::test]
 async fn same_round_keeps_session_no_clear() {
     // Тот же раунд (статус не менялся): сессия слота живёт, будится
     // по комментам — никакого fresh-eyes внутри раунда

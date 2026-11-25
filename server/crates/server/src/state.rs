@@ -1026,6 +1026,49 @@ mod tests {
     }
 
     #[test]
+    fn round_reentry_persists_across_restart_without_noise() {
+        // #1626 (тестер-пин, интеграция): pending-маркер раунд-промпта —
+        // факт носителя: переживает рестарт сервера; снятый маркер не
+        // шумит в state.json (skip_serializing_if-конвенция RowState,
+        // дельта-фикс ревью).
+        let dir = std::env::temp_dir().join(format!("uwuwu-state-reentry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        {
+            let s = store(path.clone());
+            s.set_round_reentry_pending("Задачи uwuwu", 9);
+            TickStateStore::save(&s).unwrap();
+        }
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("round_reentry"),
+            "взведённый маркер персистентен в носителе"
+        );
+        let s = store(path.clone());
+        assert!(
+            s.round_reentry_pending("Задачи uwuwu", 9),
+            "рестарт восстанавливает pending-маркер (факт носителя)"
+        );
+        assert!(
+            !s.round_reentry_pending("Задачи uwuwu", 10),
+            "чужая строка без маркера"
+        );
+        s.clear_round_reentry_pending("Задачи uwuwu", 9);
+        TickStateStore::save(&s).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("round_reentry"),
+            "снятый маркер не шумит в носителе"
+        );
+        let s = store(path.clone());
+        assert!(
+            !s.round_reentry_pending("Задачи uwuwu", 9),
+            "снятие переживает рестарт"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn own_comments_persist_across_restart() {
         // #1204: реестр серверных постов переживает рестарт — комменты,
         // опубликованные до перезапуска, остаются «своими»
