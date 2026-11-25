@@ -1857,6 +1857,57 @@ fn body_with_fat_tail_section() -> String {
     format!("## Постановка\n\nДержатель массы тела.\n\n## Хвост\n\n{tail}\n## Прочее\n\n{filler}")
 }
 
+/// #1632: полная копия карточки — от card[0..], тайтл-строка включительно
+/// (ровно то, что агент копирует из вывода task_get) — оставляет на
+/// носителе чистое тело; шапка без тела — отказ #1572, носитель цел.
+#[tokio::test]
+async fn task_body_strips_the_real_render_header_and_refuses_header_only() {
+    let (tools, memory) = hub();
+    let body = "## Постановка\n\nчистое тело носителя.\n";
+    let (number, _) = create_task(&tools, "t: зеркало шапки", body).await;
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    let body_at = card.find(body).expect("тело в выводе карточки");
+    let copied = &card[..body_at + body.len()];
+
+    let receipt = call(
+        &tools,
+        "task_body",
+        json!({ "number": number, "body": copied }),
+    )
+    .await
+    .expect("task_body ок");
+    assert!(receipt.contains("replaced"), "квитанция: {receipt}");
+
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert_eq!(stored, body, "тело без шапки: {stored}");
+
+    let header_only = &card[..body_at];
+    let err = call(
+        &tools,
+        "task_body",
+        json!({ "number": number, "body": header_only }),
+    )
+    .await
+    .expect_err("шапка без тела — отказ");
+    assert!(
+        err.contains("effective content"),
+        "отказ называет отсутствие эффективного контента: {err}"
+    );
+    let intact = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert_eq!(intact, body, "отказ не трогает носитель");
+}
+
 /// Сценарий 1 (#1572, BDD): task_body без body — громкий отказ с длиной
 /// текущего тела и рецептом следующего хода; носитель цел. Босый
 /// «empty body» (гард #406) дважды прочитан знающим агентом как успех

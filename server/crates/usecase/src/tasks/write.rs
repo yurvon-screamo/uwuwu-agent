@@ -975,14 +975,17 @@ where
     }
 }
 
-/// Дисплей-шапка task_get («--- fm ---» + branch/pr/automerge/direct/
-/// fact_track/type/body_hash) — рендер MCP-карточки, не носитель: агенты
+/// Дисплей-шапка task_get — рендер MCP-карточки, не носитель: агенты
 /// копируют вывод task_get назад в task_body, и шапка наслаивалась в
-/// теле (fm-стек инцидента #1331). Срезается на границе записи:
-/// инвариант ADR-105 «тело — чистый markdown» держит сервер, не
-/// дисциплина агента (прецедент #1151). Консервативно: строго
-/// набор/порядок ключей рендера, любой посторонний контент
-/// («--- fm ---» внутри текста) не трогается.
+/// теле (fm-стек инцидента #1331, инстансы #1526). Состав рендера
+/// (tools.rs task_get): тайтл-строка «#N title — status», пустая
+/// строка, fm-блок («--- fm ---» + branch/pr/automerge/direct/
+/// fact_track/type/body_hash). Срезается на границе записи: инвариант
+/// ADR-105 «тело — чистый markdown» держит сервер, не дисциплина
+/// агента (прецедент #1151). Консервативно: строго набор/порядок
+/// ключей рендера и форма карточки; срезаются все подряд идущие слои
+/// (стек, #1632); любой посторонний контент («--- fm ---» внутри
+/// текста) не трогается.
 fn strip_task_get_header(md: &str) -> &str {
     const KEYS: [&str; 7] = [
         "branch: ",
@@ -993,20 +996,52 @@ fn strip_task_get_header(md: &str) -> &str {
         "type: ",
         "body_hash: ",
     ];
-    let Some(rest) = md.strip_prefix("--- fm ---\n") else {
-        return md;
-    };
+    let mut pos = md;
+    while let Some(rest) = strip_header_layer(pos, &KEYS) {
+        pos = rest;
+    }
+    pos
+}
+
+/// Один слой шапки в начале входа: fm-блок (форма A) либо полная
+/// карточка рендера — тайтл-строка + пустая строка + fm-блок (форма B,
+/// #1632). None — не слой шапки, вход не трогается.
+fn strip_header_layer<'a>(md: &'a str, keys: &[&str]) -> Option<&'a str> {
+    if let Some(rest) = strip_fm_block(md, keys) {
+        return Some(rest);
+    }
+    let (title_line, after_title) = md.split_once('\n')?;
+    if !is_render_title_line(title_line) {
+        return None;
+    }
+    let after_blank = after_title.strip_prefix('\n')?;
+    strip_fm_block(after_blank, keys)
+}
+
+/// fm-блок рендера: маркер + ключи строго по порядку; возврат — вход
+/// после шапки без ведущих пустых строк.
+fn strip_fm_block<'a>(md: &'a str, keys: &[&str]) -> Option<&'a str> {
+    let rest = md.strip_prefix("--- fm ---\n")?;
     let mut pos = rest;
-    for key in KEYS {
-        let Some(line_end) = pos.find('\n') else {
-            return md;
-        };
+    for key in keys {
+        let line_end = pos.find('\n')?;
         if !pos[..line_end].starts_with(key) {
-            return md;
+            return None;
         }
         pos = &pos[line_end + 1..];
     }
-    pos.trim_start_matches('\n')
+    Some(pos.trim_start_matches('\n'))
+}
+
+/// Тайтл-строка рендера карточки: «#<номер> <тайтл> — <статус>» —
+/// решётка, цифры, пробел; разделитель « — » из рендера (статусы не
+/// захардкожены — дрейф доски гард не ломает).
+fn is_render_title_line(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix('#') else {
+        return false;
+    };
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    digits > 0 && rest[digits..].starts_with(' ') && line.contains(" — ")
 }
 
 /// Ожидания контрольного чтения edit: Some — значение менялось и должно
@@ -2031,6 +2066,73 @@ mod tests {
     fn task_get_display_header_is_stripped() {
         let md = "--- fm ---\nbranch: work/task-1331\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: —\nbody_hash: 9de430c691c92328\n\n## Постановка\nтекст";
         assert_eq!(strip_task_get_header(md), "## Постановка\nтекст");
+    }
+
+    /// Полная копия карточки (#1632): тайтл-строка рендера + пустая
+    /// строка + fm-блок — срезается целиком, на носителе тело.
+    #[test]
+    fn task_get_full_card_copy_is_stripped() {
+        let md = "#1526 Bug: гардин молчит — In Progress\n\n--- fm ---\nbranch: work/task-1526\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: 9de430c691c92328\n\n## Постановка\nтекст";
+        assert_eq!(strip_task_get_header(md), "## Постановка\nтекст");
+    }
+
+    /// Полная копия карточки без тела — срезается в пустоту (пустой
+    /// эффективный контент → отказ #1572 на границе записи).
+    #[test]
+    fn task_get_full_card_without_body_strips_to_empty() {
+        let md = "#1526 t — In Progress\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\n\n";
+        assert_eq!(strip_task_get_header(md), "");
+    }
+
+    /// fm-стек (#1331): подряд идущие шапки карточек срезаются все.
+    #[test]
+    fn task_get_stacked_card_headers_are_stripped() {
+        let layer = |title: &str| {
+            format!(
+                "{title}\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: \
+                 false\nfact_track: false\ntype: bug\nbody_hash: h\n\n"
+            )
+        };
+        let md = format!(
+            "{}{}{}## Постановка\nтело",
+            layer("#1 t — In Progress"),
+            layer("#2 t — Design"),
+            layer("#3 t — Todo"),
+        );
+        assert_eq!(strip_task_get_header(&md), "## Постановка\nтело");
+    }
+
+    /// Страж границы: внутренний слой с легаси-набором ключей (6, без
+    /// fact_track) набором этой ветки не распознаётся — остаётся до
+    /// посадки легаси-наборов #506.
+    #[test]
+    fn task_get_stacked_legacy_inner_layer_is_kept() {
+        let fresh = "#1 t — In Progress\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\n\n";
+        let legacy = "#2 t — Todo\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\ntype: bug\nbody_hash: h\n\n";
+        let md = format!("{fresh}{legacy}## Тело");
+        assert_eq!(strip_task_get_header(&md), format!("{legacy}## Тело"));
+    }
+
+    /// Шапка без хвостового переноса не распознаётся — терминатор
+    /// «конец входа» не здесь: дельта #506 (1bb88cf4).
+    #[test]
+    fn task_get_header_without_trailing_newline_is_kept() {
+        let md = "--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h";
+        assert_eq!(strip_task_get_header(md), md);
+    }
+
+    /// Негативы формы B: fm-блока за тайтлом нет, пустой строки перед
+    /// fm нет, CRLF-карточка (скоп #1637), «тайтл» не рендер-формы.
+    #[test]
+    fn task_get_card_shaped_lookalikes_are_kept() {
+        let md = "#1526 t — In Progress\n\n## Постановка\nтекст";
+        assert_eq!(strip_task_get_header(md), md);
+        let md2 = "#1526 t — In Progress\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\n\nтекст";
+        assert_eq!(strip_task_get_header(md2), md2);
+        let md3 = "#1526 t — In Progress\r\n\r\n--- fm ---\r\nbranch: b\r\npr: —\r\nautomerge: true\r\ndirect: false\r\nfact_track: false\r\ntype: bug\r\nbody_hash: h\r\n\r\nтекст";
+        assert_eq!(strip_task_get_header(md3), md3);
+        let md4 = "## Постановка\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\n\nтекст";
+        assert_eq!(strip_task_get_header(md4), md4);
     }
 
     #[test]
