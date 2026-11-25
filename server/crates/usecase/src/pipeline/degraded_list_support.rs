@@ -147,14 +147,23 @@ pub(crate) fn trap_events() -> (DefaultGuard, Arc<Mutex<Vec<String>>>) {
     (guard, records)
 }
 
-pub(crate) fn assert_degraded(records: &[String], event: &str) {
+/// Точное поле события: имя сравнивается целиком, а не по подстроке —
+/// иначе префиксный вариант (`...list_degraded_v2`) проходил бы ассерт и
+/// сдвиг имени события не ловился ни одним из ролевых пинов (проверено
+/// мутацией в раунде тестирования).
+pub(crate) fn is_exact_degraded(records: &[String], event: &str) -> bool {
+    const FAILED: &str = "executors=[\"down\"]";
     let plain = format!("event={event}");
     let quoted = format!("event=\"{event}\"");
+    records
+        .iter()
+        .any(|r| r.contains(FAILED) && r.split(" | ").any(|f| f == plain || f == quoted))
+}
+
+pub(crate) fn assert_degraded(records: &[String], event: &str) {
     const FAILED: &str = "executors=[\"down\"]";
     assert!(
-        records
-            .iter()
-            .any(|r| (r.contains(&plain) || r.contains(&quoted)) && r.contains(FAILED)),
+        is_exact_degraded(records, event),
         "нет {event} с точным полем {FAILED} в той же записи: {records:?}"
     );
 }

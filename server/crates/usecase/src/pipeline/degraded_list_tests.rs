@@ -8,7 +8,7 @@
 //! dreamer-тест дополнительно пинит отложенный prune при частичном зрении.
 
 use super::degraded_list_support::{
-    assert_degraded, dreamer_target, router, trap_events, RecordingGw,
+    assert_degraded, dreamer_target, is_exact_degraded, router, trap_events, RecordingGw,
 };
 use crate::pipeline::analyst::AnalystUseCase;
 use crate::pipeline::analyst_review::AnalystReviewUseCase;
@@ -135,4 +135,22 @@ async fn dreamer_spawns_on_live_union_defers_prune_and_logs_degradation() {
     .await
     .unwrap();
     assert!(healthy.dreamer_mark("ses_dead").is_none());
+}
+
+/// Пинит точность сопоставления имени события: префиксный вариант
+/// (`...list_degraded_v2`) и подстрока в чужом поле не удовлетворяют ассерт —
+/// сдвиг имени события теперь ловится каждым ролевым пином.
+#[test]
+fn degraded_assert_requires_exact_event_name() {
+    let good = ["event=dreamer.list_degraded | executors=[\"down\"]".to_string()];
+    let quoted = ["event=\"dreamer.list_degraded\" | executors=[\"down\"]".to_string()];
+    let suffix = ["event=dreamer.list_degraded_v2 | executors=[\"down\"]".to_string()];
+    let superset = ["event=dreamer.list_degraded | executors=[\"down\", \"live\"]".to_string()];
+    let decoy =
+        ["event=other | msg=event=dreamer.list_degraded | executors=[\"down\"]".to_string()];
+    assert!(is_exact_degraded(&good, "dreamer.list_degraded"));
+    assert!(is_exact_degraded(&quoted, "dreamer.list_degraded"));
+    assert!(!is_exact_degraded(&suffix, "dreamer.list_degraded"));
+    assert!(!is_exact_degraded(&superset, "dreamer.list_degraded"));
+    assert!(!is_exact_degraded(&decoy, "dreamer.list_degraded"));
 }
