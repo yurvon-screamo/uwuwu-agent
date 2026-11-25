@@ -5,6 +5,7 @@
 
 pub mod blobs;
 pub mod bots;
+pub mod cron_journal;
 mod crons;
 mod error;
 pub mod fm_guard;

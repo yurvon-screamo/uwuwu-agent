@@ -98,6 +98,53 @@ async fn docs_append_reports_creation_of_missing_doc() {
     );
 }
 
+/// #1576: снесённый журнал крона не воскресает через docs_append —
+/// create-on-missing (#1353) превращал удаление носителя в тихую запись.
+#[tokio::test]
+async fn docs_append_refuses_removed_cron_journal() {
+    let tools = hub();
+    let slug = "cron/Loop-надёжность-конвейера/Журнал";
+    let err = call(
+        &tools,
+        "docs_append",
+        json!({ "slug": slug, "line": "ПРОБА #1576" }),
+    )
+    .await
+    .expect_err("запись в снесённый журнал обязана отказать");
+    assert!(
+        err.contains("writing refused") && err.contains("#1576"),
+        "отказ без причины: {err}"
+    );
+    let err_read = call(&tools, "docs_read", json!({ "slug": slug }))
+        .await
+        .expect_err("журнал не должен создаться заново");
+    assert!(
+        err_read.contains("not found"),
+        "неожиданный док: {err_read}"
+    );
+}
+
+/// #1576: тот же запрет для docs_write — slug_guard #1613 разрешает корень
+/// `cron`, поэтому снесённый журнал мог создаваться полной перезаписью.
+#[tokio::test]
+async fn docs_write_refuses_removed_cron_journal() {
+    let tools = hub();
+    let err = call(
+        &tools,
+        "docs_write",
+        json!({
+            "slug": "cron/Sentry-ночной-просмотр/Журнал",
+            "content": "---\ntitle: X\ndate: 2026-11-25\n---\nПРОБА #1576",
+        }),
+    )
+    .await
+    .expect_err("запись в снесённый журнал обязана отказать");
+    assert!(
+        err.contains("writing refused") && err.contains("#1576"),
+        "отказ без причины: {err}"
+    );
+}
+
 #[tokio::test]
 async fn docs_write_requires_slug_and_content() {
     let tools = hub();

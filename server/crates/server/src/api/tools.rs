@@ -5,8 +5,8 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use uwuwu_usecase::{
-    fm_guard, jst_stamp, BlobPlace, BlobUseCase, Clock, DocsView, PersonView, SectionWrite,
-    TaskView, TaskWriteUseCase, TaskWriter,
+    cron_journal, fm_guard, jst_stamp, BlobPlace, BlobUseCase, Clock, DocsView, PersonView,
+    SectionWrite, TaskView, TaskWriteUseCase, TaskWriter,
 };
 
 pub struct ToolHub {
@@ -536,6 +536,9 @@ impl ToolHub {
     async fn docs_append(&self, args: &Value) -> Result<Value, String> {
         require_args(args, &["slug", "line"])?;
         let slug = arg_str(args, "slug");
+        // #1576: create-on-missing (#1353) не должен воскрешать снесённый
+        // журнал крона — отказ до записи, без мутации носителя.
+        cron_journal::refuse(&slug)?;
         let message = message_or(args, format!("append: {slug}"));
         let outcome = self
             .wiki
@@ -558,6 +561,9 @@ impl ToolHub {
     async fn docs_write(&self, args: &Value) -> Result<Value, String> {
         require_args(args, &["slug", "content"])?;
         let slug = arg_str(args, "slug");
+        // #1576: тот же запрет для полной перезаписи — writable-цель
+        // снесённого журнала не восстанавливается ни одним write-путём.
+        cron_journal::refuse(&slug)?;
         let message = message_or(args, format!("write: {slug}"));
         let incoming = arg_str(args, "content");
         // fm-гвард (#1444): шапка вики-дока переживает replace. Текущий
