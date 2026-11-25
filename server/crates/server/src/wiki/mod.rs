@@ -2,6 +2,7 @@
 
 mod github_wiki;
 mod gitwiki;
+mod witness;
 
 pub(crate) use github_wiki::encode_path;
 pub use github_wiki::GitHubWiki;
