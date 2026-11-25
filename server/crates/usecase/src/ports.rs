@@ -5,7 +5,7 @@
 use crate::error::{UsecaseError, UsecaseResult};
 use async_trait::async_trait;
 use uwuwu_domain::{
-    Agent, AgentSlot, BranchName, ModelRef, Slot, Status, Task, TaskFields, UtcMinute,
+    Agent, AgentSlot, BranchName, ModelRef, PrUrl, Slot, Status, Task, TaskFields, UtcMinute,
 };
 
 /// Мутатор fm-ячеек задачи (branch/pr/priority/…).
@@ -75,6 +75,16 @@ pub trait TaskBoardRepo: Send + Sync {
     /// Заявка ветки задачи (фабрика при спавне: task-env создал env,
     /// ветка `work/task-<row>` существует — ячейка правдива; ADR-041).
     async fn set_branch(&self, board: &str, number: u64, branch: &BranchName) -> UsecaseResult<()>;
+
+    /// Запись canonical PR-ячейки (issue-field «PR») — дозаполнение
+    /// демоном из резолва пробы (#1519): пустая/протухшая ячейка при
+    /// живом PR по ветке заполняется до мержа. Доменный тип — парс
+    /// валидной формы один раз у вызывающего (ревью Low раунда 3:
+    /// три копии PrUrl::parse в имплементациях — не контракт). Путь
+    /// task_edit (IssueFieldStore, мимо снапшота — «Ветка/PR/Тип живут
+    /// мимо снапшота»); read-your-writes не требуется — enrichment
+    /// прочтёт носитель следующим проходом.
+    async fn set_pr(&self, board: &str, number: u64, pr_url: &PrUrl) -> UsecaseResult<()>;
 
     /// Запись нестатусных ячеек снапшота доски (Приоритет, Automerge):
     /// поле + кеш-гигиена одним методом (паттерн set_session/set_branch).
@@ -401,6 +411,18 @@ pub enum PrState {
     Closed,
 }
 
+/// Вердикт пробы вместе с PR, о котором вердикт (#1519): url — конкретная
+/// цель вердикта — идентифицированный PR (ячейка, если она жива; иначе —
+/// веточная проба; Foreign — URL ячейки); None — цели вердикта нет
+/// (Missing: ветки/URL нет или PR не существует). Демон дозаполняет
+/// canonical PR-ячейку этим URL до мержа и мержит по нему — мержится ровно
+/// то, что прощупано.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrProbe {
+    pub state: PrState,
+    pub url: Option<String>,
+}
+
 #[async_trait]
 pub trait PrGateway: Send + Sync {
     /// Проба PR: по ячейке (URL) либо по head-ветке.
@@ -409,7 +431,7 @@ pub trait PrGateway: Send + Sync {
         project_repo: &str,
         pr_url: Option<&str>,
         branch: Option<&str>,
-    ) -> UsecaseResult<PrState>;
+    ) -> UsecaseResult<PrProbe>;
     /// Мерж PR (merge-commit).
     async fn merge(&self, project_repo: &str, pr_url: &str) -> UsecaseResult<()>;
 }
@@ -547,6 +569,33 @@ pub trait DecisionJudge: Send + Sync {
     async fn decide(&self, ctx: &JudgeContext) -> UsecaseResult<uwuwu_domain::JudgeVerdict>;
 }
 
+/// Снимок окна подписки провайдера моделей (лимитный гейт сталл-детекта,
+/// #1477): факт «окно подписки исчерпано» — глобальный для подписки, не
+/// пер-сессионный.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuotaSnapshot {
+    /// Окно подписки исчерпано — ходы провайдера встают на паузу.
+    pub exhausted: bool,
+    /// Заполнение окна в процентах, если провайдер его отдал.
+    pub window_pct: Option<u8>,
+    /// Заявленный провайдером резет (epoch ms), если отдал; ядро резет
+    /// не вычисляет — пауза по факту повторных проб.
+    pub reset_at_ms: Option<u64>,
+}
+
+/// Проба квоты подписки провайдера моделей (#1477): гейт сталл-детекта
+/// классифицирует лимитную тишину (простой ходов из-за исчерпания окна
+/// подписки — не сбой сессии). Привязка к провайдеру — за трейтом
+/// (требование владельца 23.11.2026): ядро видит только факт окна;
+/// конкретный эндпоинт — адаптер сервера. Err — проба недоступна (сеть,
+/// дрейф формы; off — это отсутствие пробы, None): гейт пропускает,
+/// старая механика сталл-детекта живёт — проба улучшение, не зависимость
+/// (прецедент DecisionJudge).
+#[async_trait]
+pub trait QuotaProbe: Send + Sync {
+    async fn probe(&self) -> UsecaseResult<QuotaSnapshot>;
+}
+
 /// Нативные поля issue (сессии/ветка/PR/приоритет/тип): fm-зеркало снесено.
 #[async_trait]
 pub trait IssueFieldStore: Send + Sync {
@@ -622,8 +671,17 @@ pub trait TickStateStore: Send + Sync {
     fn lost_session(&self, board: &str, number: u64) -> Option<(Status, u32)>;
     fn mark_lost_session(&self, board: &str, number: u64, status: Status);
     fn clear_lost_session(&self, board: &str, number: u64);
-    /// Новый раунд слота (fresh-eyes): кулдаун прошлого раунда не переносится.
+    /// Сброс кулдауна спавна слота: ячейка снята переходом — новый спавн
+    /// раунда не ждёт кулдаун прошлого.
     fn clear_spawn_ms(&self, board: &str, number: u64, slot: Slot);
+    /// Pending раунд-промпт мастер-сессии ревьювера (#1626): строка вошла
+    /// в ревью-стадию с живой сессией — новый цикл доставляется в неё же
+    /// (компакт + раунд-промпт) wakeup-путём; маркер переживает тик,
+    /// пока пик/CUP/ход сессии держат доставку. Чистится доставкой
+    /// (wakeup) и спавном свежей сессии (spawn_stage — промпт унесён).
+    fn round_reentry_pending(&self, board: &str, number: u64) -> bool;
+    fn set_round_reentry_pending(&self, board: &str, number: u64);
+    fn clear_round_reentry_pending(&self, board: &str, number: u64);
     /// Аналитика (#1135, замена триажа): кулдауны волн/ревью и цикл-гвард.
     fn last_analys_ms(&self, board: &str, number: u64) -> Option<u64>;
     fn mark_analys_spawn(&self, board: &str, number: u64, at_ms: u64);
@@ -666,5 +724,27 @@ pub trait TickStateStore: Send + Sync {
     /// агентом через MCP task_comment (не юзером и не фабрикой).
     fn own_comment(&self, id: &str) -> bool;
     fn mark_own_comment(&self, id: &str, posted_ms: u64);
+    /// Мастер-привязка роли проекта (#1634, форма роль x проект общая
+    /// с #1607): (session, model_raw provider/id[#variant], checkout).
+    fn master_binding(&self, role: &str, project: &str) -> Option<(String, String, String)>;
+    fn set_master_binding(
+        &self,
+        role: &str,
+        project: &str,
+        session: &str,
+        model_raw: &str,
+        checkout: &str,
+    );
+    /// Метка последней адмиссии компакта мастер-привязки (коулдаун
+    /// переживает рестарт; 0 - не было).
+    fn master_compact_ms(&self, role: &str, project: &str) -> u64;
+    fn set_master_compact_ms(&self, role: &str, project: &str, ms: u64);
+    /// Гигиена привязок (Low-1 ревью #1634): снести записи роли, чьи
+    /// проекты ушли из конфига. Возвращает true, если что-то снесено.
+    fn prune_master_role(
+        &self,
+        role: &str,
+        live_projects: &std::collections::HashSet<String>,
+    ) -> bool;
     fn save(&self) -> UsecaseResult<()>;
 }

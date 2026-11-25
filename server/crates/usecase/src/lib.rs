@@ -56,8 +56,8 @@ pub use ports::{
     AgentSessionGateway, AppendDocOutcome, AssistantReply, Clock, CommentRef, CronRow,
     CronRunTrack, CronStateStore, DecisionJudge, DreamerMark, FmMutator, IssueDigest,
     IssueFieldStore, IssueIndexSource, IssueView, JudgeCfg, JudgeContext, JudgeSessionTail,
-    Liveness, PrGateway, PrState, SessionInfo, SessionSpec, StatusDelivery, TaskBoardRepo,
-    TickStateStore, WikiRepo,
+    Liveness, PrGateway, PrProbe, PrState, QuotaProbe, QuotaSnapshot, SessionInfo, SessionSpec,
+    StatusDelivery, TaskBoardRepo, TickStateStore, WikiRepo,
 };
 pub use router::SessionRouter;
 pub use search::{sync_allowed, SearchHit, SearchUseCase, SemanticBackend};
@@ -74,6 +74,6 @@ pub use tasks::clean::{
 };
 pub use tasks::views::{DocsView, PersonView, TaskView};
 pub use tasks::write::{
-    BodyWriteReceipt, NewTask, SectionAction, SectionEditReport, TaskPatch, TaskWriteUseCase,
-    TaskWriter,
+    BodyWriteReceipt, NewTask, SectionAction, SectionEditReport, SectionWrite, TaskPatch,
+    TaskWriteUseCase, TaskWriter,
 };

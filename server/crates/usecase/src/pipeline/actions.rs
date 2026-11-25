@@ -4,7 +4,8 @@
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
 use crate::pipeline::tick::{
-    BoardPlan, RowContext, SpawnHold, TickPlan, TickUseCase, SESSION_LOST_ESCALATE_AFTER,
+    BoardPlan, CupGate, RowContext, SpawnHold, TickOutcome, TickPlan, TickUseCase,
+    SESSION_LOST_ESCALATE_AFTER,
 };
 use crate::ports::{CommentRef, Liveness, SessionSpec};
 use crate::router::Gateway;
@@ -138,14 +139,75 @@ impl TickUseCase {
             let _ = sessions.delete_session(&work).await;
             return Err(e);
         }
+        // Свежая сессия получила собственный промпт — pending раунд-промпт
+        // мастер-сессии погашен (#1626: мёртвая ячейка снимается переходом,
+        // пересоздание несёт промпт само; маркер без этого гашения дал бы
+        // двойную доставку в новую сессию).
+        self.state
+            .clear_round_reentry_pending(&board.board, task.number());
         tracing::info!(event = "spawn.done", number = task.number(), slot = ?slot,
             session = %work, env = %env_repo, "Spawn done");
         Ok(work)
     }
 
-    /// Wakeup: мёртвая сессия — респавн (dead-детект ПЕРВЫМ: даже без свежих
-    /// комментов — строка не висит, DS «dead-детект решает: будить или
-    /// респавнить»); живая — будим по свежим комментам (новее активности).
+    /// Раунд-промпт мастер-сессии ревьювера (#1626 срез 2): re-entry в
+    /// ревью-стадию при живой сессии доставляется в неё же — нативный
+    /// компакт (детерминированный триггер: каждый re-entry, владелец
+    /// 25.11: «автокомпактом этой сессии перед тем как делать к ней новый
+    /// цикл») и спавн-промпт стадии. Гейты те же, что у будильника: пик
+    /// проверен вызывающим, CUP — здесь; ход сессии в полёте — доставка
+    /// на тике после ответа (маркер persists). Some — раунд-промпт
+    /// решён (Woke/Deferred), None — pending нет, дальше по будильнику.
+    async fn deliver_round_prompt(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        slot: Slot,
+        session: &str,
+        cup: CupGate,
+    ) -> UsecaseResult<Option<WakeAct>> {
+        if !slot.is_review()
+            || !self
+                .state
+                .round_reentry_pending(&board.board, task.number())
+        {
+            return Ok(None);
+        }
+        if cup.full() {
+            tracing::info!(
+                event = "wakeup.round_prompt_held_cup",
+                number = task.number(),
+                active = cup.active_now,
+                cap = cup.policy.cup,
+                tier = "continuation",
+                "Раунд-промпт отложен: CUP cap"
+            );
+            return Ok(Some(WakeAct::Deferred));
+        }
+        if !self.session_idle(board, session).await {
+            return Ok(Some(WakeAct::None));
+        }
+        let sessions = self.sessions.project(&board.project);
+        sessions.compact_session(session).await?;
+        // Пин агента слота перед ходом (#1300) — как на будильнике
+        if let Some(agent) = Agent::of_slot(slot) {
+            sessions.switch_agent(session, agent).await?;
+        }
+        sessions
+            .prompt(session, &spawn_prompt(board, task, slot))
+            .await?;
+        self.state
+            .clear_round_reentry_pending(&board.board, task.number());
+        tracing::info!(
+            event = "wakeup.round_prompt_delivered",
+            number = task.number(),
+            slot = naming::slot_key(slot),
+            session = %session,
+            "Раунд-промпт доставлен в мастер-сессию (компакт admitted перед новым циклом)"
+        );
+        Ok(Some(WakeAct::Woke))
+    }
+
     /// Wakeup: мёртвая сессия — респавн (dead-детект ПЕРВЫМ: даже без свежих
     /// комментов — строка не висит, DS «dead-детект решает: будить или
     /// респавнить»); живая — будим по свежим комментам (новее активности).
@@ -188,6 +250,23 @@ impl TickUseCase {
                         "Wakeup deferred: peak window"
                     );
                     return Ok(WakeAct::Deferred);
+                }
+                // Раунд-промпт мастер-сессии (#1626 срез 2) — та же политика
+                // запуска, что у будильника
+                if let Some(act) = self
+                    .deliver_round_prompt(
+                        board,
+                        task,
+                        slot,
+                        session,
+                        CupGate {
+                            policy,
+                            active_now: global_active,
+                        },
+                    )
+                    .await?
+                {
+                    return Ok(act);
                 }
             }
             Liveness::Unknown => {
@@ -287,6 +366,11 @@ impl TickUseCase {
         {
             let sessions = self.sessions.project(&board.project);
             let activity = sessions.last_activity_ms(session).await?;
+            // Рождение читателя: метка последнего спавна слота. Реестр-коммент,
+            // изданный до рождения сессии, никогда не был для неё «новым» —
+            // спавн-промпт несёт контекст (#1204). Нет метки (внешний claim,
+            // legacy-state) — член рождения выключен, семантика прежняя.
+            let spawned_at = self.state.last_spawn_ms(&board.board, task.number(), slot);
             let fresh = last.created_ms > activity.unwrap_or(0);
             // Ход завершён (последнее сообщение сессии — финальный ответ
             // агента): коммиты хвоста созданы во время хода — активность
@@ -295,12 +379,20 @@ impl TickUseCase {
             // застынет ниже коммента» заменена честным idle-критерием)
             let idle = !fresh && self.session_idle(board, session).await;
             if fresh || idle {
-                let foreign = self.slice_self_echo(task.number(), &tail, activity);
+                let foreign = self.slice_self_echo(task.number(), &tail, activity, spawned_at);
                 if foreign.is_empty() {
-                    // Хвост целиком свой (#1204): тихо двигаем бейзлайн —
-                    // следующий чужой коммент доставится без накопленного эха
-                    self.state
-                        .set_last_comment_id(&board.board, task.number(), &last.id);
+                    // Хвост целиком свой (#1204): эхо-будки нет. Поглощение
+                    // (тихий сдвиг бейзлайна) допустимо, только когда читатель
+                    // родился после хвоста — такой хвост не достанется этому
+                    // слоту ни в одном будущем раунде. Читатель старше хвоста
+                    // (автор: вердикт опубликован в его же ход) — коммент
+                    // адресован СЛЕДУЮЩЕМУ держателю: seen не двигается,
+                    // иначе тик в окне «вердикт опубликован → статус
+                    // переведён» съедает доставку держателю (#1533).
+                    if spawned_at.is_some_and(|ms| ms > last.created_ms) {
+                        self.state
+                            .set_last_comment_id(&board.board, task.number(), &last.id);
+                    }
                     return Ok(WakeAct::None);
                 }
                 // CUP-гвард (#1231): доставка промпта — новый ход, тот же
@@ -315,6 +407,9 @@ impl TickUseCase {
                         number = task.number(),
                         active = global_active,
                         cap = policy.cup,
+                        // будильник достижим только при сессии на слоте
+                        // стадии — тир продолжений всегда
+                        tier = "continuation",
                         "Wakeup held: CUP cap"
                     );
                     return Ok(WakeAct::Deferred);
@@ -361,21 +456,30 @@ impl TickUseCase {
     /// Own-срез self-эха (#1204): коммент хвоста — «свой» для держащей
     /// сессии, если он из реестра серверных постов (MCP task_comment) и не
     /// свежее её последней активности — ход после поста двигает активность
-    /// (инвариант own-среза ADR-050). Чужие агентские (вердикты других
-    /// стадий) и юзерские будят. Активность недоступна — без среза:
-    /// лишняя эхо-будка лучше потерянного коммента (fail-open, семантика TS).
+    /// (инвариант own-среза ADR-050) — либо не свежее её рождения: коммент,
+    /// изданный до спавна сессии, спавн-промптом уже покрыт (#1533, член
+    /// рождения). Чужие агентские (вердикты других стадий) и юзерские будят.
+    /// Ни активность, ни рождение недоступны — без среза: лишняя
+    /// эхо-будка лучше потерянного коммента (fail-open, семантика TS).
     fn slice_self_echo<'a>(
         &self,
         number: u64,
         tail: &'a [CommentRef],
         activity: Option<u64>,
+        spawned_at: Option<u64>,
     ) -> Vec<&'a CommentRef> {
-        let Some(active_at) = activity else {
+        if activity.is_none() && spawned_at.is_none() {
             return tail.iter().collect();
-        };
+        }
         let foreign: Vec<&CommentRef> = tail
             .iter()
-            .filter(|c| !(self.state.own_comment(&c.id) && c.created_ms <= active_at))
+            .filter(|c| {
+                !(self.state.own_comment(&c.id)
+                    && activity
+                        .into_iter()
+                        .chain(spawned_at)
+                        .any(|at| c.created_ms <= at))
+            })
             .collect();
         let own = tail.len() - foreign.len();
         if own > 0 {
@@ -625,10 +729,16 @@ impl TickUseCase {
     /// automerge_ready не прощупывает безветочные ячейки — Vcs::Local и
     /// Artifact, #1155 — и PR-ячейки с URL не PR-формы: wiki/issues/blob
     /// с фабричной веткой, #1286 — мержить нечего, строка ждёт владельца).
-    /// Возвращает true — PR смержен этим вызовом (счётчик тика).
-    pub async fn automerge(&self, board: &BoardPlan, task: &Task) -> UsecaseResult<bool> {
+    /// Возвращает true — PR смержен этим вызовом (счётчик тика);
+    /// семантические bounce инкрементят out.automerge_bounced (#1519).
+    pub async fn automerge(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        out: &mut TickOutcome,
+    ) -> UsecaseResult<bool> {
         use crate::ports::PrState;
-        let state = self
+        let probe = self
             .prs
             .probe(
                 &board.repo,
@@ -636,7 +746,7 @@ impl TickUseCase {
                 task.branch().map(|b| b.as_str()),
             )
             .await?;
-        if state == PrState::Pending {
+        if probe.state == PrState::Pending {
             tracing::info!(
                 event = "automerge.pending",
                 number = task.number(),
@@ -644,12 +754,27 @@ impl TickUseCase {
             );
             return Ok(false);
         }
-        match state {
+        match probe.state {
             PrState::Pending => unreachable!("pending обработан выше"),
-            // Уже влит (вручную или раньше): no-op — merge-API не зовётся,
-            // строка остаётся в Review и ждёт владельца (инцидент #1151/#1162:
-            // ложный bounce вручную смерженной строки недопустим)
+            // Уже влит (вручную или раньше, либо ячейка пуста/протухла, а
+            // веточная проба нашла смерженный PR — state=all, ревью Common
+            // #1519): no-op — merge-API не зовётся, строка остаётся в Review
+            // и ждёт владельца (инцидент #1151/#1162: ложный bounce
+            // вручную смерженной строки недопустим). Резолв известен —
+            // canonical ячейка дозаполняется, Done-кандидат не остаётся
+            // без ссылки на артефакт; отказ записи — warn без bounce
+            // (строка и так ждёт владельца, мержа не будет).
             PrState::Merged => {
+                if let Some(url) = probe.url.as_deref() {
+                    if let Err(e) = self.fill_cell_if_differs(board, task, url).await {
+                        tracing::warn!(
+                            event = "automerge.pr_cell_fill_failed",
+                            number = task.number(),
+                            error = %e,
+                            "Automerge: дозаполнение смерженного PR не удалось — строка ждёт владельца в Review"
+                        );
+                    }
+                }
                 tracing::info!(
                     event = "automerge.merged",
                     number = task.number(),
@@ -666,32 +791,55 @@ impl TickUseCase {
                 Ok(false)
             }
             PrState::Missing => {
-                self.bounce(board, task, "branch set, PR not found").await?;
+                self.bounce(board, task, "branch set, PR not found", out)
+                    .await?;
                 Ok(false)
             }
             PrState::Closed => {
-                self.bounce(board, task, "PR closed without a merge")
+                self.bounce(board, task, "PR closed without a merge", out)
                     .await?;
                 Ok(false)
             }
             PrState::Open {
                 mergeable: false, ..
             } => {
-                self.bounce(board, task, "PR conflicts with master").await?;
+                self.bounce(board, task, "PR conflicts with master", out)
+                    .await?;
                 Ok(false)
             }
             PrState::Open {
                 ci_green: false, ..
             } => {
-                self.bounce(board, task, "PR has red CI").await?;
+                self.bounce(board, task, "PR has red CI", out).await?;
                 Ok(false)
             }
             PrState::Open {
                 mergeable: true,
                 ci_green: true,
             } => {
-                let pr = task.pr().map(|u| u.as_str()).unwrap_or_default();
-                match self.prs.merge(&board.repo, pr).await {
+                // Дозаполнение canonical PR-ячейки (#1519): вердикт о
+                // конкретном PR есть, ячейка пуста или несёт протухший URL —
+                // пишем резолв до мержа; отказ записи — bounce (канон
+                // UC-01, авторемонт без мержа); мерж по
+                // probe-верифицированному URL — мержится ровно то, что
+                // прощупано.
+                let url = match probe.url.as_deref() {
+                    Some(u) => u,
+                    None => {
+                        // Defensive: на текущих гейтвеях недостижимо
+                        // (Open = вердикт о конкретном PR) — текст без
+                        // «not found», чтобы не лгал о причине
+                        self.bounce(board, task, "probe resolved no PR URL", out)
+                            .await?;
+                        return Ok(false);
+                    }
+                };
+                if let Err(e) = self.fill_cell_if_differs(board, task, url).await {
+                    self.bounce(board, task, &format!("PR cell fill failed: {e}"), out)
+                        .await?;
+                    return Ok(false);
+                }
+                match self.prs.merge(&board.repo, url).await {
                     Ok(()) => {
                         // мерж без закрытия: строка остаётся в Review —
                         // финализация (Done) всегда за владельцем (#1232)
@@ -703,7 +851,7 @@ impl TickUseCase {
                         Ok(true)
                     }
                     Err(e) => {
-                        self.bounce(board, task, &format!("merge failed: {e}"))
+                        self.bounce(board, task, &format!("merge failed: {e}"), out)
                             .await?;
                         Ok(false)
                     }
@@ -712,7 +860,45 @@ impl TickUseCase {
         }
     }
 
-    async fn bounce(&self, board: &BoardPlan, task: &Task, why: &str) -> UsecaseResult<()> {
+    /// Дозаполнение canonical PR-ячейки, если она расходится с резолвом
+    /// (#1519; ревью Low раунда 3 — единая точка «записать, если
+    /// расходится» вместо дубля в Merged/Open ветках): живая ячейка не
+    /// переписывается, запись логируется. Err — отказ записи, решение
+    /// (bounce/warn) за вызывающей веткой. URL резолва парсится здесь
+    /// один раз — дальше в порты идёт доменный \`&PrUrl\`.
+    async fn fill_cell_if_differs(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        url: &str,
+    ) -> UsecaseResult<()> {
+        if task.pr().map(|u| u.as_str()) == Some(url) {
+            return Ok(());
+        }
+        let parsed = uwuwu_domain::PrUrl::parse(url)
+            .ok_or_else(|| UsecaseError::Board(format!("PR «{url}» is not an http(s) URL")))?;
+        self.board
+            .set_pr(&board.board, task.number(), &parsed)
+            .await?;
+        tracing::info!(
+            event = "automerge.pr_cell_filled",
+            number = task.number(),
+            url,
+            "Automerge: canonical PR-ячейка дозаполнена резолвом (#1519)"
+        );
+        Ok(())
+    }
+
+    /// Bounce в In Progress с комментом-причиной (канон UC-01) — единая
+    /// точка инкремента `automerge_bounced` (#1519, ревью Low: правило
+    /// «семантический bounce = +1» живёт здесь, не на сайтах вызова).
+    async fn bounce(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        why: &str,
+        out: &mut TickOutcome,
+    ) -> UsecaseResult<()> {
         self.board
             .set_status(&board.board, task.number(), Status::InProgress)
             .await?;
@@ -725,6 +911,7 @@ impl TickUseCase {
             why,
             "Automerge: bounce"
         );
+        out.automerge_bounced += 1;
         Ok(())
     }
 }

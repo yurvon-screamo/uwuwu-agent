@@ -66,8 +66,16 @@ pub(crate) fn toggles_fence(line: &str) -> bool {
 /// Исход секционной замены.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SectionEdit {
-    /// Секция заменена; одноимённые дубли на уровне пина сняты (хилинг).
-    Replaced { duplicates_removed: usize },
+    /// Секция заменена; одноимённые дубли на уровне пина сняты (хилинг);
+    /// `old_content_len` — байт-объём всего снятого контента: первая
+    /// найденная секция до границы + её дубли на уровне пина (объём,
+    /// уходящий с носителя; пустые строки по нулям) — мера гарда
+    /// радикального сжатия и честных длин квитанции (#1409, #1572):
+    /// дубли входят в меру, иначе числа гарда противоречили дельте тела.
+    Replaced {
+        duplicates_removed: usize,
+        old_content_len: usize,
+    },
     /// Секции не было (пин h2) — добавлена в конец.
     Appended,
 }
@@ -101,6 +109,8 @@ pub fn replace_md_section(
         dropping: false, // контент секции/дубля до границы не копируется
         replaced: false,
         duplicates_removed: 0usize,
+        old_content_len: 0usize,
+        measuring: false,
         twin: None,
     };
     for line in md.lines() {
@@ -111,6 +121,7 @@ pub fn replace_md_section(
             scan.out,
             SectionEdit::Replaced {
                 duplicates_removed: scan.duplicates_removed,
+                old_content_len: scan.old_content_len,
             },
         ));
     }
@@ -145,6 +156,28 @@ pub fn replace_md_section(
     Ok((out, SectionEdit::Appended))
 }
 
+/// Объём контента секции в байтах (масштаб для честных длин отказа
+/// «content не передан», #1572): None — матчабельной секции на пине нет
+/// (отсутствующая, твин, не-h2 пин — для текста отказа этого достаточно).
+pub(crate) fn section_content_len(md: &str, section: &str) -> Option<usize> {
+    match replace_md_section(md, section, "") {
+        Ok((
+            _,
+            SectionEdit::Replaced {
+                old_content_len, ..
+            },
+        )) => Some(old_content_len),
+        _ => None,
+    }
+}
+
+/// Единая мера объёма контента — байты строк без переводов строк, пустые
+/// строки по нулям: «было» (мера SectionScan) и «стало» (квитанция и пол
+/// гарда) одной меры, числа сопоставимы (ревью #1572 Low).
+pub(crate) fn section_content_metric(s: &str) -> usize {
+    s.trim().lines().map(|l| l.len()).sum()
+}
+
 /// Твин-гард: громкий отказ с уровнем тёзки, байт-точной строкой (первой
 /// по порядку — детерминизм) и рецептом обхода; записи нет.
 fn twin_rejection(
@@ -163,8 +196,10 @@ fn twin_rejection(
 }
 
 /// Один шаг прохода по строке: строки секции/дубля до границы не
-/// копируются; тёзка чужого уровня собирается в тот же проход (гард
-/// стреляет только если матча не было; первая по порядку — детерминизм).
+/// копируются; объём снятых строк (первая секция + её дубли) копится в
+/// old_content_len (мера гарда сжатия, #1572); тёзка чужого уровня
+/// собирается в тот же проход (гард стреляет только если матча не было;
+/// первая по порядку — детерминизм).
 struct SectionScan<'a> {
     want: &'a str,
     pin: usize,
@@ -174,6 +209,11 @@ struct SectionScan<'a> {
     dropping: bool,
     replaced: bool,
     duplicates_removed: usize,
+    /// байт-объём снятых строк: первая секция до границы + её дубли;
+    /// пустые строки по нулям, '\n' не считается — мера контента.
+    old_content_len: usize,
+    /// копление меры открыто: от первой найденной секции до её границы.
+    measuring: bool,
     twin: Option<(usize, &'a str)>,
 }
 
@@ -183,32 +223,45 @@ impl<'a> SectionScan<'a> {
         self.out.push('\n');
     }
 
-    fn copy_if_not_dropping(&mut self, line: &str) {
+    /// Строка внутри секции/дубля: не копируется; мера первой найденной
+    /// секции копится до границы.
+    fn drop_or_copy(&mut self, line: &str) {
         if !self.dropping {
             self.copy(line);
+            return;
+        }
+        if self.measuring {
+            self.old_content_len += line.len();
         }
     }
 
     fn step(&mut self, line: &'a str) {
         if toggles_fence(line) {
             self.fenced = !self.fenced;
-            self.copy_if_not_dropping(line);
+            self.drop_or_copy(line);
             return;
         }
         if self.fenced {
-            self.copy_if_not_dropping(line);
+            self.drop_or_copy(line);
             return;
         }
         let Some((level, text)) = heading_of(line) else {
-            self.copy_if_not_dropping(line);
+            self.drop_or_copy(line);
             return;
         };
         if level == self.pin && text == self.want {
             if self.replaced {
                 self.duplicates_removed += 1;
+                // контент дубля тоже стирается — мера снятого копится
+                // дальше (симметрия с дельтой тела: иначе телесное плечо
+                // гарда сжатия стреляло бы с «ровными» числами секции,
+                // ревью #1572 Low)
+                self.measuring = true;
             } else {
                 push_heading_block(&mut self.out, line, self.content);
                 self.replaced = true;
+                self.measuring = true;
+                self.old_content_len = 0;
             }
             self.dropping = true;
             return;
@@ -218,11 +271,12 @@ impl<'a> SectionScan<'a> {
         }
         if level <= self.pin {
             self.dropping = false;
+            self.measuring = false;
             push_blank_line(&mut self.out);
             self.copy(line);
             return;
         }
-        self.copy_if_not_dropping(line);
+        self.drop_or_copy(line);
     }
 }
 

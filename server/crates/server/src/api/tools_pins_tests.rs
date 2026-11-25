@@ -793,6 +793,14 @@ impl uwuwu_usecase::TaskBoardRepo for UnverifiedStatusBoard {
     ) -> uwuwu_usecase::UsecaseResult<()> {
         self.inner.set_branch(board, number, branch).await
     }
+    async fn set_pr(
+        &self,
+        board: &str,
+        number: u64,
+        pr_url: &uwuwu_domain::PrUrl,
+    ) -> uwuwu_usecase::UsecaseResult<()> {
+        self.inner.set_pr(board, number, pr_url).await
+    }
 
     async fn set_board_cells(
         &self,

@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use uwuwu_domain::{Status, Task};
+use uwuwu_domain::{PrUrl, Status, Task};
 use uwuwu_usecase::{CommentRef, Goal, GoalsRepo, IssueView, StatusDelivery, TaskBoardRepo};
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
@@ -1153,6 +1153,14 @@ impl TaskBoardRepo for GitHubHub {
         Ok(())
     }
 
+    async fn set_pr(&self, board: &str, number: u64, pr_url: &PrUrl) -> UsecaseResult<()> {
+        self.fields
+            .store(number, &[("PR", Some(pr_url.as_str().to_string()))])
+            .await?;
+        self.invalidate_snapshot(board);
+        Ok(())
+    }
+
     async fn set_board_cells(
         &self,
         board: &str,
@@ -1491,8 +1499,7 @@ impl TaskBoardRepo for GitHubHub {
                 Some(json!({ "body": body_md })),
             )
             .await?;
-        let applied = status.is_success() && resp["body"].as_str() == Some(body_md);
-        if !applied {
+        if !status.is_success() || !body_echo_applied(body_md, &resp) {
             return Err(UsecaseError::Board(format!(
                 "replace body #{number}: not applied (HTTP {status})"
             )));
@@ -1502,6 +1509,54 @@ impl TaskBoardRepo for GitHubHub {
 
     async fn latest_comments(&self, number: u64) -> UsecaseResult<Vec<CommentRef>> {
         self.all_comments(number).await
+    }
+}
+
+/// Эхо-проверка replace_body: GitHub нормализует пустое тело в null
+/// (живая проба 24.11, #1572: PATCH body:"" → 200, поле «body»: null) —
+/// применённая очистка, не фантом; эхо-проверка непустого тела остаётся
+/// строгой (фантомный класс #1331). Точное строковое равенство — как
+/// записано, байт-в-байт.
+fn body_echo_applied(sent: &str, echoed: &serde_json::Value) -> bool {
+    echoed["body"].as_str() == Some(sent) || (sent.is_empty() && echoed["body"].is_null())
+}
+
+#[cfg(test)]
+mod body_echo_tests {
+    use super::body_echo_applied;
+    use serde_json::json;
+
+    #[test]
+    fn empty_sent_accepts_null_normalization() {
+        // живая проба #1572: GitHub отвечает null на пустую запись
+        assert!(body_echo_applied("", &json!({ "body": null })));
+        assert!(body_echo_applied("", &json!({ "body": "" })));
+    }
+
+    #[test]
+    fn phantom_or_mismatch_still_refused() {
+        // фантомный класс #1331: ответ не равен отправленному — отказ
+        assert!(
+            !body_echo_applied("тело", &json!({ "body": null })),
+            "null на непустое — не применено"
+        );
+        assert!(!body_echo_applied("тело", &json!({ "body": "другое" })));
+        assert!(
+            !body_echo_applied("", &json!({ "body": "мусор" })),
+            "пустую пишут мусором — фантом"
+        );
+        assert!(
+            !body_echo_applied("тело", &json!({})),
+            "поля нет — не применено"
+        );
+    }
+
+    #[test]
+    fn verbatim_echo_passes() {
+        assert!(body_echo_applied(
+            "## А\nтело\n",
+            &json!({ "body": "## А\nтело\n" })
+        ));
     }
 }
 

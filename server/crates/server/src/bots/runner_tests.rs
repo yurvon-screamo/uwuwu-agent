@@ -607,6 +607,11 @@ impl TickStateStore for MemTickState {
         None
     }
     fn clear_spawn_ms(&self, _b: &str, _n: u64, _s: Slot) {}
+    fn round_reentry_pending(&self, _b: &str, _n: u64) -> bool {
+        false
+    }
+    fn set_round_reentry_pending(&self, _b: &str, _n: u64) {}
+    fn clear_round_reentry_pending(&self, _b: &str, _n: u64) {}
     fn mark_spawn(&self, _b: &str, _n: u64, _s: Slot, _at: u64) {}
     fn last_analys_ms(&self, _b: &str, _n: u64) -> Option<u64> {
         None
@@ -651,6 +656,17 @@ impl TickStateStore for MemTickState {
         false
     }
     fn mark_own_comment(&self, _id: &str, _posted_ms: u64) {}
+    fn master_binding(&self, _: &str, _: &str) -> Option<(String, String, String)> {
+        None
+    }
+    fn set_master_binding(&self, _: &str, _: &str, _: &str, _: &str, _: &str) {}
+    fn master_compact_ms(&self, _: &str, _: &str) -> u64 {
+        0
+    }
+    fn set_master_compact_ms(&self, _: &str, _: &str, _: u64) {}
+    fn prune_master_role(&self, _: &str, _: &std::collections::HashSet<String>) -> bool {
+        false
+    }
     fn save(&self) -> UsecaseResult<()> {
         Ok(())
     }

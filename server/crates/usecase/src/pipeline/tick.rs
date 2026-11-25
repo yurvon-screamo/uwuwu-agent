@@ -6,7 +6,7 @@ use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
 use crate::ports::{
     Clock, DecisionJudge, JudgeCfg, JudgeContext, JudgeSessionTail, Liveness, PrGateway,
-    TaskBoardRepo, TickStateStore,
+    QuotaProbe, TaskBoardRepo, TickStateStore,
 };
 use crate::router::SessionRouter;
 use crate::spawn_models::SpawnModels;
@@ -84,6 +84,13 @@ pub struct TickOutcome {
     pub wakeups_deferred: usize,
     /// Мержей автомержа: строка остаётся в Review (#1232).
     pub automerged: usize,
+    /// Семантических bounce автомержа (red CI / конфликт / PR не найден /
+    /// closed / merge fail / отказ дозаполнения ячейки): исход «мерж не
+    /// состоялся, причина на строке» — наблюдаемость исходов (#1519).
+    /// Инкремент — единая точка в actions::bounce; pending/no-op не
+    /// считаются. Транспортный Err пробы/мержа сюда не попадает: он
+    /// пробрасывается из тика (\`tick.failed\`) и счётчиков не несёт.
+    pub automerge_bounced: usize,
     /// Строк, переведённых в Needs attention спавн-петлёй.
     pub attention_flagged: usize,
     /// Автопингов сталл-детекта (ход завершён, статус не переведён).
@@ -126,6 +133,10 @@ pub struct TickOutcome {
     /// Строк, пропущенных тиком при отказе enrichment (#1163): решение
     /// по невидимым ячейкам — источник дублей, ждём следующий тик.
     pub enrich_skipped: usize,
+    /// Строк на лимитной паузе (#1477): гейт классифицировал тишину как
+    /// исчерпание окна подписки — пинги/эскалация не выполняются, сигнал
+    /// массовости — tick_loop (main.rs).
+    pub limit_paused: usize,
     /// Строк с недостоверной пробой активности исполнителя (Err): отказ
     /// сталл-прохода строки — без эскалации и записи каунтеров (#1281).
     pub probe_failed: usize,
@@ -142,16 +153,17 @@ pub struct TickOutcome {
 
 /// Гейт CUP на доставке мягкого пинга (#1313): пинг — запуск хода,
 /// слот выделяется как будильнику/спавну. Бандл «политика + занятость» —
-/// один смысловой вход вердикт-прохода сталл-детекта.
+/// один смысловой вход вердикт-прохода сталл-детекта; с #1626 — и
+/// доставки раунд-промпта мастер-сессии (actions.rs).
 #[derive(Debug, Clone, Copy)]
-struct CupGate {
-    policy: SpawnPolicy,
-    active_now: usize,
+pub(crate) struct CupGate {
+    pub(crate) policy: SpawnPolicy,
+    pub(crate) active_now: usize,
 }
 
 impl CupGate {
     /// Кап полон — новый ход не выдаётся.
-    fn full(&self) -> bool {
+    pub(crate) fn full(&self) -> bool {
         self.active_now >= self.policy.cup
     }
 }
@@ -171,6 +183,10 @@ enum StallAct {
     /// вердикт о тишине не может быть получен (#1281, срез честности
     /// пробы). Эскалация и запись каунтеров не выполняются.
     ProbeFailed,
+    /// Лимитная тишина (#1477): окно подписки исчерпано (проба квоты) —
+    /// простой классифицирован как лимитный: пинги/каунтеры/судья/
+    /// эскалация не выполняются, самовозобновление — пробой после спада.
+    LimitPaused,
 }
 
 /// Полоса отказов пробы за тик, при которой тик сигнализирует деградацию
@@ -204,6 +220,11 @@ pub struct TickUseCase {
     pub judge: Option<Arc<dyn DecisionJudge>>,
     /// Конфиг контура судьи (пороги/тримы/гвард — канон плана #1364).
     pub judge_cfg: JudgeCfg,
+    /// Проба квоты подписки провайдера (#1477): гейт лимитной тишины —
+    /// простой ходов из-за исчерпания окна не эскалируется. None — off
+    /// ([quota] нет в конфиге); Err пробы — старая механика немедленно
+    /// (проба улучшение, не зависимость).
+    pub quota: Option<Arc<dyn QuotaProbe>>,
 }
 
 /// Причина hold спавна: зрение недоступно или в env живая сестра.
@@ -236,7 +257,7 @@ pub(crate) struct PreemptCandidate {
 }
 
 /// Пул жертв тика: собирается в run() из union-скана, расходуется
-/// HeldCup-ветками run_board (по одной жертве на отдачу слота).
+/// HeldCup-ветками process_row (по одной жертве на отдачу слота).
 /// Mutex — не для параллелизма (доски обходятся последовательно):
 /// interior mutability для изъятия жертв между досками сквозь await
 /// и Send-ность будущего тика.
@@ -497,25 +518,55 @@ impl TickUseCase {
         // спавн одной доски занимает слот глобального капа, следующая
         // доска видит занятость через ссылку
         let mut active_now = global_active;
-        for (board, tasks) in boards {
+        // Глобальная очередь кандидатов (#1586): строки всех досок — один
+        // порядок до обхода. Ключ: тир is_continuation (классификация по
+        // снапшоту до round_transition — см. doc в домене), приоритет,
+        // доска в порядке конфига, порядок строк.
+        // Дебаг-гейт одной строки (мок-Е2Е): UWUWU_ONLY_TASK=<number> —
+        // конвейер действует только по ней, остальная доска read-only.
+        let only = std::env::var("UWUWU_ONLY_TASK")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        let now = self.clock.utc_minute();
+        let now_ms = self.clock.now_ms();
+        let mut rows: Vec<(usize, usize, &BoardPlan, Task)> = Vec::new();
+        for (bi, (board, tasks)) in boards.iter_mut().enumerate() {
+            for (ri, t) in tasks.drain(..).enumerate() {
+                if only.is_some_and(|n| t.number() != n) {
+                    continue;
+                }
+                rows.push((bi, ri, *board, t));
+            }
+        }
+        rows.sort_by_key(|(bi, ri, _board, t)| {
+            (
+                !uwuwu_domain::is_continuation(t),
+                t.priority().rank(),
+                *bi,
+                *ri,
+            )
+        });
+        for (_, _, board, task) in &rows {
             // Пер-проектное зрение (#1263): контекст доски — список её
             // исполнителя; чужие исполнители зрение проекта не гасят.
             let executor = self.sessions.project_executor_name(&board.project);
             let sightings = sight_by_executor.get(executor).and_then(|v| v.as_deref());
-            out = self
-                .run_board(
-                    plan,
-                    board,
-                    tasks,
-                    &mut active_now,
-                    &RowContext {
-                        sightings,
-                        enrich_failed: &enrich_failed,
-                        preempts: &preempt_pool,
-                    },
-                    out,
-                )
-                .await?;
+            let ctx = RowContext {
+                sightings,
+                enrich_failed: &enrich_failed,
+                preempts: &preempt_pool,
+            };
+            self.process_row(
+                plan,
+                board,
+                task,
+                now,
+                now_ms,
+                &mut active_now,
+                &ctx,
+                &mut out,
+            )
+            .await?;
         }
         if let Err(e) = self.state.save() {
             tracing::error!(event = "state.save_failed", error = %e, "Failed to save tick state");
@@ -542,11 +593,13 @@ impl TickUseCase {
             wakeups_deferred = out.wakeups_deferred,
             lost_deferred = out.lost_deferred,
             automerged = out.automerged,
+            automerge_bounced = out.automerge_bounced,
             held_live = out.held_live,
             stall_pings = out.stall_pings,
             soft_pings = out.soft_pings,
             soft_pings_deferred = out.soft_pings_deferred,
             stall_flagged = out.stall_flagged,
+            limit_paused = out.limit_paused,
             review_flagged = out.review_flagged,
             session_lost_flagged = out.session_lost_flagged,
             observed = out.observed,
@@ -560,283 +613,266 @@ impl TickUseCase {
         Ok(out)
     }
 
-    async fn run_board(
+    /// Один ход обхода глобальной очереди кандидатов (#1586): строка уже
+    /// заняла своё место в порядке; здесь — enrichment-гард, переход
+    /// стадии, гард-цепочка и действие тика (спавн/автомерж/наблюдение).
+    /// Эффекты — в общий счётчик капа и outcome тика; решение «какая
+    /// строка следующая» здесь не принимается.
+    #[allow(clippy::too_many_arguments)]
+    async fn process_row(
         &self,
         plan: &TickPlan,
         board: &BoardPlan,
-        mut tasks: Vec<Task>,
+        task_ref: &Task,
+        now: uwuwu_domain::UtcMinute,
+        now_ms: u64,
         active_now: &mut usize,
         ctx: &RowContext<'_>,
-        mut out: TickOutcome,
-    ) -> UsecaseResult<TickOutcome> {
-        let now = self.clock.utc_minute();
-        let now_ms = self.clock.now_ms();
-        // Активные для гейтов: снапшот обхода + состоявшиеся спавны
-        // этого тика, общий для всех досок (ссылка из run, #1244) —
-        // иначе несколько мёртвых stage-строк пройдут CUP по одному
-        // снапшоту и оверселят кап внутри прохода (Low-находка #1200),
-        // а много-досочные тики — по разу на доску.
-        // Дебаг-гейт одной строки (мок-Е2Е): UWUWU_ONLY_TASK=<number> —
-        // конвейер действует только по ней, остальная доска read-only
-        if let Ok(only) = std::env::var("UWUWU_ONLY_TASK") {
-            if let Ok(n) = only.trim().parse::<u64>() {
-                tasks.retain(|t| t.number() == n);
-            }
+        out: &mut TickOutcome,
+    ) -> UsecaseResult<()> {
+        // Отказ enrichment (#1163): строка пропускается — ячейки не
+        // видны, decide по снапшоту даст вечный needs_spawn (механизм
+        // дубль-спавнов ночи 15.11). Пропущенный тик ретраится даром.
+        if ctx.enrich_failed.contains(&task_ref.number()) {
+            out.enrich_skipped += 1;
+            return Ok(());
         }
-        tasks.sort_by_key(|t| t.priority().rank());
-        for task_ref in &tasks {
-            // Отказ enrichment (#1163): строка пропускается — ячейки не
-            // видны, decide по снапшоту даст вечный needs_spawn (механизм
-            // дубль-спавнов ночи 15.11). Пропущенный тик ретраится даром.
-            if ctx.enrich_failed.contains(&task_ref.number()) {
-                out.enrich_skipped += 1;
-                continue;
-            }
-            let mut cleared_clone: Option<Task> = None;
-            // Attention-механика: счётчики слотов, сохранённые при другом
-            // статусе строки, устарели (строка ушла и вернулась) — сброс.
-            // Live-only: observe стейт не пишет.
-            if plan.mode == Mode::Live {
-                self.state.reset_stale_spawn_loops(
-                    &board.board,
-                    task_ref.number(),
-                    task_ref.status(),
-                );
-                // Канон сессий: переход стадии = новый раунд слота. Ревью/тест —
-                // свежие глаза всегда (незамыленность оценки); дев-семья едина
-                // между этапами и откатами (требование владельца), но мёртвая
-                // дев-ячейка не «едина» ни с чем и замораживает кик владельца
-                // навсегда (#397) — канон fast-track: исключение от спавна —
-                // живая дев-ячейка. Какой слот чистим — решает хелпер.
-                let prev = self.state.last_seen_status(&board.board, task_ref.number());
-                if prev.as_ref() != Some(&task_ref.status()) {
-                    cleared_clone = self.round_transition(board, task_ref, &mut out).await;
-                    self.state.set_last_seen_status(
-                        &board.board,
-                        task_ref.number(),
-                        task_ref.status(),
-                    );
-                    // Цикл-гвард ревью-контура (#1311): счёт подряд
-                    // request_changes по статус-переходам; кап достигнут —
-                    // эскалация вместо раунда N+1, строка снята с тика.
-                    if self
-                        .review_round_pass(board, prev, task_ref, &mut out)
-                        .await
-                    {
-                        continue;
-                    }
+        let mut cleared_clone: Option<Task> = None;
+        // Attention-механика: счётчики слотов, сохранённые при другом
+        // статусе строки, устарели (строка ушла и вернулась) — сброс.
+        // Live-only: observe стейт не пишет.
+        if plan.mode == Mode::Live {
+            self.state
+                .reset_stale_spawn_loops(&board.board, task_ref.number(), task_ref.status());
+            // Канон сессий: переход стадии = раунд слота. Мастер-сессии
+            // ревьюверов (#1626) переживают циклы задачи в пределах стадии
+            // (новый цикл — компакт + раунд-промпт в ту же сессию);
+            // дев-семья едина между этапами и откатами (требование
+            // владельца). Снимается только мёртвая ячейка — она не «едина»
+            // ни с чем и замораживает кик владельца навсегда (#397); канон
+            // fast-track: исключение от спавна — живая ячейка. Какой слот
+            // обрабатывается — решает хелпер.
+            let prev = self.state.last_seen_status(&board.board, task_ref.number());
+            if prev.as_ref() != Some(&task_ref.status()) {
+                cleared_clone = self.round_transition(board, task_ref, out).await;
+                self.state
+                    .set_last_seen_status(&board.board, task_ref.number(), task_ref.status());
+                // Цикл-гвард ревью-контура (#1311): счёт подряд
+                // request_changes по статус-переходам; кап достигнут —
+                // эскалация вместо раунда N+1, строка снята с тика.
+                if self.review_round_pass(board, prev, task_ref, out).await {
+                    return Ok(());
                 }
             }
-            // тень: если слот снят переходом — работаем с очищенным клоном
-            let task: &Task = cleared_clone.as_ref().unwrap_or(task_ref);
-            let action = decide(task);
-            match action {
-                Action::Spawn { slot } => {
-                    // Анти-шторм: слот строки не спавнится чаще кулдауна
-                    let cooldown_left = {
-                        let last = self.state.last_spawn_ms(&board.board, task.number(), slot);
-                        last.map(|ts| self.clock.now_ms().saturating_sub(ts))
-                            .unwrap_or(u64::MAX)
-                    };
-                    if cooldown_left < SPAWN_COOLDOWN_MS {
-                        out.observed += 1;
-                        continue;
-                    }
-                    // Attention-механика: >2 спавнов слота при неизменном
-                    // статусе = петля → Needs attention, конвейер бросает строку
-                    let mut guard = self
-                        .state
-                        .spawn_loop(&board.board, task.number(), slot)
-                        .map(|(status, repeats)| {
-                            let mut g = SpawnLoop::new(status);
-                            for _ in 0..repeats {
-                                g.register_spawn(status);
-                            }
-                            g
-                        })
-                        .unwrap_or_else(|| SpawnLoop::new(task.status()));
-                    if guard.register_spawn(task.status()) == LoopOutcome::Escalate {
-                        out.attention_flagged += 1;
-                        tracing::warn!(
-                            event = "spawn.loop_escalated",
-                            number = task.number(),
-                            slot = naming::slot_key(slot),
-                            "Spawn loop >2: Needs attention"
-                        );
-                        if plan.mode == Mode::Live {
-                            let _ = self
-                                .board
-                                .set_status(&board.board, task.number(), Status::NeedsAttention)
-                                .await;
-                            let _ = self
-                                .board
-                                .post_comment(
-                                    task.number(),
-                                    &format!(
-                                        "⚠︎ Spawn loop: the `{}` slot spawned >2 times without \
+        }
+        // тень: если слот снят переходом — работаем с очищенным клоном
+        let task: &Task = cleared_clone.as_ref().unwrap_or(task_ref);
+        let action = decide(task);
+        match action {
+            Action::Spawn { slot } => {
+                // Анти-шторм: слот строки не спавнится чаще кулдауна
+                let cooldown_left = {
+                    let last = self.state.last_spawn_ms(&board.board, task.number(), slot);
+                    last.map(|ts| self.clock.now_ms().saturating_sub(ts))
+                        .unwrap_or(u64::MAX)
+                };
+                if cooldown_left < SPAWN_COOLDOWN_MS {
+                    out.observed += 1;
+                    return Ok(());
+                }
+                // Attention-механика: >2 спавнов слота при неизменном
+                // статусе = петля → Needs attention, конвейер бросает строку
+                let mut guard = self
+                    .state
+                    .spawn_loop(&board.board, task.number(), slot)
+                    .map(|(status, repeats)| {
+                        let mut g = SpawnLoop::new(status);
+                        for _ in 0..repeats {
+                            g.register_spawn(status);
+                        }
+                        g
+                    })
+                    .unwrap_or_else(|| SpawnLoop::new(task.status()));
+                if guard.register_spawn(task.status()) == LoopOutcome::Escalate {
+                    out.attention_flagged += 1;
+                    tracing::warn!(
+                        event = "spawn.loop_escalated",
+                        number = task.number(),
+                        slot = naming::slot_key(slot),
+                        "Spawn loop >2: Needs attention"
+                    );
+                    if plan.mode == Mode::Live {
+                        let _ = self
+                            .board
+                            .set_status(&board.board, task.number(), Status::NeedsAttention)
+                            .await;
+                        let _ = self
+                            .board
+                            .post_comment(
+                                task.number(),
+                                &format!(
+                                    "⚠︎ Spawn loop: the `{}` slot spawned >2 times without \
                                          status progress ({:?}). The row moved to \
                                          Needs attention — owner's triage.",
-                                        naming::slot_key(slot),
-                                        task.status()
-                                    ),
-                                )
-                                .await;
-                        }
-                        continue;
+                                    naming::slot_key(slot),
+                                    task.status()
+                                ),
+                            )
+                            .await;
                     }
-                    // Гард «одна живая сессия на строку» (#1163) + зрение
-                    // (#1263): сироты спавна, клеймы в гонке с тиком и
-                    // невидимые ячейки не дублируют раунд; слепой скан —
-                    // hold без спавна до восстановления списка.
-                    match self.spawn_hold(ctx, board, task, slot, now_ms) {
-                        Some(SpawnHold::Live) => {
-                            out.held_live += 1;
-                            tracing::info!(
-                                event = "spawn.held_live_session",
-                                number = task.number(),
-                                slot = naming::slot_key(slot),
-                                "Spawn held: живая сессия в env строки (second source #1163)"
-                            );
-                            continue;
-                        }
-                        Some(SpawnHold::BlindScan) => {
-                            out.held_blind += 1;
-                            tracing::info!(
+                    return Ok(());
+                }
+                // Гард «одна живая сессия на строку» (#1163) + зрение
+                // (#1263): сироты спавна, клеймы в гонке с тиком и
+                // невидимые ячейки не дублируют раунд; слепой скан —
+                // hold без спавна до восстановления списка.
+                match self.spawn_hold(ctx, board, task, slot, now_ms) {
+                    Some(SpawnHold::Live) => {
+                        out.held_live += 1;
+                        tracing::info!(
+                            event = "spawn.held_live_session",
+                            number = task.number(),
+                            slot = naming::slot_key(slot),
+                            "Spawn held: живая сессия в env строки (second source #1163)"
+                        );
+                        return Ok(());
+                    }
+                    Some(SpawnHold::BlindScan) => {
+                        out.held_blind += 1;
+                        tracing::info!(
                                 event = "spawn.held_blind_scan",
                                 number = task.number(),
                                 slot = naming::slot_key(slot),
                                 "Spawn held: список исполнителя недоступен — спавн без зрения невозможен (#1263)"
                             );
-                            continue;
-                        }
-                        None => {}
+                        return Ok(());
                     }
-                    let mut gated = gate(task, &action, plan.policy, *active_now, now);
-                    if matches!(gated, Gate::HeldCup { .. }) && plan.mode == Mode::Live {
-                        // Отдача слота при понижении приоритета (#1259):
-                        // спавн кандидата держит кап, есть busy-жертва
-                        // строго ниже рангом → гасим её и отдаём слот на
-                        // этом же тике (детали — в try_preempt).
-                        if self
-                            .try_preempt(board, task, ctx, active_now, &mut out)
-                            .await
-                        {
-                            gated = gate(task, &action, plan.policy, *active_now, now);
-                        }
+                    None => {}
+                }
+                let mut gated = gate(task, &action, plan.policy, *active_now, now);
+                if matches!(gated, Gate::HeldCup { .. }) && plan.mode == Mode::Live {
+                    // Отдача слота при понижении приоритета (#1259):
+                    // спавн кандидата держит кап, есть busy-жертва
+                    // строго ниже рангом → гасим её и отдаём слот на
+                    // этом же тике (детали — в try_preempt).
+                    if self.try_preempt(board, task, ctx, active_now, out).await {
+                        gated = gate(task, &action, plan.policy, *active_now, now);
                     }
-                    match gated {
-                        Gate::Allowed => {
-                            out.spawns_allowed += 1;
-                            if plan.mode == Mode::Live {
-                                match self.spawn_stage(board, task, slot).await {
-                                    Ok(session) => {
-                                        *active_now += 1;
-                                        // счётчик/кулдаун пишем только при
-                                        // реальном спавне: observe не накручивает
-                                        // петли (#1046), а временный отказ
-                                        // (бюджет 10/ч) — не петля и не спавн
-                                        // (15.11: #1151 high ложно эскалировала
-                                        // бы за 3 бюджет-отказа)
-                                        self.state.set_spawn_loop(
-                                            &board.board,
-                                            task.number(),
-                                            slot,
-                                            guard.status(),
-                                            guard.repeats(),
-                                        );
-                                        self.state.mark_spawn(
-                                            &board.board,
-                                            task.number(),
-                                            slot,
-                                            self.clock.now_ms(),
-                                        );
-                                        if let Err(e) = self
-                                            .board
-                                            .set_session(
-                                                &board.board,
-                                                task.number(),
-                                                slot,
-                                                &session,
-                                            )
-                                            .await
-                                        {
-                                            out.actions_failed += 1;
-                                            // Сирота (#1163): сессия создана и
-                                            // запромпчена, ячейки нет — гасим,
-                                            // иначе живой сеанс вне ячейки
-                                            // вечно держит гард, а будить его
-                                            // некому (id не в ячейке).
-                                            let _ = self
-                                                .sessions
-                                                .project(&board.project)
-                                                .delete_session(&session)
-                                                .await;
-                                            self.log_action_failed(task_ref, e);
-                                        } else {
-                                            out.spawns_done += 1;
-                                            // свежая сессия в ячейке — счётчик
-                                            // прошлой сессии устарел (#1288)
-                                            self.state
-                                                .clear_lost_session(&board.board, task.number());
-                                        }
-                                    }
-                                    Err(e) => {
+                }
+                match gated {
+                    Gate::Allowed => {
+                        out.spawns_allowed += 1;
+                        if plan.mode == Mode::Live {
+                            match self.spawn_stage(board, task, slot).await {
+                                Ok(session) => {
+                                    *active_now += 1;
+                                    // счётчик/кулдаун пишем только при
+                                    // реальном спавне: observe не накручивает
+                                    // петли (#1046), а временный отказ
+                                    // (бюджет 10/ч) — не петля и не спавн
+                                    // (15.11: #1151 high ложно эскалировала
+                                    // бы за 3 бюджет-отказа)
+                                    self.state.set_spawn_loop(
+                                        &board.board,
+                                        task.number(),
+                                        slot,
+                                        guard.status(),
+                                        guard.repeats(),
+                                    );
+                                    self.state.mark_spawn(
+                                        &board.board,
+                                        task.number(),
+                                        slot,
+                                        self.clock.now_ms(),
+                                    );
+                                    if let Err(e) = self
+                                        .board
+                                        .set_session(&board.board, task.number(), slot, &session)
+                                        .await
+                                    {
                                         out.actions_failed += 1;
+                                        // Сирота (#1163): сессия создана и
+                                        // запромпчена, ячейки нет — гасим,
+                                        // иначе живой сеанс вне ячейки
+                                        // вечно держит гард, а будить его
+                                        // некому (id не в ячейке).
+                                        let _ = self
+                                            .sessions
+                                            .project(&board.project)
+                                            .delete_session(&session)
+                                            .await;
                                         self.log_action_failed(task_ref, e);
+                                    } else {
+                                        out.spawns_done += 1;
+                                        // свежая сессия в ячейке — счётчик
+                                        // прошлой сессии устарел (#1288)
+                                        self.state.clear_lost_session(&board.board, task.number());
                                     }
+                                }
+                                Err(e) => {
+                                    out.actions_failed += 1;
+                                    self.log_action_failed(task_ref, e);
                                 }
                             }
                         }
-                        Gate::HeldCup { active, cap } => {
-                            out.held_cup += 1;
-                            tracing::info!(
-                                event = "spawn.held_cup",
-                                number = task.number(),
-                                active,
-                                cap,
-                                "Spawn held: CUP cap"
-                            );
-                        }
-                        Gate::DeferredPeak => {
-                            out.deferred_peak += 1;
-                            tracing::info!(
-                                event = "spawn.deferred_peak",
-                                number = task.number(),
-                                "Spawn deferred: peak window"
-                            );
-                        }
                     }
-                }
-                Action::Automerge => {
-                    if plan.mode == Mode::Live {
-                        let merged = self
-                            .automerge(board, task)
-                            .await
-                            .map_err(|e| self.log_action_failed(task, e))?;
-                        // счётчик — факты мержа: bounce/pending/no-op не считаются
-                        if merged {
-                            out.automerged += 1;
-                        }
-                    } else {
+                    Gate::HeldCup { active, cap } => {
+                        out.held_cup += 1;
                         tracing::info!(
-                            event = "automerge.probe",
+                            event = "spawn.held_cup",
                             number = task.number(),
-                            pr = task.pr().map(|u| u.as_str()).unwrap_or(""),
-                            "Automerge probe (observe)"
+                            active,
+                            cap,
+                            // тир — по снапшоту строки (task_ref): очередь
+                            // строилась до round_transition, клон мог сменить
+                            // фасетку (возврат в Design с мёртвой ячейкой)
+                            tier = if uwuwu_domain::is_continuation(task_ref) {
+                                "continuation"
+                            } else {
+                                "new"
+                            },
+                            "Spawn held: CUP cap"
+                        );
+                    }
+                    Gate::DeferredPeak => {
+                        out.deferred_peak += 1;
+                        tracing::info!(
+                            event = "spawn.deferred_peak",
+                            number = task.number(),
+                            "Spawn deferred: peak window"
                         );
                     }
                 }
-                Action::Observe { awaits } => {
-                    if plan.mode == Mode::Live && awaits == Awaits::StageSession {
-                        self.observe_stage_session(board, plan, task, active_now, ctx, &mut out)
-                            .await;
-                    } else {
-                        out.observed += 1;
+            }
+            Action::Automerge => {
+                if plan.mode == Mode::Live {
+                    let merged = self
+                        .automerge(board, task, out)
+                        .await
+                        .map_err(|e| self.log_action_failed(task, e))?;
+                    // счётчик — факты мержа: bounce/pending/no-op не считаются
+                    if merged {
+                        out.automerged += 1;
                     }
+                } else {
+                    tracing::info!(
+                        event = "automerge.probe",
+                        number = task.number(),
+                        pr = task.pr().map(|u| u.as_str()).unwrap_or(""),
+                        "Automerge probe (observe)"
+                    );
+                }
+            }
+            Action::Observe { awaits } => {
+                if plan.mode == Mode::Live && awaits == Awaits::StageSession {
+                    self.observe_stage_session(board, plan, task, active_now, ctx, out)
+                        .await;
+                } else {
+                    out.observed += 1;
                 }
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Отдача слота при понижении приоритета (#1259): кандидат держится
@@ -1014,6 +1050,9 @@ impl TickUseCase {
                 Ok(StallAct::Deferred) => out.soft_pings_deferred += 1,
                 Ok(StallAct::Flagged) => out.stall_flagged += 1,
                 Ok(StallAct::ProbeFailed) => out.probe_failed += 1,
+                // лимитная пауза учтена гейтом (out.limit_paused), сигнал
+                // массовости — tick_loop (main.rs)
+                Ok(StallAct::LimitPaused) => {}
                 // обе Err-ветки — путь доставки: классифицированная потеря
                 // маршрутизируется, прочие отказы логируются как раньше (#1288)
                 Err(e) => {
@@ -1134,8 +1173,7 @@ impl TickUseCase {
         }
     }
 
-    /// Смена статуса строки = новый раунд слота: определить событие
-    /// (свежие глаза / кик-разморозка) и снять сессию, если раунд новый.
+    /// Смена статуса строки = раунд слота: решить судьбу ячейки.
     /// Сбой логируется в outcome. Возвращает очищенный клон строки.
     async fn round_transition(
         &self,
@@ -1144,12 +1182,7 @@ impl TickUseCase {
         out: &mut TickOutcome,
     ) -> Option<Task> {
         let slot = task.stage_slot()?;
-        let event = if matches!(slot, Slot::Design | Slot::Dev) {
-            "stage.kick_unfreeze"
-        } else {
-            "stage.fresh_eyes"
-        };
-        match self.transition_clear_slot(board, task, slot, event).await {
+        match self.transition_clear_slot(board, task, slot).await {
             Ok(cleared) => cleared,
             Err(e) => {
                 out.actions_failed += 1;
@@ -1159,32 +1192,60 @@ impl TickUseCase {
         }
     }
 
-    /// Вход строки в стадию = новый раунд слота. Ревью/тест-сессии снимаются
-    /// всегда (свежие глаза, незамыленность оценки); дев-семья (Design/Dev) —
-    /// только мёртвая: живая едина между этапами и откатами (требование
-    /// владельца), а мёртвая блокирует разворот кика навсегда (#397) —
-    /// канон fast-track: исключение от спавна — живая дев-ячейка. Unknown
-    /// (serve недоступен) мёртвой не считается — консервативно, dead-детект
-    /// wakeup-пути подхватит строку на следующем тике.
+    /// Вход строки в стадию = раунд слота. Канон мастер-сессий (#1626,
+    /// владелец 25.11.2026 дословно: «1 задача = 1 сессия на каждый этап
+    /// ревью и между циклами мы их не меняем»): живая сессия ревьювера
+    /// (PlanReview/ResultReview/TestReview) сохраняется между циклами
+    /// задачи в пределах своей стадии — риск замыленности обыгран
+    /// детерминированным компактом перед каждым новым циклом (п.2
+    /// постановки: «автокомпактом этой сессии перед тем как делать к ней
+    /// новый цикл»). Дев-семья (Design/Dev) — как раньше: живая едина
+    /// между этапами и откатами (требование владельца). Снимаются:
+    /// мёртвая ячейка (любого слота — она блокирует разворот кика
+    /// навсегда, #397) и тест-слот (тестировщик — прежний канон свежей
+    /// сессии на входе; мастер-сессии тестера — скоуп #1607); спавн/
+    /// респавн несёт свежий промпт. Изоляция этапов и задач сохранена: план/код/
+    /// тест-ревью — три разные сессии (п.1 постановки дословно), чужая
+    /// задача — чужая строка. Unknown (serve недоступен) мёртвой не
+    /// считается — консервативно, dead-детект wakeup-пути подхватит
+    /// строку на следующем тике.
     /// Возвращает очищенный клон строки (тик работает с ним как с тенью).
     async fn transition_clear_slot(
         &self,
         board: &BoardPlan,
         task: &Task,
         slot: Slot,
-        log_event: &'static str,
     ) -> UsecaseResult<Option<Task>> {
         let Some(session) = task.session_of(slot) else {
+            // первое вхождение в стадию: ячейки нет — спавн понесёт промпт
             return Ok(None);
         };
-        if matches!(slot, Slot::Design | Slot::Dev)
+        // Тест-слот (тестировщик) — прежний канон: сессия снимается на
+        // каждом входе в Testing (мастер-сессии тестера — скоуп #1607,
+        // не этой задачи). Остальные слоты: снимается только мёртвая.
+        let keep = slot != Slot::Test
             && self
                 .sessions
                 .project(&board.project)
                 .liveness(session)
                 .await
-                != Liveness::Dead
-        {
+                != Liveness::Dead;
+        if keep {
+            if slot.is_review() {
+                // Мастер-сессия ревьювера живёт: новый цикл = компакт +
+                // раунд-промпт в неё же (срез 2 #1626). Доставка —
+                // wakeup-путём (пик/CUP-гейты, ретрай, lost-маршрутизация):
+                // pending-маркер в state.
+                self.state
+                    .set_round_reentry_pending(&board.board, task.number());
+                tracing::info!(
+                    event = "stage.reentry_keep",
+                    number = task.number(),
+                    slot = naming::slot_key(slot),
+                    session = %session,
+                    "Re-entry в ревью-стадию: сессия сохранена — компакт и раунд-промпт доставляются в неё же"
+                );
+            }
             return Ok(None);
         }
         self.board
@@ -1195,10 +1256,11 @@ impl TickUseCase {
         // новый раунд: кулдаун прошлого не переносится
         self.state.clear_spawn_ms(&board.board, task.number(), slot);
         tracing::info!(
-            event = log_event,
+            event = "stage.dead_cell_cleared",
             number = task.number(),
             slot = naming::slot_key(slot),
-            "Переход стадии: сессия слота снята — раунд с новой сессией"
+            session = %session,
+            "Переход стадии: ячейка снята (мёртвая сессия либо тест-слот) — спавн с новым промптом"
         );
         Ok(Some(cleared))
     }
@@ -1216,10 +1278,11 @@ impl TickUseCase {
         cup: CupGate,
         out: &mut TickOutcome,
     ) -> UsecaseResult<StallAct> {
-        let Some(slot) = task.stage_slot() else {
-            return Ok(StallAct::None);
-        };
-        let Some(session) = task.session_of(slot).map(str::to_string) else {
+        // без слота или сессии на слоте сталл не определён — тихий пропуск
+        let Some((slot, session)) = task
+            .stage_slot()
+            .and_then(|slot| task.session_of(slot).map(|s| (slot, s.to_string())))
+        else {
             return Ok(StallAct::None);
         };
         // нет данных/ошибка чтения — не сталл (мёртвую сессию заберёт decide);
@@ -1280,34 +1343,37 @@ impl TickUseCase {
         if prev_status != Some(task.status()) {
             count = 0;
         }
-        // Раунд из-под рестарта недействителен (инцидент 18.11 #1281):
-        // persisted каунтеры volume переживают пересоздание контейнера,
-        // эскалация по ним паркует живые сессии без единого доставленного
-        // в этом процессе пинга. Пинги, отправленные до boot_ms, текущим
-        // процессом не доставлялись — сброс персистится на носителе
-        // (иначе mark_stall_ping инкрементит stale-каунтер: эскалация
-        // после одного пинга, счётчик с чужими пингами).
-        if count > 0 && last_ping < self.boot_ms {
-            tracing::info!(
-                event = "stall.round_stale",
-                number = task.number(),
-                "Сталл-раунд пережил рестарт — сброс на носителе, свежий раунд пингов"
-            );
-            self.state.clear_stall(&board.board, task.number());
-            count = 0;
-        }
+        // Раунд сталла переживает рестарт (#1585, ветка А — санкция
+        // владельца 24.11: «Рестарт не должен приводить к потерям»; сброс
+        // `round_stale` снесён): счётчик и метка пинга остаются
+        // действительными — сессия та же (мастер-сессия #1626), тишина та
+        // же. Инвариант #1281 сохранён: эскалация требует пинга,
+        // доставленного ТЕКУЩИМ процессом — сталый раунд (последний пинг
+        // до boot) не эскалирует и не зовёт судью; доставляется один
+        // бутстрап-пинг, дальше контур идёт обычным ходом (см.
+        // stall_action).
+        let stale_round = count > 0 && last_ping < self.boot_ms;
         let now = self.clock.now_ms();
         if count > 0 && now.saturating_sub(last_ping) < every {
             return Ok(StallAct::None);
         }
+        // Лимитный гейт (#1477): до пингов/судьи — см. quota_gate.
+        if let Some(quota) = &self.quota {
+            if let Some(act) = self.quota_gate(quota, task, out).await {
+                return Ok(act);
+            }
+        }
         // Контур судьи (#1364): тот же гейтинг (тишина, раунд по статусу,
-        // интервал повторов, рестарт-инвариант #1281), решение — вердикт
-        // decision-модели вместо пингов/автопаркинга. Err вызова — fallback
-        // на старую механику ниже: судья — улучшение, не зависимость.
-        // Стадии вне матрицы (ReviewTesting #1413 — вердикт тест-ревьювера)
-        // остаются на пингах старой механики: вызов судьи там сжёг бы API —
-        // любой вердикт гард отклоняет (judge_stage).
-        if judge_here {
+        // интервал повторов), решение — вердикт decision-модели вместо
+        // пингов/автопаркинга. Err вызова — fallback на старую механику
+        // ниже: судья — улучшение, не зависимость. Стадии вне матрицы
+        // (ReviewTesting #1413 — вердикт тест-ревьювера) остаются на
+        // пингах старой механики: вызов судьи там сжёг бы API — любой
+        // вердикт гард отклоняет (judge_stage). Сталый раунд (#1585)
+        // судье не отдаётся: гард ForceEscalate решает по каунтерам,
+        // доставленным прошлым процессом — сначала бутстрап-пинг (#1281
+        // инвариант), судья на следующих проходах.
+        if judge_here && !stale_round {
             let call = JudgeCall {
                 board,
                 task,
@@ -1319,11 +1385,67 @@ impl TickUseCase {
             };
             return self.judge_stall_action(&call, soft, now, cup, out).await;
         }
+        // Бутстрап-пинг сталого раунда (#1585 + инвариант #1281): раунд
+        // пережил рестарт без сброса, но эскалация требует доставки в
+        // этом процессе — один пинг, дальше контур идёт обычным ходом.
+        if stale_round {
+            return self
+                .stall_ping_round(board, task, slot, &session, soft, silence, now, cup)
+                .await;
+        }
         self.stall_action(board, task, slot, &session, soft, silence, count, now, cup)
             .await
     }
 
-    /// Действие сталл-раунда: эскалация владельцу (пинги исчерпаны),
+    /// Лимитный гейт (#1477): исчерпание окна подписки — простой ходов
+    /// нормативный, не сбой сессии. Каунтеры раунда не пишутся
+    /// (пост-резетный пинг не задерживается), вердикт судьи на лимитной
+    /// тишине не сжигается. Err пробы — None: старая механика немедленно,
+    /// отказ пробы не парализует эскалацию сталл-детекта (проба —
+    /// улучшение, не зависимость).
+    async fn quota_gate(
+        &self,
+        quota: &Arc<dyn QuotaProbe>,
+        task: &Task,
+        out: &mut TickOutcome,
+    ) -> Option<StallAct> {
+        match quota.probe().await {
+            Ok(snapshot) if snapshot.exhausted => {
+                // пауза — норма контура (#1477): info, как stall.soft_pinged,
+                // а не уровень эскалации; атрибуты — значениями, не Debug
+                tracing::info!(
+                    event = "stall.limit_paused",
+                    number = task.number(),
+                    window_pct = snapshot
+                        .window_pct
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "none".into()),
+                    reset_at_ms = snapshot
+                        .reset_at_ms
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "none".into()),
+                    "Лимитная тишина: окно подписки исчерпано — строка на паузе \
+                     без эскалации, продолжит после спада процента"
+                );
+                out.limit_paused += 1;
+                Some(StallAct::LimitPaused)
+            }
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(
+                    event = "stall.quota_probe_err",
+                    number = task.number(),
+                    error = %e,
+                    "Проба квоты недоступна — лимитный гейт пропущен, \
+                     сталл-механика живёт как раньше"
+                );
+                None
+            }
+        }
+    }
+
+    /// Действие сталл-раунда (сталые раунды сюда не доходят — бутстрап
+    /// выше, #1585/#1281): эскалация владельцу (пинги исчерпаны),
     /// мягкий пинг прямым промптом (ход завершён) или классический
     /// коммент-автопинг (ход, возможно, идёт).
     #[allow(clippy::too_many_arguments)]
@@ -1506,9 +1628,9 @@ impl TickUseCase {
     /// вердиктом (судья видит ленту — «цикл не сходится»). Два исхода:
     /// паркинг (вердикт Needs attention — дайджест с факторами вердикта)
     /// или «ещё раунд» (без мутаций — раунды считаются дальше, следующий
-    /// cap-переход переспросит). Промптов сессиям здесь нет: review-слот
-    /// очищен round_transition'ом до вызова — будить осиротевшую ревью-
-    /// сессию = дубль активного агента (ревью C3). Форс-паркинг без вызова:
+    /// cap-переход переспросит). Промптов сессиям здесь нет в любом
+    /// исходе: следующий цикл доставляет раунд-промпт мастер-сессии
+    /// (#1626), при паркинге строка снята с тика. Форс-паркинг без вызова:
     /// раунды CAP + escalate_after (escalate_after=0 — гвард выключен,
     /// семантика judge_step — ревью L4). Err — fallback на автопаркинг.
     /// true — строка снята с тика.
@@ -2021,6 +2143,9 @@ impl TickUseCase {
                     number = task.number(),
                     active = cup.active_now,
                     cap = cup.policy.cup,
+                    // мягкий пинг достижим только при сессии на слоте
+                    // стадии — тир продолжений всегда
+                    tier = "continuation",
                     "Мягкий пинг отложен: CUP cap — запуск хода ждёт слот"
                 );
                 return Ok(StallAct::Deferred);

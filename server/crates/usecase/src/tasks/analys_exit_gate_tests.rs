@@ -89,6 +89,10 @@ impl TaskBoardRepo for GateBoard {
         Ok(())
     }
 
+    async fn set_pr(&self, _: &str, _: u64, _: &uwuwu_domain::PrUrl) -> UsecaseResult<()> {
+        Ok(())
+    }
+
     async fn clear_session(&self, _: &str, _: u64, _: Slot) -> UsecaseResult<()> {
         Ok(())
     }

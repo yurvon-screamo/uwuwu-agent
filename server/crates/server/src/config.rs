@@ -80,6 +80,25 @@ pub struct NotifyCfg {
     pub tg_chat_id: i64,
 }
 
+/// Проба квоты подписки провайдера моделей (#1477): гейт лимитной тишины
+/// сталл-детекта. Секция отсутствует — off (safe default). Привязка к
+/// провайдеру — только конфигом (требование владельца 23.11.2026:
+/// «запаковать за трейты») — ядро конвейера видит трейт QuotaProbe.
+#[derive(Debug, Clone, Deserialize)]
+pub struct QuotaCfg {
+    /// База лимит-эндпоинта (без хвостового слэша).
+    pub base_url: String,
+    /// Путь лимит-эндпоинта.
+    #[serde(default = "default_quota_path")]
+    pub path: String,
+    /// Имя env-переменной с ключом провайдера (секрет — env, не конфиг).
+    pub api_key_env: String,
+}
+
+fn default_quota_path() -> String {
+    "/api/monitor/usage/quota/limit".into()
+}
+
 /// Автокомпакт вечных сессий ботов (#1221, ADR-082): нативный compact
 /// по idle-политике в тике супервизора. Секция отсутствует — механика
 /// off (safe default, откат = снять секцию); провенанс дефолтов:
@@ -164,6 +183,9 @@ pub struct Config {
     /// Судья конвейера (#1364); нет секции — off (opt-in владельца).
     #[serde(default)]
     pub judge: Option<JudgeToml>,
+    /// Проба квоты подписки провайдера (#1477); нет секции — off.
+    #[serde(default)]
+    pub quota: Option<QuotaCfg>,
 }
 
 /// Секция `[judge]` (#1364): порты вызовов и тримы контекста. Ключ —
@@ -318,6 +340,13 @@ impl Config {
         }
         if self.policy.cup == 0 {
             return Err(ConfigError::Validation("cup = 0 (конвейер стоит)".into()));
+        }
+        // [quota] (#1477): пустой base_url — включённая секция, которая
+        // молча не работает (Err пробы на каждый гейт) — громче на старте
+        if let Some(q) = &self.quota {
+            if q.base_url.trim().is_empty() {
+                return Err(ConfigError::Validation("[quota] base_url пуст".into()));
+            }
         }
         // env-gc (#1431): снос обязан успевать до архивации строки в
         // холодный ящик — иначе env уходит в сироты вне досягаемости
@@ -973,5 +1002,29 @@ env_root = "/tmp/env"
                 String::from_utf8_lossy(&origin.stderr)
             );
         }
+    }
+
+    /// [quota] (#1477, ревью раунд 3 L5): validate видит секцию — пустой
+    /// base_url это громкий отказ старта, а не молчаливо неработающая
+    /// включённая секция (Err пробы на каждый гейт).
+    #[test]
+    fn quota_validate_rejects_empty_base_url() {
+        let good = format!(
+            "{}\n[quota]\nbase_url = \"https://api.z.ai\"\npath = \"/api/monitor/usage/quota/limit\"\napi_key_env = \"UWUWU_ZAI_API_KEY\"\n",
+            example()
+        );
+        let cfg = toml::from_str::<Config>(&good).expect("toml парсится");
+        cfg.validate().expect("непустой base_url валиден");
+
+        let bad = format!(
+            "{}\n[quota]\nbase_url = \"\"\npath = \"/api/monitor/usage/quota/limit\"\napi_key_env = \"UWUWU_ZAI_API_KEY\"\n",
+            example()
+        );
+        let cfg = toml::from_str::<Config>(&bad).expect("toml парсится");
+        let err = cfg.validate().expect_err("пустой base_url должен падать");
+        assert!(
+            err.to_string().contains("base_url"),
+            "validate называет причину: {err}"
+        );
     }
 }

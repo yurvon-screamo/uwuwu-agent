@@ -87,6 +87,7 @@ fn analyst_review_wave(cup: usize) -> AnalystReviewUseCase {
         clock: Arc::new(FixedClock),
         models: Arc::new(SpawnModels::canonical()),
         cup,
+        compact: None,
     }
 }
 

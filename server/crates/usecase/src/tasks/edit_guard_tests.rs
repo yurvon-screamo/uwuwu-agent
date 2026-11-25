@@ -82,6 +82,9 @@ impl TaskBoardRepo for StaleBoard {
     async fn set_branch(&self, _: &str, _: u64, _: &BranchName) -> UsecaseResult<()> {
         Ok(())
     }
+    async fn set_pr(&self, _: &str, _: u64, _: &uwuwu_domain::PrUrl) -> UsecaseResult<()> {
+        Ok(())
+    }
     async fn set_board_cells(
         &self,
         _b: &str,
@@ -266,6 +269,11 @@ impl TickStateStore for NopState {
     fn clear_lost_session(&self, _: &str, _: u64) {}
 
     fn clear_spawn_ms(&self, _: &str, _: u64, _: Slot) {}
+    fn round_reentry_pending(&self, _: &str, _: u64) -> bool {
+        false
+    }
+    fn set_round_reentry_pending(&self, _: &str, _: u64) {}
+    fn clear_round_reentry_pending(&self, _: &str, _: u64) {}
 
     fn last_analys_ms(&self, _: &str, _: u64) -> Option<u64> {
         None
@@ -317,6 +325,22 @@ impl TickStateStore for NopState {
     }
 
     fn mark_own_comment(&self, _: &str, _: u64) {}
+
+    fn master_binding(&self, _: &str, _: &str) -> Option<(String, String, String)> {
+        None
+    }
+
+    fn set_master_binding(&self, _: &str, _: &str, _: &str, _: &str, _: &str) {}
+
+    fn master_compact_ms(&self, _: &str, _: &str) -> u64 {
+        0
+    }
+
+    fn set_master_compact_ms(&self, _: &str, _: &str, _: u64) {}
+
+    fn prune_master_role(&self, _: &str, _: &std::collections::HashSet<String>) -> bool {
+        false
+    }
 
     fn save(&self) -> UsecaseResult<()> {
         Ok(())
