@@ -7,6 +7,8 @@
 #![allow(dead_code)]
 
 pub mod form;
+pub mod github_rig;
+pub mod github_stand;
 
 use std::process::{Command, Stdio};
 
