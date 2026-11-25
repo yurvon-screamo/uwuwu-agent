@@ -216,6 +216,7 @@ impl TaskBoardRepo for FakeBoard {
         _priority: Option<&str>,
         _automerge: Option<bool>,
         _direct: Option<bool>,
+        _fact_track: Option<bool>,
     ) -> UsecaseResult<()> {
         todo!("не используется проходом env-gc")
     }

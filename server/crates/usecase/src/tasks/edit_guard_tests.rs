@@ -92,6 +92,7 @@ impl TaskBoardRepo for StaleBoard {
         _p: Option<&str>,
         _a: Option<bool>,
         _d: Option<bool>,
+        _f: Option<bool>,
     ) -> UsecaseResult<()> {
         Ok(())
     }
@@ -172,6 +173,26 @@ impl IssueFieldStore for FilledFields {
         Ok(std::collections::HashMap::from([
             (crate::naming::F_PRIORITY.to_string(), "medium".to_string()),
             (crate::naming::F_AUTOMERGE.to_string(), "on".to_string()),
+        ]))
+    }
+
+    async fn store(&self, _: u64, _: &[(&str, Option<String>)]) -> UsecaseResult<()> {
+        Ok(())
+    }
+}
+
+/// fact_track-строка (#1631): носитель несёт FactTrack=on — гард
+/// открывает ребро ReviewResult → Review и закрывает входы в
+/// тест-контур только этой строке.
+struct FactTrackFields;
+
+#[async_trait]
+impl IssueFieldStore for FactTrackFields {
+    async fn load(&self, _: u64) -> UsecaseResult<std::collections::HashMap<String, String>> {
+        Ok(std::collections::HashMap::from([
+            (crate::naming::F_PRIORITY.to_string(), "medium".to_string()),
+            (crate::naming::F_AUTOMERGE.to_string(), "on".to_string()),
+            (crate::naming::F_FACT_TRACK.to_string(), "on".to_string()),
         ]))
     }
 
@@ -480,6 +501,83 @@ async fn ordinary_row_cannot_skip_to_review() {
         "мутации не должно быть: {:?}",
         board.writes()
     );
+}
+
+#[tokio::test]
+async fn fact_track_row_finishes_to_review() {
+    // #1631: fact_track-строка после код-ревью идёт сразу на приёмку —
+    // ReviewResult → Review с флагом FactTrack=on на носителе.
+    let board = Arc::new(StaleBoard {
+        snapshot: vec![StaleBoard::task(11, Status::ReviewResult)],
+        carrier: vec![StaleBoard::task(11, Status::ReviewResult)],
+        cached: vec![StaleBoard::task(11, Status::ReviewResult)],
+        writes: Mutex::new(vec![]),
+    });
+    writer_with(board.clone(), Arc::new(FactTrackFields))
+        .edit(
+            "uwuwu",
+            11,
+            TaskPatch {
+                status: Some(Status::UserReview),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("fact_track-ребро ReviewResult → Review открыто флагом");
+    assert_eq!(board.writes(), vec![(11, Status::UserReview)]);
+}
+
+#[tokio::test]
+async fn fact_track_row_cannot_enter_testing() {
+    // #1631, негативы: тест-контур fact_track-строке закрыт — гард
+    // режет и прямую отправку, и вердиктный вход; мутации нет.
+    for from in [Status::InProgress, Status::ReviewResult] {
+        let board = Arc::new(StaleBoard {
+            snapshot: vec![StaleBoard::task(11, from)],
+            carrier: vec![StaleBoard::task(11, from)],
+            cached: vec![StaleBoard::task(11, from)],
+            writes: Mutex::new(vec![]),
+        });
+        let res = writer_with(board.clone(), Arc::new(FactTrackFields))
+            .edit(
+                "uwuwu",
+                11,
+                TaskPatch {
+                    status: Some(Status::Testing),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(res.is_err(), "{from:?} → Testing закрыто флагом");
+        assert!(
+            board.writes().is_empty(),
+            "мутации не должно быть: {:?}",
+            board.writes()
+        );
+    }
+}
+
+#[tokio::test]
+async fn ordinary_row_still_enters_testing() {
+    // Без флага запреты #1631 не действуют — канон UC-01 побайтово:
+    // обычная строка из ReviewResult уходит в Testing.
+    let board = Arc::new(StaleBoard {
+        snapshot: vec![StaleBoard::task(11, Status::ReviewResult)],
+        carrier: vec![StaleBoard::task(11, Status::ReviewResult)],
+        cached: vec![StaleBoard::task(11, Status::ReviewResult)],
+        writes: Mutex::new(vec![]),
+    });
+    writer_with(board.clone(), Arc::new(FilledFields))
+        .edit(
+            "uwuwu",
+            11,
+            TaskPatch {
+                status: Some(Status::Testing),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("без флага ReviewResult → Testing легально");
 }
 
 #[tokio::test]

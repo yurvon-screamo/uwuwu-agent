@@ -207,7 +207,8 @@ pub fn tool_descriptors() -> Value {
                 "type": string(&type_enum_list()),
                 "priority": string("high|medium|low; default medium"),
                 "automerge": json!({"type":"boolean","description":"automerge: merge the PR on entering Review, the row stays in Review; default true (direct — false)"}),
-                "direct": json!({"type":"boolean","description":"direct task (#1357): row goes straight to In Progress, the agent finalizes to Review itself bypassing factory stages. Only on the owner's direct order — verbatim quote of the order in the body; default false"})
+                "direct": json!({"type":"boolean","description":"direct task (#1357): row goes straight to In Progress, the agent finalizes to Review itself bypassing factory stages. Only on the owner's direct order — verbatim quote of the order in the body; default false"}),
+                "fact_track": json!({"type":"boolean","description":"fact_track task (#1631): shortened pipe without Design and Testing — only In Progress → Result review → Review. Create-only, immutable, mutually exclusive with direct; default false"})
             }))
         ),
         tool(
@@ -470,7 +471,7 @@ impl ToolHub {
         let number = need_number(args)?;
         let view = self.tasks.card(project, number).await.map_err(view_err)?;
         let mut out = format!(
-            "#{} {} — {}\n\n--- fm ---\nbranch: {}\npr: {}\nautomerge: {}\ndirect: {}\ntype: {}\nbody_hash: {}\n\n",
+            "#{} {} — {}\n\n--- fm ---\nbranch: {}\npr: {}\nautomerge: {}\ndirect: {}\nfact_track: {}\ntype: {}\nbody_hash: {}\n\n",
             view.task.number(),
             view.task.title(),
             uwuwu_usecase::status_name(view.task.status()),
@@ -478,6 +479,7 @@ impl ToolHub {
             view.task.pr().map(|u| u.as_str()).unwrap_or("—"),
             view.task.automerge(),
             view.task.direct(),
+            view.task.fact_track(),
             // канонное имя (словарь MCP-поверхности); None — «—» как
             // branch/pr (native-null хвост, дефолт Task; #1271)
             view.task
@@ -665,6 +667,12 @@ impl ToolHub {
             .get("direct")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // fact_track-класс (#1631): укороченный пайп; create-only,
+        // immutable; с direct взаимоисключающ — отказ ниже, в юзкейсе
+        let fact_track = args
+            .get("fact_track")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         // direct-строке дефолт off (план #1357, развилка 5): мерж только по
         // явному мандату владельца (automerge: true в create-вызове), не по
         // умолчанию конвейера. Не-boolean значение (null не считается —
@@ -688,6 +696,7 @@ impl ToolHub {
             priority: arg_str(args, "priority"),
             automerge,
             direct,
+            fact_track,
         };
         let n = self
             .writer
@@ -696,6 +705,8 @@ impl ToolHub {
             .map_err(|e| e.to_string())?;
         ok_text(if direct {
             format!("direct task #{n} created (In Progress) on the {project} board")
+        } else if fact_track {
+            format!("fact_track task #{n} created (Analys) on the {project} board")
         } else {
             format!("task #{n} created (Analys) on the {project} board")
         })
@@ -1387,6 +1398,11 @@ mod tests {
             &json!({ "number": 1, "text": "т", "project": "uwuwu" })
         )
         .is_ok());
+        // fact_track create-only (#1631): ключ вне схемы task_edit —
+        // чужой ключ отвергается гардом #1572 до мутации
+        let err = refuse_unknown_args("task_edit", &json!({ "number": 1, "fact_track": true }))
+            .expect_err("fact_track в task_edit — отказ");
+        assert!(err.contains("fact_track"), "чужой ключ назван: {err}");
     }
 
     /// Пин разбиения поверхности (ревью #1572, Common): каждый тул
