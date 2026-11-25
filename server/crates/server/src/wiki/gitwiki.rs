@@ -66,13 +66,23 @@ impl GitWikiWriter {
         UsecaseError::Board(format!("gitwiki: {msg}"))
     }
 
-    /// Читает текущее содержимое файла (None — файла нет).
+    /// Читает текущее содержимое файла; на Contents-404 сверяется со
+    /// свежим деревом: None — файла нет и в дереве (#1653).
     pub async fn read(&self, path: &str) -> UsecaseResult<Option<String>> {
         let (status, body) = self
             .call(reqwest::Method::GET, &contents_url(&self.repo, path), None)
             .await?;
         if status.as_u16() == 404 {
-            return Ok(None);
+            // #1653: append не должен отказывать ложным AppendMissing
+            // по устаревшему Contents-чтению; дерево — свежий свидетель.
+            return crate::wiki::witness::TreeWitness {
+                http: &self.http,
+                token: &self.token,
+                repo: &self.repo,
+                branch: &self.branch,
+            }
+            .read(path)
+            .await;
         }
         if !status.is_success() {
             return Err(Self::err(format!("read {path}: HTTP {status}")));
@@ -166,6 +176,9 @@ impl GitWikiWriter {
         let fast_forward =
             status.is_success() && resp["object"]["sha"].as_str() == Some(new_sha.as_str());
         if !fast_forward {
+            // #1653: сразу после своего коммита GitHub изредка отвечает
+            // 422 без конкурента. Повтор мутации рискует гонкой, поэтому
+            // отказ честный (ADR-093, #1353) — окно описано в задаче.
             return Err(Self::err(format!(
                 "update_ref {path}: not fast-forward (HTTP {status}) — a competing commit"
             )));

@@ -177,7 +177,16 @@ impl WikiRepo for GitHubWiki {
             ))
             .await?;
         if status.as_u16() == 404 {
-            return Ok(None);
+            // #1653: Contents отстаёт от git-data-коммита; до вердикта
+            // «дока нет» спрашиваем свежее дерево и читаем blob по sha.
+            return crate::wiki::witness::TreeWitness {
+                http: &self.http,
+                token: &self.token,
+                repo: &self.repo,
+                branch: &self.branch,
+            }
+            .read(&path)
+            .await;
         }
         if !status.is_success() {
             return Err(UsecaseError::Board(format!("read «{slug}»: HTTP {status}")));
