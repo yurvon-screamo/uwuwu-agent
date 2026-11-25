@@ -35,6 +35,9 @@
 #     сессию, без компакта) + мастер-сессия аналитика (волна пачкой →
 #     привязка в state.json → вторая волна reuse) + компакт-проход
 #     (адмиссия idle-сессии + метка коулдауна).
+#   фаза 17 (#1619): вопрос из Design → Needs attention; ответ владельца
+#     через агента (аргумент owner_answer) возвращает строку в Design без
+#     ручного флипа; без ответа и с пробелами — громкий отказ гейта.
 #
 # Запуск: server/ops/stand/e2e.sh   (из каталога server; cargo build сам)
 # Выход: 0 — ок; 1 — провал с диагнозом. Логи/state/config — mktemp-рандир
@@ -1497,4 +1500,51 @@ SRV_PID=""; MOCK_PID=""
 sleep 1
 say "фаза 16 ок: мастер-тестер (1 спавн + re-entry wake) + мастер-аналитик (spawn/bind/reuse) + компакт-проход"
 
-say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри и семейство-непрерывностью сессий #1237 + мульти-экзекьютор + гард #1163 + self-эхо в прод-геометрии #1237 + слепой hold #1263 + преемпшен CUP #1259 + давка-волна #1412 + клин #1293 + дример #1306 + phantom-квитанции #1331 + lost-сессия #1288: десинк-парковка + lost-resurrection + env-gc #1431 + судья #1364 + мастер-сессии и компакт #1607); логи: $RUN_DIR"
+say "фаза 17: ответ владельца через агента снимает Needs attention (#1607/#1619)"
+# Свой стек: строка ушла в Needs attention из Design по вопросу агента,
+# ответ владельца пришёл в чат (моделируется аргументом owner_answer).
+# Без ответа ребро закрыто, с ответом — возврат в стадию-источник.
+kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+SRV_PID=""; MOCK_PID=""
+sleep 1
+rm -f "$STATE"
+LOG_SRV_1619="$RUN_DIR/server-1619.log"
+MOCK_MODE=plain MOCK_PORT=$PORT_MOCK MOCK_MCP_URL="http://127.0.0.1:$PORT_SRV" \
+  MOCK_MCP_TOKEN="$BEARER" MOCK_STEP_MS=300 \
+  "$BIN_MOCK" >"$LOG_MOCK" 2>&1 &
+MOCK_PID=$!
+sleep 1
+UWUWU_SERVER_CONFIG=$CONFIG UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
+  UWUWU_SERVER_MODE=live \
+  UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
+  UWUWU_MOCK_SEED="2063:Design" \
+  RUST_LOG=info "$BIN_SRV" >"$LOG_SRV_1619" 2>&1 &
+SRV_PID=$!
+sleep 5
+mcp task_get '{"number":2063}' | grep -q '"isError":false' \
+  || fail "сид 2063 не прочитан (фаза 17)"
+mcp task_edit '{"number":2063,"project":"uwuwu","status":"Needs attention"}' | grep -q '"isError":false' \
+  || fail "Design → Needs attention не применился (фаза 17)"
+NEG=$(mcp task_edit '{"number":2063,"project":"uwuwu","status":"Design"}')
+printf '%s' "$NEG" | grep -q '"isError":true' \
+  || fail "снятие без ответа не отклонено (фаза 17)"
+printf '%s' "$NEG" | grep -q 'owner_answer' \
+  || fail "отказ не называет ключ owner_answer (фаза 17)"
+NEG_EMPTY=$(mcp task_edit '{"number":2063,"project":"uwuwu","status":"Design","owner_answer":"   "}')
+printf '%s' "$NEG_EMPTY" | grep -q '"isError":true' \
+  || fail "пробельный ответ принят как факт (фаза 17)"
+mcp task_edit '{"number":2063,"project":"uwuwu","status":"Design","owner_answer":"владелец: делай как в чате"}' | grep -q '"isError":false' \
+  || fail "возврат с ответом владельца отклонён (фаза 17)"
+# task_get читает снапшот доски с TTL и может отстать на считанные милли-
+# секунды после записи (#1258/#1437); независимое доказательство — событие
+# гарда, принявшего ребро по свежему носителю.
+grep -q '"event":"board.status_transition","number":2063,"from":"Needs attention","to":"Design"' "$LOG_SRV_1619" \
+  || fail "гард не зафиксировал возврат Needs attention → Design (фаза 17)"
+kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
+SRV_PID=""; MOCK_PID=""
+sleep 1
+say "фаза 17 ок: NA → Design с owner_answer без ручного флипа; без ответа и с пробелами — отказ"
+
+say "ИТОГ: E2E зелёный (observe-чистота + полный цикл с ре-энтри и семейство-непрерывностью сессий #1237 + мульти-экзекьютор + гард #1163 + self-эхо в прод-геометрии #1237 + слепой hold #1263 + преемпшен CUP #1259 + давка-волна #1412 + клин #1293 + дример #1306 + phantom-квитанции #1331 + lost-сессия #1288: десинк-парковка + lost-resurrection + env-gc #1431 + судья #1364 + мастер-сессии и компакт #1607 + ответ владельца из NA #1619); логи: $RUN_DIR"
