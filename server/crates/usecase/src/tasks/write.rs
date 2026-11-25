@@ -445,8 +445,7 @@ impl TaskWriter for TaskWriteUseCase {
         let mut owner_answer_ignored = false;
         if let Some(status) = patch.status {
             let answer = patch.owner_answer.as_deref();
-            let (current, answer_used) =
-                self.guard_canon(&board, number, status, answer).await?;
+            let (current, answer_used) = self.guard_canon(&board, number, status, answer).await?;
             owner_answer_ignored = answer.is_some() && !answer_used;
             // Гейт полноты полей на выходе из Analys (#1280): волна
             // аналитики обязана выпускать строки с явными Приоритетом
@@ -1144,12 +1143,7 @@ impl TaskWriteUseCase {
             // повторной fresh-сверки нет — канон-проверка по нему
             GuardView::Fresh(current) => {
                 let (direct, fact_track) = self.carrier_flags(number, current, status).await;
-                if uwuwu_domain::Status::can_transition_with(
-                    current,
-                    status,
-                    direct,
-                    fact_track,
-                ) {
+                if uwuwu_domain::Status::can_transition_with(current, status, direct, fact_track) {
                     return Ok((current, false));
                 }
                 if uwuwu_domain::Status::can_transition_with_answer(
@@ -1163,16 +1157,17 @@ impl TaskWriteUseCase {
                 }
                 // отказ: кеш-вида как источника здесь нет (рид был свежим
                 // или кеш нечитаем) — расхождению докладывать нечего
-                Err(Self::reject_canon(number, current, None, status, owner_answer))
+                Err(Self::reject_canon(
+                    number,
+                    current,
+                    None,
+                    status,
+                    owner_answer,
+                ))
             }
             GuardView::Cached(cached) => {
                 let (direct, fact_track) = self.carrier_flags(number, cached, status).await;
-                if uwuwu_domain::Status::can_transition_with(
-                    cached,
-                    status,
-                    direct,
-                    fact_track,
-                ) {
+                if uwuwu_domain::Status::can_transition_with(cached, status, direct, fact_track) {
                     return Ok((cached, false));
                 }
                 if uwuwu_domain::Status::can_transition_with_answer(
@@ -1190,18 +1185,15 @@ impl TaskWriteUseCase {
                     self.board.fresh_row_status(board, number).await?,
                 )?;
                 let (direct, fact_track) = self.carrier_flags(number, fresh, status).await;
-                let answer_used = !uwuwu_domain::Status::can_transition_with(
-                    fresh,
-                    status,
-                    direct,
-                    fact_track,
-                ) && uwuwu_domain::Status::can_transition_with_answer(
-                    fresh,
-                    status,
-                    direct,
-                    fact_track,
-                    owner_answer,
-                );
+                let answer_used =
+                    !uwuwu_domain::Status::can_transition_with(fresh, status, direct, fact_track)
+                        && uwuwu_domain::Status::can_transition_with_answer(
+                            fresh,
+                            status,
+                            direct,
+                            fact_track,
+                            owner_answer,
+                        );
                 if !uwuwu_domain::Status::can_transition_with_answer(
                     fresh,
                     status,
@@ -1259,7 +1251,7 @@ impl TaskWriteUseCase {
         }
         let hint = if fresh == Status::NeedsAttention
             && !uwuwu_domain::Status::can_transition(fresh, to)
-            && owner_answer.map_or(true, |answer| answer.trim().is_empty())
+            && owner_answer.is_none_or(|answer| answer.trim().is_empty())
         {
             // #1619: самообучающий отказ доезжает до живого агента, даже
             // если его сессия заспавнена до деплоя новой клаузы промпта.
