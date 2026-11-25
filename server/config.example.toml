@@ -40,7 +40,7 @@ code-quality-reviewer = "zai-coding-plan/glm-5.4#high"
 tester = "zai-coding-plan/glm-5.3-flash#high"
 test-reviewer = "zai-coding-plan/glm-5.4#high"
 analyst = "zai-coding-plan/glm-5.3-flash#high"
-analyst-reviewer = "zai-coding-plan/glm-5.3-flash#high"
+analyst-reviewer = "zai-coding-plan/glm-5.4#high"
 dreamer = "zai-coding-plan/glm-5.3-flash#high"
 
 [policy]

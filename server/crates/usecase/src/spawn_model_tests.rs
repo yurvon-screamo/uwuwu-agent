@@ -52,7 +52,7 @@ impl AgentSessionGateway for CaptureSessions {
     async fn prompt(&self, _session: &str, _text: &str) -> UsecaseResult<()> {
         Ok(())
     }
-    async fn run_command(&self, _s: &str, _n: &str, _a: &str) -> UsecaseResult<()> {
+    async fn run_command(&self, _s: &str, _n: &str, _a: &str, _b: u64) -> UsecaseResult<()> {
         Ok(())
     }
     async fn liveness(&self, _s: &str) -> Liveness {
@@ -130,6 +130,11 @@ impl TickStateStore for NoopState {
     fn mark_lost_session(&self, _: &str, _: u64, _: Status) {}
     fn clear_lost_session(&self, _: &str, _: u64) {}
     fn clear_spawn_ms(&self, _b: &str, _n: u64, _s: Slot) {}
+    fn round_reentry_pending(&self, _b: &str, _n: u64) -> bool {
+        false
+    }
+    fn set_round_reentry_pending(&self, _b: &str, _n: u64) {}
+    fn clear_round_reentry_pending(&self, _b: &str, _n: u64) {}
     /// Аналитика: кулдауны волн/ревью и цикл-гварды (#1135).
     fn last_analys_ms(&self, _b: &str, _n: u64) -> Option<u64> {
         None
@@ -164,6 +169,17 @@ impl TickStateStore for NoopState {
         false
     }
     fn mark_own_comment(&self, _id: &str, _posted_ms: u64) {}
+    fn master_binding(&self, _: &str, _: &str) -> Option<(String, String, String)> {
+        None
+    }
+    fn set_master_binding(&self, _: &str, _: &str, _: &str, _: &str, _: &str) {}
+    fn master_compact_ms(&self, _: &str, _: &str) -> u64 {
+        0
+    }
+    fn set_master_compact_ms(&self, _: &str, _: &str, _: u64) {}
+    fn prune_master_role(&self, _: &str, _: &std::collections::HashSet<String>) -> bool {
+        false
+    }
     fn save(&self) -> UsecaseResult<()> {
         Ok(())
     }
@@ -205,6 +221,7 @@ impl TaskBoardRepo for RowsBoard {
         _priority: Option<&str>,
         _automerge: Option<bool>,
         _direct: Option<bool>,
+        _fact_track: Option<bool>,
     ) -> UsecaseResult<()> {
         Ok(())
     }
@@ -336,6 +353,7 @@ async fn analyst_review_spawn_carries_model_from_server_map() {
         clock: Arc::new(TestClock),
         models: models(),
         cup: 7,
+        compact: None,
     };
 
     // Act
@@ -346,7 +364,7 @@ async fn analyst_review_spawn_carries_model_from_server_map() {
     assert_model(
         sessions.spec_of(),
         "ревью-спавн аналитики",
-        "zai-coding-plan/glm-5.3-flash#high",
+        "zai-coding-plan/glm-5.4#high",
     );
 }
 
@@ -390,6 +408,7 @@ async fn dreamer_spawn_carries_model_from_server_map() {
     // Arrange: уснувшая dev-сессия с финалом и реальной работой
     let sessions = CaptureSessions::new(vec![SessionInfo {
         id: "ses_dev1".into(),
+        title: String::new(),
         agent: "developer".into(),
         directory: String::new(),
         updated_ms: 0,

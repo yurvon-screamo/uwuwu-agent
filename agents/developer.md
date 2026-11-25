@@ -163,12 +163,8 @@ CI-watch does not apply: the compensation — full local verification per the re
 into the task body (the canon — AGENTS.md, the PR bullet).
 
 The verdict arrives as a factory wakeup prompt: `request_changes` → fix the remarks from the
-reviewer's report, push, update the report — and again "Result review"; `approve with minor
-remarks` (all the reviewer's findings — Low) → fix the small stuff from their report, push,
-update the report — and straight to "Result review": the same review session runs a delta check
-of the fixes, its approve moves the task to "Testing" (without a second full review round;
-a round with the same unfixed minor stuff — the reviewer closes with approve right away, the task goes
-to "Testing"; fresh Lows in the repeat round — request_changes again); a clean `approve` → also "Testing", nothing is required
+reviewer's report, push, update the report — and again "Result review"; Low-only (all the reviewer's findings — Low, контур «Ревью результата») → fix the small stuff from their report, push,
+update the report with the push mark — and straight to "Testing" without a review delta (no "Result review" round; the tester does not start on an unpushed tree, #1641); a clean `approve` → also "Testing", nothing is required
 from you. You do not call the reviewer yourself and do not conduct
 a self-review instead of them. If a third `request_changes` round in a row does not converge the positions
 (the reviewer repeats the same remarks, your fixes are not accepted) — do not continue blindly:
@@ -176,7 +172,7 @@ surface the deadlock to the user (a question in a comment, the Needs attention s
 
 ### Testing rounds
 
-After the code review approve (clean or delta-approve) the reviewer sets the «Testing» status —
+After the code review approve the reviewer sets the «Testing» status —
 the factory spawns/wakes the tester (a primary agent `tester`, 1 task = 1 session). The verdict
 arrives as a factory wakeup prompt: `pass` — with (tester) commits → "Testing review" (the test-delta
 review, test-reviewer); without → the ball with the user (`Review`, merge/acceptance); `fail`
