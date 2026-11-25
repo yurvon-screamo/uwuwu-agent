@@ -5,7 +5,7 @@
 //! тексты отказов и ответов, чтобы дрейф вернуть нечем. Пробы через живой
 //! диспетчер на MemoryHub — без GitHub, как в tools_tests.rs.
 
-use super::test_support::{blob_usecase, tool_hub, StubCronState};
+use super::test_support::{blob_usecase, mcp_call, tool_hub, StubCronState};
 use super::tools::ToolHub;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -144,7 +144,7 @@ async fn docs_write_refuses_removed_cron_journal() {
         err.contains("writing refused") && err.contains("#1576"),
         "отказ без причины: {err}"
     );
-    // refill #1576 (тест-ревью Low-1): «отказ до мутации» для docs_write
+    // код-ревью Low-1 (#1576): «отказ до мутации» для docs_write
     // закреплён так же, как для docs_append — гард не должен переехать
     // после write_doc и оставить созданный файл при громком отказе.
     let err_read = call(&tools, "docs_read", json!({ "slug": slug }))
@@ -158,46 +158,17 @@ async fn docs_write_refuses_removed_cron_journal() {
 
 /// #1576 приёмка на проводе MCP: то, что видит живой агент-писатель —
 /// оба мутационных тула вики отвечают isError с текстом гарда, и носитель
-/// цел (тем же проводом journal-слаг не читается). Уровень выше диспетчера,
-/// по образцу пина #1572 `contentless_mutations_refuse_loudly_over_the_wire`.
+/// цел (тем же проводом journal-слаг не читается). Маршрутная интеграция
+/// in-memory (роутер + MemoryHub, без сокета), по образцу пина `mcp.rs`
+/// `contentless_mutations_refuse_loudly_over_the_wire_and_carrier_survives`.
 #[tokio::test]
 async fn removed_cron_journal_refuses_loudly_over_mcp_wire() {
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use http_body_util::BodyExt;
-    use tower::ServiceExt;
-
     let tools = hub();
     let state = Arc::new(super::McpState {
         bearer: Arc::new("t-bearer".into()),
         tools,
     });
     let app = super::mcp_router(state);
-
-    async fn call_tool(app: &axum::Router, name: &str, args: Value) -> Value {
-        let payload = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": { "name": name, "arguments": args }
-        });
-        let res = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/mcp")
-                    .header("authorization", "Bearer t-bearer")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let bytes = res.into_body().collect().await.unwrap().to_bytes();
-        serde_json::from_slice(&bytes).unwrap()
-    }
 
     for (name, args, slug) in [
         (
@@ -214,7 +185,7 @@ async fn removed_cron_journal_refuses_loudly_over_mcp_wire() {
             "cron/Sentry-ночной-просмотр/Журнал",
         ),
     ] {
-        let answer = call_tool(&app, name, args).await;
+        let answer = mcp_call(&app, "t-bearer", name, args).await;
         assert_eq!(
             answer["result"]["isError"],
             Value::Bool(true),
@@ -227,7 +198,7 @@ async fn removed_cron_journal_refuses_loudly_over_mcp_wire() {
             text.contains("writing refused") && text.contains("#1576"),
             "{name}: {text}"
         );
-        let read = call_tool(&app, "docs_read", json!({ "slug": slug })).await;
+        let read = mcp_call(&app, "t-bearer", "docs_read", json!({ "slug": slug })).await;
         assert_eq!(
             read["result"]["isError"],
             Value::Bool(true),
@@ -237,6 +208,60 @@ async fn removed_cron_journal_refuses_loudly_over_mcp_wire() {
             .as_str()
             .unwrap_or_default();
         assert!(read_text.contains("not found"), "{read_text}");
+    }
+}
+
+/// #1576 / Common-1 тест-ревью: инвариант развязки конфликта с мастером
+/// (#509 normalizes slug на write-путях). Гард обязан смотреть на слаг
+/// ПОСЛЕ нормализации: если при развязке `refuse` останется на сыром
+/// аргументе, формы `docs/cron/<имя>/Журнал`, с пробелами по краям, с
+/// ведущим `/` и с пустым сегментом станут каноническим журналом — пин
+/// краснеет чтением канонического слага. На ветке без #509 эти формы
+/// пишут по другим путям — пин зелёный и не ловит ложных срабатываний.
+#[tokio::test]
+async fn normalized_journal_slugs_do_not_recreate_removed_journal() {
+    let tools = hub();
+    let fm = "---\ntitle: X\ndate: 2026-11-25\n---\nPIN #1576";
+
+    // Чистая форма и .md-вариант отказывают текстом гарда.
+    for raw in ["cron/Нормализация/Журнал", "cron/Нормализация/Журнал.md"]
+    {
+        let err = call(&tools, "docs_write", json!({ "slug": raw, "content": fm }))
+            .await
+            .expect_err("журнал обязан отказать в любой форме");
+        assert!(
+            err.contains("writing refused") && err.contains("#1576"),
+            "{raw}: {err}"
+        );
+    }
+    let read = call(
+        &tools,
+        "docs_read",
+        json!({ "slug": "cron/Нормализация/Журнал" }),
+    )
+    .await
+    .expect_err("чистая форма создала журнал");
+    assert!(read.contains("not found"), "{read}");
+
+    // Нормализуемые формы: сам write может отказать или уйти по другому
+    // пути — важен инвариант: канонический журнал не читается.
+    for (i, shape) in [
+        "docs/cron/{name}/Журнал",
+        " cron/{name}/Журнал ",
+        "/cron/{name}/Журнал",
+        "cron//{name}/Журнал",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("Нормализация2-{i}");
+        let raw = shape.replace("{name}", &name);
+        let canonical = format!("cron/{name}/Журнал");
+        let _ = call(&tools, "docs_write", json!({ "slug": raw, "content": fm })).await;
+        match call(&tools, "docs_read", json!({ "slug": canonical })).await {
+            Ok(doc) => panic!("{raw}: канонический журнал создан: {doc}"),
+            Err(e) => assert!(e.contains("not found"), "{raw}: {e}"),
+        }
     }
 }
 
