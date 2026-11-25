@@ -613,6 +613,20 @@ pub enum DreamerMark {
     Forever,
 }
 
+/// Привязка мастер-сессии (#1607): сессия + модель рождения + checkout.
+/// Расхождение модели с картой `[executor.models]` или checkout с
+/// конфигом — пересоздание (прецедент ботов: смена model/workspace).
+/// Форма ключа — перечисление «роль:проект» (на неё садится #1634).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalystMaster {
+    pub session: String,
+    /// Модель рождения «provider/id[#variant]» — аргумент usage_pct (C1).
+    pub model: Option<String>,
+    pub checkout: Option<String>,
+    /// ms последней адмиссии компакта прохода (срез 4 #1607).
+    pub last_compact_ms: u64,
+}
+
 /// Персистентное состояние тика (wakeup-дедуп, дример-инвариант).
 pub trait TickStateStore: Send + Sync {
     fn last_comment_id(&self, board: &str, number: u64) -> Option<String>;
@@ -680,6 +694,12 @@ pub trait TickStateStore: Send + Sync {
     /// ушедших с досок, вычищаются — live = ключи «board:number» всех строк
     /// всех досок тика.
     fn prune_analys_guards(&self, live: &std::collections::HashSet<String>);
+    /// Мастер-сессии (#1607): привязка «роль:проект» → сессия + модель
+    /// рождения + checkout. None — привязки нет (первая волна / legacy).
+    fn analyst_master(&self, key: &str) -> Option<AnalystMaster>;
+    fn set_analyst_master(&self, key: &str, binding: AnalystMaster);
+    /// Метка последней адмиссии компакта мастер-сессии (проход, срез 4).
+    fn mark_analyst_compact(&self, key: &str, at_ms: u64);
     /// Attention-механика: счётчик повторных спавнов слота
     /// (статус на момент прошлого спавна, число повторов).
     fn spawn_loop(&self, board: &str, number: u64, slot: Slot) -> Option<(Status, u32)>;

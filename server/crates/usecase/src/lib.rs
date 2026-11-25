@@ -53,7 +53,7 @@ pub use pipeline::{
     ANALYST_WAVE_MARKER, STAGE_PROMPTS,
 };
 pub use ports::{
-    AgentSessionGateway, AppendDocOutcome, AssistantReply, Clock, CommentRef, CronRow,
+    AgentSessionGateway, AnalystMaster, AppendDocOutcome, AssistantReply, Clock, CommentRef, CronRow,
     CronRunTrack, CronStateStore, DecisionJudge, DreamerMark, FmMutator, IssueDigest,
     IssueFieldStore, IssueIndexSource, IssueView, JudgeCfg, JudgeContext, JudgeSessionTail,
     Liveness, PrGateway, PrProbe, PrState, QuotaProbe, QuotaSnapshot, SessionInfo, SessionSpec,

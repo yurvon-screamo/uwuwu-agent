@@ -10,8 +10,8 @@ use crate::pipeline::analyst_review::AnalystReviewUseCase;
 use crate::pipeline::dreamer::DreamerUseCase;
 use crate::ports::AppendDocOutcome;
 use crate::ports::{
-    AgentSessionGateway, AssistantReply, Clock, CommentRef, DreamerMark, IssueView, Liveness,
-    SessionInfo, SessionSpec, TaskBoardRepo, TickStateStore, WikiRepo,
+    AgentSessionGateway, AnalystMaster, AssistantReply, Clock, CommentRef, DreamerMark, IssueView,
+    Liveness, SessionInfo, SessionSpec, TaskBoardRepo, TickStateStore, WikiRepo,
 };
 use crate::router::SessionRouter;
 use crate::spawn_models::SpawnModels;
@@ -135,6 +135,11 @@ impl TickStateStore for NoopState {
     }
     fn set_round_reentry_pending(&self, _b: &str, _n: u64) {}
     fn clear_round_reentry_pending(&self, _b: &str, _n: u64) {}
+    fn analyst_master(&self, _key: &str) -> Option<AnalystMaster> {
+        None
+    }
+    fn set_analyst_master(&self, _key: &str, _binding: AnalystMaster) {}
+    fn mark_analyst_compact(&self, _key: &str, _at_ms: u64) {}
     /// Аналитика: кулдауны волн/ревью и цикл-гварды (#1135).
     fn last_analys_ms(&self, _b: &str, _n: u64) -> Option<u64> {
         None

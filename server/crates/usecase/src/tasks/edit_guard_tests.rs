@@ -6,8 +6,8 @@
 
 use crate::error::UsecaseResult;
 use crate::ports::{
-    Clock, CommentRef, DreamerMark, FmMutator, IssueFieldStore, IssueView, TaskBoardRepo,
-    TickStateStore,
+    AnalystMaster, Clock, CommentRef, DreamerMark, FmMutator, IssueFieldStore, IssueView,
+    TaskBoardRepo, TickStateStore,
 };
 use crate::tasks::write::{TaskPatch, TaskWriteUseCase, TaskWriter};
 use async_trait::async_trait;
@@ -274,6 +274,11 @@ impl TickStateStore for NopState {
     }
     fn set_round_reentry_pending(&self, _: &str, _: u64) {}
     fn clear_round_reentry_pending(&self, _: &str, _: u64) {}
+    fn analyst_master(&self, _: &str) -> Option<AnalystMaster> {
+        None
+    }
+    fn set_analyst_master(&self, _: &str, _: AnalystMaster) {}
+    fn mark_analyst_compact(&self, _: &str, _: u64) {}
 
     fn last_analys_ms(&self, _: &str, _: u64) -> Option<u64> {
         None

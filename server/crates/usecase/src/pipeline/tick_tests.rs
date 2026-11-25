@@ -4,8 +4,8 @@
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::pipeline::tick::{BoardPlan, Mode, TickPlan, TickUseCase, PROBE_DEGRADE_MIN_ROWS};
 use crate::ports::{
-    AgentSessionGateway, Clock, CommentRef, DecisionJudge, DreamerMark, JudgeCfg, Liveness,
-    PrGateway, PrProbe, PrState, QuotaProbe, SessionSpec, TaskBoardRepo, TickStateStore,
+    AgentSessionGateway, AnalystMaster, Clock, CommentRef, DecisionJudge, DreamerMark, JudgeCfg,
+    Liveness, PrGateway, PrProbe, PrState, QuotaProbe, SessionSpec, TaskBoardRepo, TickStateStore,
 };
 use crate::router::SessionRouter;
 use async_trait::async_trait;
@@ -586,6 +586,8 @@ struct MemStateInner {
     spawn_ms: Vec<(u64, Slot, u64)>,
     /// Pending раунд-промпт мастер-сессии (#1626): number-журнал
     round_reentry: Vec<u64>,
+    /// Привязки мастер-сессий (#1607): «роль:проект» → привязка
+    analyst_masters: BTreeMap<String, AnalystMaster>,
     /// реестр серверных постов (own-тест self-эха #1204)
     own: BTreeMap<String, u64>,
 }
@@ -689,6 +691,26 @@ impl TickStateStore for MemState {
     }
     fn clear_round_reentry_pending(&self, _b: &str, n: u64) {
         self.0.lock().unwrap().round_reentry.retain(|num| *num != n);
+    }
+    fn analyst_master(&self, key: &str) -> Option<AnalystMaster> {
+        self.0
+            .lock()
+            .unwrap()
+            .analyst_masters
+            .get(key)
+            .cloned()
+    }
+    fn set_analyst_master(&self, key: &str, binding: AnalystMaster) {
+        self.0
+            .lock()
+            .unwrap()
+            .analyst_masters
+            .insert(key.to_string(), binding);
+    }
+    fn mark_analyst_compact(&self, key: &str, at_ms: u64) {
+        if let Some(row) = self.0.lock().unwrap().analyst_masters.get_mut(key) {
+            row.last_compact_ms = at_ms;
+        }
     }
     fn last_analys_ms(&self, b: &str, n: u64) -> Option<u64> {
         self.0
@@ -7018,6 +7040,238 @@ async fn analyst_wave_one_session_for_all_rows() {
 }
 
 #[tokio::test]
+async fn analyst_wave_reuses_live_master_session_1607() {
+    // Мастер-сессия аналитика (#1607, срез 2б): волна едет промптом в
+    // живую привязанную сессию — спавна нет, привязка не трогается.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.0.lock().unwrap().analyst_masters.insert(
+        "analyst:p".into(),
+        AnalystMaster {
+            session: "ses_master".into(),
+            model: Some("zai-coding-plan/glm-5.4#high".into()),
+            checkout: Some("/tmp/checkout".into()),
+            last_compact_ms: 0,
+        },
+    );
+    let sessions = Arc::new(FakeSessions::new());
+    let (u, _) = analyst_uc(
+        vec![titled(70, "заявка", Status::Analys)],
+        state.clone(),
+        sessions.clone(),
+    );
+    let spawned = u.tick().await.unwrap();
+    assert_eq!(spawned, 0, "reuse — не спавн: счётчик волн не растёт");
+    assert!(
+        sessions.spawned.lock().unwrap().is_empty(),
+        "новых сессий нет"
+    );
+    assert!(
+        sessions.specs.lock().unwrap().is_empty(),
+        "спеков спавна нет"
+    );
+    let prompts = sessions.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1, "волна доставлена одним промптом");
+    assert!(
+        prompts[0].starts_with("ses_master|"),
+        "волна едет в привязанную сессию: {prompts:?}"
+    );
+    assert!(
+        prompts[0].contains("Analytics wave"),
+        "промпт волны, не спавн-промпт стадии: {prompts:?}"
+    );
+    let inner = state.0.lock().unwrap();
+    assert_eq!(inner.analys_loops.len(), 1, "захват волны отмечен");
+    assert!(
+        inner
+            .analyst_masters
+            .get("analyst:p")
+            .is_some_and(|b| b.session == "ses_master"),
+        "привязка не переписана при reuse"
+    );
+}
+
+#[tokio::test]
+async fn analyst_wave_respawns_dead_master_session_1607() {
+    // Мёртвая мастер-сессия (#1607): волна спавнит новую сессию,
+    // привязка перезаписывается (старая не гасится — статус-кво).
+    let state = Arc::new(MemState(Mutex::default()));
+    state.0.lock().unwrap().analyst_masters.insert(
+        "analyst:p".into(),
+        AnalystMaster {
+            session: "ses_dead".into(),
+            model: Some("zai-coding-plan/glm-5.4#high".into()),
+            checkout: Some("/tmp/checkout".into()),
+            last_compact_ms: 0,
+        },
+    );
+    let fake = FakeSessions::new();
+    fake.dead_sessions.lock().unwrap().push("ses_dead".into());
+    let sessions = Arc::new(fake);
+    let (u, _) = analyst_uc(
+        vec![titled(71, "заявка", Status::Analys)],
+        state.clone(),
+        sessions.clone(),
+    );
+    let spawned = u.tick().await.unwrap();
+    assert_eq!(spawned, 1, "мёртвая мастер-сессия — пересоздание");
+    let specs = sessions.specs.lock().unwrap();
+    assert_eq!(specs.len(), 1, "один спавн");
+    assert_eq!(
+        specs[0].model,
+        uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.4#high")
+            .unwrap()
+            .model,
+        "новая сессия — на модели карты"
+    );
+    let bound = state
+        .0
+        .lock()
+        .unwrap()
+        .analyst_masters
+        .get("analyst:p")
+        .cloned()
+        .expect("привязка перезаписана");
+    assert_eq!(bound.session, "ses_1", "привязка указывает на новую сессию");
+    assert_eq!(
+        bound.model.as_deref(),
+        Some("zai-coding-plan/glm-5.4#high"),
+        "модель рождения записана"
+    );
+}
+
+#[tokio::test]
+async fn analyst_wave_defers_on_unknown_master_session_1607() {
+    // Liveness неизвестен (#1607): доска откладывается на тик — спавна
+    // нет, кулдауны и цикл-гарды не заряжаются («failed spawn не заряжает»).
+    let state = Arc::new(MemState(Mutex::default()));
+    state.0.lock().unwrap().analyst_masters.insert(
+        "analyst:p".into(),
+        AnalystMaster {
+            session: "ses_ghost".into(),
+            model: Some("zai-coding-plan/glm-5.4#high".into()),
+            checkout: Some("/tmp/checkout".into()),
+            last_compact_ms: 0,
+        },
+    );
+    let mut fake = FakeSessions::new();
+    fake.liveness_unknown = true;
+    let sessions = Arc::new(fake);
+    let (u, _) = analyst_uc(
+        vec![titled(72, "заявка", Status::Analys)],
+        state.clone(),
+        sessions.clone(),
+    );
+    let spawned = u.tick().await.unwrap();
+    assert_eq!(spawned, 0, "без зрения — ни спавна, ни reuse");
+    assert!(
+        sessions.spawned.lock().unwrap().is_empty(),
+        "сессий нет"
+    );
+    assert!(
+        sessions.prompts.lock().unwrap().is_empty(),
+        "промптов нет"
+    );
+    let inner = state.0.lock().unwrap();
+    assert!(
+        inner.analys_loops.is_empty(),
+        "цикл-гард не заряжен отложкой"
+    );
+    assert!(
+        inner.analys_ms.is_empty(),
+        "кулдаун не заряжен отложкой"
+    );
+    assert!(
+        inner
+            .analyst_masters
+            .get("analyst:p")
+            .is_some_and(|b| b.session == "ses_ghost"),
+        "привязка не тронута отложкой"
+    );
+}
+
+#[tokio::test]
+async fn analyst_master_recreated_on_model_divergence_1607() {
+    // Расхождение с картой (C1 #1607): модель рождения ≠ карта —
+    // пересоздание на модели карты, привязка перезаписывается.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.0.lock().unwrap().analyst_masters.insert(
+        "analyst:p".into(),
+        AnalystMaster {
+            session: "ses_old".into(),
+            model: Some("zai-coding-plan/glm-5.3-flash#high".into()),
+            checkout: Some("/tmp/checkout".into()),
+            last_compact_ms: 0,
+        },
+    );
+    let sessions = Arc::new(FakeSessions::new());
+    let (u, _) = analyst_uc(
+        vec![titled(73, "заявка", Status::Analys)],
+        state.clone(),
+        sessions.clone(),
+    );
+    let spawned = u.tick().await.unwrap();
+    assert_eq!(spawned, 1, "расхождение модели — пересоздание");
+    let specs = sessions.specs.lock().unwrap();
+    assert_eq!(
+        specs[0].model,
+        uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.4#high")
+            .unwrap()
+            .model,
+        "новая сессия — на модели карты, не рождения"
+    );
+    assert!(
+        state
+            .0
+            .lock()
+            .unwrap()
+            .analyst_masters
+            .get("analyst:p")
+            .is_some_and(|b| b.model.as_deref()
+                == Some("zai-coding-plan/glm-5.4#high")),
+        "модель рождения в привязке обновлена"
+    );
+}
+
+#[tokio::test]
+async fn analyst_master_recreated_on_checkout_divergence_1607() {
+    // Расхождение checkout (Low-1 р.4, прецедент ботов): каталог привязки
+    // ≠ конфигу — пересоздание в актуальном каталоге.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.0.lock().unwrap().analyst_masters.insert(
+        "analyst:p".into(),
+        AnalystMaster {
+            session: "ses_old".into(),
+            model: Some("zai-coding-plan/glm-5.4#high".into()),
+            checkout: Some("/tmp/stale-checkout".into()),
+            last_compact_ms: 0,
+        },
+    );
+    let sessions = Arc::new(FakeSessions::new());
+    let (u, _) = analyst_uc(
+        vec![titled(74, "заявка", Status::Analys)],
+        state.clone(),
+        sessions.clone(),
+    );
+    let spawned = u.tick().await.unwrap();
+    assert_eq!(spawned, 1, "расхождение checkout — пересоздание");
+    let specs = sessions.specs.lock().unwrap();
+    assert_eq!(
+        specs[0].directory, "/tmp/checkout",
+        "новая сессия — в каталоге конфига"
+    );
+    assert!(
+        state
+            .0
+            .lock()
+            .unwrap()
+            .analyst_masters
+            .get("analyst:p")
+            .is_some_and(|b| b.checkout.as_deref() == Some("/tmp/checkout")),
+        "checkout в привязке обновлён"
+    );
+}
+
+#[tokio::test]
 async fn analyst_wave_orders_by_priority() {
     let state = Arc::new(MemState(Mutex::default()));
     let sessions = Arc::new(FakeSessions::new());
@@ -7191,12 +7445,23 @@ async fn analyst_verdictless_waves_do_not_burn_cycles() {
         cup: 7,
     };
     // четыре волны подряд (сессия аналитика гибнет без вердикта, строка
-    // не двигается) — старый код сжигал круг за кругом и эскалировал
-    for _ in 0..4 {
-        assert_eq!(u.tick().await.unwrap(), 1, "волна берёт строку (ретрай)");
+    // не двигается) — старый код сжигал круг за кругом и эскалировал.
+    // Мастер-сессия (#1607): ретраи едут в ту же сессию, спавн один.
+    for i in 0..4 {
+        let got = u.tick().await.unwrap();
+        if i == 0 {
+            assert_eq!(got, 1, "первая волна — спавн мастер-сессии");
+        } else {
+            assert_eq!(got, 0, "ретрай — reuse, не спавн (#1607)");
+        }
         clock.0.fetch_add(16 * 60_000, Ordering::SeqCst); // кулдаун прошёл
     }
-    assert_eq!(sessions.spawned.lock().unwrap().len(), 4, "4 ретрай-волны");
+    assert_eq!(sessions.spawned.lock().unwrap().len(), 1, "одна мастер-сессия на все ретраи");
+    assert_eq!(
+        sessions.prompts.lock().unwrap().len(),
+        4,
+        "каждая волна доставлена промптом"
+    );
     let rounds = state
         .0
         .lock()
@@ -7343,8 +7608,8 @@ async fn analyst_three_real_rounds_escalate_with_honest_message() {
     }
     assert_eq!(
         sessions.spawned.lock().unwrap().len(),
-        3,
-        "захват + два возврата — строка ретраится до лимита"
+        1,
+        "захват — один спавн, возвраты едут в ту же мастер-сессию (#1607)"
     );
     // круг 3: возврат инкрементит до лимита — эскалация на том же тике
     cur = board(Status::ReviewAnalys);
@@ -7361,8 +7626,8 @@ async fn analyst_three_real_rounds_escalate_with_honest_message() {
     u.tick().await.unwrap();
     assert_eq!(
         sessions.spawned.lock().unwrap().len(),
-        3,
-        "за лимитом волна не спавнится"
+        1,
+        "за лимитом волна не спавнится — и до лимита спавн был один (#1607)"
     );
     let log = cur.log.lock().unwrap().clone(); // борд возврата круга 3 — эскалация здесь
     assert!(

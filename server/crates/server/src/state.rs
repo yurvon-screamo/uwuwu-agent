@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use uwuwu_domain::{Slot, Status};
 use uwuwu_usecase as naming;
+use uwuwu_usecase::AnalystMaster;
 use uwuwu_usecase::BotStateStore;
 use uwuwu_usecase::Clock;
 use uwuwu_usecase::CronRow;
@@ -111,6 +112,27 @@ struct StateFile {
     /// Id GitHub глобально уникальны — плоский map без ключа доски.
     #[serde(default)]
     own_comments: BTreeMap<String, u64>,
+    /// Мастер-сессии (#1607): «роль:проект» → привязка. Форма
+    /// перечисления — на неё садится #1634 (analyst-reviewer).
+    #[serde(default)]
+    analyst_masters: BTreeMap<String, AnalystMasterRow>,
+}
+
+/// Привязка мастер-сессии на носителе (#1607): сессия + модель рождения +
+/// checkout. Расхождение модели с картой или checkout с конфигом —
+/// пересоздание (прецедент ботов: смена model/workspace).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AnalystMasterRow {
+    #[serde(default)]
+    session: String,
+    /// Модель рождения «provider/id[#variant]» (None — legacy-привязка).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkout: Option<String>,
+    /// ms последней адмиссии компакта прохода (срез 4).
+    #[serde(default)]
+    last_compact_ms: u64,
 }
 
 /// Машинный учёт крона на носителе (срез #1480): SERDE-форма CronRow
@@ -697,6 +719,38 @@ impl TickStateStore for JsonStateStore {
             .collect();
         for k in dead {
             guard.spawn_loops.remove(&k);
+        }
+    }
+
+    fn analyst_master(&self, key: &str) -> Option<AnalystMaster> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .analyst_masters
+            .get(key)
+            .map(|row| AnalystMaster {
+                session: row.session.clone(),
+                model: row.model.clone(),
+                checkout: row.checkout.clone(),
+                last_compact_ms: row.last_compact_ms,
+            })
+    }
+
+    fn set_analyst_master(&self, key: &str, binding: AnalystMaster) {
+        let mut guard = self.state.lock().expect("state lock");
+        let row = guard.analyst_masters.entry(key.to_string()).or_default();
+        row.session = binding.session;
+        row.model = binding.model;
+        row.checkout = binding.checkout;
+        // новая привязка — новый контекст: коулдаун прошлой адмиссии не
+        // наследуется; явная метка (probee) — пишется как есть
+        row.last_compact_ms = binding.last_compact_ms;
+    }
+
+    fn mark_analyst_compact(&self, key: &str, at_ms: u64) {
+        let mut guard = self.state.lock().expect("state lock");
+        if let Some(row) = guard.analyst_masters.get_mut(key) {
+            row.last_compact_ms = at_ms;
         }
     }
     fn spawn_loop(&self, board: &str, number: u64, slot: Slot) -> Option<(Status, u32)> {

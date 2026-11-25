@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use uwuwu_domain::{Slot, Status};
 use uwuwu_usecase::{
-    AgentSessionGateway, AppendDocOutcome, DreamerMark, Liveness, SessionInfo, SessionSpec,
-    TaskView, TaskWriteUseCase, TickStateStore, UsecaseResult, WikiRepo,
+    AgentSessionGateway, AnalystMaster, AppendDocOutcome, DreamerMark, Liveness, SessionInfo,
+    SessionSpec, TaskView, TaskWriteUseCase, TickStateStore, UsecaseResult, WikiRepo,
 };
 
 use crate::clock::SystemClock;
@@ -338,6 +338,11 @@ impl TickStateStore for StubState {
     }
     fn set_round_reentry_pending(&self, _: &str, _: u64) {}
     fn clear_round_reentry_pending(&self, _: &str, _: u64) {}
+    fn analyst_master(&self, _: &str) -> Option<AnalystMaster> {
+        None
+    }
+    fn set_analyst_master(&self, _: &str, _: AnalystMaster) {}
+    fn mark_analyst_compact(&self, _: &str, _: u64) {}
     fn last_analys_ms(&self, _: &str, _: u64) -> Option<u64> {
         None
     }

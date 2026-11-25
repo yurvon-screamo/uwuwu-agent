@@ -1,12 +1,12 @@
 //! Аналитика (замена триажа, #1135): все строки Analys досок образуют
-//! одну волну → одна fresh-сессия аналитика на волну (методичка
+//! одну волну → одна мастер-сессия аналитика на проект (методичка
 //! agents/analyst: sourcing, соразмерность рамок, вердикты через MCP).
 
 use crate::error::UsecaseResult;
-use crate::ports::{SessionSpec, TaskBoardRepo, TickStateStore};
+use crate::ports::{AnalystMaster, SessionSpec, TaskBoardRepo, TickStateStore};
 use crate::spawn_models::SpawnModels;
 use std::sync::Arc;
-use uwuwu_domain::{Agent, AgentSlot, Status, Task};
+use uwuwu_domain::{Agent, AgentSlot, SpawnModel, Status, Task};
 
 /// Кулдаун волны по строке (анти-шторм, как у спавнов слотов).
 const WAVE_COOLDOWN_MS: u64 = 15 * 60_000;
@@ -47,6 +47,21 @@ fn board_row_key(board: &str, number: u64) -> String {
 /// Дословный маркер волны в промпте — контракт мок-стенда
 /// (mock_opencode::stage_action_of_prompt); правка промпта через него.
 pub const ANALYST_WAVE_MARKER: &str = "Analytics wave (project {project})";
+
+/// Ключ привязки мастер-сессии: перечисление «роль:проект» (#1607) —
+/// на ту же форму садится #1634 (analyst-reviewer) без второй карты.
+pub fn analyst_master_key(role: &str, project: &str) -> String {
+    format!("{role}:{project}")
+}
+
+/// Сырая строка модели карты («provider/id[#variant]») — значение поля
+/// модели рождения в привязке (C1: сравнение — парсингом, не строками).
+fn card_model_raw(model: &SpawnModel) -> String {
+    match &model.variant {
+        Some(v) => format!("{}/{}#{v}", model.model.provider(), model.model.id()),
+        None => format!("{}/{}", model.model.provider(), model.model.id()),
+    }
+}
 
 impl AnalystUseCase {
     /// Один проход: по каждой доске — не больше одного спавна за тик,
@@ -198,19 +213,106 @@ impl AnalystUseCase {
             // tick_tests failed_spawn_does_not_charge_loop_or_cooldown):
             // сбой гейтвея не сжигает круг волны и не заряжает кулдаун.
             let sm = self.models.for_agent(Agent::Analyst);
+            // Сырая строка модели карты — в привязку (spec ниже забирает
+            // sm по частям, borrow после move невозможен).
+            let sm_raw = card_model_raw(&sm);
             let spec = SessionSpec {
                 directory: tb.checkout.clone(),
                 title: format!("{} аналитика волны", Agent::Analyst.emoji()),
                 agent: AgentSlot::Role(Agent::Analyst),
                 custom_agent: None,
-                model: sm.model,
-                variant: sm.variant,
+                model: sm.model.clone(),
+                variant: sm.variant.clone(),
                 bootstrap: false,
             };
             let sessions = self.sessions.project(&tb.project);
+            // Мастер-сессия проекта (#1607, срез 2б): волна едет промптом
+            // в живую привязанную сессию; мёртвая или разошедшаяся с
+            // картой/конфигом — пересоздание с перезаписью привязки.
+            let key = analyst_master_key("analyst", &tb.project);
+            let mut reuse: Option<String> = None;
+            if let Some(bound) = self.state.analyst_master(&key) {
+                // Контракт расхождения (C1, прецедент ботов): модель
+                // рождения ≠ карта или checkout ≠ конфигу — пересоздание.
+                // Legacy-привязка (поля None) расхождением не считается.
+                let model_ok = bound.model.as_deref().map_or(true, |raw| {
+                    SpawnModel::parse(raw).ok().as_ref() == Some(&sm)
+                });
+                let checkout_ok = bound
+                    .checkout
+                    .as_deref()
+                    .map_or(true, |c| c == tb.checkout);
+                if model_ok && checkout_ok {
+                    match sessions.liveness(&bound.session).await {
+                        crate::ports::Liveness::Alive => reuse = Some(bound.session),
+                        // Second source (#1072→#1163): проба солгала,
+                        // сессия жива в union-скане тика — респавн
+                        // отменён, волна едет в неё же.
+                        crate::ports::Liveness::Dead
+                            if scan.iter().any(|s| s.id == bound.session) =>
+                        {
+                            tracing::warn!(
+                                event = "analys.second_source_alive",
+                                session = %bound.session,
+                                "Проба Dead при живой сессии в union-скане — респавн отменён"
+                            );
+                            reuse = Some(bound.session);
+                        }
+                        // Dead без второго источника — пересоздание ниже.
+                        crate::ports::Liveness::Dead => {}
+                        // Unknown — доска откладывается на тик (канон
+                        // stage-wakeup: без зрения вслепую не работаем).
+                        crate::ports::Liveness::Unknown => {
+                            tracing::info!(
+                                event = "analys.deferred_unknown",
+                                project = %tb.project,
+                                session = %bound.session,
+                                "Мастер-сессия: liveness неизвестен — доска ждёт тика"
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    tracing::info!(
+                        event = "analys.diverged",
+                        project = %tb.project,
+                        session = %bound.session,
+                        "Привязка разошлась с картой/конфигом — пересоздание"
+                    );
+                }
+            }
+            if let Some(session) = reuse {
+                let prompt = analyst_prompt(&tb.project, &wave);
+                sessions.prompt(&session, &prompt).await?;
+                busy += 1; // ход этого тика занимает слот капа
+                for t in &wave {
+                    let rounds = self
+                        .state
+                        .analys_loop(&tb.board, t.number())
+                        .map(|(_, r)| r)
+                        .unwrap_or(0);
+                    self.state
+                        .set_analys_loop(&tb.board, t.number(), Status::Analys, rounds);
+                    self.state.mark_analys_spawn(&tb.board, t.number(), now);
+                }
+                tracing::info!(event = "analys.reused", board = %tb.board, rows = wave.len(),
+                    session = %session, "Analyst wave reused master session");
+                continue;
+            }
             let session = sessions.create_session(&spec).await?;
             let prompt = analyst_prompt(&tb.project, &wave);
             sessions.prompt(&session, &prompt).await?;
+            // Привязка мастер-сессии: модель рождения — аргумент usage_pct
+            // прохода (C1), checkout — контракт пересоздания (Low-1 р.4).
+            self.state.set_analyst_master(
+                &key,
+                AnalystMaster {
+                    session: session.clone(),
+                    model: Some(sm_raw.clone()),
+                    checkout: Some(tb.checkout.clone()),
+                    last_compact_ms: 0,
+                },
+            );
             busy += 1; // спавн этого тика занимает слот капа
             for t in &wave {
                 let rounds = self
