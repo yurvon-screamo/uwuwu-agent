@@ -22,7 +22,8 @@ struct RowState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_comment_id: Option<String>,
     /// Последний статус, виденный тиком (детект переходов стадии —
-    /// канон сессий: ревью/тест-раунды всегда со свежей сессией).
+    /// канон сессий: переход стадии = раунд слота; мастер-сессии
+    /// ревьюверов переживают циклы, #1626).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_status: Option<String>,
     /// Сталл-детект: (статус раунда, ms пинга, счётчик) — смена статуса
@@ -33,6 +34,10 @@ struct RowState {
     /// смена статуса = новый раунд; успех доставки сбрасывает.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lost: Option<(String, u32)>,
+    /// Pending раунд-промпт мастер-сессии ревьювера (#1626): re-entry в
+    /// ревью-стадию с живой сессией ждёт доставки (компакт + промпт).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    round_reentry: bool,
 }
 
 /// Состояние бота (секция `bots`): вечная сессия + offset апдейтов ТГ.
@@ -52,6 +57,23 @@ struct BotRow {
     lessons_hash: Option<u64>,
     /// Метка последней адмиссии нативного компакта (ms; None — не было):
     /// коулдаун автокомпакта переживает рестарт сервера (#1221, ADR-082).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compact_ms: Option<u64>,
+}
+
+/// Мастер-привязка роли проекта (#1634, форма роль x проект общая
+/// с #1607): вечная сессия волны + модель рождения + checkout.
+/// Пересоздание - перезапись записи, старая сессия не гасится.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct MasterRow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkout: Option<String>,
+    /// Метка последней адмиссии компакта (ms; None - не было):
+    /// коулдаун переживает рестарт сервера.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compact_ms: Option<u64>,
 }
@@ -106,6 +128,9 @@ struct StateFile {
     /// Id GitHub глобально уникальны — плоский map без ключа доски.
     #[serde(default)]
     own_comments: BTreeMap<String, u64>,
+    /// Мастер-привязки волн (#1634, форма роль:проект общая с #1607).
+    #[serde(default)]
+    master: BTreeMap<String, MasterRow>,
 }
 
 /// Машинный учёт крона на носителе (срез #1480): SERDE-форма CronRow
@@ -570,6 +595,33 @@ impl TickStateStore for JsonStateStore {
         );
     }
 
+    fn round_reentry_pending(&self, board: &str, number: u64) -> bool {
+        self.state
+            .lock()
+            .expect("state lock")
+            .rows
+            .get(&Self::key(board, number))
+            .map(|r| r.round_reentry)
+            .unwrap_or(false)
+    }
+
+    fn set_round_reentry_pending(&self, board: &str, number: u64) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .rows
+            .entry(Self::key(board, number))
+            .or_default()
+            .round_reentry = true;
+    }
+
+    fn clear_round_reentry_pending(&self, board: &str, number: u64) {
+        let mut guard = self.state.lock().expect("state lock");
+        if let Some(row) = guard.rows.get_mut(&Self::key(board, number)) {
+            row.round_reentry = false;
+        }
+    }
+
     fn last_analys_ms(&self, board: &str, number: u64) -> Option<u64> {
         self.state
             .lock()
@@ -740,6 +792,83 @@ impl TickStateStore for JsonStateStore {
             .expect("state lock")
             .own_comments
             .insert(id.to_string(), posted_ms);
+    }
+
+    fn master_binding(&self, role: &str, project: &str) -> Option<(String, String, String)> {
+        let key = format!("{role}:{project}");
+        self.state
+            .lock()
+            .expect("state lock")
+            .master
+            .get(&key)
+            .and_then(
+                |r| match (r.session.clone(), r.model.clone(), r.checkout.clone()) {
+                    (Some(s), Some(m), Some(c)) => Some((s, m, c)),
+                    _ => None,
+                },
+            )
+    }
+
+    fn set_master_binding(
+        &self,
+        role: &str,
+        project: &str,
+        session: &str,
+        model_raw: &str,
+        checkout: &str,
+    ) {
+        let key = format!("{role}:{project}");
+        let mut guard = self.state.lock().expect("state lock");
+        let row = guard.master.entry(key).or_default();
+        row.session = Some(session.to_string());
+        row.model = Some(model_raw.to_string());
+        row.checkout = Some(checkout.to_string());
+    }
+
+    fn master_compact_ms(&self, role: &str, project: &str) -> u64 {
+        let key = format!("{role}:{project}");
+        self.state
+            .lock()
+            .expect("state lock")
+            .master
+            .get(&key)
+            .and_then(|r| r.compact_ms)
+            .unwrap_or(0)
+    }
+
+    fn set_master_compact_ms(&self, role: &str, project: &str, ms: u64) {
+        let key = format!("{role}:{project}");
+        self.state
+            .lock()
+            .expect("state lock")
+            .master
+            .entry(key)
+            .or_default()
+            .compact_ms = Some(ms);
+    }
+
+    fn prune_master_role(
+        &self,
+        role: &str,
+        live_projects: &std::collections::HashSet<String>,
+    ) -> bool {
+        let prefix = format!("{role}:");
+        let mut guard = self.state.lock().expect("state lock");
+        let dead: Vec<String> = guard
+            .master
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .filter(|k| {
+                k.strip_prefix(&prefix)
+                    .is_none_or(|p| !live_projects.contains(p))
+            })
+            .cloned()
+            .collect();
+        let pruned = !dead.is_empty();
+        for k in dead {
+            guard.master.remove(&k);
+        }
+        pruned
     }
 
     fn save(&self) -> UsecaseResult<()> {
@@ -990,6 +1119,49 @@ mod tests {
         // сброс: успешная доставка / парковка
         TickStateStore::clear_lost_session(&s, "Задачи uwuwu", 7);
         assert_eq!(TickStateStore::lost_session(&s, "Задачи uwuwu", 7), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn round_reentry_persists_across_restart_without_noise() {
+        // #1626 (тестер-пин, интеграция): pending-маркер раунд-промпта —
+        // факт носителя: переживает рестарт сервера; снятый маркер не
+        // шумит в state.json (skip_serializing_if-конвенция RowState,
+        // дельта-фикс ревью).
+        let dir = std::env::temp_dir().join(format!("uwuwu-state-reentry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        {
+            let s = store(path.clone());
+            s.set_round_reentry_pending("Задачи uwuwu", 9);
+            TickStateStore::save(&s).unwrap();
+        }
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("round_reentry"),
+            "взведённый маркер персистентен в носителе"
+        );
+        let s = store(path.clone());
+        assert!(
+            s.round_reentry_pending("Задачи uwuwu", 9),
+            "рестарт восстанавливает pending-маркер (факт носителя)"
+        );
+        assert!(
+            !s.round_reentry_pending("Задачи uwuwu", 10),
+            "чужая строка без маркера"
+        );
+        s.clear_round_reentry_pending("Задачи uwuwu", 9);
+        TickStateStore::save(&s).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("round_reentry"),
+            "снятый маркер не шумит в носителе"
+        );
+        let s = store(path.clone());
+        assert!(
+            !s.round_reentry_pending("Задачи uwuwu", 9),
+            "снятие переживает рестарт"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1417,6 +1589,101 @@ mod tests {
         assert_eq!(
             CronStateStore::cron_row(&*s, "cron-7").last_fire_ms,
             Some(719)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn master_binding_persists_across_restart_and_prunes_orphans() {
+        // #1634 (тестер-пин, интеграция): привязка роль:проект и метка
+        // компакта — факты носителя (не процесса): переживают рестарт;
+        // prune сносит только сирот своей роли.
+        let dir = std::env::temp_dir().join(format!("uwuwu-state-master-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        {
+            let s = store(path.clone());
+            s.set_master_binding(
+                "analyst-reviewer",
+                "uwuwu",
+                "ses_live",
+                "zai-coding-plan/glm-5.4#high",
+                "/tmp/checkout",
+            );
+            s.set_master_compact_ms("analyst-reviewer", "uwuwu", 123_456);
+            s.set_master_binding("analyst-reviewer", "gone", "ses_gone", "m", "/c");
+            s.set_master_binding("analyst", "gone", "ses_a", "m", "/c");
+            TickStateStore::save(&s).unwrap();
+        }
+        let s = store(path.clone());
+        assert_eq!(
+            s.master_binding("analyst-reviewer", "uwuwu"),
+            Some((
+                "ses_live".to_string(),
+                "zai-coding-plan/glm-5.4#high".to_string(),
+                "/tmp/checkout".into()
+            )),
+            "рестарт восстанавливает тройку привязки"
+        );
+        assert_eq!(
+            s.master_compact_ms("analyst-reviewer", "uwuwu"),
+            123_456,
+            "метка компакта переживает рестарт"
+        );
+        assert_eq!(
+            s.master_compact_ms("analyst-reviewer", "нет-такой"),
+            0,
+            "нет записи — метка ноль"
+        );
+        let mut live = std::collections::HashSet::new();
+        live.insert("uwuwu".to_string());
+        assert!(
+            s.prune_master_role("analyst-reviewer", &live),
+            "сирота есть — prune докладывает"
+        );
+        assert!(
+            !s.prune_master_role("analyst-reviewer", &live),
+            "второй проход чист — prune молчит"
+        );
+        TickStateStore::save(&s).unwrap();
+        let s = store(path.clone());
+        assert_eq!(
+            s.master_binding("analyst-reviewer", "gone"),
+            None,
+            "сирота своей роли снесена"
+        );
+        assert!(
+            s.master_binding("analyst-reviewer", "uwuwu").is_some(),
+            "живой проект цел"
+        );
+        assert!(
+            s.master_binding("analyst", "gone").is_some(),
+            "чужая роль не тронута"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn master_binding_reads_legacy_file_without_section() {
+        // #1634: state.json, записанный до мастер-привязок (без master),
+        // читается — serde-дефолт пустой карты, рестарт не падает.
+        let dir = std::env::temp_dir().join(format!("uwuwu-state-mlegacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(&path, r#"{"rows":{},"bots":{}}"#).unwrap();
+        let s = store(path.clone());
+        assert_eq!(
+            s.master_binding("analyst-reviewer", "uwuwu"),
+            None,
+            "легаси-файл — привязок нет"
+        );
+        assert_eq!(s.master_compact_ms("analyst-reviewer", "uwuwu"), 0);
+        s.set_master_binding("analyst-reviewer", "uwuwu", "ses_1", "m", "/c");
+        TickStateStore::save(&s).unwrap();
+        let s = store(path.clone());
+        assert!(
+            s.master_binding("analyst-reviewer", "uwuwu").is_some(),
+            "привязка доезжает после легаси-чтения"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

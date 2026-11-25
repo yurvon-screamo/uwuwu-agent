@@ -615,6 +615,14 @@ async fn run(
             clock: clock.clone(),
             models: spawn_models.clone(),
             cup: plan.policy.cup,
+            compact: cfg
+                .compact
+                .clone()
+                .map(|c| uwuwu_usecase::bots::CompactPolicy {
+                    idle_ms: c.idle_min * 60_000,
+                    min_context_pct: c.min_context_pct,
+                    cooldown_ms: c.cooldown_min * 60_000,
+                }),
         });
         let dreamer = Arc::new(uwuwu_usecase::DreamerUseCase {
             sessions: sessions.clone(),

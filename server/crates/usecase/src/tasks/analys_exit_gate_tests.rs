@@ -72,6 +72,7 @@ impl TaskBoardRepo for GateBoard {
         p: Option<&str>,
         a: Option<bool>,
         _d: Option<bool>,
+        _f: Option<bool>,
     ) -> UsecaseResult<()> {
         *self.cells.lock().expect("gate board cells") = (p.map(str::to_string), a);
         Ok(())

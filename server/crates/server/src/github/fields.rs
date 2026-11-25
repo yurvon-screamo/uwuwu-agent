@@ -257,6 +257,13 @@ fn ensure_field_body(name: &str) -> Value {
             body["data_type"] = json!("single_select");
             body
         }
+        // fact_track-класс (#1631): тот же паттерн, legacy-алиаса нет
+        uwuwu_usecase::F_FACT_TRACK => {
+            let mut body = on_off("blue");
+            body["name"] = json!(name);
+            body["data_type"] = json!("single_select");
+            body
+        }
         _ => json!({ "name": name, "data_type": "text" }),
     }
 }
@@ -324,7 +331,12 @@ mod tests {
     /// на свежей среде (баг-репорт #1357 круг 1; семья — Automerge и Direct).
     #[test]
     fn ensure_field_body_options_carry_priority() {
-        for name in ["Automerge", "Autodone", uwuwu_usecase::F_DIRECT] {
+        for name in [
+            "Automerge",
+            "Autodone",
+            uwuwu_usecase::F_DIRECT,
+            uwuwu_usecase::F_FACT_TRACK,
+        ] {
             let body = ensure_field_body(name);
             assert_eq!(body["name"], *name, "{name}: имя поля в теле");
             assert_eq!(body["data_type"], "single_select");

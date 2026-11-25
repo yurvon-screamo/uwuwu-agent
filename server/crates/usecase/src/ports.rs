@@ -2,7 +2,7 @@
 //! и нативных ошибках (UsecaseError); инфра (uwuwu-server) реализует их
 //! поверх gh/опенкода/ФС.
 
-use crate::error::UsecaseResult;
+use crate::error::{UsecaseError, UsecaseResult};
 use async_trait::async_trait;
 use uwuwu_domain::{
     Agent, AgentSlot, BranchName, ModelRef, PrUrl, Slot, Status, Task, TaskFields, UtcMinute,
@@ -92,8 +92,10 @@ pub trait TaskBoardRepo: Send + Sync {
     /// записанные значения сразу — write-through кешированного снапшота
     /// при живой строке, инвалидация при отсутствующей (окно create).
     /// None — ячейку не трогаем. Ветка/PR/Тип живут мимо снапшота —
-    /// идут через IssueFieldStore напрямую. direct (#1357) — как
-    /// automerge: состояние на носителе явно, write-through тот же.
+    /// идут через IssueFieldStore напрямую. direct (#1357) и fact_track
+    /// (#1631) — как automerge: состояние на носителе явно, write-through
+    /// тот же; оба пишутся только create (create-only, immutable), edit
+    /// несёт None.
     async fn set_board_cells(
         &self,
         board: &str,
@@ -101,6 +103,7 @@ pub trait TaskBoardRepo: Send + Sync {
         priority: Option<&str>,
         automerge: Option<bool>,
         direct: Option<bool>,
+        fact_track: Option<bool>,
     ) -> UsecaseResult<()>;
 
     /// Очистить сессию слота строки (переход в раунд свежих глаз:
@@ -288,8 +291,38 @@ pub trait AgentSessionGateway: Send + Sync {
     async fn switch_agent(&self, _session: &str, _agent: Agent) -> UsecaseResult<()> {
         Ok(())
     }
-    /// Slash-команда сессии (детерминированные shell-блоки — env-подготовка).
-    async fn run_command(&self, session: &str, name: &str, args: &str) -> UsecaseResult<()>;
+    /// Slash-команда сессии (детерминированные shell-блоки — env-подготовка,
+    /// спавн стадий task-env #1431). Бюджет ожидания ответа: POST /command
+    /// синхронен — opencode отвечает после полного завершения shell-блока,
+    /// per-request таймаут обязан покрывать длительность скрипта; бюджет
+    /// приходит от юзкейса (та же механика, что у run_shell),
+    /// общий клиентский таймаут адаптера не трогается.
+    async fn run_command(
+        &self,
+        session: &str,
+        name: &str,
+        args: &str,
+        budget_ms: u64,
+    ) -> UsecaseResult<()>;
+    /// Прямой shell в рабочей директории сессии БЕЗ LLM-поворота (#1526:
+    /// вырезаем slash-команду task-env-gc — её user-сообщение
+    /// «ENV-GC … / Служебная команда конвейера…» плодило мусорные сессии
+    /// в листинге исполнителя и жгло поворот на проход). POST
+    /// /session/:id/shell синхронен (204 после завершения shell-блока);
+    /// per-request таймаут = budget_ms. Возврат: stdout shell-блока при
+    /// завершённом статусе; None — дедлайн (исхода нет). Транспортный Err
+    /// — отказ запроса (юзкейс считает строкой failed). Дефолт Err:
+    /// фейки без shell-ручки отказывают громко, не тихим None.
+    async fn run_shell(
+        &self,
+        _session: &str,
+        _command: &str,
+        _budget_ms: u64,
+    ) -> UsecaseResult<Option<String>> {
+        Err(UsecaseError::Session(
+            "run_shell не поддерживается гейтвеем".into(),
+        ))
+    }
     async fn liveness(&self, session: &str) -> Liveness;
     async fn delete_session(&self, session: &str) -> UsecaseResult<()>;
     /// Прервать активный ход сессии (преемпшен CUP #1259): opencode
@@ -330,19 +363,6 @@ pub trait AgentSessionGateway: Send + Sync {
     async fn last_activity_ms(&self, session: &str) -> UsecaseResult<Option<u64>>;
     /// Последний ассистентский ответ сессии (для ботов: ожидание реплая).
     async fn last_assistant_reply(&self, session: &str) -> UsecaseResult<Option<AssistantReply>>;
-    /// Дождаться user-сообщения сессии, содержащего `marker`, не дольше
-    /// `deadline_ms`; вердикты env-gc (#1431): shell-вывод slash-команды
-    /// доезжает user-сообщением bootstrap-сессии. None — дедлайн. Опрос
-    /// с паузами — инфра-забота адаптера (runtime), юзкейс агностичен.
-    /// Дефолт None: фейки без env-gc не должны уметь канал.
-    async fn wait_user_message(
-        &self,
-        _session: &str,
-        _marker: &str,
-        _deadline_ms: u64,
-    ) -> UsecaseResult<Option<String>> {
-        Ok(None)
-    }
     /// Список сессий исполнителя (для дримера: idle-детект).
     async fn list_sessions(&self) -> UsecaseResult<Vec<SessionInfo>>;
     /// Экспорт сессии (сообщения/сводка) — контент для дримера.
@@ -353,6 +373,10 @@ pub trait AgentSessionGateway: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionInfo {
     pub id: String,
+    /// Заголовок сессии на носителе (bootstrap env-gc: «env-gc {доска}»;
+    /// точный ключ рипера протухших bootstrap-сессий #1526 — матчинг
+    /// только по нему, каталог/агент для опознания не годятся).
+    pub title: String,
     pub agent: String,
     /// Директория сессии (cwd); пустая — исполнитель не отдал location:
     /// вне раскладки гарда спавна (#1163), никогда не матчится.
@@ -650,8 +674,17 @@ pub trait TickStateStore: Send + Sync {
     fn lost_session(&self, board: &str, number: u64) -> Option<(Status, u32)>;
     fn mark_lost_session(&self, board: &str, number: u64, status: Status);
     fn clear_lost_session(&self, board: &str, number: u64);
-    /// Новый раунд слота (fresh-eyes): кулдаун прошлого раунда не переносится.
+    /// Сброс кулдауна спавна слота: ячейка снята переходом — новый спавн
+    /// раунда не ждёт кулдаун прошлого.
     fn clear_spawn_ms(&self, board: &str, number: u64, slot: Slot);
+    /// Pending раунд-промпт мастер-сессии ревьювера (#1626): строка вошла
+    /// в ревью-стадию с живой сессией — новый цикл доставляется в неё же
+    /// (компакт + раунд-промпт) wakeup-путём; маркер переживает тик,
+    /// пока пик/CUP/ход сессии держат доставку. Чистится доставкой
+    /// (wakeup) и спавном свежей сессии (spawn_stage — промпт унесён).
+    fn round_reentry_pending(&self, board: &str, number: u64) -> bool;
+    fn set_round_reentry_pending(&self, board: &str, number: u64);
+    fn clear_round_reentry_pending(&self, board: &str, number: u64);
     /// Аналитика (#1135, замена триажа): кулдауны волн/ревью и цикл-гвард.
     fn last_analys_ms(&self, board: &str, number: u64) -> Option<u64>;
     fn mark_analys_spawn(&self, board: &str, number: u64, at_ms: u64);
@@ -694,5 +727,27 @@ pub trait TickStateStore: Send + Sync {
     /// агентом через MCP task_comment (не юзером и не фабрикой).
     fn own_comment(&self, id: &str) -> bool;
     fn mark_own_comment(&self, id: &str, posted_ms: u64);
+    /// Мастер-привязка роли проекта (#1634, форма роль x проект общая
+    /// с #1607): (session, model_raw provider/id[#variant], checkout).
+    fn master_binding(&self, role: &str, project: &str) -> Option<(String, String, String)>;
+    fn set_master_binding(
+        &self,
+        role: &str,
+        project: &str,
+        session: &str,
+        model_raw: &str,
+        checkout: &str,
+    );
+    /// Метка последней адмиссии компакта мастер-привязки (коулдаун
+    /// переживает рестарт; 0 - не было).
+    fn master_compact_ms(&self, role: &str, project: &str) -> u64;
+    fn set_master_compact_ms(&self, role: &str, project: &str, ms: u64);
+    /// Гигиена привязок (Low-1 ревью #1634): снести записи роли, чьи
+    /// проекты ушли из конфига. Возвращает true, если что-то снесено.
+    fn prune_master_role(
+        &self,
+        role: &str,
+        live_projects: &std::collections::HashSet<String>,
+    ) -> bool;
     fn save(&self) -> UsecaseResult<()>;
 }

@@ -90,7 +90,7 @@ async fn tick_never_spawns_direct_row_but_spawns_untracked_control() {
     // флаг direct через set_board_cells — как прод-носитель (REST-поле);
     // мутация материализует сид (ensure_seed ленив), next_number = 2
     memory
-        .set_board_cells("Задачи sandbox", 1, None, None, Some(true))
+        .set_board_cells("Задачи sandbox", 1, None, None, Some(true), None)
         .await
         .expect("direct cell");
     let control = memory

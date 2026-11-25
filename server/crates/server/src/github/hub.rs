@@ -553,6 +553,7 @@ impl GitHubHub {
         priority: Option<&str>,
         automerge: Option<bool>,
         direct: Option<bool>,
+        fact_track: Option<bool>,
     ) {
         let now = std::time::Instant::now();
         let Some(hit) = self.snap_cache.get(board, now) else {
@@ -575,6 +576,9 @@ impl GitHubHub {
             }
             if let Some(d) = direct {
                 task.set_direct(d);
+            }
+            if let Some(f) = fact_track {
+                task.set_fact_track(f);
             }
         }
         self.snap_cache.put(board, (rows, meta), now);
@@ -922,6 +926,7 @@ fn parse_page(items: &[Value], meta: &mut BoardMeta) -> Vec<Task> {
             task.set_priority(uwuwu_usecase::parse_priority(&v.priority));
             task.set_automerge(v.automerge);
             task.set_direct(v.direct);
+            task.set_fact_track(v.fact_track);
             // тип — нативный issue Type на issue-узле (не ячейка доски;
             // #1271): null/Task/неизвестное имя → None
             task.set_kind(uwuwu_usecase::parse_task_type(
@@ -940,6 +945,7 @@ struct ItemValues {
     priority: String,
     automerge: bool,
     direct: bool,
+    fact_track: bool,
 }
 
 fn item_values(item: &Value) -> ItemValues {
@@ -948,6 +954,7 @@ fn item_values(item: &Value) -> ItemValues {
         priority: String::new(),
         automerge: false,
         direct: false,
+        fact_track: false,
     };
     if let Some(vals) = item["fieldValues"]["nodes"].as_array() {
         for v in vals {
@@ -967,6 +974,7 @@ fn item_values(item: &Value) -> ItemValues {
                 // автомерж (#1232): новое имя, legacy «Autodone» — back-compat
                 "Automerge" | "Autodone" => out.automerge = value == "on" || value == "true",
                 uwuwu_usecase::F_DIRECT => out.direct = value == "on",
+                uwuwu_usecase::F_FACT_TRACK => out.fact_track = value == "on",
                 _ => {}
             }
         }
@@ -1177,6 +1185,7 @@ impl TaskBoardRepo for GitHubHub {
         priority: Option<&str>,
         automerge: Option<bool>,
         direct: Option<bool>,
+        fact_track: Option<bool>,
     ) -> UsecaseResult<()> {
         // поля — нативные issue (REST), как и у set_branch
         let mut patch: Vec<(&str, Option<String>)> = Vec::new();
@@ -1198,12 +1207,18 @@ impl TaskBoardRepo for GitHubHub {
                 Some(if d { "on" } else { "off" }.to_string()),
             ));
         }
+        if let Some(f) = fact_track {
+            patch.push((
+                uwuwu_usecase::F_FACT_TRACK,
+                Some(if f { "on" } else { "off" }.to_string()),
+            ));
+        }
         if !patch.is_empty() {
             self.fields.store(number, &patch).await?;
         }
         // read-your-writes (#1258): кеш-гигиена снапшота — write-through
         // записанных значений при живой строке, инвалидация при отсутствующей
-        self.settle_board_cells(board, number, priority, automerge, direct);
+        self.settle_board_cells(board, number, priority, automerge, direct, fact_track);
         Ok(())
     }
 
@@ -1278,6 +1293,16 @@ impl TaskBoardRepo for GitHubHub {
             .map(|v| v == "on" || v == "true")
             .unwrap_or(false);
         task.set_automerge(automerge);
+        task.set_automerge(automerge);
+        // fact_track с носителя (#1631) — симметрично automerge: REST-путь
+        // MCP честен, тик-путь читает item_values. direct (#1616) сюда не
+        // дублируется: apply_fields(map_task_fields) уже несёт его из
+        // того же raw — один механизм, один источник
+        let fact_track = raw
+            .get(uwuwu_usecase::F_FACT_TRACK)
+            .map(|v| v == "on")
+            .unwrap_or(false);
+        task.set_fact_track(fact_track);
         // тип — нативный issue Type (верхний уровень GET issue, не
         // issue_field_values; #1271) — REST-путь MCP честен, как тик-путь
         task.set_kind(uwuwu_usecase::parse_task_type(
@@ -2518,7 +2543,7 @@ mod tests {
             ),
             std::time::Instant::now(),
         );
-        hub.settle_board_cells("B", 7, Some("high"), Some(true), None);
+        hub.settle_board_cells("B", 7, Some("high"), Some(true), None, None);
         let snap = hub
             .snap_cache
             .get("B", std::time::Instant::now())
@@ -2545,7 +2570,7 @@ mod tests {
             ),
             std::time::Instant::now(),
         );
-        hub.settle_board_cells("B", 7, Some("high"), None, None);
+        hub.settle_board_cells("B", 7, Some("high"), None, None, None);
         assert!(
             hub.snap_cache.get("B", std::time::Instant::now()).is_none(),
             "снимок без строки сброшен"
@@ -2556,7 +2581,7 @@ mod tests {
     #[test]
     fn board_cells_without_snapshot_is_clean_noop() {
         let hub = GitHubHub::new("o/r".into(), "t".into());
-        hub.settle_board_cells("B", 7, Some("high"), None, None);
+        hub.settle_board_cells("B", 7, Some("high"), None, None, None);
         assert!(hub.snap_cache.get("B", std::time::Instant::now()).is_none());
     }
 
@@ -2598,9 +2623,16 @@ mod tests {
             };
             let probe_automerge = !base_automerge;
             // 2. контракт фикса: запись → СРАЗУ чтение тем же хабом
-            hub.set_board_cells(board, n, Some(probe_priority), Some(probe_automerge), None)
-                .await
-                .expect("set_board_cells");
+            hub.set_board_cells(
+                board,
+                n,
+                Some(probe_priority),
+                Some(probe_automerge),
+                None,
+                None,
+            )
+            .await
+            .expect("set_board_cells");
             let after = hub
                 .read_board(board)
                 .await
@@ -2656,6 +2688,7 @@ mod tests {
                 n,
                 Some(base_priority_arg),
                 Some(base_automerge),
+                None,
                 None,
             )
             .await
@@ -3190,6 +3223,55 @@ mod tests {
             !map_task_fields(&Fields::new()).direct(),
             "нет поля — не direct (дефолт false)"
         );
+    }
+
+    /// Строковый контракт FactTrack на тик-пути снапшота (#1631, тестировщик):
+    /// тот же issue-backed шейп, что у Direct — «on» поднимает флаг, «off»
+    /// и чужая опция — нет; отсутствие поля — обычная строка. Сломанный
+    /// парс (чужое имя поля/опции) убивает укороченный пайп тихо: гард
+    /// на REST fields.load отвечает отказом на ReviewResult → Review,
+    /// а тесты юзкейса на моках остаются зелёными — пин здесь.
+    #[test]
+    fn item_values_fact_track_flag_string_contract() {
+        let item = |fact_track: &str| {
+            json!({
+                "content": { "__typename": "Issue", "number": 1631, "title": "t", "state": "open" },
+                "fieldValues": { "nodes": [
+                    { "__typename": "ProjectV2ItemIssueFieldValue",
+                      "field": { "__typename": "ProjectV2SingleSelectField", "name": "FactTrack" },
+                      "issueFieldValue": {
+                          "__typename": "IssueFieldSingleSelectValue",
+                          "name": fact_track, "value": fact_track, "optionId": "IFSSO_f"
+                      } },
+                ]}
+            })
+        };
+        assert!(item_values(&item("on")).fact_track, "«on» — флаг поднят");
+        assert!(!item_values(&item("off")).fact_track, "«off» — флаг опущен");
+        assert!(
+            !item_values(&item("true")).fact_track,
+            "чужая опция флаг не поднимает (парсинг строгий)"
+        );
+        let bare = json!({
+            "content": { "__typename": "Issue", "number": 1, "title": "t", "state": "open" },
+            "fieldValues": { "nodes": [
+                { "name": "In Progress", "field": { "name": "Status" } },
+            ]}
+        });
+        assert!(!item_values(&bare).fact_track, "нет поля — обычная строка");
+    }
+
+    /// Pv2-own шейп (значение на верхнем уровне узла): FactTrack=on
+    /// читается и оттуда — шейп колонок доски (#1631, тестировщик).
+    #[test]
+    fn item_values_fact_track_board_column_shape() {
+        let item = json!({
+            "content": { "__typename": "Issue", "number": 2, "title": "t", "state": "open" },
+            "fieldValues": { "nodes": [
+                { "name": "on", "field": { "name": "FactTrack" } },
+            ]}
+        });
+        assert!(item_values(&item).fact_track);
     }
 
     #[test]

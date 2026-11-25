@@ -71,8 +71,14 @@ impl AgentSessionGateway for BudgetedSessions {
         self.inner.switch_agent(session, agent).await
     }
 
-    async fn run_command(&self, session: &str, name: &str, args: &str) -> UsecaseResult<()> {
-        self.inner.run_command(session, name, args).await
+    async fn run_command(
+        &self,
+        session: &str,
+        name: &str,
+        args: &str,
+        budget_ms: u64,
+    ) -> UsecaseResult<()> {
+        self.inner.run_command(session, name, args, budget_ms).await
     }
 
     async fn liveness(&self, session: &str) -> Liveness {
@@ -103,18 +109,15 @@ impl AgentSessionGateway for BudgetedSessions {
         self.inner.last_activity_ms(session).await
     }
 
-    /// Канал вердиктов env-gc (#1431): чтение ленты — не спавн, тарификации
-    /// не касается (прецедент last_activity_ms); без делегирования дефолт
-    /// декоратора отдавал бы None, обходя живой адаптер.
-    async fn wait_user_message(
+    /// Прямой shell без LLM-поворота (#1526): детерминированный канал,
+    /// не спавн — тарификации не касается (прецедент last_activity_ms).
+    async fn run_shell(
         &self,
         session: &str,
-        marker: &str,
-        deadline_ms: u64,
+        command: &str,
+        budget_ms: u64,
     ) -> UsecaseResult<Option<String>> {
-        self.inner
-            .wait_user_message(session, marker, deadline_ms)
-            .await
+        self.inner.run_shell(session, command, budget_ms).await
     }
 
     /// Компакт-ручки (#1221): чтение занятости и адмиссия компакта —
@@ -160,7 +163,7 @@ mod tests {
         async fn prompt(&self, _s: &str, _t: &str) -> UsecaseResult<()> {
             Ok(())
         }
-        async fn run_command(&self, _s: &str, _n: &str, _a: &str) -> UsecaseResult<()> {
+        async fn run_command(&self, _s: &str, _n: &str, _a: &str, _b: u64) -> UsecaseResult<()> {
             Ok(())
         }
         async fn delete_session(&self, _s: &str) -> UsecaseResult<()> {

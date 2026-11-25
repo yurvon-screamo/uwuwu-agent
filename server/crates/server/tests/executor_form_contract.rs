@@ -338,6 +338,73 @@ async fn session_list_matches_pin_wrapper_and_agent_semantics() {
 
 // ---------- юнит-пины: носитель пина и дифф-механика ----------
 
+#[tokio::test]
+async fn shell_message_matches_pin_live_shape() {
+    // Прямой shell env-gc (#1526, slash-команда task-env-gc вырезана):
+    // в ленте — shell-сообщение со stdout, content[] нет; user-сообщений
+    // и assistant-поворота команда не создаёт — живая форма по
+    // throwaway-пробе #1526 (оси пина shell_message)
+    let (base, _mock) = spawn_mock(&[]);
+    wait_ready(&base).await;
+    let http = reqwest::Client::new();
+    let pin = Pin::load();
+
+    let id = create_session_with(&base, &http, json!({ "title": "verdict probe" })).await;
+    http.post(format!("{base}/api/session/{id}/shell"))
+        .json(&json!({ "command": "task-env-gc.sh sweep 1431 1432" }))
+        .send()
+        .await
+        .expect("shell");
+    let tail = get_json(
+        &http,
+        &format!("{base}/api/session/{id}/message?limit=5&order=desc"),
+    )
+    .await;
+
+    let mut d = Diff::default();
+    let msgs = tail["data"].as_array().cloned().unwrap_or_default();
+    let shell = msgs.iter().find(|m| m["type"] == "shell").cloned();
+    d.expect(
+        "shell_message.present",
+        shell.is_some(),
+        "хвост без shell-сообщения команды",
+    );
+    let msg = shell.unwrap_or_default();
+    let output = msg["output"]["output"].as_str().unwrap_or_default();
+    d.expect(
+        &format!("shell_message.form[{}]", pin.shell_message_form),
+        !output.is_empty(),
+        "output shell-сообщения пуст — мок не в живой форме",
+    );
+    d.expect(
+        "shell_message.batch_lines",
+        output.contains("ENV-GC 1431 SWEPT") && output.contains("ENV-GC 1432 SWEPT"),
+        "shell-вывод без вердикт-строки на каждую строку батча",
+    );
+    let leaked: Vec<String> = pin
+        .shell_message_forbidden
+        .iter()
+        .filter(|k| !msg[k.as_str()].is_null())
+        .cloned()
+        .collect();
+    d.expect(
+        "shell_message.forbidden_keys",
+        leaked.is_empty(),
+        &format!(
+            "запрещённые живой формой ключи в shell-сообщении: {leaked:?} ({})",
+            pin.shell_message_form
+        ),
+    );
+    d.expect(
+        "shell_message.no_user_no_assistant",
+        !msgs
+            .iter()
+            .any(|m| m["type"] == "user" || m["type"] == "assistant"),
+        "shell-команда создала user/assistant сообщения — мусорные сессии вернутся",
+    );
+    d.finish("session shell message");
+}
+
 #[test]
 fn pin_carries_every_contract_axis() {
     let pin = Pin::load();
@@ -347,6 +414,14 @@ fn pin_carries_every_contract_axis() {
     assert!(
         pin.forbidden_time.contains(&"updated".to_string()),
         "forbidden-ось без updated — страж инцидента #1249 потерян"
+    );
+    assert_eq!(
+        pin.shell_message_form, "type shell with command/status/output.output",
+        "ось формы shell-сообщения (#1526): живой носитель несёт shell с output, без content"
+    );
+    assert!(
+        pin.shell_message_forbidden.contains(&"content".to_string()),
+        "content[] в shell-сообщении — дрейф мока от живой формы"
     );
     assert!(pin.assistant_final_time.contains(&"completed".to_string()));
     assert!(pin.assistant_final_time.contains(&"created".to_string()));
