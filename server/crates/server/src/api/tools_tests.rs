@@ -1514,26 +1514,26 @@ async fn task_get_without_comments_carries_no_comments_section() {
     );
 }
 
-/// #1604 (ревью Common-1): зеркало шапки (strip_task_get_header в фазе
-/// записи) живёт по строгому набору ключей рендера — пин собирается из
-/// РЕАЛЬНОГО рендера task_get, не из рукописной шапки: копия вывода
-/// карточки в task_body срезает шапку целиком (включая body_bytes),
-/// тело на носителе чистое (ADR-105); шапка без тела — отказ «нет
-/// эффективного контента» (#1572), носитель цел.
+/// #1632+#1604: зеркало шапки (strip_task_get_header в фазе записи)
+/// собрано из РЕАЛЬНОГО рендера task_get, не из рукописной шапки, и от
+/// card[0..] — тайтл-строка включительно, ровно то, что агент копирует
+/// из карточки (старт от fm_start не ловит дрейф «новая первая
+/// строка»): копия вывода карточки в task_body срезает шапку целиком
+/// (все наборы ключей, включая body_bytes), тело на носителе чистое
+/// (ADR-105); шапка без тела — отказ «нет эффективного контента»
+/// (#1572) с хвостовым переносом и без него (терминатор #1604),
+/// носитель цел.
 #[tokio::test]
 async fn task_body_strips_the_real_render_header_and_refuses_header_only() {
     let (tools, memory) = hub();
     let body = "## Постановка\n\nчистое тело носителя.\n";
     let (number, _) = create_task(&tools, "t: зеркало шапки", body).await;
 
-    // Реальный рендер: fm-блок вывода task_get + тело — ровно то, что
-    // агент копирует из карточки при переносе текста в запись.
     let card = call(&tools, "task_get", json!({ "number": number }))
         .await
         .expect("get");
-    let fm_start = card.find("--- fm ---").expect("fm-блок в выводе карточки");
     let body_at = card.find(body).expect("тело в выводе карточки");
-    let copied = &card[fm_start..body_at + body.len()];
+    let copied = &card[..body_at + body.len()];
 
     let receipt = call(
         &tools,
@@ -1551,7 +1551,7 @@ async fn task_body_strips_the_real_render_header_and_refuses_header_only() {
         .body;
     assert_eq!(stored, body, "тело без шапки: {stored}");
 
-    let header_only = &card[fm_start..body_at];
+    let header_only = &card[..body_at];
     let err = call(
         &tools,
         "task_body",
