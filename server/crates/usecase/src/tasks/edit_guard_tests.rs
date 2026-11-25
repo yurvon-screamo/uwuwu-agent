@@ -216,6 +216,23 @@ impl IssueFieldStore for DirectFields {
     }
 }
 
+/// Носитель без триаж-полей (Приоритет и Automerge пусты): пин гейта
+/// полноты #1280 на свежем current — «волна выпустила строку с пустым
+/// триажем» ловится, только если гейт видит свежий носитель, а не
+/// кеш-вид (Common ревью тестов #1615).
+struct EmptyFields;
+
+#[async_trait]
+impl IssueFieldStore for EmptyFields {
+    async fn load(&self, _: u64) -> UsecaseResult<std::collections::HashMap<String, String>> {
+        Ok(std::collections::HashMap::new())
+    }
+
+    async fn store(&self, _: u64, _: &[(&str, Option<String>)]) -> UsecaseResult<()> {
+        Ok(())
+    }
+}
+
 struct FixedClock;
 
 impl Clock for FixedClock {
@@ -347,6 +364,37 @@ fn writer(board: Arc<StaleBoard>) -> TaskWriteUseCase {
     writer_with(board, Arc::new(FilledFields))
 }
 
+/// Транспортный отказ fresh-рида — громкий fail-closed (контракт
+/// #1235/#1236): ошибка транспорта доходит до вызывающего, не винит
+/// носитель «строкой нет на доске», мутации нет, рид один. Возвращает
+/// текст отказа — веткам с особой маской (канон-отказ на отказной
+/// ветке #1615) добавить свой ассерт. Общий хелпер трёх транспортных
+/// пинов (qlty similar-code дельты #1615).
+async fn assert_fresh_transport_fail_closed(
+    board: &Arc<StaleBoard>,
+    number: u64,
+    status: Status,
+    context: &str,
+) -> String {
+    let err = edit_status(board, number, status).await.expect_err(context);
+    let text = err.to_string();
+    assert!(
+        text.contains("fresh carrier read failed"),
+        "транспортная ошибка дошла до агента, не проглочена: {text}"
+    );
+    assert!(
+        !text.contains("is not on board"),
+        "сбой транспорта не винит носитель «строкой нет на доске»: {text}"
+    );
+    assert!(
+        board.writes().is_empty(),
+        "мутации не должно быть: {:?}",
+        board.writes()
+    );
+    assert_eq!(board.fresh_reads(), 1);
+    text
+}
+
 fn writer_with(board: Arc<StaleBoard>, fields: Arc<dyn IssueFieldStore>) -> TaskWriteUseCase {
     TaskWriteUseCase {
         board,
@@ -362,6 +410,47 @@ async fn edit_status(board: &Arc<StaleBoard>, number: u64, status: Status) -> Us
         .edit(
             "uwuwu",
             number,
+            TaskPatch {
+                status: Some(status),
+                ..Default::default()
+            },
+        )
+        .await
+        .map(|_| ())
+}
+
+/// Фикстура строки 11 с расщеплённой правдой (qlty similar-code дельты
+/// #1615): (снапшот, носитель, кеш-вид — None = строки нет в лагающем
+/// REST-листе), флаг транспортного отказа.
+fn board(
+    snapshot: Status,
+    carrier: Status,
+    cached: Option<Status>,
+    fresh_err: bool,
+) -> Arc<StaleBoard> {
+    Arc::new(StaleBoard {
+        snapshot: vec![StaleBoard::task(11, snapshot)],
+        carrier: vec![StaleBoard::task(11, carrier)],
+        cached: cached
+            .map(|s| vec![StaleBoard::task(11, s)])
+            .unwrap_or_default(),
+        writes: Mutex::new(vec![]),
+        fresh_reads: Mutex::new(0),
+        fresh_err,
+    })
+}
+
+/// edit(status) с произвольным носителем полей — direct/Empty-пины
+/// дельты #1615.
+async fn edit_status_with(
+    board: &Arc<StaleBoard>,
+    fields: Arc<dyn IssueFieldStore>,
+    status: Status,
+) -> UsecaseResult<()> {
+    writer_with(board.clone(), fields)
+        .edit(
+            "uwuwu",
+            11,
             TaskPatch {
                 status: Some(status),
                 ..Default::default()
@@ -711,35 +800,107 @@ async fn rejection_stands_when_fresh_carrier_confirms_stale_cache() {
 }
 
 #[tokio::test]
+async fn direct_edge_on_stale_cache_reads_flag_from_fresh_carrier() {
+    // Common ревью тестов #1615: на ветке «кеш-вид отстал, свежий носитель
+    // разрешает» direct-флаг добывается по свежему current, не по
+    // кеш-виду. Кеш показывает Todo (ребро Todo → Review закрыто),
+    // носитель живёт In Progress, строка direct (Direct=on): мутант
+    // «флаг по кеш-виду» отвечает ложным отказом «In Progress → Review
+    // вне канона» — регресс класса инстанса #1612 на ребре финализации
+    // direct-задачи. Один fresh-рид на вызов.
+    let board = board(Status::Todo, Status::InProgress, Some(Status::Todo), false);
+    edit_status_with(&board, Arc::new(DirectFields), Status::UserReview)
+        .await
+        .expect(
+            "direct-ребро In Progress → Review открыто по свежему носителю — кеш-стейл не отказывает",
+        );
+    assert_eq!(board.writes(), vec![(11, Status::UserReview)]);
+    assert_eq!(board.fresh_reads(), 1);
+}
+
+#[tokio::test]
+async fn fresh_current_feeds_analys_exit_gate_not_cache_view() {
+    // Common ревью тестов #1615: edit() получает fresh current из
+    // guard_canon — гейт полноты #1280 решает по нему. Кеш-вид отстал
+    // (показывает Analys), носитель — Review Analys, триаж-поля на
+    // носителе пусты: ребро Review Analys → Todo проходит, гейт «выход
+    // из Analys» не срабатывает — строка на носителе уже не в Analys.
+    // Мутант «вернуть кеш-вид» запускает гейт по кеш-виду и валит
+    // легальный переход требованием «fill them in».
+    let board = board(
+        Status::Analys,
+        Status::ReviewAnalys,
+        Some(Status::Analys),
+        false,
+    );
+    edit_status_with(&board, Arc::new(EmptyFields), Status::Todo)
+        .await
+        .expect("ребро Review Analys → Todo проходит — гейт полноты #1280 не смотрит в кеш-вид");
+    assert_eq!(board.writes(), vec![(11, Status::Todo)]);
+    assert_eq!(board.fresh_reads(), 1);
+}
+
+#[tokio::test]
 async fn fresh_transport_failure_on_rejection_branch_fails_closed() {
     // Отказная ветка #1615 с упавшим транспортом: кеш-вид зовёт отказ,
     // fresh-сверка падает — edit обязан отказать ГРОМКО транспортной
     // ошибкой (контракт #1235/#1236: мутация либо применяется и видна
     // следующим чтением, либо громкая ошибка), не тихим пропуском и не
     // канон-отказом по непроверенному кеш-виду. Мутации нет.
-    let board = Arc::new(StaleBoard {
-        snapshot: vec![StaleBoard::task(11, Status::Analys)],
-        carrier: vec![StaleBoard::task(11, Status::ReviewAnalys)],
-        cached: vec![StaleBoard::task(11, Status::Analys)],
-        writes: Mutex::new(vec![]),
-        fresh_reads: Mutex::new(0),
-        fresh_err: true,
-    });
-    let err = edit_status(&board, 11, Status::Todo)
-        .await
-        .expect_err("транспортный отказ fresh-рида — громкий fail-closed отказ edit");
-    let text = err.to_string();
-    assert!(
-        text.contains("fresh carrier read failed"),
-        "транспортная ошибка дошла до агента, не проглочена: {text}"
+    let board = board(
+        Status::Analys,
+        Status::ReviewAnalys,
+        Some(Status::Analys),
+        true,
     );
+    let text = assert_fresh_transport_fail_closed(
+        &board,
+        11,
+        Status::Todo,
+        "транспортный отказ fresh-рида — громкий fail-closed отказ edit",
+    )
+    .await;
     assert!(
         !text.contains("outside the pipeline canon"),
         "канон-отказ по непроверенному кеш-виду маскирует сбой носителя: {text}"
     );
-    assert!(
-        board.writes().is_empty(),
-        "мутации не должно быть: {:?}",
-        board.writes()
+}
+
+#[tokio::test]
+async fn fresh_transport_failure_on_idempotent_branch_fails_closed() {
+    // Low ревью тестов #1615: идемпотентная ветка guard_current
+    // (cached == target) тоже платит fresh-рид (#1437) — транспортный
+    // отказ доходит до вызывающего громкой ошибкой (fail-closed
+    // #1235/#1236), не превращается в «row is not on board» (вина
+    // честного носителя за сбой транспорта) и не маскируется кеш-видом.
+    // Мутации нет.
+    let board = board(
+        Status::InProgress,
+        Status::InProgress,
+        Some(Status::InProgress),
+        true,
     );
+    assert_fresh_transport_fail_closed(
+        &board,
+        11,
+        Status::InProgress,
+        "транспортный отказ fresh-рида на идемпотентной ветке — громкий fail-closed",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn fresh_transport_failure_on_unreadable_cache_branch_fails_closed() {
+    // Low ревью тестов #1615: нечитаемый кеш-вид (строки нет в лагающем
+    // REST-листе) уходит в fresh-рид — транспортный отказ и здесь громкий
+    // (fail-closed #1235/#1236), не «row is not on board» по кеш-миссе.
+    // Мутации нет.
+    let board = board(Status::Analys, Status::ReviewAnalys, None, true);
+    assert_fresh_transport_fail_closed(
+        &board,
+        11,
+        Status::Todo,
+        "транспортный отказ fresh-рида на нечитаемом кеш-виде — громкий fail-closed",
+    )
+    .await;
 }
