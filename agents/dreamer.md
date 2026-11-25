@@ -72,26 +72,45 @@ Compare with what actually happened in the session and the git state:
   The canon of records — `platform/ops-mechanics` (Design Spec);
 - **requirement records transfer (uwuwu#1630, 25.11.2026 — the owner's word: the
   analyst formulates US/UC/NFT records in the task body, the dreamer transfers
-  them to the wiki)**: on every pass, for the analyzed session's own task only
-  (the title `#{N} …`; cron/bot sessions and rows without records — skip):
-  `task_get` (the project — from the session's spawn header in the dump, never
-  from cwd) → the row in Review/Done and the body carries US/UC/NFT records →
-  the AS-IS anchor as a fact: the row's PR is merged (`gh pr view <url>
-  --json state` = MERGED; docs-only — the PR cell holds a non-PR URL and the
-  wiki artifact is live) → transfer the records absent from the spec. Judgment:
-  target section per record type; status «действует»; global ID — the next free
-  number of the section in the live spec (never reused); dedup — an identical
-  formulation exists → skip; a changed formulation → a new record with a new
-  global ID and the old one → status «отменено» (ADR-102: IDs are not reused,
-  withdrawn records stay; an in-place edit erases the audit history). Matching
-  key between a body record and a spec record: the spec record carries
-  «uwuwu#<task> <local ID>». Source classes travel with the record; a class-в
-  source keeps its canon mark. Write discipline: read the fresh spec → a
-  surgical local edit (the row into the table) → `uwuwu_docs_write` with the fm
-  header preserved → a scripted pre/post comparison (mechanical, line-wise) →
-  the control fails: roll back from the pre-image (a session temp file, e.g.
-  `mktemp`, never the wiki) and flag the task with the recovery path (the hub
-  file history). No silent skip, no silent damage;
+  them to the wiki)**. Six contracts, one pass:
+  - **Scan** — the analyzed session's own task only: the title `#{N} …`; cron,
+    bot and non-task sessions — out of scope. One `task_get` per pass (the
+    project — from the session's spawn header in the dump, never from cwd).
+    No records in the body, row not in Review/Done — this pass has no transfer.
+  - **AS-IS anchor** — a fact, checked per the PR host in the row's PR cell:
+    `github.com` → `gh pr view <url> --json state` = MERGED; a Forgejo/Gitea
+    host (`git.l4a.ru`, `git.true-wash.com`, …) → `GET /api/v1/repos/<owner>/<repo>/pulls/<n>`
+    → field `merged` (token — env `GITEA_TOKENS`, host→token, #1269); docs-only —
+    the PR cell holds a non-PR URL and the wiki artifact is live. The check
+    fails (unknown host, unreachable, no token) — the outcome is neither yes
+    nor no: defer the transfer, mark it in the pass's final line, retry on the
+    next pass. Never read a failed check as «not merged».
+  - **Judgment** — target section per record type; status «действует»; global
+    ID — the next free number of the section in the live spec (never reused);
+    dedup — an identical formulation exists → skip; a changed formulation → a
+    new record with a new global ID and the old one → status «отменено»
+    (ADR-102: IDs are not reused, withdrawn records stay; an in-place edit
+    erases the audit history).
+  - **Source qualification travels** — the record transfers with its source as
+    written in the body: class labels (а)/(б)/(в) and the marks
+    (интерпретация / вывод из <doc> / не подтверждено / частично покрыто
+    цитатой) are carried into the spec row. A record covered by a quote only in
+    part keeps the per-part attribution — the transfer never re-attributes
+    mechanic wording (IDs, dedup, routes) to the owner's words.
+  - **Matching key** — the spec record's source carries «<project>#<task>
+    <local ID>» (example: uwuwu#1630 US-1); it links a body record to its spec
+    record and is the bridge for pre-transfer local citations.
+  - **Write discipline** — no spec in the project → skip the transfer (the
+    transition policy ADR-102; the records stay in the body). Read the fresh
+    spec → a surgical local edit (the row into the table) → `uwuwu_docs_write`
+    with the fm header preserved → a scripted pre/post comparison (mechanical,
+    line-wise) → the control fails: roll back from the pre-image (a session
+    temp file, e.g. `mktemp`, never the wiki) and flag the task with the
+    recovery path (the hub file history). No silent skip, no silent damage. A
+    spec with code fences or mermaid blocks is plain markdown — the full
+    round-trip survives it under the control; HTML embeds and database blocks
+    do not — such a spec is append/point-edit only and the transfer defers to
+    the owner (flag, don't force).
 - rich docs with embedded diagrams — **do not overwrite in full** — append only
   or a point edit of the block (a replace kills the embeds); the records
   transfer above is the named exception — a plain markdown spec tolerates the
