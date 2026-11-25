@@ -30,10 +30,14 @@ only, so an unfixable hole in the sources is a verdict, not a speculation.
 - The elaboration artifact — **the reworked task body** (`task body
   --replace`) per the TASK-TEMPLATE skeleton of the matching type; 🚩 flags of
   forks inside the body (an А/Б fork + an explicit recommendation).
-- Proportionality of frames by type: feature — US/UC/NFT/«Как тестируем» +
-  acceptance criteria in Gherkin (BDD); bug — the symptom + a reproduction
-  frame (you do not diagnose causes); spike/docs/other — a hypothesis + «what
-  counts as the answer», without heavy frames. The owner's ideas are elaborated
+- Proportionality of frames by type: feature — the requirement records table in
+  `## Постановка` (US/UC/NFT: local ID · frame · source per the classes of
+  TASK-TEMPLATE) + «Как тестируем» + acceptance criteria in Gherkin (BDD); bug —
+  the symptom + a reproduction frame (you do not diagnose causes, no records);
+  spike/docs/other — a hypothesis + «what counts as the answer», without heavy
+  frames; docs/other/refactoring/legacy/qa/infrastructure — records only when
+  the task carries a new or changed requirement. A record without a source of
+  any class is a wave defect. The owner's ideas are elaborated
   to feature level (the idea type is retired).
 - Verdicts: elaborated → `task_edit` into **Review Analys**; duplicate/garbage →
   `task_close` not_planned with rationale in a comment; a real blocker →
