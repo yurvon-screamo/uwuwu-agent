@@ -7488,6 +7488,51 @@ async fn analyst_compact_off_without_section_1607() {
 }
 
 #[tokio::test]
+async fn analyst_compact_ignores_foreign_role_bindings_1607() {
+    // Форма «роль:проект» (#1634): проход мастер-сессий аналитика не
+    // трогает привязки других ролей (префиксный матч lapнул бы
+    // analyst-reviewer:* — проект был бы неверен).
+    let state = Arc::new(MemState(Mutex::default()));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .analyst_masters
+        .insert("analyst:p".into(), master_binding("ses_master"));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .analyst_masters
+        .insert(
+            "analyst-reviewer:p".into(),
+            AnalystMaster {
+                session: "ses_reviewer".into(),
+                model: Some("zai-coding-plan/glm-5.4#high".into()),
+                checkout: Some("/tmp/checkout".into()),
+                last_compact_ms: 0,
+            },
+        );
+    let mut fake = FakeSessions::new();
+    fake.activity_ms = Some(0);
+    fake.usage_pct = Mutex::new(Some(90.0));
+    let sessions = Arc::new(fake);
+    let u = analyst_compact_uc(
+        state,
+        sessions.clone(),
+        Arc::new(LostClock),
+        Some(compact_policy_1607()),
+        7,
+    );
+    u.tick().await.unwrap();
+    assert_eq!(
+        sessions.compacted.lock().unwrap().as_slice(),
+        ["ses_master"],
+        "проход тронул только свою роль"
+    );
+}
+
+#[tokio::test]
 async fn analyst_wave_orders_by_priority() {
     let state = Arc::new(MemState(Mutex::default()));
     let sessions = Arc::new(FakeSessions::new());

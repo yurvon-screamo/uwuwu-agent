@@ -1344,7 +1344,7 @@ rm -f "$STATE"
 LOG_SRV_1607="$RUN_DIR/server-1607.log"
 MOCK_MODE=agent MOCK_PORT=$PORT_MOCK MOCK_MCP_URL="http://127.0.0.1:$PORT_SRV" \
   MOCK_MCP_TOKEN="$BEARER" MOCK_STEP_MS=300 \
-  MOCK_VERDICTS="test:hold" \
+  MOCK_VERDICTS="test:hold;dev:hold" \
   "$BIN_MOCK" >"$LOG_MOCK" 2>&1 &
 MOCK_PID=$!
 sleep 1

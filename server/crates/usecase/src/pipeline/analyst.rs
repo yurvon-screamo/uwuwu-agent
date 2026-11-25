@@ -377,7 +377,12 @@ impl AnalystUseCase {
         let now = self.clock.now_ms();
         let mut admitted = 0usize;
         for key in self.state.analyst_master_keys() {
-            let Some(project) = key.strip_prefix("analyst:") else {
+            // Строго роль analyst: префиксный матч lapнул бы будущие
+            // ключи analyst-reviewer:* (#1634) — проект был бы неверен.
+            let Some(project) = key
+                .split_once(':')
+                .and_then(|(role, project)| (role == "analyst").then_some(project))
+            else {
                 continue;
             };
             let Some(bound) = self.state.analyst_master(&key) else {
