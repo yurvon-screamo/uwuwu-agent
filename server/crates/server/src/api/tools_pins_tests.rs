@@ -5,7 +5,7 @@
 //! тексты отказов и ответов, чтобы дрейф вернуть нечем. Пробы через живой
 //! диспетчер на MemoryHub — без GitHub, как в tools_tests.rs.
 
-use super::test_support::{blob_usecase, tool_hub, StubCronState};
+use super::test_support::{blob_usecase, mcp_call, tool_hub, StubCronState};
 use super::tools::ToolHub;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -520,6 +520,173 @@ impl uwuwu_usecase::WikiRepo for CountingWiki {
         message: &str,
     ) -> uwuwu_usecase::UsecaseResult<usize> {
         self.inner.append_doc(slug, line, message).await
+    }
+}
+
+/// #1576: снесённый журнал крона не воскресает через docs_append —
+/// create-on-missing (#1353) превращал удаление носителя в тихую запись.
+#[tokio::test]
+async fn docs_append_refuses_removed_cron_journal() {
+    let tools = hub();
+    let slug = "cron/Loop-надёжность-конвейера/Журнал";
+    let err = call(
+        &tools,
+        "docs_append",
+        json!({ "slug": slug, "line": "ПРОБА #1576" }),
+    )
+    .await
+    .expect_err("запись в снесённый журнал обязана отказать");
+    assert!(
+        err.contains("writing refused") && err.contains("#1576"),
+        "отказ без причины: {err}"
+    );
+    let err_read = call(&tools, "docs_read", json!({ "slug": slug }))
+        .await
+        .expect_err("журнал не должен создаться заново");
+    assert!(
+        err_read.contains("not found"),
+        "неожиданный док: {err_read}"
+    );
+}
+
+/// #1576: тот же запрет для docs_write — slug_guard #1613 разрешает корень
+/// `cron`, поэтому снесённый журнал мог создаваться полной перезаписью.
+#[tokio::test]
+async fn docs_write_refuses_removed_cron_journal() {
+    let tools = hub();
+    let slug = "cron/Sentry-ночной-просмотр/Журнал";
+    let err = call(
+        &tools,
+        "docs_write",
+        json!({
+            "slug": slug,
+            "content": "---\ntitle: X\ndate: 2026-11-25\n---\nПРОБА #1576",
+        }),
+    )
+    .await
+    .expect_err("запись в снесённый журнал обязана отказать");
+    assert!(
+        err.contains("writing refused") && err.contains("#1576"),
+        "отказ без причины: {err}"
+    );
+    // код-ревью Low-1 (#1576): «отказ до мутации» для docs_write
+    // закреплён так же, как для docs_append — гард не должен переехать
+    // после write_doc и оставить созданный файл при громком отказе.
+    let err_read = call(&tools, "docs_read", json!({ "slug": slug }))
+        .await
+        .expect_err("журнал не должен создаться заново через docs_write");
+    assert!(
+        err_read.contains("not found"),
+        "неожиданный док: {err_read}"
+    );
+}
+
+/// #1576 приёмка на проводе MCP: то, что видит живой агент-писатель —
+/// оба мутационных тула вики отвечают isError с текстом гарда, и носитель
+/// цел (тем же проводом journal-слаг не читается). Маршрутная интеграция
+/// in-memory (роутер + MemoryHub, без сокета), по образцу пина `mcp.rs`
+/// `contentless_mutations_refuse_loudly_over_the_wire_and_carrier_survives`.
+#[tokio::test]
+async fn removed_cron_journal_refuses_loudly_over_mcp_wire() {
+    let tools = hub();
+    let state = Arc::new(super::McpState {
+        bearer: Arc::new("t-bearer".into()),
+        tools,
+    });
+    let app = super::mcp_router(state);
+
+    for (name, args, slug) in [
+        (
+            "docs_append",
+            json!({"slug": "cron/Loop-надёжность-конвейера/Журнал", "line": "провода"}),
+            "cron/Loop-надёжность-конвейера/Журнал",
+        ),
+        (
+            "docs_write",
+            json!({
+                "slug": "cron/Sentry-ночной-просмотр/Журнал",
+                "content": "---\ntitle: X\ndate: 2026-11-25\n---\nпровода",
+            }),
+            "cron/Sentry-ночной-просмотр/Журнал",
+        ),
+    ] {
+        let answer = mcp_call(&app, "t-bearer", name, args).await;
+        assert_eq!(
+            answer["result"]["isError"],
+            Value::Bool(true),
+            "{name}: {answer}"
+        );
+        let text = answer["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            text.contains("writing refused") && text.contains("#1576"),
+            "{name}: {text}"
+        );
+        let read = mcp_call(&app, "t-bearer", "docs_read", json!({ "slug": slug })).await;
+        assert_eq!(
+            read["result"]["isError"],
+            Value::Bool(true),
+            "журнал создан: {read}"
+        );
+        let read_text = read["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(read_text.contains("not found"), "{read_text}");
+    }
+}
+
+/// #1576 / Common-1 тест-ревью: инвариант развязки конфликта с мастером
+/// (#509 normalizes slug на write-путях). Гард обязан смотреть на слаг
+/// ПОСЛЕ нормализации: если при развязке `refuse` останется на сыром
+/// аргументе, формы `docs/cron/<имя>/Журнал`, с пробелами по краям, с
+/// ведущим `/` и с пустым сегментом станут каноническим журналом — пин
+/// краснеет чтением канонического слага. На ветке без #509 эти формы
+/// пишут по другим путям — пин зелёный и не ловит ложных срабатываний.
+#[tokio::test]
+async fn normalized_journal_slugs_do_not_recreate_removed_journal() {
+    let tools = hub();
+    let fm = "---\ntitle: X\ndate: 2026-11-25\n---\nPIN #1576";
+
+    // Чистая форма и .md-вариант отказывают текстом гарда.
+    for raw in ["cron/Нормализация/Журнал", "cron/Нормализация/Журнал.md"]
+    {
+        let err = call(&tools, "docs_write", json!({ "slug": raw, "content": fm }))
+            .await
+            .expect_err("журнал обязан отказать в любой форме");
+        assert!(
+            err.contains("writing refused") && err.contains("#1576"),
+            "{raw}: {err}"
+        );
+    }
+    let read = call(
+        &tools,
+        "docs_read",
+        json!({ "slug": "cron/Нормализация/Журнал" }),
+    )
+    .await
+    .expect_err("чистая форма создала журнал");
+    assert!(read.contains("not found"), "{read}");
+
+    // Нормализуемые формы: сам write может отказать или уйти по другому
+    // пути — важен инвариант: канонический журнал не читается.
+    for (i, shape) in [
+        "docs/cron/{name}/Журнал",
+        " cron/{name}/Журнал ",
+        "/cron/{name}/Журнал",
+        "cron//{name}/Журнал",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("Нормализация2-{i}");
+        let raw = shape.replace("{name}", &name);
+        let canonical = format!("cron/{name}/Журнал");
+        let _ = call(&tools, "docs_write", json!({ "slug": raw, "content": fm })).await;
+        match call(&tools, "docs_read", json!({ "slug": canonical })).await {
+            Ok(doc) => panic!("{raw}: канонический журнал создан: {doc}"),
+            Err(e) => assert!(e.contains("not found"), "{raw}: {e}"),
+        }
     }
 }
 

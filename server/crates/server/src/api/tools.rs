@@ -5,8 +5,8 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use uwuwu_usecase::{
-    fm_guard, jst_stamp, sanitize_slug, slug_guard, BlobPlace, BlobUseCase, Clock, DocsView,
-    PersonView, SectionWrite, TaskView, TaskWriteUseCase, TaskWriter, UsecaseError,
+    cron_journal, fm_guard, jst_stamp, sanitize_slug, slug_guard, BlobPlace, BlobUseCase, Clock,
+    DocsView, PersonView, SectionWrite, TaskView, TaskWriteUseCase, TaskWriter, UsecaseError,
 };
 
 pub struct ToolHub {
@@ -558,6 +558,10 @@ impl ToolHub {
         if slug.is_empty() {
             return Err(empty_slug_error());
         }
+        // #1576: create-on-missing (#1353) не должен воскрешать снесённый
+        // журнал крона — отказ до записи, без мутации носителя. Нормализация
+        // слага обязана предшествовать проверке (#1613, пин тестера).
+        cron_journal::refuse(&slug)?;
         let message = message_or(args, format!("append: {slug}"));
         // append не создаёт (#1613, развилка Б): несуществующий таргет —
         // доменный отказ писателя; кандидаты суффикса — best-effort из
@@ -583,6 +587,10 @@ impl ToolHub {
         if slug.is_empty() {
             return Err(empty_slug_error());
         }
+        // #1576: тот же запрет для полной перезаписи — writable-цель
+        // снесённого журнала не восстанавливается ни одним write-путём.
+        // Порядок: sanitize_slug → пустой слаг → refuse → писатель.
+        cron_journal::refuse(&slug)?;
         let message = message_or(args, format!("write: {slug}"));
         let incoming = arg_str(args, "content");
         // fm-гвард (#1444): шапка вики-дока переживает replace. Текущий
