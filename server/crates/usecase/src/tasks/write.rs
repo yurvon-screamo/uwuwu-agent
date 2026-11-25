@@ -976,7 +976,7 @@ where
 }
 
 /// Дисплей-шапка task_get («--- fm ---» + branch/pr/automerge/direct/
-/// fact_track/body_hash) — рендер MCP-карточки, не носитель: агенты
+/// fact_track/type/body_hash) — рендер MCP-карточки, не носитель: агенты
 /// копируют вывод task_get назад в task_body, и шапка наслаивалась в
 /// теле (fm-стек инцидента #1331). Срезается на границе записи:
 /// инвариант ADR-105 «тело — чистый markdown» держит сервер, не
@@ -984,12 +984,13 @@ where
 /// набор/порядок ключей рендера, любой посторонний контент
 /// («--- fm ---» внутри текста) не трогается.
 fn strip_task_get_header(md: &str) -> &str {
-    const KEYS: [&str; 6] = [
+    const KEYS: [&str; 7] = [
         "branch: ",
         "pr: ",
         "automerge: ",
         "direct: ",
         "fact_track: ",
+        "type: ",
         "body_hash: ",
     ];
     let Some(rest) = md.strip_prefix("--- fm ---\n") else {
@@ -2028,14 +2029,14 @@ mod tests {
     /// инцидента #1331: агент копирует вывод task_get назад в task_body).
     #[test]
     fn task_get_display_header_is_stripped() {
-        let md = "--- fm ---\nbranch: work/task-1331\npr: —\nautomerge: true\ndirect: false\nfact_track: false\nbody_hash: 9de430c691c92328\n\n## Постановка\nтекст";
+        let md = "--- fm ---\nbranch: work/task-1331\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: —\nbody_hash: 9de430c691c92328\n\n## Постановка\nтекст";
         assert_eq!(strip_task_get_header(md), "## Постановка\nтекст");
     }
 
     #[test]
     fn task_get_header_in_middle_is_kept() {
         let md =
-            "## Секция\n\n--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\nfact_track: false\nbody_hash: h\n\nтекст";
+            "## Секция\n\n--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\nfact_track: false\ntype: —\nbody_hash: h\n\nтекст";
         assert_eq!(
             strip_task_get_header(md),
             md,

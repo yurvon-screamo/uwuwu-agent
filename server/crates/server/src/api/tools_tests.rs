@@ -1904,7 +1904,7 @@ async fn task_body_with_fm_only_body_refuses_without_write() {
     for fm_only in [
         "---\nbranch: work/task-1\n---\n",
         "---\ntitle: x\nstatus: Done\n---\n",
-        "--- fm ---\nbranch: work/task-1\npr: —\nautomerge: true\ndirect: false\nfact_track: false\nbody_hash: abc\n",
+        "--- fm ---\nbranch: work/task-1\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: —\nbody_hash: abc\n",
     ] {
         let err = call(
             &tools,

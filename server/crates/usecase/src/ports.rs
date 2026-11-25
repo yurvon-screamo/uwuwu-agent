@@ -94,10 +94,8 @@ pub trait TaskBoardRepo: Send + Sync {
     /// None — ячейку не трогаем. Ветка/PR/Тип живут мимо снапшота —
     /// идут через IssueFieldStore напрямую. direct (#1357) и fact_track
     /// (#1631) — как automerge: состояние на носителе явно, write-through
-    /// тот же, оба пишутся только create (create-only, immutable).
-    /// прямое поручение владельца (#1357) и укороченный пайп (#1631):
-    /// оба пишутся только create (create-only, immutable), edit несёт
-    /// None — состояние на носителе явно, write-through тот же.
+    /// тот же; оба пишутся только create (create-only, immutable), edit
+    /// несёт None.
     async fn set_board_cells(
         &self,
         board: &str,

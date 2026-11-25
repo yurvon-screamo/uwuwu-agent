@@ -1027,6 +1027,10 @@ mod tests {
             false,
             true
         ));
+        assert!(
+            !S::can_transition_with(S::InProgress, S::UserReview, false, true),
+            "прямой прыжок в Review мимо код-ревью закрыт и для fact_track"
+        );
         // мутация на агрегате: default false, сеттер пишет, гвард держит
         let mut t = Task::new(7, "fact_track-строка".into(), S::InProgress);
         assert!(!t.fact_track(), "по умолчанию строка не fact_track");
