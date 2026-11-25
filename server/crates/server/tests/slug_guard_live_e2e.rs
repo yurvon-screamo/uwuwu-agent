@@ -336,34 +336,75 @@ impl Drop for RigLease {
 impl RigGithub {
     async fn create(http: &reqwest::Client, token: &str, stamp: &str) -> Self {
         let name = format!("uwuwu-rig-e2e-{stamp}");
-        let (status, body) = api_call(
-            http,
-            token,
-            reqwest::Method::POST,
-            "/user/repos",
-            Some(json!({
-                "name": name,
-                "private": true,
-                "auto_init": true,
-                "has_issues": false,
-                "has_wiki": false,
-                "has_projects": false,
-            })),
-        )
-        .await;
-        let repo = body["full_name"].as_str().unwrap_or("").to_string();
-        let branch = body["default_branch"].as_str().unwrap_or("").to_string();
+        let payload = json!({
+            "name": name,
+            "private": true,
+            "auto_init": true,
+            "has_issues": false,
+            "has_wiki": false,
+            "has_projects": false,
+        });
+        let mut repo = String::new();
+        let mut branch = String::new();
+        let mut private_ok = false;
+        let mut creation_error = None;
+        for attempt in 1..=API_RETRIES {
+            let (status, body) = api_call(
+                http,
+                token,
+                reqwest::Method::POST,
+                "/user/repos",
+                Some(payload.clone()),
+            )
+            .await;
+            if status.is_success() {
+                repo = body["full_name"].as_str().unwrap_or("").to_string();
+                branch = body["default_branch"].as_str().unwrap_or("").to_string();
+                private_ok = body["private"].as_bool() == Some(true);
+                break;
+            }
+            if !status.is_server_error() && status.as_u16() != 429 {
+                creation_error = Some(format!("rig-репо не создано: HTTP {status} — {body}"));
+                break;
+            }
+            // 5xx/429 после POST: репо мог создаться, а ответ пропал.
+            // Проверяем точное имя и подхватываем его — повтор POST создал бы дубль.
+            println!("создание рига: HTTP {status} — проверяю, не создан ли репо");
+            let (_, user) = api_call_retry(http, token, reqwest::Method::GET, "/user").await;
+            let owner = user["login"].as_str().unwrap_or("").to_string();
+            let (found, existing) = api_call_retry(
+                http,
+                token,
+                reqwest::Method::GET,
+                &format!("/repos/{owner}/{name}"),
+            )
+            .await;
+            if found.is_success() {
+                repo = existing["full_name"].as_str().unwrap_or("").to_string();
+                branch = existing["default_branch"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                private_ok = existing["private"].as_bool() == Some(true);
+                break;
+            }
+            if attempt == API_RETRIES {
+                creation_error = Some(format!(
+                    "rig-репо не создано после {API_RETRIES} попыток: HTTP {status} — {body}"
+                ));
+            } else {
+                tokio::time::sleep(API_RETRY_PAUSE).await;
+            }
+        }
         // Ни одной паники после POST: ошибка ответа уходит в сценарий, который
         // исполняется внутри spawn — teardown всё равно состоится.
-        let creation_error = if !status.is_success() {
-            Some(format!("rig-репо не создано: HTTP {status} — {body}"))
-        } else if !repo.ends_with(&format!("/uwuwu-rig-e2e-{stamp}")) {
-            Some(format!("имя рига не совпало с ожидаемым префиксом: {repo}"))
-        } else if body["private"].as_bool() != Some(true) {
-            Some("риг обязан быть приватным".to_string())
-        } else {
-            None
-        };
+        if creation_error.is_none() {
+            if !repo.ends_with(&format!("/uwuwu-rig-e2e-{stamp}")) {
+                creation_error = Some(format!("имя рига не совпало с ожидаемым префиксом: {repo}"));
+            } else if !private_ok {
+                creation_error = Some("риг обязан быть приватным".to_string());
+            }
+        }
         Self {
             http: http.clone(),
             token: token.to_string(),
