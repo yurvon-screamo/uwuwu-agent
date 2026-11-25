@@ -47,7 +47,7 @@ Body sections themselves stay Russian: task bodies are user-facing content the o
   existing spec record («реализует US-0X» — no duplicate minted); (в) a canon doc (ADR/README/spec)
   with the canon mark when derived. Local IDs — Latin per the spec form (US-1, UC-2, NFT-3; no
   Cyrillic doubles); the dreamer assigns global IDs at transfer. Rows that left analytics before the
-  rule (before 25.11.2026) go as is — no table is not a defect. Direct/fast-track rows: the session
+  rule (before the merge of PR uwuwu-agent#517) go as is — no table is not a defect. Direct/fast-track rows: the session
   formulates records from the owner's verbatim order (source = the order itself).
 - **Records by type**: feature — the table is mandatory (proportionality inside); bug/spike — no
   records (the type's frames only: BDD scenario / hypothesis); docs/other/refactoring/legacy/qa/

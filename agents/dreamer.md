@@ -50,7 +50,10 @@ basename(cwd) or the git remote name = the project folder name. In doubt — cou
 as unmatched (do not invent correspondences). Not matched — doc hygiene (step 4)
 is skipped with the mark «проект не сматчился»; experience (step 5), the persona (step 6)
 and tasks (step 7)
-always run; the incident analysis (step 8) — the task run only.
+always run; the incident analysis (step 8) — the task run only. The one exception:
+the records transfer (step 4, uwuwu#1630) resolves its project from the analyzed
+session's spawn header in the dump (the session may work on any project) — the cwd
+rule above does not gate it.
 
 ### 4. Project documentation hygiene (if the project matched)
 
@@ -78,13 +81,18 @@ Compare with what actually happened in the session and the git state:
     project — from the session's spawn header in the dump, never from cwd).
     No records in the body, row not in Review/Done — this pass has no transfer.
   - **AS-IS anchor** — a fact, checked per the PR host in the row's PR cell:
-    `github.com` → `gh pr view <url> --json state` = MERGED; a Forgejo/Gitea
-    host (`git.l4a.ru`, `git.true-wash.com`, …) → `GET /api/v1/repos/<owner>/<repo>/pulls/<n>`
-    → field `merged` (token — env `GITEA_TOKENS`, host→token, #1269); docs-only —
-    the PR cell holds a non-PR URL and the wiki artifact is live. The check
-    fails (unknown host, unreachable, no token) — the outcome is neither yes
-    nor no: defer the transfer, mark it in the pass's final line, retry on the
-    next pass. Never read a failed check as «not merged».
+    `github.com` → `gh pr view <url> --json state` = MERGED (`GH_TOKEN` in the
+    session env); a Forgejo/Gitea host (`git.true-wash.com`, `git.l4a.ru`) →
+    `gt pr list --host <url> --repo <owner>/<repo> --state all` (tea CLI, its
+    config carries the tokens; the STATE column shows `merged` — both hosts
+    probe-verified 26.11.2026); docs-only — the PR cell holds a non-PR URL and
+    the wiki artifact is live. A host with no reachable route (no `gt` config
+    entry — the token grant is the owner's hands, Deployment): the transfer is
+    unavailable for it — records stay in the body, recorded here as a
+    limitation, no per-pass flags. The route exists but the check fails
+    (network, auth) → flag the task (a visible channel, same as the write
+    control below) — the outcome is neither yes nor no; never read a failed
+    check as «not merged».
   - **Judgment** — target section per record type; status «действует»; global
     ID — the next free number of the section in the live spec (never reused);
     dedup — an identical formulation exists → skip; a changed formulation → a
@@ -104,9 +112,13 @@ Compare with what actually happened in the session and the git state:
     transition policy ADR-102; the records stay in the body). Read the fresh
     spec → a surgical local edit (the row into the table) → `uwuwu_docs_write`
     with the fm header preserved → a scripted pre/post comparison (mechanical,
-    line-wise) → the control fails: roll back from the pre-image (a session
-    temp file, e.g. `mktemp`, never the wiki) and flag the task with the
-    recovery path (the hub file history). No silent skip, no silent damage. A
+    line-wise) → the control fails: roll back from the pre-image and flag the
+    task with the recovery path (the hub file history). The pre-image is a
+    byte-exact copy obtained instrumentally — the raw hub blob (`gh api repos/
+    …/contents/…` → decode) or `cp` of the fetched file — sha256-checked
+    against the live blob before the edit; a model-retyped copy is not a
+    pre-image (it regenerates the corruption class the control catches).
+    No silent skip, no silent damage. A
     spec with code fences or mermaid blocks is plain markdown — the full
     round-trip survives it under the control; HTML embeds and database blocks
     do not — such a spec is append/point-edit only and the transfer defers to
