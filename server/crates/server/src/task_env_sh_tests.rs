@@ -143,10 +143,10 @@ fn task_env_reuses_existing_worktree_without_touching_working_state() {
     let fx = fixture();
     let env_root = fx.root.join("env");
     let first = run_task_env(&env_root, &fx.carrier, "1504fx");
+    let stderr_first = String::from_utf8_lossy(&first.stderr);
     assert!(
         first.status.success(),
-        "первый вызов создал env: stderr={}",
-        String::from_utf8_lossy(&first.stderr)
+        "первый вызов создал env: stderr={stderr_first}"
     );
     let repo = env_root.join("1504fx").join("repo");
     std::fs::write(repo.join("local-edit.txt"), "working state\n").expect("правка записана");
@@ -189,11 +189,11 @@ fn task_env_reuses_classic_checkout_with_git_directory() {
     let (head_before, _) = git_out(&repo, &["rev-parse", "HEAD"]);
 
     let out = run_task_env(&env_root, &fx.carrier, "1504fx");
+    let stderr = String::from_utf8_lossy(&out.stderr);
 
     assert!(
         out.status.success(),
-        "классический чекаут с .git-каталогом переиспользуется: stderr={}",
-        String::from_utf8_lossy(&out.stderr)
+        "классический чекаут с .git-каталогом переиспользуется: stderr={stderr}"
     );
     let (head_after, _) = git_out(&repo, &["rev-parse", "HEAD"]);
     assert_eq!(head_after, head_before, "HEAD чекаута не сдвинулся");
@@ -205,28 +205,50 @@ fn task_env_reuse_refreshes_remote_refs_without_moving_head() {
     let fx = fixture();
     let env_root = fx.root.join("env");
     let first = run_task_env(&env_root, &fx.carrier, "1504fx");
+    let stderr_first = String::from_utf8_lossy(&first.stderr);
     assert!(
         first.status.success(),
-        "первый вызов создал env: stderr={}",
-        String::from_utf8_lossy(&first.stderr)
+        "первый вызов создал env: stderr={stderr_first}"
     );
     let repo = env_root.join("1504fx").join("repo");
-    let (base_before, _) = git_out(&fx.carrier, &["rev-parse", "origin/master"]);
+    let (base_before, _) = git_out(&repo, &["rev-parse", "origin/master"]);
 
-    std::fs::write(fx.carrier.join("remote-marker.txt"), "origin moved\n").expect("маркер записан");
-    git_out(&fx.carrier, &["add", "remote-marker.txt"]);
-    git_out(&fx.carrier, &["commit", "-q", "-m", "origin moved"]);
-    git_out(&fx.carrier, &["push", "-q", "origin", "master"]);
-    git_out(&fx.carrier, &["fetch", "-q", "origin"]);
-    let (base_after, _) = git_out(&fx.carrier, &["rev-parse", "origin/master"]);
-    assert_ne!(base_before, base_after, "arrange: origin сдвинулся");
+    // Отдельный клон двигает origin: в ворктри env реф остаётся старым.
+    let pusher = fx.root.join("pusher");
+    let bare = fx.root.join("origin.git");
+    git_out(
+        &fx.root,
+        &[
+            "clone",
+            "-q",
+            bare.to_str().expect("utf8"),
+            pusher.to_str().expect("utf8"),
+        ],
+    );
+    std::fs::write(pusher.join("remote-marker.txt"), "origin moved\n").expect("маркер записан");
+    git_out(&pusher, &["add", "remote-marker.txt"]);
+    git_out(&pusher, &["commit", "-q", "-m", "origin moved"]);
+    git_out(&pusher, &["push", "-q", "origin", "master"]);
+    git_out(&pusher, &["fetch", "-q", "origin"]);
+    let (base_after, _) = git_out(&pusher, &["rev-parse", "origin/master"]);
+    assert_ne!(
+        base_before.trim(),
+        base_after.trim(),
+        "arrange: origin сдвинулся"
+    );
+    let (stale_origin, _) = git_out(&repo, &["rev-parse", "origin/master"]);
+    assert_eq!(
+        stale_origin.trim(),
+        base_before.trim(),
+        "arrange: реф env ещё старый"
+    );
 
     let second = run_task_env(&env_root, &fx.carrier, "1504fx");
+    let stderr = String::from_utf8_lossy(&second.stderr);
 
     assert!(
         second.status.success(),
-        "повторный вызов зелёный: stderr={}",
-        String::from_utf8_lossy(&second.stderr)
+        "повторный вызов зелёный: stderr={stderr}"
     );
     let (env_origin, _) = git_out(&repo, &["rev-parse", "origin/master"]);
     assert_eq!(
