@@ -68,7 +68,7 @@ fn parse_model(raw: &str) -> Result<BotModel, String> {
 mod tests {
     use super::*;
 
-    const DOC: &str = "---\ntitle: Помощник\nmodel: zai-coding-plan/glm-5.3-flash#low\n\
+    const DOC: &str = "---\ntitle: Помощник\nmodel: opencode-go/hy4-flash-free#low\n\
 token_env: UWUWU_BOT_TOKEN_HELPER\nowner: @yurvon\nworkspace: /home/yurvon/uwuwu-agent\n\
 greeting: Привет!\nenabled: false\n---\n\n## Методичка\nсоздавай Draft";
 
@@ -76,8 +76,8 @@ greeting: Привет!\nenabled: false\n---\n\n## Методичка\nсозд�
     fn parses_full_doc() {
         let s = parse_bot_doc("bot/помощник", DOC).unwrap();
         assert_eq!(s.title, "Помощник");
-        assert_eq!(s.model.provider, "zai-coding-plan");
-        assert_eq!(s.model.id, "glm-5.3-flash");
+        assert_eq!(s.model.provider, "opencode-go");
+        assert_eq!(s.model.id, "hy4-flash-free");
         assert_eq!(s.model.variant.as_deref(), Some("low"));
         assert_eq!(s.token_env, "UWUWU_BOT_TOKEN_HELPER");
         assert_eq!(s.owner.as_deref(), Some("yurvon"), "@ срезается");

@@ -204,7 +204,7 @@ mod tests {
             directory: "/tmp".into(),
             title: "t".into(),
             agent: uwuwu_domain::AgentSlot::Default,
-            model: uwuwu_domain::ModelRef::new("zai-coding-plan", "glm-5.3-flash"),
+            model: uwuwu_domain::ModelRef::new("opencode-go", "hy4-flash-free"),
             variant: None,
             bootstrap,
         }

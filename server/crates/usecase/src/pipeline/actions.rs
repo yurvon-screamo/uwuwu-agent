@@ -331,6 +331,19 @@ impl TickUseCase {
                 return Ok(WakeAct::None);
             }
             Liveness::Dead => {
+                // #1616 (срез 4): контракт #1357 безусловен — direct-строке
+                // фабрика никого не спавнит, включая респавн по мёртвой
+                // сессии; строка тихо ждёт владельца (оживление/чистка
+                // ячейки — его ходы), исход None — без эскалаций
+                if task.direct() {
+                    tracing::debug!(
+                        event = "respawn.held_direct",
+                        number = task.number(),
+                        slot = naming::slot_key(slot),
+                        "Респавн direct-строки запрещён контрактом #1357 — строка ждёт владельца"
+                    );
+                    return Ok(WakeAct::None);
+                }
                 // Second source (#1072→#1163): сессия в списке исполнителя —
                 // проба солгала (serve-шторм 13.11 давал 404 живым ходам);
                 // респавн отменяется, вердикт уйдёт wakeup-путём на тике,
@@ -704,6 +717,19 @@ impl TickUseCase {
         };
         if sighting_known(sightings, session) {
             return self.session_lost_desync(board, task, slot).await;
+        }
+        // #1616 (срез 4): resurrection-рука — тоже спавн; direct-строке
+        // запрещён контрактом #1357 безусловно. Исход Counted: счётчик
+        // потерянных доставок ведётся, респавна и эскалаций нет — строка
+        // ждёт владельца
+        if task.direct() {
+            tracing::debug!(
+                event = "lost.held_direct",
+                number = task.number(),
+                slot = naming::slot_key(slot),
+                "Респавн потерянной сессии direct-строки запрещён контрактом #1357"
+            );
+            return Ok(LostAct::Counted);
         }
         // resurrection-рука: исполнитель сам подтвердил отсутствие сессии
         if matches!(

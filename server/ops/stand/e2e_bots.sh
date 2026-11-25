@@ -67,7 +67,7 @@ MOCK_PID=$!
 sleep 1
 
 # вики-док бота: «один док = один бот», токен только в env стенда
-BOT_DOC='{"bot/Проба-раннера/README": "---\ntitle: Проба раннера\nmodel: zai-coding-plan/glm-5.3-flash\ntoken_env: UWUWU_BOT_TOKEN_E2E\nowner: yurvon\nworkspace: /tmp/opencode\ngreeting: привет от стенда\n---\n\nОтвечай кратко, одной строкой."}'
+BOT_DOC='{"bot/Проба-раннера/README": "---\ntitle: Проба раннера\nmodel: opencode-go/hy4-flash-free\ntoken_env: UWUWU_BOT_TOKEN_E2E\nowner: yurvon\nworkspace: /tmp/opencode\ngreeting: привет от стенда\n---\n\nОтвечай кратко, одной строкой."}'
 
 say "сервер (live, memory-hub, вики в памяти)"
 UWUWU_SERVER_CONFIG=$PWD/ops/config.memory.e2e.toml \

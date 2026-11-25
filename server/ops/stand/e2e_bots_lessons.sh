@@ -97,11 +97,11 @@ sleep 1
 # три бота: doc-режим с уроками, agent-режим с уроками, agent-режим без
 # дока уроков (регресс-гейт «дока нет — поведение прежнее»)
 BOT_DOCS='{
-"bot/Урокодок/README": "---\ntitle: Урокодок\nmodel: zai-coding-plan/glm-5.3-flash\ntoken_env: UWUWU_BOT_TOKEN_LESS_D\nowner: yurvon\nworkspace: /tmp/opencode\n---\n\nМетодичка док-бота: отвечай кратко.",
+"bot/Урокодок/README": "---\ntitle: Урокодок\nmodel: opencode-go/hy4-flash-free\ntoken_env: UWUWU_BOT_TOKEN_LESS_D\nowner: yurvon\nworkspace: /tmp/opencode\n---\n\nМетодичка док-бота: отвечай кратко.",
 "bot/Урокодок/Уроки": "Урок-1: отвечай по-русски.",
-"bot/Урокоагент/README": "---\ntitle: Урокоагент\nmodel: zai-coding-plan/glm-5.3-flash\ntoken_env: UWUWU_BOT_TOKEN_LESS_A\nowner: yurvon\nworkspace: /tmp/opencode\nagent: probe-agent\n---\n\nТело дока игнорируется (методичка в agents/probe-agent.md).",
+"bot/Урокоагент/README": "---\ntitle: Урокоагент\nmodel: opencode-go/hy4-flash-free\ntoken_env: UWUWU_BOT_TOKEN_LESS_A\nowner: yurvon\nworkspace: /tmp/opencode\nagent: probe-agent\n---\n\nТело дока игнорируется (методичка в agents/probe-agent.md).",
 "bot/Урокоагент/Уроки": "Урок-A: не выдумывай факты.",
-"bot/Чистбот/README": "---\ntitle: Чистбот\nmodel: zai-coding-plan/glm-5.3-flash\ntoken_env: UWUWU_BOT_TOKEN_LESS_C\nowner: yurvon\nworkspace: /tmp/opencode\nagent: probe-agent\n---\n\nТело дока игнорируется (методичка в agents/probe-agent.md)."
+"bot/Чистбот/README": "---\ntitle: Чистбот\nmodel: opencode-go/hy4-flash-free\ntoken_env: UWUWU_BOT_TOKEN_LESS_C\nowner: yurvon\nworkspace: /tmp/opencode\nagent: probe-agent\n---\n\nТело дока игнорируется (методичка в agents/probe-agent.md)."
 }'
 
 UWUWU_SERVER_CONFIG=$PWD/ops/config.memory.e2e-lessons.toml \
