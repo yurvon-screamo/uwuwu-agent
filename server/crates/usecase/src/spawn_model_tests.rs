@@ -130,6 +130,11 @@ impl TickStateStore for NoopState {
     fn mark_lost_session(&self, _: &str, _: u64, _: Status) {}
     fn clear_lost_session(&self, _: &str, _: u64) {}
     fn clear_spawn_ms(&self, _b: &str, _n: u64, _s: Slot) {}
+    fn round_reentry_pending(&self, _b: &str, _n: u64) -> bool {
+        false
+    }
+    fn set_round_reentry_pending(&self, _b: &str, _n: u64) {}
+    fn clear_round_reentry_pending(&self, _b: &str, _n: u64) {}
     /// Аналитика: кулдауны волн/ревью и цикл-гварды (#1135).
     fn last_analys_ms(&self, _b: &str, _n: u64) -> Option<u64> {
         None
