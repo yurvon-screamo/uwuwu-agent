@@ -164,6 +164,14 @@ impl TickStateStore for NoopState {
         false
     }
     fn mark_own_comment(&self, _id: &str, _posted_ms: u64) {}
+    fn master_binding(&self, _: &str, _: &str) -> Option<(String, String, String)> {
+        None
+    }
+    fn set_master_binding(&self, _: &str, _: &str, _: &str, _: &str, _: &str) {}
+    fn master_compact_ms(&self, _: &str, _: &str) -> u64 {
+        0
+    }
+    fn set_master_compact_ms(&self, _: &str, _: &str, _: u64) {}
     fn save(&self) -> UsecaseResult<()> {
         Ok(())
     }
@@ -336,6 +344,7 @@ async fn analyst_review_spawn_carries_model_from_server_map() {
         clock: Arc::new(TestClock),
         models: models(),
         cup: 7,
+        compact: None,
     };
 
     // Act
@@ -346,7 +355,7 @@ async fn analyst_review_spawn_carries_model_from_server_map() {
     assert_model(
         sessions.spec_of(),
         "ревью-спавн аналитики",
-        "zai-coding-plan/glm-5.3-flash#high",
+        "zai-coding-plan/glm-5.4#high",
     );
 }
 

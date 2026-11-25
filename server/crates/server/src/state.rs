@@ -56,6 +56,23 @@ struct BotRow {
     compact_ms: Option<u64>,
 }
 
+/// Мастер-привязка роли проекта (#1634, форма роль x проект общая
+/// с #1607): вечная сессия волны + модель рождения + checkout.
+/// Пересоздание - перезапись записи, старая сессия не гасится.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct MasterRow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkout: Option<String>,
+    /// Метка последней адмиссии компакта (ms; None - не было):
+    /// коулдаун переживает рестарт сервера.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compact_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct StateFile {
     /// «board:number» → состояние строки.
@@ -106,6 +123,9 @@ struct StateFile {
     /// Id GitHub глобально уникальны — плоский map без ключа доски.
     #[serde(default)]
     own_comments: BTreeMap<String, u64>,
+    /// Мастер-привязки волн (#1634, форма роль:проект общая с #1607).
+    #[serde(default)]
+    master: BTreeMap<String, MasterRow>,
 }
 
 /// Машинный учёт крона на носителе (срез #1480): SERDE-форма CronRow
@@ -740,6 +760,59 @@ impl TickStateStore for JsonStateStore {
             .expect("state lock")
             .own_comments
             .insert(id.to_string(), posted_ms);
+    }
+
+    fn master_binding(&self, role: &str, project: &str) -> Option<(String, String, String)> {
+        let key = format!("{role}:{project}");
+        self.state
+            .lock()
+            .expect("state lock")
+            .master
+            .get(&key)
+            .and_then(
+                |r| match (r.session.clone(), r.model.clone(), r.checkout.clone()) {
+                    (Some(s), Some(m), Some(c)) => Some((s, m, c)),
+                    _ => None,
+                },
+            )
+    }
+
+    fn set_master_binding(
+        &self,
+        role: &str,
+        project: &str,
+        session: &str,
+        model_raw: &str,
+        checkout: &str,
+    ) {
+        let key = format!("{role}:{project}");
+        let mut guard = self.state.lock().expect("state lock");
+        let row = guard.master.entry(key).or_default();
+        row.session = Some(session.to_string());
+        row.model = Some(model_raw.to_string());
+        row.checkout = Some(checkout.to_string());
+    }
+
+    fn master_compact_ms(&self, role: &str, project: &str) -> u64 {
+        let key = format!("{role}:{project}");
+        self.state
+            .lock()
+            .expect("state lock")
+            .master
+            .get(&key)
+            .and_then(|r| r.compact_ms)
+            .unwrap_or(0)
+    }
+
+    fn set_master_compact_ms(&self, role: &str, project: &str, ms: u64) {
+        let key = format!("{role}:{project}");
+        self.state
+            .lock()
+            .expect("state lock")
+            .master
+            .entry(key)
+            .or_default()
+            .compact_ms = Some(ms);
     }
 
     fn save(&self) -> UsecaseResult<()> {

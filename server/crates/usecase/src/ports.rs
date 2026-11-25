@@ -694,5 +694,20 @@ pub trait TickStateStore: Send + Sync {
     /// агентом через MCP task_comment (не юзером и не фабрикой).
     fn own_comment(&self, id: &str) -> bool;
     fn mark_own_comment(&self, id: &str, posted_ms: u64);
+    /// Мастер-привязка роли проекта (#1634, форма роль x проект общая
+    /// с #1607): (session, model_raw provider/id[#variant], checkout).
+    fn master_binding(&self, role: &str, project: &str) -> Option<(String, String, String)>;
+    fn set_master_binding(
+        &self,
+        role: &str,
+        project: &str,
+        session: &str,
+        model_raw: &str,
+        checkout: &str,
+    );
+    /// Метка последней адмиссии компакта мастер-привязки (коулдаун
+    /// переживает рестарт; 0 - не было).
+    fn master_compact_ms(&self, role: &str, project: &str) -> u64;
+    fn set_master_compact_ms(&self, role: &str, project: &str, ms: u64);
     fn save(&self) -> UsecaseResult<()>;
 }
