@@ -72,8 +72,8 @@ impl GitWikiWriter {
             .call(reqwest::Method::GET, &contents_url(&self.repo, path), None)
             .await?;
         if status.as_u16() == 404 {
-            // #1653: append не должен создавать/затирать док по
-            // устаревшему Contents-чтению; дерево — свежий свидетель.
+            // #1653: append не должен отказывать ложным AppendMissing
+            // по устаревшему Contents-чтению; дерево — свежий свидетель.
             return crate::wiki::witness::TreeWitness {
                 http: &self.http,
                 token: &self.token,

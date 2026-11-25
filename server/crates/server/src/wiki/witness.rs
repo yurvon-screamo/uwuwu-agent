@@ -45,13 +45,7 @@ impl TreeWitness<'_> {
                 "wiki blob {path}: HTTP {status}"
             )));
         }
-        let b64 = blob["content"]
-            .as_str()
-            .unwrap_or_default()
-            .replace('\n', "");
-        let bytes = base64_std(&b64)
-            .ok_or_else(|| UsecaseError::Board(format!("wiki blob {path}: base64")))?;
-        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+        Ok(Some(blob_text(&blob)?))
     }
 
     async fn call(
@@ -85,23 +79,41 @@ impl TreeWitness<'_> {
     }
 }
 
-/// Blob-sha документа в свежем дереве. Усечённое дерево не доказывает
-/// отсутствие: такой ответ — честная ошибка вместо вердикта Created.
-pub(crate) fn blob_sha_for<'a>(tree: &'a Value, path: &str) -> UsecaseResult<Option<&'a str>> {
+/// Blob-sha документа в свежем дереве. Неполный/усечённый ответ не
+/// доказывает отсутствие: честная ошибка вместо вердикта Created.
+fn blob_sha_for<'a>(tree: &'a Value, path: &str) -> UsecaseResult<Option<&'a str>> {
     if tree["truncated"].as_bool().unwrap_or(false) {
         return Err(UsecaseError::Board(format!(
             "wiki tree truncated — cannot confirm absence of {path}"
         )));
     }
-    let found = tree["tree"]
+    let entries = tree["tree"]
         .as_array()
-        .and_then(|entries| {
-            entries.iter().find(|entry| {
-                entry["path"].as_str() == Some(path) && entry["type"].as_str() == Some("blob")
-            })
-        })
-        .and_then(|entry| entry["sha"].as_str());
-    Ok(found)
+        .ok_or_else(|| UsecaseError::Board(format!("wiki tree for {path}: no tree array")))?;
+    let Some(entry) = entries.iter().find(|entry| {
+        entry["path"].as_str() == Some(path) && entry["type"].as_str() == Some("blob")
+    }) else {
+        return Ok(None);
+    };
+    let sha = entry["sha"]
+        .as_str()
+        .ok_or_else(|| UsecaseError::Board(format!("wiki tree entry for {path}: no blob sha")))?;
+    Ok(Some(sha))
+}
+
+/// Содержимое blob только из ответа с объявленным base64: 2xx без `content`
+/// или с чужим `encoding` не доказывает содержимое и не становится пустым доком.
+fn blob_text(blob: &Value) -> UsecaseResult<String> {
+    if blob["encoding"].as_str() != Some("base64") {
+        return Err(UsecaseError::Board("wiki blob: no base64 encoding".into()));
+    }
+    let b64 = blob["content"]
+        .as_str()
+        .ok_or_else(|| UsecaseError::Board("wiki blob: no content".into()))?
+        .replace('\n', "");
+    let bytes =
+        base64_std(&b64).ok_or_else(|| UsecaseError::Board("wiki blob: bad base64".into()))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 #[cfg(test)]
@@ -132,5 +144,41 @@ mod tests {
     fn truncated_tree_cannot_witness_absence() {
         let tree = json!({"truncated": true, "tree": []});
         assert!(blob_sha_for(&tree, "docs/missing.md").is_err());
+    }
+
+    #[test]
+    fn malformed_tree_cannot_witness_absence() {
+        for tree in [Value::Null, json!({}), json!({"tree": "not-an-array"})] {
+            assert!(blob_sha_for(&tree, "docs/missing.md").is_err());
+        }
+    }
+
+    #[test]
+    fn folder_with_doc_name_is_not_a_blob() {
+        let tree = json!({"tree": [
+            {"path": "docs/a.md", "type": "tree", "sha": "folder"}
+        ]});
+        assert_eq!(blob_sha_for(&tree, "docs/a.md").expect("tree"), None);
+    }
+
+    #[test]
+    fn blob_without_declared_base64_is_not_content() {
+        for blob in [
+            json!({}),
+            json!({"content": "Ym9keQ=="}),
+            json!({"encoding": "utf-8", "content": "Ym9keQ=="}),
+            json!({"encoding": "base64"}),
+            json!({"encoding": "base64", "content": "!!!"}),
+        ] {
+            assert!(blob_text(&blob).is_err(), "blob: {blob}");
+        }
+    }
+
+    #[test]
+    fn blob_text_declares_base64_and_decodes() {
+        assert_eq!(
+            blob_text(&json!({"encoding": "base64", "content": "Ym9keQ=="})).expect("blob"),
+            "body"
+        );
     }
 }

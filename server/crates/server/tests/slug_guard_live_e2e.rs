@@ -838,6 +838,40 @@ async fn run_scenario(dir: PathBuf, rig: RigGithub, stamp: String) {
         "тело заменено полностью: {content}"
     );
 
+    // --- #1653: вердикты сразу после commit'а, без паузы между записями.
+    // Contents ещё может не видеть свежий файл; fm-шапка и append обязаны
+    // опираться на дерево, а не на устаревшее чтение.
+    let fresh = format!("Experience/rig{stamp}/fresh");
+    let (err, text) = write(
+        fresh.clone(),
+        "---\ntitle: witness-original\ndate: 2026-01-01T00:00:00+09:00\n---\n\nfirst body\n".into(),
+    )
+    .await;
+    assert!(!err, "свежая запись с fm: {text}");
+    let (err, text) = write(fresh.clone(), "second body\n".into()).await;
+    assert!(!err, "повторная запись после commit'а: {text}");
+    assert!(
+        text.contains("fm header carried over"),
+        "в окне лага ожидался Carried, а не Created: {text}"
+    );
+    let (err, text) = append(fresh.clone()).await;
+    assert!(!err, "append сразу после commit'а: {text}");
+    assert!(
+        text.contains("appended to"),
+        "ложный append-nonexistent в окне лага: {text}"
+    );
+    let content = rig
+        .wait_file(&format!("docs/{fresh}.md"), "e2e probe line")
+        .await;
+    assert!(
+        content.contains("title: witness-original"),
+        "шапка потеряна при повторной записи: {content}"
+    );
+    assert!(
+        content.trim_end().ends_with("e2e probe line"),
+        "строка append'а не в конце: {content}"
+    );
+
     // --- финальная целостность: blob-набор дерева в точности ожидаемый.
     // Двойники «….md.md», сырые «docs/…»-пути и корневые файлы — красные
     // даже вне пиненых путей.
@@ -847,6 +881,7 @@ async fn run_scenario(dir: PathBuf, rig: RigGithub, stamp: String) {
         format!("docs/{legit}.md"),
         format!("docs/{adr}.md"),
         format!("docs/{norm_slug}.md"),
+        format!("docs/{fresh}.md"),
     ]);
     rig.wait_final_blobs(expected).await;
 }
