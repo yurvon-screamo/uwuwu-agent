@@ -24,7 +24,7 @@ use crate::search::semantic::Embedder;
 use crate::search::semantic_backend::LanceSemanticBackend;
 use async_trait::async_trait;
 use lancedb::connection::ConnectBuilder;
-use uwuwu_usecase::{AppendDocOutcome, SemanticBackend, UsecaseResult, WikiRepo};
+use uwuwu_usecase::{SemanticBackend, UsecaseResult, WikiRepo};
 
 const DOCS: usize = 3;
 const CHURN_ROUNDS: usize = 6;
@@ -120,16 +120,8 @@ impl WikiRepo for ChurnWiki {
         Ok(())
     }
 
-    async fn append_doc(
-        &self,
-        _slug: &str,
-        _line: &str,
-        _message: &str,
-    ) -> UsecaseResult<AppendDocOutcome> {
-        Ok(AppendDocOutcome {
-            created: false,
-            lines: 0,
-        })
+    async fn append_doc(&self, _slug: &str, _line: &str, _message: &str) -> UsecaseResult<usize> {
+        Ok(0)
     }
 }
 

@@ -64,7 +64,9 @@ const EV_ESC: &str = "stall.escalated";
 const EV_PING: &str = "stall.ping";
 const EV_SIGNAL: &str = "quota.limit_unnotified";
 const NEEDS: &str = "Needs attention";
-const COMM: &str = "--- comments (latest) ---";
+/// Префикс заголовка хвоста комментов task_get (#1604): счётчики
+/// «latest N of M» в заголовке переменные, гард ловит сам факт секции.
+const COMM: &str = "--- comments (latest ";
 const IN_PROGRESS: &str = "In Progress";
 const PROJECT_STAND: &str = "stand";
 const WIN_PCT: &str = "window_pct";

@@ -8,7 +8,6 @@ use crate::error::UsecaseResult;
 use crate::pipeline::analyst::{AnalystBoard, AnalystUseCase};
 use crate::pipeline::analyst_review::AnalystReviewUseCase;
 use crate::pipeline::dreamer::DreamerUseCase;
-use crate::ports::AppendDocOutcome;
 use crate::ports::{
     AgentSessionGateway, AssistantReply, Clock, CommentRef, DreamerMark, IssueView, Liveness,
     SessionInfo, SessionSpec, TaskBoardRepo, TickStateStore, WikiRepo,
@@ -17,7 +16,7 @@ use crate::router::SessionRouter;
 use crate::spawn_models::SpawnModels;
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
-use uwuwu_domain::{Slot, SpawnModel, Status, Task};
+use uwuwu_domain::{PeakWindow, Slot, SpawnModel, Status, Task};
 
 /// Канон-карта владельца (единственный механизм моделей — #1154).
 fn models() -> Arc<SpawnModels> {
@@ -317,11 +316,8 @@ impl WikiRepo for CronWiki {
     async fn write_doc(&self, _s: &str, _c: &str, _m: &str) -> UsecaseResult<()> {
         Ok(())
     }
-    async fn append_doc(&self, _s: &str, _l: &str, _m: &str) -> UsecaseResult<AppendDocOutcome> {
-        Ok(AppendDocOutcome {
-            created: false,
-            lines: 0,
-        })
+    async fn append_doc(&self, _s: &str, _l: &str, _m: &str) -> UsecaseResult<usize> {
+        Ok(0)
     }
 }
 
@@ -389,6 +385,12 @@ async fn analyst_spawn_carries_model_from_server_map() {
         clock: Arc::new(TestClock),
         models: models(),
         cup: 7,
+        peak: PeakWindow {
+            enabled: false,
+            start_min: 0,
+            end_min: 0,
+        },
+        compact: None,
     };
 
     // Act

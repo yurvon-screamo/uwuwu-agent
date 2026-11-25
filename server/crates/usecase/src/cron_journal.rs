@@ -29,7 +29,7 @@ mod tests {
     use super::refuse;
 
     #[test]
-    fn refuses_frozen_journal_slug() {
+    fn refuses_removed_journal_slug() {
         let err = refuse("cron/Loop-надёжность-конвейера/Журнал").expect_err("отказ");
         assert!(err.contains("writing refused"));
         assert!(err.contains("#1576"));

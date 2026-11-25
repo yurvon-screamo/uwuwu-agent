@@ -1377,6 +1377,10 @@ async fn soft_ping_prompt_routes_to_project_executor() {
         named_prompts.iter().any(|p| p.contains("Soft ping")),
         "soft-ping на гейтвее проекта: {named_prompts:?}"
     );
+    assert!(
+        named_prompts.iter().any(|p| p.contains("owner_answer")),
+        "#1619: мягкий пинг напоминает про ответ владельца: {named_prompts:?}"
+    );
     // пин агента слота и на мягком пинге (#1300)
     let switched = named_gw.switched.lock().unwrap();
     assert!(
@@ -3436,12 +3440,13 @@ async fn stage_transition_clears_dead_review_cell() {
 }
 
 #[tokio::test]
-async fn test_slot_still_cleared_on_reentry_scope_1607() {
-    // Тест-слот — прежний канон: свежая сессия тестировщика на каждом
-    // входе в Testing (мастер-сессии тестера — скоуп #1607, не #1626).
-    // Пин защищает базу #1607 от случайного перевода на мастер-семантику
+async fn test_slot_reentry_keeps_master_session_and_delivers_delta_wake() {
+    // Мастер-сессия тестера (#1607, срез 2а): повторный вход в Testing при
+    // живой ячейке — сессия не снимается (никакого fresh-eyes-спавна),
+    // вход доставляет re-entry wake с дельта-промптом; нативного компакта
+    // нет — контекст прошлых раундов и есть ценность мастер-сессии.
     let state = Arc::new(MemState(Mutex::default()));
-    let mut t = task(38, Status::Testing);
+    let mut t = task(60, Status::Testing);
     let mut f = TaskFields::default();
     f.set_session(
         Slot::Test,
@@ -3453,15 +3458,363 @@ async fn test_slot_still_cleared_on_reentry_scope_1607() {
         .lock()
         .unwrap()
         .statuses
-        .push((38, Status::ReviewResult));
-    let (u, board, _, _) = usecase_with_state(vec![t], PrState::Missing, state);
+        .push((60, Status::InProgress));
+    let mut fake = FakeSessions::new();
+    fake.idle_reply = true;
+    let (u, board, sessions, _) =
+        fixture_usecase(vec![t], vec![], state.clone(), Arc::new(FixedClock), fake);
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     let log = board.log.lock().unwrap();
     assert!(
-        log.iter().any(|l| l.starts_with("clear#38=")),
-        "тест-слот снят при входе в Testing (прежний канон): {log:?}"
+        !log.iter().any(|l| l.starts_with("clear#60=")),
+        "живая сессия тестера не снимается при re-entry: {log:?}"
     );
-    assert_eq!(out.spawns_done, 1, "свежий тестировщик заспавнен");
+    assert_eq!(out.spawns_done, 0, "спавна нет — сессия та же");
+    assert_eq!(out.wakeups, 1, "re-entry wake доставлен");
+    let prompts = sessions.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1, "одна доставка за вход: {prompts:?}");
+    assert!(
+        prompts[0].starts_with("ses_tester_live|"),
+        "wake уходит в ту же сессию: {prompts:?}"
+    );
+    assert!(
+        prompts[0].contains("Repeat testing round"),
+        "промпт входа — дельта, не спавн-промпт стадии: {prompts:?}"
+    );
+    assert!(
+        prompts[0].contains("owner_answer"),
+        "#1619: re-entry тоже знает про ответ владельца: {prompts:?}"
+    );
+    assert!(
+        sessions.compacted.lock().unwrap().is_empty(),
+        "тестер без компакта на входе — контекст раундов живёт"
+    );
+    assert!(
+        !state.round_reentry_pending("B", 60),
+        "маркер погашен доставкой"
+    );
+}
+
+#[tokio::test]
+async fn test_slot_reentry_with_foreign_comments_wakeup_owns_entry() {
+    // Вход с чужим хвостом (#1607, контракт C2): доставкой владеет wakeup —
+    // вердикт едет обычным путём, re-entry wake молчит (ровно один промпт).
+    let state = Arc::new(MemState(Mutex::default()));
+    let mut t = task(61, Status::Testing);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Test,
+        uwuwu_domain::SessionRef::parse("ses_tester_live").unwrap(),
+    );
+    t.apply_fields(f);
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((61, Status::InProgress));
+    let mut fake = FakeSessions::new();
+    fake.idle_reply = true;
+    let comments = vec![CommentRef {
+        id: "c1".into(),
+        created_ms: 3000,
+        body: "вердикт ревьювера: правь".into(),
+    }];
+    let (u, _, sessions, _) =
+        fixture_usecase(vec![t], comments, state.clone(), Arc::new(FixedClock), fake);
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.wakeups, 1, "wakeup доставлен");
+    assert_eq!(out.spawns_done, 0, "спавна нет — сессия та же");
+    let prompts = sessions.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1, "ровно один промпт за вход: {prompts:?}");
+    assert!(
+        prompts[0].contains("Wakeup"),
+        "чужой хвост доставлен wakeup-путём: {prompts:?}"
+    );
+    assert!(
+        !prompts[0].contains("Repeat testing round"),
+        "re-entry wake молчит при чужом хвосте: {prompts:?}"
+    );
+    assert!(
+        !state.round_reentry_pending("B", 61),
+        "маркер погашен wakeup-доставкой"
+    );
+}
+
+#[tokio::test]
+async fn test_slot_reentry_marker_open_skips_stall_pass() {
+    // Открытый маркер (#1607, Low-2 р.4): сессия занята (re-entry ждёт
+    // тика после ответа), тишина за порогом — сталл-пасс пропускается:
+    // пинг «переведи статус» ложен для держателя входа. Контроль — та же
+    // тишина без маркера: классический сталл-пинг стреляет.
+    let build = |n: u64, prev: Status| {
+        let state = Arc::new(MemState(Mutex::default()));
+        let mut t = task(n, Status::Testing);
+        let mut f = TaskFields::default();
+        f.set_session(
+            Slot::Test,
+            uwuwu_domain::SessionRef::parse("ses_tester_live").unwrap(),
+        );
+        t.apply_fields(f);
+        state.0.lock().unwrap().statuses.push((n, prev));
+        let mut fake = FakeSessions::new();
+        fake.activity_ms = Some(0);
+        // занята: ни re-entry, ни wakeup не доставляют — маркер/тишина
+        fixture_usecase(vec![t], vec![], state.clone(), Arc::new(LostClock), fake)
+    };
+    // маркер взведён переходом In Progress → Testing
+    let (u, board, _, _) = build(62, Status::InProgress);
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.soft_pings, 0, "мягкого пина нет при открытом маркере");
+    assert_eq!(
+        out.stall_pings, 0,
+        "классического пина нет при открытом маркере"
+    );
+    {
+        let log = board.log.lock().unwrap();
+        assert!(
+            !log.iter().any(|l| l.starts_with("comment#62=")),
+            "пинг-комментов нет при открытом маркере: {log:?}"
+        );
+    }
+    // контроль: та же тишина без перехода (маркера нет) — сталл стреляет
+    let (u2, board2, _, _) = build(63, Status::Testing);
+    let out2 = u2.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out2.stall_pings, 1,
+        "без маркера классический пинг стреляет"
+    );
+    assert!(
+        board2
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("comment#63=")),
+        "контроль: пинг-коммент ушёл"
+    );
+}
+
+#[tokio::test]
+async fn test_reentry_held_when_cup_full_marker_persists() {
+    // #1607 (тестер-пин): CUP-гейт deliver_tester_reentry — тот же контур,
+    // что у будильника. Кап полон — дельта-промпт откладывается (Deferred),
+    // компакт/промпт не выполняются, pending-маркер persists: доставка
+    // ретраится на свободном тике, вход не теряется.
+    let state = Arc::new(MemState(Mutex::default()));
+    let mut t = task(64, Status::Testing);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Test,
+        uwuwu_domain::SessionRef::parse("ses_tester_cup").unwrap(),
+    );
+    t.apply_fields(f);
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((64, Status::InProgress));
+    let mut fake = FakeSessions::new();
+    fake.idle_reply = true;
+    let (u, board, sessions, _) =
+        fixture_usecase(vec![t], vec![], state.clone(), Arc::new(FixedClock), fake);
+    // чужой ход в полёте — единый кап занят
+    sessions
+        .extra
+        .lock()
+        .unwrap()
+        .push(crate::ports::SessionInfo {
+            id: "ses_other_busy".into(),
+            title: String::new(),
+            agent: String::new(),
+            directory: String::new(),
+            updated_ms: 0,
+            outcome: String::new(),
+            total_tokens: 0,
+            busy: true,
+        });
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert!(
+        sessions.compacted.lock().unwrap().is_empty(),
+        "при полном капе компакт тестера не выполняется"
+    );
+    assert!(
+        sessions.prompts.lock().unwrap().is_empty(),
+        "при полном капе дельта-промпт не доставляется"
+    );
+    assert_eq!(out.wakeups, 0, "доставки нет");
+    assert_eq!(out.wakeups_deferred, 1, "доставка отложена, не потеряна");
+    assert!(
+        state.round_reentry_pending("B", 64),
+        "маркер persists — ретрай на свободном тике"
+    );
+    assert!(
+        !board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("clear#64=")),
+        "ячейка не снята — сессия та же"
+    );
+    assert_eq!(out.spawns_done, 0, "спавна нет");
+}
+
+#[tokio::test]
+async fn test_reentry_delivered_on_empty_journal_with_marker() {
+    // #1607 (тестер-пин): пустой журнал при открытом маркере — будить
+    // нечем, вход доставляет re-entry wake с дельта-промптом (первая
+    // ветка wakeup_if_fresh). Контроль: та же тишина без маркера —
+    // тихий пропуск, никаких доставок (канон #1237).
+    let build = |n: u64, prev: Status| {
+        let state = Arc::new(MemState(Mutex::default()));
+        let mut t = task(n, Status::Testing);
+        let mut f = TaskFields::default();
+        f.set_session(
+            Slot::Test,
+            uwuwu_domain::SessionRef::parse("ses_tester_empty").unwrap(),
+        );
+        t.apply_fields(f);
+        state.0.lock().unwrap().statuses.push((n, prev));
+        let mut fake = FakeSessions::new();
+        fake.idle_reply = true;
+        fixture_usecase(vec![t], vec![], state.clone(), Arc::new(FixedClock), fake)
+    };
+    // маркер открыт (переход In Progress → Testing прошлого тика) —
+    // re-entry доставляется
+    let (u, _, sessions, _) = build(65, Status::InProgress);
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    {
+        let prompts = sessions.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1, "одна доставка за вход: {prompts:?}");
+        assert!(
+            prompts[0].starts_with("ses_tester_empty|"),
+            "wake уходит в ту же сессию: {prompts:?}"
+        );
+        assert!(
+            prompts[0].contains("Repeat testing round"),
+            "пустой журнал при маркере — дельта-промпт, не спавн: {prompts:?}"
+        );
+    }
+    assert_eq!(out.wakeups, 1, "re-entry доставлен");
+    assert_eq!(out.spawns_done, 0, "спавна нет — сессия та же");
+    // контроль: тот же раунд без перехода (маркера нет) — пустой журнал
+    // молчит (вход уже доставлен спавн-промптом, будить нечем)
+    let (u2, _, sessions2, _) = build(66, Status::Testing);
+    let out2 = u2.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert!(
+        sessions2.prompts.lock().unwrap().is_empty(),
+        "без маркера пустой журнал молчит"
+    );
+    assert_eq!(out2.wakeups, 0, "доставки нет без маркера");
+}
+
+#[tokio::test]
+async fn test_reentry_delivered_when_tail_fully_own_echo() {
+    // #1607 (тестер-пин): хвост целиком свой (self-эхо срезано, #1204)
+    // при открытом маркере — будить нечем, вход доставляет re-entry wake.
+    // Маркер гасится доставкой; seen не двигается (#1533: хвост ждёт
+    // следующего держателя).
+    let state = Arc::new(MemState(Mutex::default()));
+    state.mark_own_comment("own-echo", 10);
+    state.set_last_comment_id("B", 67, "old-seen");
+    let mut t = task(67, Status::Testing);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Test,
+        uwuwu_domain::SessionRef::parse("ses_tester_echo").unwrap(),
+    );
+    t.apply_fields(f);
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((67, Status::InProgress));
+    let mut fake = FakeSessions::new();
+    fake.idle_reply = true;
+    fake.activity_ms = Some(5000);
+    let (u, _, sessions, _) = fixture_usecase(
+        vec![t],
+        vec![
+            CommentRef {
+                id: "old-seen".into(),
+                created_ms: 1000,
+                body: "старое".into(),
+            },
+            CommentRef {
+                id: "own-echo".into(),
+                created_ms: 3000,
+                body: "мой отчёт тестера".into(),
+            },
+        ],
+        state.clone(),
+        Arc::new(FixedClock),
+        fake,
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    let prompts = sessions.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1, "одна доставка за вход: {prompts:?}");
+    assert!(
+        prompts[0].contains("Repeat testing round"),
+        "свой хвост — re-entry wake, не wakeup с эхом: {prompts:?}"
+    );
+    assert!(
+        !prompts[0].contains("мой отчёт"),
+        "свой коммент не доставляется: {prompts:?}"
+    );
+    drop(prompts);
+    assert_eq!(out.wakeups, 1, "re-entry доставлен");
+    assert!(
+        !state.round_reentry_pending("B", 67),
+        "маркер погашен доставкой"
+    );
+    assert_eq!(
+        state.0.lock().unwrap().comments.last().map(String::as_str),
+        Some("old-seen"),
+        "seen не двигается — хвост ждёт следующего держателя (#1533)"
+    );
+}
+
+#[tokio::test]
+async fn stall_pass_on_foreign_slot_not_suppressed_by_tester_marker() {
+    // #1607 (тестер-пин, C2 р.2): маркер раунда переживает уход строки
+    // из Testing (тестер так и не получил вход) — сталл-детект ЧУЖОЙ
+    // стадии (Dev) давиться им не должен: пинг «переведи статус» адресован
+    // деву и честен. Скоуп marker_stage (Test|review) — красная линия.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_round_reentry_pending("B", 68);
+    let mut t = task(68, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dev_stall").unwrap(),
+    );
+    t.apply_fields(f);
+    state.0.lock().unwrap().statuses.push((68, Status::Testing));
+    let mut fake = FakeSessions::new();
+    fake.activity_ms = Some(0);
+    let (u, board, _, _) =
+        fixture_usecase(vec![t], vec![], state.clone(), Arc::new(LostClock), fake);
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.stall_pings, 1,
+        "открытый маркер тестера не давит сталл чужой стадии (Dev)"
+    );
+    assert!(
+        board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("comment#68=")),
+        "пинг-коммент ушёл деву — маркер чужой стадии не скоупится"
+    );
+    assert!(
+        state.round_reentry_pending("B", 68),
+        "маркер не тронут сталлом чужой стадии — вход тестера ретраится"
+    );
 }
 
 #[tokio::test]
@@ -6261,6 +6614,10 @@ async fn spawn_prompt_demands_finish_transaction() {
         prompt.contains("Needs attention"),
         "вопрос владельцу — легальный финал"
     );
+    assert!(
+        prompt.contains("owner_answer"),
+        "#1619: возврат по ответу владельца объяснён в промпте спавна"
+    );
 }
 
 #[tokio::test]
@@ -6527,6 +6884,12 @@ async fn analyst_multiboard_no_oversell_within_tick() {
         clock: Arc::new(FixedClock),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         cup: 2,
+        peak: PeakWindow {
+            enabled: false,
+            start_min: 0,
+            end_min: 0,
+        },
+        compact: None,
     };
     let spawned = u.tick().await.unwrap();
     assert_eq!(spawned, 1, "вторая волна отложена занятым слотом");
@@ -6535,8 +6898,6 @@ async fn analyst_multiboard_no_oversell_within_tick() {
     assert_eq!(specs[0].directory, "/checkout-1");
 }
 
-/// Билдер юзкейса сайдкара аналитики: доска + роутер + кап (общая
-/// механика для аналитика и ревьювера, ревью #1231 similar-code).
 fn analyst_uc_with_cup(
     rows: Vec<Task>,
     state: Arc<MemState>,
@@ -6561,6 +6922,12 @@ fn analyst_uc_with_cup(
         clock: Arc::new(FixedClock),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         cup,
+        peak: PeakWindow {
+            enabled: false,
+            start_min: 0,
+            end_min: 0,
+        },
+        compact: None,
     };
     (u, board.clone())
 }
@@ -7108,6 +7475,553 @@ async fn analyst_wave_one_session_for_all_rows() {
 }
 
 #[tokio::test]
+async fn analyst_wave_reuses_live_master_session_1607() {
+    // Мастер-сессия аналитика (#1607, срез 2б): волна едет промптом в
+    // живую привязанную сессию — спавна нет, привязка не трогается.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_master",
+        "opencode-go/hy4-flash-free#high",
+        "/tmp/checkout",
+    );
+    let sessions = Arc::new(FakeSessions::new());
+    let (u, _) = analyst_uc(
+        vec![titled(70, "заявка", Status::Analys)],
+        state.clone(),
+        sessions.clone(),
+    );
+    let spawned = u.tick().await.unwrap();
+    assert_eq!(spawned, 0, "reuse — не спавн: счётчик волн не растёт");
+    assert!(
+        sessions.spawned.lock().unwrap().is_empty(),
+        "новых сессий нет"
+    );
+    assert!(
+        sessions.specs.lock().unwrap().is_empty(),
+        "спеков спавна нет"
+    );
+    let prompts = sessions.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1, "волна доставлена одним промптом");
+    assert!(
+        prompts[0].starts_with("ses_master|"),
+        "волна едет в привязанную сессию: {prompts:?}"
+    );
+    assert!(
+        prompts[0].contains("Analytics wave"),
+        "промпт волны, не спавн-промпт стадии: {prompts:?}"
+    );
+    {
+        let inner = state.0.lock().unwrap();
+        assert_eq!(inner.analys_loops.len(), 1, "захват волны отмечен");
+    }
+    assert!(
+        state
+            .master_binding("analyst", "p")
+            .is_some_and(|(s, _, _)| s == "ses_master"),
+        "привязка не переписана при reuse"
+    );
+}
+
+#[tokio::test]
+async fn analyst_wave_respawns_dead_master_session_1607() {
+    // Мёртвая мастер-сессия (#1607): волна спавнит новую сессию,
+    // привязка перезаписывается (старая не гасится — статус-кво).
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_dead",
+        "opencode-go/hy4-flash-free#high",
+        "/tmp/checkout",
+    );
+    let fake = FakeSessions::new();
+    fake.dead_sessions.lock().unwrap().push("ses_dead".into());
+    let sessions = Arc::new(fake);
+    let (u, _) = analyst_uc(
+        vec![titled(71, "заявка", Status::Analys)],
+        state.clone(),
+        sessions.clone(),
+    );
+    let spawned = u.tick().await.unwrap();
+    assert_eq!(spawned, 1, "мёртвая мастер-сессия — пересоздание");
+    let specs = sessions.specs.lock().unwrap();
+    assert_eq!(specs.len(), 1, "один спавн");
+    assert_eq!(
+        specs[0].model,
+        uwuwu_domain::SpawnModel::parse("opencode-go/hy4-flash-free#high")
+            .unwrap()
+            .model,
+        "новая сессия — на модели карты"
+    );
+    let bound = state
+        .master_binding("analyst", "p")
+        .expect("привязка перезаписана");
+    assert_eq!(bound.0, "ses_1", "привязка указывает на новую сессию");
+    assert_eq!(
+        bound.1.as_str(),
+        "opencode-go/hy4-flash-free#high",
+        "модель рождения записана"
+    );
+}
+
+#[tokio::test]
+async fn analyst_wave_defers_on_unknown_master_session_1607() {
+    // Liveness неизвестен (#1607): доска откладывается на тик — спавна
+    // нет, кулдауны и цикл-гарды не заряжаются («failed spawn не заряжает»).
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_ghost",
+        "opencode-go/hy4-flash-free#high",
+        "/tmp/checkout",
+    );
+    let mut fake = FakeSessions::new();
+    fake.liveness_unknown = true;
+    let sessions = Arc::new(fake);
+    let (u, _) = analyst_uc(
+        vec![titled(72, "заявка", Status::Analys)],
+        state.clone(),
+        sessions.clone(),
+    );
+    let spawned = u.tick().await.unwrap();
+    assert_eq!(spawned, 0, "без зрения — ни спавна, ни reuse");
+    assert!(sessions.spawned.lock().unwrap().is_empty(), "сессий нет");
+    assert!(sessions.prompts.lock().unwrap().is_empty(), "промптов нет");
+    {
+        let inner = state.0.lock().unwrap();
+        assert!(
+            inner.analys_loops.is_empty(),
+            "цикл-гард не заряжен отложкой"
+        );
+        assert!(inner.analys_ms.is_empty(), "кулдаун не заряжен отложкой");
+    }
+    assert!(
+        state
+            .master_binding("analyst", "p")
+            .is_some_and(|(s, _, _)| s == "ses_ghost"),
+        "привязка не тронута отложкой"
+    );
+}
+
+#[tokio::test]
+async fn analyst_master_recreated_on_model_divergence_1607() {
+    // Расхождение с картой (C1 #1607): модель рождения ≠ карта —
+    // пересоздание на модели карты, привязка перезаписывается.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_old",
+        "zai-coding-plan/glm-5.3-flash#high",
+        "/tmp/checkout",
+    );
+    let sessions = Arc::new(FakeSessions::new());
+    let (u, _) = analyst_uc(
+        vec![titled(73, "заявка", Status::Analys)],
+        state.clone(),
+        sessions.clone(),
+    );
+    let spawned = u.tick().await.unwrap();
+    assert_eq!(spawned, 1, "расхождение модели — пересоздание");
+    let specs = sessions.specs.lock().unwrap();
+    assert_eq!(
+        specs[0].model,
+        uwuwu_domain::SpawnModel::parse("opencode-go/hy4-flash-free#high")
+            .unwrap()
+            .model,
+        "новая сессия — на модели карты, не рождения"
+    );
+    assert!(
+        state
+            .master_binding("analyst", "p")
+            .is_some_and(|(_, m, _)| m == "opencode-go/hy4-flash-free#high"),
+        "модель рождения в привязке обновлена"
+    );
+}
+
+#[tokio::test]
+async fn analyst_master_recreated_on_checkout_divergence_1607() {
+    // Расхождение checkout (Low-1 р.4, прецедент ботов): каталог привязки
+    // ≠ конфигу — пересоздание в актуальном каталоге.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_old",
+        "opencode-go/hy4-flash-free#high",
+        "/tmp/stale-checkout",
+    );
+    let sessions = Arc::new(FakeSessions::new());
+    let (u, _) = analyst_uc(
+        vec![titled(74, "заявка", Status::Analys)],
+        state.clone(),
+        sessions.clone(),
+    );
+    let spawned = u.tick().await.unwrap();
+    assert_eq!(spawned, 1, "расхождение checkout — пересоздание");
+    let specs = sessions.specs.lock().unwrap();
+    assert_eq!(
+        specs[0].directory, "/tmp/checkout",
+        "новая сессия — в каталоге конфига"
+    );
+    assert!(
+        state
+            .master_binding("analyst", "p")
+            .is_some_and(|(_, _, c)| c == "/tmp/checkout"),
+        "checkout в привязке обновлён"
+    );
+}
+
+/// Билдер аналитика с компакт-политикой (#1607, срез 4): часы и политика
+/// задаются явно — проход проверяется изолированно от волн (пустая доска).
+fn analyst_compact_uc(
+    state: Arc<MemState>,
+    sessions: Arc<FakeSessions>,
+    clock: Arc<dyn Clock>,
+    policy: Option<crate::bots::CompactPolicy>,
+    cup: usize,
+) -> AnalystUseCase {
+    AnalystUseCase {
+        board: Arc::new(FakeBoard {
+            rows: std::sync::Mutex::new(vec![]),
+            log: Mutex::default(),
+            comments: vec![],
+            fields_fails: false,
+            set_session_fails: false,
+            set_pr_fails: AtomicBool::new(false),
+            clear_session_fails: AtomicBool::new(false),
+            status_fails: AtomicBool::new(false),
+        }),
+        boards: vec![analyst_board()],
+        sessions: Arc::new(SessionRouter::uniform(sessions)),
+        state,
+        clock,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        cup,
+        peak: PeakWindow {
+            enabled: false,
+            start_min: 0,
+            end_min: 0,
+        },
+        compact: policy,
+    }
+}
+
+/// Политика прохода тестов: те же числа, что в живом конфиге — idle 4ч,
+/// доля 62%, коулдаун 1ч (санкция владельца 25.11 в #1607).
+fn compact_policy_1607() -> crate::bots::CompactPolicy {
+    crate::bots::CompactPolicy {
+        idle_ms: 240 * 60_000,
+        min_context_pct: 62.0,
+        cooldown_ms: 60 * 60_000,
+    }
+}
+
+#[tokio::test]
+async fn analyst_compact_fires_on_idle_full_session_1607() {
+    // Проход (#1607, срез 4): idle-сессия с занятостью выше доли —
+    // нативная адмиссия, метка ДО POST (ADR-082).
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_master",
+        "opencode-go/hy4-flash-free#high",
+        "/tmp/checkout",
+    );
+    let mut fake = FakeSessions::new();
+    fake.activity_ms = Some(0); // тишина = всё время тика
+    fake.usage.lock().unwrap().insert("ses_master".into(), 70.0);
+    fake.usage
+        .lock()
+        .unwrap()
+        .insert("ses_reviewer".into(), 70.0);
+    let sessions = Arc::new(fake);
+    let u = analyst_compact_uc(
+        state.clone(),
+        sessions.clone(),
+        Arc::new(LostClock),
+        Some(compact_policy_1607()),
+        7,
+    );
+    u.tick().await.unwrap();
+    assert_eq!(
+        sessions.compacted.lock().unwrap().as_slice(),
+        ["ses_master"],
+        "адмиссия в привязанную сессию"
+    );
+    assert!(
+        state.master_compact_ms("analyst", "p") == 20_000_000,
+        "метка коулдауна выставлена"
+    );
+}
+
+#[tokio::test]
+async fn analyst_compact_skips_fresh_session_1607() {
+    // Свежая сессия (idle ниже порога) — проход молчит, метки нет.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_master",
+        "opencode-go/hy4-flash-free#high",
+        "/tmp/checkout",
+    );
+    let mut fake = FakeSessions::new();
+    fake.activity_ms = Some(20_000_000); // idle 0
+    fake.usage.lock().unwrap().insert("ses_master".into(), 90.0);
+    fake.usage
+        .lock()
+        .unwrap()
+        .insert("ses_reviewer".into(), 90.0);
+    let sessions = Arc::new(fake);
+    let u = analyst_compact_uc(
+        state.clone(),
+        sessions.clone(),
+        Arc::new(LostClock),
+        Some(compact_policy_1607()),
+        7,
+    );
+    u.tick().await.unwrap();
+    assert!(
+        sessions.compacted.lock().unwrap().is_empty(),
+        "свежая сессия — адмиссии нет"
+    );
+    assert!(
+        state.master_compact_ms("analyst", "p") == 0,
+        "метка не выставлена"
+    );
+}
+
+#[tokio::test]
+async fn analyst_compact_honours_cooldown_1607() {
+    // Коулдаун прошлой адмиссии — повторного выстрела нет.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_master",
+        "opencode-go/hy4-flash-free#high",
+        "/tmp/checkout",
+    );
+    state.set_master_compact_ms("analyst", "p", 20_000_000 - 60_000); // минута назад
+    let mut fake = FakeSessions::new();
+    fake.activity_ms = Some(0);
+    fake.usage.lock().unwrap().insert("ses_master".into(), 90.0);
+    fake.usage
+        .lock()
+        .unwrap()
+        .insert("ses_reviewer".into(), 90.0);
+    let sessions = Arc::new(fake);
+    let u = analyst_compact_uc(
+        state.clone(),
+        sessions.clone(),
+        Arc::new(LostClock),
+        Some(compact_policy_1607()),
+        7,
+    );
+    u.tick().await.unwrap();
+    assert!(
+        sessions.compacted.lock().unwrap().is_empty(),
+        "коулдаун держит повторную адмиссию"
+    );
+}
+
+#[tokio::test]
+async fn analyst_compact_held_when_cup_full_1607() {
+    // CUP полон на старте тика — проход откладывается целиком без метки
+    // (бот-ветка вне гейта — UC-05: «Ботов не гейти»; гейт только здесь,
+    // Low-6 р.4). Занятой слот держит чужая сессия (роль не analyst —
+    // alive-скип волны не срабатывает, волн в доске нет).
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_master",
+        "opencode-go/hy4-flash-free#high",
+        "/tmp/checkout",
+    );
+    let mut fake = FakeSessions::new();
+    fake.activity_ms = Some(0);
+    fake.usage.lock().unwrap().insert("ses_master".into(), 90.0);
+    fake.extra
+        .lock()
+        .unwrap()
+        .push(fake_session("ses_stage", "developer", "", 100, true));
+    let sessions = Arc::new(fake);
+    let u = analyst_compact_uc(
+        state.clone(),
+        sessions.clone(),
+        Arc::new(LostClock),
+        Some(compact_policy_1607()),
+        1, // кап занят чужой сессией
+    );
+    u.tick().await.unwrap();
+    assert!(
+        sessions.compacted.lock().unwrap().is_empty(),
+        "при полном капе адмиссии нет"
+    );
+    assert_eq!(
+        state.master_compact_ms("analyst", "p"),
+        0,
+        "отложка метку не ставит — ретрай следующим тиком"
+    );
+}
+
+#[tokio::test]
+async fn analyst_compact_off_without_section_1607() {
+    // Секции [compact] нет — проход off: idle-полная сессия не трогается.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_master",
+        "opencode-go/hy4-flash-free#high",
+        "/tmp/checkout",
+    );
+    let mut fake = FakeSessions::new();
+    fake.activity_ms = Some(0);
+    fake.usage.lock().unwrap().insert("ses_master".into(), 90.0);
+    fake.usage
+        .lock()
+        .unwrap()
+        .insert("ses_reviewer".into(), 90.0);
+    let sessions = Arc::new(fake);
+    let u = analyst_compact_uc(state, sessions.clone(), Arc::new(LostClock), None, 7);
+    u.tick().await.unwrap();
+    assert!(
+        sessions.compacted.lock().unwrap().is_empty(),
+        "без секции — no-op"
+    );
+}
+
+#[tokio::test]
+async fn analyst_compact_ignores_foreign_role_bindings_1607() {
+    // Форма «роль:проект» (#1634): проход мастер-сессий аналитика не
+    // трогает привязки других ролей (префиксный матч lapнул бы
+    // analyst-reviewer:* — проект был бы неверен).
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_master",
+        "opencode-go/hy4-flash-free#high",
+        "/tmp/checkout",
+    );
+    state.set_master_binding(
+        "analyst-reviewer",
+        "p",
+        "ses_reviewer",
+        "zai-coding-plan/glm-5.4#high",
+        "/tmp/checkout",
+    );
+    let mut fake = FakeSessions::new();
+    fake.activity_ms = Some(0);
+    fake.usage.lock().unwrap().insert("ses_master".into(), 90.0);
+    fake.usage
+        .lock()
+        .unwrap()
+        .insert("ses_reviewer".into(), 90.0);
+    let sessions = Arc::new(fake);
+    let u = analyst_compact_uc(
+        state,
+        sessions.clone(),
+        Arc::new(LostClock),
+        Some(compact_policy_1607()),
+        7,
+    );
+    u.tick().await.unwrap();
+    assert_eq!(
+        sessions.compacted.lock().unwrap().as_slice(),
+        ["ses_master"],
+        "проход тронул только свою роль"
+    );
+}
+
+#[tokio::test]
+async fn analyst_compact_probe_failure_aborts_whole_pass_1607() {
+    // #1607 (тестер-пин): отказ пробы активности по живой привязке —
+    // достоверности тишины нет (#1281), проход завершается ЦЕЛИКОМ,
+    // а не молча пропускает строку: остальные проекты не адмиссились
+    // на этом тике (эталон — бот-супервизор, Unknown ≠ Dead).
+    let state = Arc::new(MemState(Mutex::default()));
+    // проекты в порядке прохода (sorted): первый — с отказывающей пробой
+    state.set_master_binding(
+        "analyst",
+        "pa",
+        "ses_probe_err",
+        "opencode-go/hy4-flash-free#high",
+        "/tmp/checkout",
+    );
+    state.set_master_binding(
+        "analyst",
+        "pb",
+        "ses_pb_idle",
+        "opencode-go/hy4-flash-free#high",
+        "/tmp/checkout",
+    );
+    let mut fake = FakeSessions::new();
+    fake.activity_ms = Some(0); // idle достаточен — но проба pa врёт отказом
+    fake.activity_fails_sessions
+        .lock()
+        .unwrap()
+        .push("ses_probe_err".into());
+    fake.usage
+        .lock()
+        .unwrap()
+        .insert("ses_pb_idle".into(), 90.0);
+    let sessions = Arc::new(fake);
+    let u = AnalystUseCase {
+        board: Arc::new(FakeBoard {
+            rows: std::sync::Mutex::new(vec![]),
+            log: Mutex::default(),
+            comments: vec![],
+            fields_fails: false,
+            set_session_fails: false,
+            set_pr_fails: AtomicBool::new(false),
+            clear_session_fails: AtomicBool::new(false),
+            status_fails: AtomicBool::new(false),
+        }),
+        boards: vec![
+            AnalystBoard {
+                project: "pb".into(),
+                board: "B2".into(),
+                checkout: "/tmp/checkout".into(),
+            },
+            AnalystBoard {
+                project: "pa".into(),
+                board: "B".into(),
+                checkout: "/tmp/checkout".into(),
+            },
+        ],
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        state: state.clone(),
+        clock: Arc::new(LostClock),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        cup: 7,
+        peak: PeakWindow {
+            enabled: false,
+            start_min: 0,
+            end_min: 0,
+        },
+        compact: Some(compact_policy_1607()),
+    };
+    u.tick().await.unwrap();
+    assert!(
+        sessions.compacted.lock().unwrap().is_empty(),
+        "отказ пробы — адмиссий нет (проход завершён)"
+    );
+    assert!(
+        state.master_compact_ms("analyst", "pa") == 0
+            && state.master_compact_ms("analyst", "pb") == 0,
+        "метки не выставлены — ретрай следующим тиком без коулдауна"
+    );
+}
+
+#[tokio::test]
 async fn analyst_wave_orders_by_priority() {
     let state = Arc::new(MemState(Mutex::default()));
     let sessions = Arc::new(FakeSessions::new());
@@ -7279,14 +8193,35 @@ async fn analyst_verdictless_waves_do_not_burn_cycles() {
         clock: clock.clone(),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         cup: 7,
+        peak: PeakWindow {
+            enabled: false,
+            start_min: 0,
+            end_min: 0,
+        },
+        compact: None,
     };
     // четыре волны подряд (сессия аналитика гибнет без вердикта, строка
-    // не двигается) — старый код сжигал круг за кругом и эскалировал
-    for _ in 0..4 {
-        assert_eq!(u.tick().await.unwrap(), 1, "волна берёт строку (ретрай)");
+    // не двигается) — старый код сжигал круг за кругом и эскалировал.
+    // Мастер-сессия (#1607): ретраи едут в ту же сессию, спавн один.
+    for i in 0..4 {
+        let got = u.tick().await.unwrap();
+        if i == 0 {
+            assert_eq!(got, 1, "первая волна — спавн мастер-сессии");
+        } else {
+            assert_eq!(got, 0, "ретрай — reuse, не спавн (#1607)");
+        }
         clock.0.fetch_add(16 * 60_000, Ordering::SeqCst); // кулдаун прошёл
     }
-    assert_eq!(sessions.spawned.lock().unwrap().len(), 4, "4 ретрай-волны");
+    assert_eq!(
+        sessions.spawned.lock().unwrap().len(),
+        1,
+        "одна мастер-сессия на все ретраи"
+    );
+    assert_eq!(
+        sessions.prompts.lock().unwrap().len(),
+        4,
+        "каждая волна доставлена промптом"
+    );
     let rounds = state
         .0
         .lock()
@@ -7396,6 +8331,12 @@ async fn analyst_three_real_rounds_escalate_with_honest_message() {
         clock: clock.clone(),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         cup: 7,
+        peak: PeakWindow {
+            enabled: false,
+            start_min: 0,
+            end_min: 0,
+        },
+        compact: None,
     };
     let pair = |state: &Arc<MemState>| {
         state
@@ -7433,8 +8374,8 @@ async fn analyst_three_real_rounds_escalate_with_honest_message() {
     }
     assert_eq!(
         sessions.spawned.lock().unwrap().len(),
-        3,
-        "захват + два возврата — строка ретраится до лимита"
+        1,
+        "захват — один спавн, возвраты едут в ту же мастер-сессию (#1607)"
     );
     // круг 3: возврат инкрементит до лимита — эскалация на том же тике
     cur = board(Status::ReviewAnalys);
@@ -7451,8 +8392,8 @@ async fn analyst_three_real_rounds_escalate_with_honest_message() {
     u.tick().await.unwrap();
     assert_eq!(
         sessions.spawned.lock().unwrap().len(),
-        3,
-        "за лимитом волна не спавнится"
+        1,
+        "за лимитом волна не спавнится — и до лимита спавн был один (#1607)"
     );
     let log = cur.log.lock().unwrap().clone(); // борд возврата круга 3 — эскалация здесь
     assert!(
@@ -7567,7 +8508,7 @@ async fn reviewer_respawns_dead_master_session() {
         "analyst-reviewer",
         "p",
         "ses_old",
-        "zai-coding-plan/glm-5.4#high",
+        "zai-coding-plan/glm-5.3-flash#high",
         "/tmp/checkout",
     );
     let sessions = Arc::new(FakeSessions::new());
@@ -7631,7 +8572,7 @@ async fn reviewer_recreates_on_model_divergence() {
         "analyst-reviewer",
         "p",
         "ses_old",
-        "opencode-go/hy4-flash-free#high",
+        "zai-coding-plan/glm-5.3-flash#high",
         "/tmp/checkout",
     );
     let sessions = Arc::new(FakeSessions::new());
@@ -7813,7 +8754,7 @@ async fn reviewer_compact_skips_dead_binding() {
         "analyst-reviewer",
         "p",
         "ses_old",
-        "zai-coding-plan/glm-5.4#high",
+        "zai-coding-plan/glm-5.3-flash#high",
         "/tmp/checkout",
     );
     let sessions = Arc::new(FakeSessions {
@@ -8343,6 +9284,12 @@ async fn analyst_wave_per_board_own_checkout_and_project() {
         clock: Arc::new(FixedClock),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         cup: 7,
+        peak: PeakWindow {
+            enabled: false,
+            start_min: 0,
+            end_min: 0,
+        },
+        compact: None,
     };
     assert_eq!(u.tick().await.unwrap(), 2, "по сессии на доску");
     let specs = sessions.specs.lock().unwrap();
@@ -8523,6 +9470,12 @@ async fn prune_skipped_when_a_board_read_fails() {
         clock: Arc::new(FixedClock),
         models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
         cup: 7,
+        peak: PeakWindow {
+            enabled: false,
+            start_min: 0,
+            end_min: 0,
+        },
+        compact: None,
     };
     u.tick().await.unwrap();
     assert!(
@@ -12404,4 +13357,31 @@ async fn continuation_soft_ping_on_later_board_beats_new_design_on_first() {
             .any(|p| p.starts_with("ses_702|") && p.contains("Soft ping")),
         "пинг доставлен в сессию продолжения: {prompts:?}"
     );
+}
+
+/// #1619: обе волны аналитики знают про owner_answer — у них свои промпты,
+/// мимо spawn_prompt; без клаузы ответ через чат снова упрётся в гард.
+#[test]
+fn analyst_wave_prompts_teach_owner_answer() {
+    let task = Task::new(9, "t".into(), Status::Analys);
+    let prompts = [
+        (
+            "analyst",
+            crate::pipeline::analyst::analyst_prompt("p", &[&task]),
+        ),
+        (
+            "analyst-reviewer",
+            crate::pipeline::analyst_review::analyst_review_prompt("p", &[&task]),
+        ),
+    ];
+    for (name, prompt) in prompts {
+        assert!(
+            prompt.contains("owner_answer"),
+            "{name}: клауза #1619 потеряна: {prompt}"
+        );
+        assert!(
+            prompt.contains("verbatim"),
+            "{name}: ответ должен быть дословным: {prompt}"
+        );
+    }
 }

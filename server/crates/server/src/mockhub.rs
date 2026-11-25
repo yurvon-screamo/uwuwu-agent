@@ -6,9 +6,9 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use uwuwu_domain::{PrUrl, Priority, Slot, Status, Task, TaskFields};
-use uwuwu_usecase::{AppendDocOutcome, UsecaseError, UsecaseResult};
 use uwuwu_usecase::{CommentRef, IssueView};
 use uwuwu_usecase::{IssueFieldStore, TaskBoardRepo};
+use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 /// Состояние мок-хаба: строки «доски» (все имена досок → один стенд).
 #[derive(Default)]
@@ -310,7 +310,11 @@ impl TaskBoardRepo for MemoryHub {
                 .tasks
                 .get_mut(&number)
                 .ok_or_else(|| UsecaseError::Board(format!("mockhub: #{number} нет")))?;
-            let _ = task.transition(status);
+            // Канон проверен гардом в usecase до записи; ребро, открытое
+            // ответом владельца (#1619), базовым `transition` не проходит.
+            // Носитель стенда — как прод: фиксирует принятую запись, а не
+            // молча игнорирует её и не выдаёт ложный «Confirmed» (#1619-pinned).
+            task.override_status(status);
             Ok(())
         })?;
         Ok(uwuwu_usecase::StatusDelivery::Confirmed {
@@ -850,24 +854,19 @@ impl uwuwu_usecase::WikiRepo for MemoryHub {
         })
     }
 
-    async fn append_doc(
-        &self,
-        slug: &str,
-        line: &str,
-        _message: &str,
-    ) -> UsecaseResult<AppendDocOutcome> {
+    async fn append_doc(&self, slug: &str, line: &str, _message: &str) -> UsecaseResult<usize> {
         self.with_state(|state| {
-            let existed = state.docs.contains_key(slug);
-            let entry = state.docs.entry(slug.to_string()).or_default();
+            let Some(entry) = state.docs.get_mut(slug) else {
+                return Err(UsecaseError::AppendMissing(format!(
+                    "doc does not exist: {slug}"
+                )));
+            };
             if !entry.is_empty() && !entry.ends_with('\n') {
                 entry.push('\n');
             }
             entry.push_str(line);
             entry.push('\n');
-            Ok(AppendDocOutcome {
-                created: !existed,
-                lines: entry.lines().count(),
-            })
+            Ok(entry.lines().count())
         })
     }
 }
@@ -1228,6 +1227,30 @@ mod tests {
             fresh,
             Some(Status::ReviewAnalys),
             "свежая запись видна сразу"
+        );
+    }
+
+    /// #1619: гейт канона пропустил возврат из Needs attention по ответу
+    /// владельца — носитель стенда обязан зафиксировать принятую запись.
+    /// До правки мок молча игнорировал ребро через `Task::transition` и
+    /// отвечал «Confirmed», хотя task_get продолжал показывать старый статус.
+    #[tokio::test]
+    async fn owner_answer_reopen_is_visible_to_carrier_reads() {
+        let hub = MemoryHub::with_seed(Some((7, Status::NeedsAttention)));
+        hub.row_status("B", 7).await.expect("материализация сида");
+        hub.set_status("B", 7, Status::Design)
+            .await
+            .expect("возврат по ответу владельца принят гардом");
+        let issue = hub.read_issue("B", 7).await.expect("чтение носителя");
+        assert_eq!(
+            issue.task.status(),
+            Status::Design,
+            "принятая запись видна task_get — квитанция не врёт"
+        );
+        assert_eq!(
+            hub.row_status("B", 7).await.expect("свежий статус"),
+            Some(Status::Design),
+            "повторный гард видит записанный статус"
         );
     }
 

@@ -62,6 +62,9 @@ pub struct BodyWriteReceipt {
 pub struct EditReceipt {
     /// Some — патч нёс статус, исход подтверждения носителем.
     pub status: Option<StatusDelivery>,
+    /// #1619: ответ был передан, но строка уже не была в Needs attention —
+    /// ключ проигнорирован, квитанция обязана сказать это явно.
+    pub owner_answer_ignored: bool,
 }
 
 /// Квитанция секционной правки (#1152): исход + тело после записи.
@@ -204,6 +207,9 @@ pub struct TaskPatch {
     /// Тип задачи (#1271): нативный issue Type, PATCH {"type": имя}.
     /// None — не трогать (снос значения патчем не предусмотрен).
     pub kind: Option<TaskType>,
+    /// Дословный ответ владельца (#1619): разрешает возврат из Needs
+    /// attention в стадию-источник. Сам по себе не мутация.
+    pub owner_answer: Option<String>,
 }
 
 impl TaskPatch {
@@ -219,6 +225,7 @@ impl TaskPatch {
                 title: None,
                 automerge: None,
                 kind: None,
+                owner_answer: None,
             }
         )
     }
@@ -435,8 +442,11 @@ impl TaskWriter for TaskWriteUseCase {
         let mut want_priority: Option<String> = None;
         let mut want_automerge: Option<bool> = None;
         let mut status_delivery: Option<StatusDelivery> = None;
+        let mut owner_answer_ignored = false;
         if let Some(status) = patch.status {
-            let current = self.guard_canon(&board, number, status).await?;
+            let answer = patch.owner_answer.as_deref();
+            let (current, answer_used) = self.guard_canon(&board, number, status, answer).await?;
+            owner_answer_ignored = answer.is_some() && !answer_used;
             // Гейт полноты полей на выходе из Analys (#1280): волна
             // аналитики обязана выпускать строки с явными Приоритетом
             // и Automerge — решение разбора, не пустота носителя.
@@ -547,6 +557,7 @@ impl TaskWriter for TaskWriteUseCase {
         .await?;
         Ok(EditReceipt {
             status: status_delivery,
+            owner_answer_ignored,
         })
     }
 
@@ -969,16 +980,32 @@ where
     }
 }
 
-/// Дисплей-шапка task_get («--- fm ---» + branch/pr/automerge/direct/
-/// fact_track/type/body_hash) — рендер MCP-карточки, не носитель: агенты
-/// копируют вывод task_get назад в task_body, и шапка наслаивалась в
-/// теле (fm-стек инцидента #1331). Срезается на границе записи:
-/// инвариант ADR-105 «тело — чистый markdown» держит сервер, не
-/// дисциплина агента (прецедент #1151). Консервативно: строго
-/// набор/порядок ключей рендера, любой посторонний контент
-/// («--- fm ---» внутри текста) не трогается.
+/// Дисплей-шапка task_get («--- fm ---» + fm-ключи рендера) — рендер
+/// MCP-карточки, не носитель: агенты копируют вывод task_get назад в
+/// task_body, и шапка наслаивалась в теле (fm-стек инцидента #1331).
+/// Срезается на границе записи: инвариант ADR-105 «тело — чистый
+/// markdown» держит сервер, не дисциплина агента (прецедент #1151).
+/// Консервативно: строго набор/порядок ключей одного из рендеров,
+/// любой посторонний контент («--- fm ---» внутри текста) не трогается.
+/// Зеркало рендера (api/tools.rs task_get): рендер меняется — менять
+/// все формы здесь; пин в tools_tests собран из реального рендера и
+/// краснеет при расхождении (#1604: рендер добавил body_bytes;
+/// #1631 — fact_track).
 fn strip_task_get_header(md: &str) -> &str {
-    const KEYS: [&str; 7] = [
+    // Актуальный рендер (#1604+#1631): branch/pr/automerge/direct/
+    // fact_track/type/body_hash/body_bytes
+    const KEYS: [&str; 8] = [
+        "branch: ",
+        "pr: ",
+        "automerge: ",
+        "direct: ",
+        "fact_track: ",
+        "type: ",
+        "body_hash: ",
+        "body_bytes: ",
+    ];
+    // Легаси-рендер #1631..#1604: fact_track без body_bytes
+    const LEGACY_KEYS: [&str; 7] = [
         "branch: ",
         "pr: ",
         "automerge: ",
@@ -987,20 +1014,56 @@ fn strip_task_get_header(md: &str) -> &str {
         "type: ",
         "body_hash: ",
     ];
+    // Легаси-рендер #1271..#1631: type без fact_track/body_bytes
+    const LEGACY_KEYS_6: [&str; 6] = [
+        "branch: ",
+        "pr: ",
+        "automerge: ",
+        "direct: ",
+        "type: ",
+        "body_hash: ",
+    ];
+    // Легаси-рендер до #1271: без type (старые выводы копируются
+    // агентами из старых сессий и статей опыта — срезаются тоже)
+    const LEGACY_KEYS_NO_TYPE: [&str; 5] =
+        ["branch: ", "pr: ", "automerge: ", "direct: ", "body_hash: "];
     let Some(rest) = md.strip_prefix("--- fm ---\n") else {
         return md;
     };
+    for keys in [
+        &KEYS[..],
+        &LEGACY_KEYS[..],
+        &LEGACY_KEYS_6[..],
+        &LEGACY_KEYS_NO_TYPE[..],
+    ] {
+        if let Some(stripped) = strip_header_keys(rest, keys) {
+            return stripped;
+        }
+    }
+    md
+}
+
+/// Строгое совпадение набора/порядка ключей одного рендера; частичные
+/// шапки и посторонний контент — None. У последнего ключа хвостовой
+/// перенос не обязателен: копия шапки проходит через .trim() скрипта
+/// потребителя — без этого KEYS (актуальная форма) не матчится, а
+/// короткая легаси-форма матчится на префиксе, и остаток последней
+/// строки («body_bytes: N») уезжает эффективным контентом (#1604,
+/// ревью раунд 2).
+fn strip_header_keys<'a>(rest: &'a str, keys: &[&str]) -> Option<&'a str> {
     let mut pos = rest;
-    for key in KEYS {
-        let Some(line_end) = pos.find('\n') else {
-            return md;
+    for (index, key) in keys.iter().enumerate() {
+        let line_end = match pos.find('\n') {
+            Some(at) => at,
+            None if index + 1 == keys.len() => pos.len(),
+            None => return None,
         };
         if !pos[..line_end].starts_with(key) {
-            return md;
+            return None;
         }
-        pos = &pos[line_end + 1..];
+        pos = pos[line_end..].strip_prefix('\n').unwrap_or("");
     }
-    pos.trim_start_matches('\n')
+    Some(pos.trim_start_matches('\n'))
 }
 
 /// Ожидания контрольного чтения edit: Some — значение менялось и должно
@@ -1118,23 +1181,55 @@ impl TaskWriteUseCase {
     /// Квотная дисциплина ADR-113/#1437: точечный GraphQL-рид только
     /// на редких ветках — отказная, идемпотентная, нечитаемый кеш-вид
     /// (один рид на вызов, без повторов).
-    async fn guard_canon(&self, board: &str, number: u64, status: Status) -> UsecaseResult<Status> {
+    async fn guard_canon(
+        &self,
+        board: &str,
+        number: u64,
+        status: Status,
+        owner_answer: Option<&str>,
+    ) -> UsecaseResult<(Status, bool)> {
+        // bool — ответ владельца реально понадобился для ребра; квитанция
+        // обязана отличать его от ключа, переданного по привычке (#1619).
         match self.guard_current(board, number, status).await? {
             // Свежий носитель уже оплачен (рид #1437/нечитаемый кеш-вид):
             // повторной fresh-сверки нет — канон-проверка по нему
             GuardView::Fresh(current) => {
                 let (direct, fact_track) = self.carrier_flags(number, current, status).await;
                 if uwuwu_domain::Status::can_transition_with(current, status, direct, fact_track) {
-                    return Ok(current);
+                    return Ok((current, false));
+                }
+                if uwuwu_domain::Status::can_transition_with_answer(
+                    current,
+                    status,
+                    direct,
+                    fact_track,
+                    owner_answer,
+                ) {
+                    return Ok((current, true));
                 }
                 // отказ: кеш-вида как источника здесь нет (рид был свежим
                 // или кеш нечитаем) — расхождению докладывать нечего
-                Err(Self::reject_canon(number, current, None, status))
+                Err(Self::reject_canon(
+                    number,
+                    current,
+                    None,
+                    status,
+                    owner_answer,
+                ))
             }
             GuardView::Cached(cached) => {
                 let (direct, fact_track) = self.carrier_flags(number, cached, status).await;
                 if uwuwu_domain::Status::can_transition_with(cached, status, direct, fact_track) {
-                    return Ok(cached);
+                    return Ok((cached, false));
+                }
+                if uwuwu_domain::Status::can_transition_with_answer(
+                    cached,
+                    status,
+                    direct,
+                    fact_track,
+                    owner_answer,
+                ) {
+                    return Ok((cached, true));
                 }
                 let fresh = verifiable_current(
                     board,
@@ -1142,8 +1237,29 @@ impl TaskWriteUseCase {
                     self.board.fresh_row_status(board, number).await?,
                 )?;
                 let (direct, fact_track) = self.carrier_flags(number, fresh, status).await;
-                if !uwuwu_domain::Status::can_transition_with(fresh, status, direct, fact_track) {
-                    return Err(Self::reject_canon(number, fresh, Some(cached), status));
+                let answer_used =
+                    !uwuwu_domain::Status::can_transition_with(fresh, status, direct, fact_track)
+                        && uwuwu_domain::Status::can_transition_with_answer(
+                            fresh,
+                            status,
+                            direct,
+                            fact_track,
+                            owner_answer,
+                        );
+                if !uwuwu_domain::Status::can_transition_with_answer(
+                    fresh,
+                    status,
+                    direct,
+                    fact_track,
+                    owner_answer,
+                ) {
+                    return Err(Self::reject_canon(
+                        number,
+                        fresh,
+                        Some(cached),
+                        status,
+                        owner_answer,
+                    ));
                 }
                 tracing::warn!(
                     event = "board.guard_stale_cache",
@@ -1152,7 +1268,7 @@ impl TaskWriteUseCase {
                     fresh = %naming::status_name(fresh),
                     "Кеш-вид гарда отстал от носителя — переход проведён по свежему чтению (#1615)"
                 );
-                Ok(fresh)
+                Ok((fresh, answer_used))
             }
         }
     }
@@ -1166,6 +1282,7 @@ impl TaskWriteUseCase {
         fresh: Status,
         cached: Option<Status>,
         to: Status,
+        owner_answer: Option<&str>,
     ) -> UsecaseError {
         match cached {
             Some(cached) => tracing::warn!(
@@ -1184,9 +1301,19 @@ impl TaskWriteUseCase {
                 "Гард канона: переход запрещён (свежий носитель подтвердил отказ)"
             ),
         }
+        let hint = if fresh == Status::NeedsAttention
+            && !uwuwu_domain::Status::can_transition(fresh, to)
+            && owner_answer.is_none_or(|answer| answer.trim().is_empty())
+        {
+            // #1619: самообучающий отказ доезжает до живого агента, даже
+            // если его сессия заспавнена до деплоя новой клаузы промпта.
+            "; Needs attention → source stage requires owner_answer (the verbatim owner reply, fixed in the body/thread first)"
+        } else {
+            ""
+        };
         UsecaseError::Board(format!(
-            "transition {:?} → {:?} outside the pipeline canon",
-            fresh, to
+            "transition {:?} → {:?} outside the pipeline canon{}",
+            fresh, to, hint
         ))
     }
 
@@ -2117,12 +2244,34 @@ mod tests {
         assert_eq!(out.matches("## Постановка").count(), 1);
     }
 
+    #[test]
+    fn create_body_strips_task_get_header_without_trailing_newline() {
+        let header = "--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\nfact_track: false\ntype: feature\nbody_hash: h\nbody_bytes: 66";
+        let out = render_create_body(&spec(header));
+        assert!(
+            !out.contains("body_bytes"),
+            "остаток шапки не становится телом: {out}"
+        );
+    }
+
     /// Дисплей-шапка task_get срезается на границе записи (fm-стек
     /// инцидента #1331: агент копирует вывод task_get назад в task_body).
+    /// Все четыре формы рендера — актуальная (#1604+#1631, fact_track и
+    /// body_bytes) и три легаси (#1631+, #1271+, до #1271).
     #[test]
     fn task_get_display_header_is_stripped() {
-        let md = "--- fm ---\nbranch: work/task-1331\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: —\nbody_hash: 9de430c691c92328\n\n## Постановка\nтекст";
+        // актуальный рендер (#1604+#1631): 8 ключей, body_bytes последним
+        let md = "--- fm ---\nbranch: work/task-1604\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: 9de430c691c92328\nbody_bytes: 36\n\n## Постановка\nтекст";
         assert_eq!(strip_task_get_header(md), "## Постановка\nтекст");
+        // легаси #1631..#1604: 7 ключей, fact_track без body_bytes
+        let md_legacy7 = "--- fm ---\nbranch: work/task-1331\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: —\nbody_hash: 9de430c691c92328\n\n## Постановка\nтекст";
+        assert_eq!(strip_task_get_header(md_legacy7), "## Постановка\nтекст");
+        // легаси #1271..#1631: 6 ключей, без fact_track/body_bytes
+        let md_legacy6 = "--- fm ---\nbranch: x\npr: —\nautomerge: true\ndirect: false\ntype: bug\nbody_hash: h\n\n## Т";
+        assert_eq!(strip_task_get_header(md_legacy6), "## Т");
+        // легаси до #1271: 5 ключей, без type
+        let md_legacy5 = "--- fm ---\nbranch: work/task-1331\npr: —\nautomerge: true\ndirect: false\nbody_hash: 9de430c691c92328\n\n## Постановка\nтекст";
+        assert_eq!(strip_task_get_header(md_legacy5), "## Постановка\nтекст");
     }
 
     #[test]
@@ -2137,6 +2286,19 @@ mod tests {
     }
 
     #[test]
+    fn task_get_header_only_without_trailing_newline_strips_to_empty() {
+        let h8 = "--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\nfact_track: false\ntype: feature\nbody_hash: h\nbody_bytes: 66";
+        assert_eq!(strip_task_get_header(h8), "");
+        let h7 = "--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h";
+        assert_eq!(strip_task_get_header(h7), "");
+        let h6 =
+            "--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\ntype: bug\nbody_hash: h";
+        assert_eq!(strip_task_get_header(h6), "");
+        let h5 = "--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\nbody_hash: h";
+        assert_eq!(strip_task_get_header(h5), "");
+    }
+
+    #[test]
     fn task_get_header_partial_or_foreign_is_kept() {
         // неполный набор ключей — не рендер task_get
         let md = "--- fm ---\nbranch: x\npr: y\n\n## Тело";
@@ -2147,6 +2309,10 @@ mod tests {
         // валидный fm старого канона — это fm_lite, не дисплей-шапка
         let md3 = "---\ntitle: x\n---\nтекст";
         assert_eq!(strip_task_get_header(md3), md3);
+        // лишний посторонний ключ в наборе — не рендер (актуальная
+        // 8-ключевая форма с чужой строкой между type и body_hash)
+        let md4 = "--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nслучайная строка\nbody_hash: h\nbody_bytes: 1\n\n## Т";
+        assert_eq!(strip_task_get_header(md4), md4);
     }
 
     // --- Честные квитанции: контрольное чтение носителя (#1331) ---

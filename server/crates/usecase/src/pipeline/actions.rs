@@ -208,6 +208,62 @@ impl TickUseCase {
         Ok(Some(WakeAct::Woke))
     }
 
+    /// Re-entry wake тестера (#1607): повторный вход в Testing при живой
+    /// мастер-сессии и пустом чужом хвосте — будить нечем, вход доставляет
+    /// детерминированный дельта-промпт. Без компакта: контекст прошлых
+    /// раундов — ценность мастер-сессии, линию держит нативный порог
+    /// (срез 3). Гейты — как у будильника: CUP держит (маркер persists),
+    /// ход в полёте — доставка на тике после ответа. Err — маркер открыт,
+    /// ретрай следующим тиком.
+    async fn deliver_tester_reentry(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        session: &str,
+        global_active: usize,
+        policy: SpawnPolicy,
+    ) -> UsecaseResult<WakeAct> {
+        if global_active >= policy.cup {
+            tracing::info!(
+                event = "wakeup.tester_reentry_held_cup",
+                number = task.number(),
+                active = global_active,
+                cap = policy.cup,
+                tier = "continuation",
+                "Re-entry wake тестера отложен: CUP cap"
+            );
+            return Ok(WakeAct::Deferred);
+        }
+        if !self.session_idle(board, session).await {
+            return Ok(WakeAct::None);
+        }
+        let sessions = self.sessions.project(&board.project);
+        // Пин агента слота перед ходом (#1300) — как на будильнике.
+        // Отказ — Err без гашения маркера: доставка повторится тиком.
+        if let Some(agent) = Agent::of_slot(Slot::Test) {
+            sessions.switch_agent(session, agent).await?;
+        }
+        sessions
+            .prompt(
+                session,
+                &format!(
+                    "Repeat testing round for task #{}: run the delta per Delta mode (agents/tester.md) — verdict only after a real delta run. \
+                     If the owner answered a Needs attention question, fix the reply verbatim in the body/thread and pass owner_answer when clearing it.",
+                    task.number()
+                ),
+            )
+            .await?;
+        self.state
+            .clear_round_reentry_pending(&board.board, task.number());
+        tracing::info!(
+            event = "wakeup.tester_reentry_delivered",
+            number = task.number(),
+            session = %session,
+            "Re-entry wake тестера доставлен в мастер-сессию"
+        );
+        Ok(WakeAct::Woke)
+    }
+
     /// Wakeup: мёртвая сессия — респавн (dead-детект ПЕРВЫМ: даже без свежих
     /// комментов — строка не висит, DS «dead-детект решает: будить или
     /// респавнить»); живая — будим по свежим комментам (новее активности).
@@ -374,6 +430,17 @@ impl TickUseCase {
             None => comments.into_iter().next_back().into_iter().collect(),
         };
         let Some(last) = tail.last().cloned() else {
+            // Журнал пуст при открытом маркере тестера (#1607): будить
+            // нечем — вход доставляет re-entry wake; иначе тихий пропуск.
+            if slot == Slot::Test
+                && self
+                    .state
+                    .round_reentry_pending(&board.board, task.number())
+            {
+                return self
+                    .deliver_tester_reentry(board, task, session, global_active, policy)
+                    .await;
+            }
             return Ok(WakeAct::None);
         };
         {
@@ -405,6 +472,19 @@ impl TickUseCase {
                     if spawned_at.is_some_and(|ms| ms > last.created_ms) {
                         self.state
                             .set_last_comment_id(&board.board, task.number(), &last.id);
+                    }
+                    // Re-entry тестера без чужих комментов (#1607): хвост
+                    // целиком свой — будить нечем, вход доставляет re-entry
+                    // wake. Маркер гасится только доставкой (Woke);
+                    // Deferred/Err и занятая сессия — маркер открыт, ретрай.
+                    if slot == Slot::Test
+                        && self
+                            .state
+                            .round_reentry_pending(&board.board, task.number())
+                    {
+                        return self
+                            .deliver_tester_reentry(board, task, session, global_active, policy)
+                            .await;
                     }
                     return Ok(WakeAct::None);
                 }
@@ -458,6 +538,12 @@ impl TickUseCase {
                 );
                 self.state
                     .set_last_comment_id(&board.board, task.number(), &last.id);
+                // Вход с чужим хвостом — доставкой владеет wakeup (#1607):
+                // re-entry wake тестера на этот раунд больше не нужен.
+                if slot == Slot::Test {
+                    self.state
+                        .clear_round_reentry_pending(&board.board, task.number());
+                }
                 return Ok(WakeAct::Woke);
             }
             // Агент ещё работает (последнее сообщение — промпт/tool-call):
@@ -1013,6 +1099,10 @@ pub(crate) fn spawn_prompt(board: &BoardPlan, task: &Task, slot: Slot) -> String
          «Needs attention».\n\
          «Worked and went silent» = the row hangs until the pipeline auto-ping\n\
          (15 min after a finished turn, up to 60 min while the turn is in progress).\n\
+         \n\
+         After the owner answers a question in Needs attention: fix the verbatim\n\
+         reply in the body or thread, then call uwuwu_task_edit with owner_answer\n\
+         set to that reply and the source status — the gate requires it.\n\
          \n\
          The platform goes through the uwuwu server MCP tools (Code Mode: tools.uwuwu.*):\n\
          - task body and comments: uwuwu_task_get {{number: {number}}}\n\

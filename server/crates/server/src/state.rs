@@ -719,6 +719,7 @@ impl TickStateStore for JsonStateStore {
             guard.spawn_loops.remove(&k);
         }
     }
+
     fn spawn_loop(&self, board: &str, number: u64, slot: Slot) -> Option<(Status, u32)> {
         self.state
             .lock()
