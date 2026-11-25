@@ -75,7 +75,7 @@ Take a task to the end — the task body is a living document:
 
 ### Testing rounds
 
-After the code review approve (clean or delta-approve) the reviewer sets «Testing» — the factory
+After the code review approve the reviewer sets «Testing» — the factory
 spawns/wakes the tester (a primary agent `tester`, 1 task = 1 session, cwd = the task worktree).
 The verdict arrives as a wakeup comment on the task: `pass` — a test-commits checkpoint: with (tester)
 commits on the branch → "Testing review" (its own contour — below), without → `Review`, ball with the user
