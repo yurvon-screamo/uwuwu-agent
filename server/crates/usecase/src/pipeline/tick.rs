@@ -1302,7 +1302,10 @@ impl TickUseCase {
         // Re-entry маркер открыт (#1607, #1626): вход ждёт доставки
         // wakeup-путём (раунд-промпт/дельта) — мягкий пинг «переведи
         // статус» сюда не ходит: инструкция ложна для держателя входа.
-        if self.state.round_reentry_pending(&board.board, task.number()) {
+        if self
+            .state
+            .round_reentry_pending(&board.board, task.number())
+        {
             tracing::debug!(
                 event = "stall.reentry_open",
                 number = task.number(),

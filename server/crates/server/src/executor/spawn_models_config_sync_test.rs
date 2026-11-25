@@ -10,8 +10,8 @@ use uwuwu_usecase::SpawnModels;
 
 /// Карта [executor.models] из TOML-файла (пример или живой конфиг).
 fn models_of(path: &std::path::Path) -> HashMap<String, SpawnModel> {
-    let raw = std::fs::read_to_string(path)
-        .unwrap_or_else(|_| panic!("{} читается", path.display()));
+    let raw =
+        std::fs::read_to_string(path).unwrap_or_else(|_| panic!("{} читается", path.display()));
     let value: toml::Value = raw.parse().expect("валидный toml");
     let section = value["executor"]["models"]
         .as_table()

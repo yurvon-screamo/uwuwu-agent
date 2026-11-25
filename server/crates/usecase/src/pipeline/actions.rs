@@ -464,13 +464,7 @@ impl TickUseCase {
                             .round_reentry_pending(&board.board, task.number())
                     {
                         return self
-                            .deliver_tester_reentry(
-                                board,
-                                task,
-                                session,
-                                global_active,
-                                policy,
-                            )
+                            .deliver_tester_reentry(board, task, session, global_active, policy)
                             .await;
                     }
                     return Ok(WakeAct::None);
