@@ -4,8 +4,8 @@
 //! мгновенно — темп ожидания инфра-забота адаптера.
 
 use super::env_gc::{
-    sweep_envs, EnvGcCtx, EnvGcOutcome, EnvGcPolicy, ENV_GC_BATCH_CAP, ENV_GC_VERDICT_DEADLINE_MS,
-    TASK_ENV_GC_SCRIPT,
+    env_gc_bootstrap_title, sweep_envs, EnvGcCtx, EnvGcOutcome, EnvGcPolicy, ENV_GC_BATCH_CAP,
+    ENV_GC_VERDICT_DEADLINE_MS, TASK_ENV_GC_SCRIPT,
 };
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::ports::{
@@ -33,6 +33,11 @@ struct FakeGcSessions {
     last_budget_ms: Mutex<u64>,
     /// Команда не принята исполнителем (транспортный отказ).
     command_fails: Mutex<bool>,
+    /// Bootstrap не создаётся (слепой проход — env.gc.blind, no-op).
+    create_fails: bool,
+    /// Сколько ближайших delete_session упадут (ретрай гашения bootstrap:
+    /// до 3 попыток, затем громкий env.bootstrap_not_deleted).
+    delete_fail_times: Mutex<usize>,
     /// Ключ → вердикт-глагол; ключ матчится к токену args; «*» — дефолт.
     /// Отсутствие записи для строки = вердикта в батч-сообщении нет
     /// (parse-all: строка failed).
@@ -78,6 +83,9 @@ fn verdict_default(gw: &FakeGcSessions, verdict: &str) {
 #[async_trait]
 impl AgentSessionGateway for FakeGcSessions {
     async fn create_session(&self, _spec: &SessionSpec) -> UsecaseResult<String> {
+        if self.create_fails {
+            return Err(UsecaseError::Session("bootstrap недоступен (мок)".into()));
+        }
         let mut created = self.created.lock().unwrap();
         let id = format!("ses_gc_{}", created.len() + 1);
         created.push(id.clone());
@@ -135,7 +143,13 @@ impl AgentSessionGateway for FakeGcSessions {
         Liveness::Alive
     }
     async fn delete_session(&self, s: &str) -> UsecaseResult<()> {
+        // Каждая попытка пишется (ретрай гашения виден по числу записей).
         self.deleted.lock().unwrap().push(s.into());
+        let mut left = self.delete_fail_times.lock().unwrap();
+        if *left > 0 {
+            *left -= 1;
+            return Err(UsecaseError::Session("гашение не прошло (мок)".into()));
+        }
         Ok(())
     }
     async fn list_sessions(&self) -> UsecaseResult<Vec<SessionInfo>> {
@@ -855,5 +869,83 @@ fn sweep_shell_command_carries_literal_sweep_prefix() {
     assert!(
         cmd.ends_with(" sweep 1431 1432"),
         "строки батча идут после литерала sweep в порядке диспатча, через пробел: {cmd}"
+    );
+}
+
+// ---------- пины тестера #1526 (ретрай гашения, слепой bootstrap, ключ рипера) ----------
+
+#[test]
+fn bootstrap_title_is_exact_reaper_key() {
+    // Рипер чистит протухшие bootstrap по ТОЧНОМУ титулу (61 висяк «env-gc …»
+    // в проде плодила slash-команда): формат титула — контракт между
+    // ensure_bootstrap и reap_stale_bootstraps, дрейф ломает обе стороны.
+    assert_eq!(
+        env_gc_bootstrap_title("Задачи uwuwu"),
+        "env-gc Задачи uwuwu"
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_create_failure_makes_the_pass_a_blind_noop() {
+    // Bootstrap не создан — проход no-op (env.gc.blind): ни шелла, ни
+    // счётчиков диспатча, ни попыток гашения; проход не падает.
+    let gw = Arc::new(FakeGcSessions {
+        create_fails: true,
+        ..FakeGcSessions::default()
+    });
+    verdict_default(&gw, "SWEPT");
+    let tasks = [done_closed(1431, THREE_DAYS, NOW)];
+    let out = run(&tasks, &gw, &FakeBoard::all_done(), NOW, false).await;
+    assert_eq!(out.candidates, 1);
+    assert_eq!(out.dispatched, 0);
+    assert_eq!(out.failed, 0);
+    assert!(gw.commands.lock().unwrap().is_empty());
+    assert!(gw.created.lock().unwrap().is_empty());
+    assert!(gw.deleted.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn bootstrap_delete_retries_then_succeeds() {
+    // Гашение bootstrap с ретраем вместо тихого let _: два отказа —
+    // проход продолжается, третья попытка доводит гашение.
+    let gw = Arc::new(FakeGcSessions {
+        delete_fail_times: Mutex::new(2),
+        ..FakeGcSessions::default()
+    });
+    verdict_default(&gw, "SWEPT");
+    let tasks = [done_closed(1431, THREE_DAYS, NOW)];
+    let out = run(&tasks, &gw, &FakeBoard::all_done(), NOW, false).await;
+    assert_eq!(out.swept, 1);
+    assert_eq!(
+        gw.deleted
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.as_str() == "ses_gc_1")
+            .count(),
+        3,
+        "два отказа + успешное гашение"
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_delete_failure_is_loud_and_bounded() {
+    // Гашение не проходит вовсе: ретрай ограничен тремя попытками (не
+    // бесконечность и не тихий одиночный try), проход при этом завершается
+    // штатно — вердикты уже собраны (громкий env.bootstrap_not_deleted —
+    // в логе, здесь — граница попыток и живой итог).
+    let gw = Arc::new(FakeGcSessions {
+        delete_fail_times: Mutex::new(100),
+        ..FakeGcSessions::default()
+    });
+    verdict_default(&gw, "SWEPT");
+    let tasks = [done_closed(1431, THREE_DAYS, NOW)];
+    let out = run(&tasks, &gw, &FakeBoard::all_done(), NOW, false).await;
+    assert_eq!(out.swept, 1);
+    assert_eq!(out.failed, 0);
+    assert_eq!(
+        gw.deleted.lock().unwrap().as_slice(),
+        ["ses_gc_1", "ses_gc_1", "ses_gc_1"],
+        "ровно три попытки гашения — дальше рипер следующего прохода"
     );
 }
