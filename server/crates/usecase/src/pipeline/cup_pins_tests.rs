@@ -15,7 +15,7 @@ use crate::ports::Clock;
 use crate::router::SessionRouter;
 use crate::spawn_models::SpawnModels;
 use std::sync::Arc;
-use uwuwu_domain::{Status, Task, UtcMinute};
+use uwuwu_domain::{PeakWindow, Status, Task, UtcMinute};
 
 /// Часы с большим now_ms — филлеры updated_ms=0 дозревают до idle-кандидатов
 /// дримера (IDLE_MS 30 мин) при фиксированном времени.
@@ -72,6 +72,12 @@ fn analyst_wave(cup: usize) -> AnalystUseCase {
         clock: Arc::new(FixedClock),
         models: Arc::new(SpawnModels::canonical()),
         cup,
+        peak: PeakWindow {
+            enabled: false,
+            start_min: 0,
+            end_min: 0,
+        },
+        compact: None,
     }
 }
 

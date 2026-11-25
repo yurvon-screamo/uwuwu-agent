@@ -698,6 +698,8 @@ pub trait TickStateStore: Send + Sync {
     /// рождения + checkout. None — привязки нет (первая волна / legacy).
     fn analyst_master(&self, key: &str) -> Option<AnalystMaster>;
     fn set_analyst_master(&self, key: &str, binding: AnalystMaster);
+    /// Перечисление ключей привязок — скан компакт-прохода (срез 4).
+    fn analyst_master_keys(&self) -> Vec<String>;
     /// Метка последней адмиссии компакта мастер-сессии (проход, срез 4).
     fn mark_analyst_compact(&self, key: &str, at_ms: u64);
     /// Attention-механика: счётчик повторных спавнов слота

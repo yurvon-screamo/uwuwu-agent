@@ -17,7 +17,7 @@ use crate::router::SessionRouter;
 use crate::spawn_models::SpawnModels;
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
-use uwuwu_domain::{Slot, SpawnModel, Status, Task};
+use uwuwu_domain::{PeakWindow, Slot, SpawnModel, Status, Task};
 
 /// Канон-карта владельца (единственный механизм моделей — #1154).
 fn models() -> Arc<SpawnModels> {
@@ -139,6 +139,9 @@ impl TickStateStore for NoopState {
         None
     }
     fn set_analyst_master(&self, _key: &str, _binding: AnalystMaster) {}
+    fn analyst_master_keys(&self) -> Vec<String> {
+        Vec::new()
+    }
     fn mark_analyst_compact(&self, _key: &str, _at_ms: u64) {}
     /// Аналитика: кулдауны волн/ревью и цикл-гварды (#1135).
     fn last_analys_ms(&self, _b: &str, _n: u64) -> Option<u64> {
@@ -381,6 +384,12 @@ async fn analyst_spawn_carries_model_from_server_map() {
         clock: Arc::new(TestClock),
         models: models(),
         cup: 7,
+        peak: PeakWindow {
+            enabled: false,
+            start_min: 0,
+            end_min: 0,
+        },
+        compact: None,
     };
 
     // Act

@@ -342,6 +342,9 @@ impl TickStateStore for StubState {
         None
     }
     fn set_analyst_master(&self, _: &str, _: AnalystMaster) {}
+    fn analyst_master_keys(&self) -> Vec<String> {
+        Vec::new()
+    }
     fn mark_analyst_compact(&self, _: &str, _: u64) {}
     fn last_analys_ms(&self, _: &str, _: u64) -> Option<u64> {
         None

@@ -747,6 +747,16 @@ impl TickStateStore for JsonStateStore {
         row.last_compact_ms = binding.last_compact_ms;
     }
 
+    fn analyst_master_keys(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .analyst_masters
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     fn mark_analyst_compact(&self, key: &str, at_ms: u64) {
         let mut guard = self.state.lock().expect("state lock");
         if let Some(row) = guard.analyst_masters.get_mut(key) {

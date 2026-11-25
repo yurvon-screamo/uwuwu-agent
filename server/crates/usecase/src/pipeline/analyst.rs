@@ -2,11 +2,12 @@
 //! одну волну → одна мастер-сессия аналитика на проект (методичка
 //! agents/analyst: sourcing, соразмерность рамок, вердикты через MCP).
 
+use crate::bots::{compact_verdict, CompactFacts, CompactPolicy};
 use crate::error::UsecaseResult;
 use crate::ports::{AnalystMaster, SessionSpec, TaskBoardRepo, TickStateStore};
 use crate::spawn_models::SpawnModels;
 use std::sync::Arc;
-use uwuwu_domain::{Agent, AgentSlot, SpawnModel, Status, Task};
+use uwuwu_domain::{Agent, AgentSlot, PeakWindow, SpawnModel, Status, Task};
 
 /// Кулдаун волны по строке (анти-шторм, как у спавнов слотов).
 const WAVE_COOLDOWN_MS: u64 = 15 * 60_000;
@@ -29,6 +30,12 @@ pub struct AnalystUseCase {
     /// Единый кап активных ходов исполнителя (policy.cup): волна не
     /// спавнится при полном капе (#1231).
     pub cup: usize,
+    /// Пик-окно GLM: компакт-проход откладывается целиком (политика
+    /// запуска будильника, UC-05). Волны пик-гейта не несут (канон #1135).
+    pub peak: PeakWindow,
+    /// Автокомпакт мастер-сессий (#1607, срез 4): расширение матрицы
+    /// ботов на привязки аналитики. None — проход off (safe default).
+    pub compact: Option<CompactPolicy>,
 }
 
 /// Доска аналитики: где искать очередь и где спавнить агента.
@@ -235,13 +242,11 @@ impl AnalystUseCase {
                 // Контракт расхождения (C1, прецедент ботов): модель
                 // рождения ≠ карта или checkout ≠ конфигу — пересоздание.
                 // Legacy-привязка (поля None) расхождением не считается.
-                let model_ok = bound.model.as_deref().map_or(true, |raw| {
-                    SpawnModel::parse(raw).ok().as_ref() == Some(&sm)
-                });
-                let checkout_ok = bound
-                    .checkout
+                let model_ok = bound
+                    .model
                     .as_deref()
-                    .map_or(true, |c| c == tb.checkout);
+                    .is_none_or(|raw| SpawnModel::parse(raw).ok().as_ref() == Some(&sm));
+                let checkout_ok = bound.checkout.as_deref().is_none_or(|c| c == tb.checkout);
                 if model_ok && checkout_ok {
                     match sessions.liveness(&bound.session).await {
                         crate::ports::Liveness::Alive => reuse = Some(bound.session),
@@ -338,7 +343,124 @@ impl AnalystUseCase {
         if !read_failed {
             self.state.prune_analys_guards(&live_rows);
         }
+        // Компакт-проход мастер-сессий (срез 4): после волн — волны в
+        // приоритете за слоты капа.
+        self.compact_pass(busy).await;
         Ok(spawned)
+    }
+
+    /// Компакт-проход мастер-сессий (#1607, срез 4): расширение матрицы
+    /// вердикта ботов (`compact_verdict`, ADR-082) на привязки аналитики —
+    /// та же политика `[compact]`, тот же нативный `compact_session`.
+    /// Бот-ветка не затрагивается: гейт ниже — только для адмиссий
+    /// аналитика (UC-05: «Ботов не гейти»). Секция отсутствует — no-op.
+    /// Скан — по привязкам state (ключ «роль:проект»); занятость — от
+    /// модели рождения привязки (C1), не от карты.
+    async fn compact_pass(&self, busy: usize) {
+        let Some(policy) = &self.compact else { return };
+        // Пик-окно — как будильник: запуск хода откладывается целиком.
+        if self.peak.holds(self.clock.utc_minute()) {
+            tracing::info!(
+                event = "analys.compact_deferred_peak",
+                "Компакт-проход мастер-сессий отложен: пик-окно"
+            );
+            return;
+        }
+        let (scan, failed) = self.sessions.list_sessions_reachable().await;
+        if !failed.is_empty() {
+            tracing::warn!(
+                event = "analys.compact_list_degraded",
+                executors = ?failed,
+                "Компакт-проход: часть исполнителей недоступна — факты по живому union"
+            );
+        }
+        let now = self.clock.now_ms();
+        let mut admitted = 0usize;
+        for key in self.state.analyst_master_keys() {
+            let Some(project) = key.strip_prefix("analyst:") else {
+                continue;
+            };
+            let Some(bound) = self.state.analyst_master(&key) else {
+                continue;
+            };
+            let sessions = self.sessions.project(project);
+            let busy_flag = scan
+                .iter()
+                .find(|s| s.id == bound.session)
+                .map(|s| s.busy)
+                .unwrap_or(false);
+            let idle_ms = match sessions.last_activity_ms(&bound.session).await {
+                Ok(ms) => ms.map(|ms| now.saturating_sub(ms)),
+                // Транспорт/потеря — пропуск до следующего тика (волна
+                // подхватит живую сессию; мёртвую — пересоздаст).
+                Err(_) => continue,
+            };
+            let model = bound
+                .model
+                .as_deref()
+                .and_then(|raw| SpawnModel::parse(raw).ok())
+                .unwrap_or_else(|| self.models.for_agent(Agent::Analyst));
+            let usage_pct = match sessions
+                .context_usage_pct(&bound.session, &model.model)
+                .await
+            {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+            let verdict = compact_verdict(
+                &CompactFacts {
+                    busy: busy_flag,
+                    idle_ms,
+                    usage_pct,
+                    last_compact_ms: bound.last_compact_ms,
+                    now_ms: now,
+                },
+                policy,
+            );
+            if !verdict.fire {
+                tracing::debug!(
+                    event = "analys.compact_skip",
+                    key = %key,
+                    reason = %verdict.reason,
+                    "Компакт мастер-сессии: не стреляем"
+                );
+                continue;
+            }
+            // CUP-гейт адмиссий аналитика: admitted этого прохода занимают
+            // слоты (волны тика — в счётчике busy вызывающего).
+            if busy + admitted >= self.cup {
+                tracing::info!(
+                    event = "analys.compact_held_cup",
+                    key = %key,
+                    active = busy + admitted,
+                    cap = self.cup,
+                    "Компакт мастер-сессии отложен: CUP cap"
+                );
+                break;
+            }
+            // Метка ДО POST (ADR-082): коулдаун переживает рестарт сервера,
+            // повторная адмиссия исключена.
+            self.state.mark_analyst_compact(&key, now);
+            match sessions.compact_session(&bound.session).await {
+                Ok(()) => {
+                    admitted += 1;
+                    tracing::info!(
+                        event = "analys.compacted",
+                        key = %key,
+                        session = %bound.session,
+                        "Компакт мастер-сессии admitted"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        event = "analys.compact_failed",
+                        key = %key,
+                        error = %e,
+                        "Адмиссия компакта не удалась — метка держит коулдаун"
+                    );
+                }
+            }
+        }
     }
 
     /// Тупик цикла: строка переведена в Needs attention + коммент владельцу.
