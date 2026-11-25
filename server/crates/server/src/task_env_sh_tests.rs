@@ -201,6 +201,27 @@ fn task_env_reuses_classic_checkout_with_git_directory() {
 }
 
 #[test]
+fn task_env_does_not_report_ready_over_stray_git_marker() {
+    // Гард re-use требует не только наличия .git, но и настоящего git-носителя:
+    // инородная .git-запись не должна уходить в ветвь re-use с «env ready».
+    let fx = fixture();
+    let env_root = fx.root.join("env");
+    let repo = env_root.join("1504fx").join("repo");
+    std::fs::create_dir_all(&repo).expect("repo-каталог создан");
+    std::fs::write(repo.join(".git"), "gitdir: /nonexistent\n").expect("stray .git записан");
+
+    let out = run_task_env(&env_root, &fx.carrier, "1504fx");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        !stdout.contains("env ready"),
+        "сломанный .git не считается живым env: stdout={stdout} stderr={stderr}"
+    );
+    cleanup(fx);
+}
+
+#[test]
 fn task_env_reuse_refreshes_remote_refs_without_moving_head() {
     let fx = fixture();
     let env_root = fx.root.join("env");
