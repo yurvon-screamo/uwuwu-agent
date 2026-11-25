@@ -92,8 +92,10 @@ pub trait TaskBoardRepo: Send + Sync {
     /// записанные значения сразу — write-through кешированного снапшота
     /// при живой строке, инвалидация при отсутствующей (окно create).
     /// None — ячейку не трогаем. Ветка/PR/Тип живут мимо снапшота —
-    /// идут через IssueFieldStore напрямую. direct (#1357) — как
-    /// automerge: состояние на носителе явно, write-through тот же.
+    /// идут через IssueFieldStore напрямую. direct (#1357) и fact_track
+    /// (#1631) — как automerge: состояние на носителе явно, write-through
+    /// тот же; оба пишутся только create (create-only, immutable), edit
+    /// несёт None.
     async fn set_board_cells(
         &self,
         board: &str,
@@ -101,6 +103,7 @@ pub trait TaskBoardRepo: Send + Sync {
         priority: Option<&str>,
         automerge: Option<bool>,
         direct: Option<bool>,
+        fact_track: Option<bool>,
     ) -> UsecaseResult<()>;
 
     /// Очистить сессию слота строки (переход в раунд свежих глаз:
@@ -613,20 +616,6 @@ pub enum DreamerMark {
     Forever,
 }
 
-/// Привязка мастер-сессии (#1607): сессия + модель рождения + checkout.
-/// Расхождение модели с картой `[executor.models]` или checkout с
-/// конфигом — пересоздание (прецедент ботов: смена model/workspace).
-/// Форма ключа — перечисление «роль:проект» (на неё садится #1634).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AnalystMaster {
-    pub session: String,
-    /// Модель рождения «provider/id[#variant]» — аргумент usage_pct (C1).
-    pub model: Option<String>,
-    pub checkout: Option<String>,
-    /// ms последней адмиссии компакта прохода (срез 4 #1607).
-    pub last_compact_ms: u64,
-}
-
 /// Персистентное состояние тика (wakeup-дедуп, дример-инвариант).
 pub trait TickStateStore: Send + Sync {
     fn last_comment_id(&self, board: &str, number: u64) -> Option<String>;
@@ -694,14 +683,6 @@ pub trait TickStateStore: Send + Sync {
     /// ушедших с досок, вычищаются — live = ключи «board:number» всех строк
     /// всех досок тика.
     fn prune_analys_guards(&self, live: &std::collections::HashSet<String>);
-    /// Мастер-сессии (#1607): привязка «роль:проект» → сессия + модель
-    /// рождения + checkout. None — привязки нет (первая волна / legacy).
-    fn analyst_master(&self, key: &str) -> Option<AnalystMaster>;
-    fn set_analyst_master(&self, key: &str, binding: AnalystMaster);
-    /// Перечисление ключей привязок — скан компакт-прохода (срез 4).
-    fn analyst_master_keys(&self) -> Vec<String>;
-    /// Метка последней адмиссии компакта мастер-сессии (проход, срез 4).
-    fn mark_analyst_compact(&self, key: &str, at_ms: u64);
     /// Attention-механика: счётчик повторных спавнов слота
     /// (статус на момент прошлого спавна, число повторов).
     fn spawn_loop(&self, board: &str, number: u64, slot: Slot) -> Option<(Status, u32)>;
@@ -725,5 +706,27 @@ pub trait TickStateStore: Send + Sync {
     /// агентом через MCP task_comment (не юзером и не фабрикой).
     fn own_comment(&self, id: &str) -> bool;
     fn mark_own_comment(&self, id: &str, posted_ms: u64);
+    /// Мастер-привязка роли проекта (#1634, форма роль x проект общая
+    /// с #1607): (session, model_raw provider/id[#variant], checkout).
+    fn master_binding(&self, role: &str, project: &str) -> Option<(String, String, String)>;
+    fn set_master_binding(
+        &self,
+        role: &str,
+        project: &str,
+        session: &str,
+        model_raw: &str,
+        checkout: &str,
+    );
+    /// Метка последней адмиссии компакта мастер-привязки (коулдаун
+    /// переживает рестарт; 0 - не было).
+    fn master_compact_ms(&self, role: &str, project: &str) -> u64;
+    fn set_master_compact_ms(&self, role: &str, project: &str, ms: u64);
+    /// Гигиена привязок (Low-1 ревью #1634): снести записи роли, чьи
+    /// проекты ушли из конфига. Возвращает true, если что-то снесено.
+    fn prune_master_role(
+        &self,
+        role: &str,
+        live_projects: &std::collections::HashSet<String>,
+    ) -> bool;
     fn save(&self) -> UsecaseResult<()>;
 }

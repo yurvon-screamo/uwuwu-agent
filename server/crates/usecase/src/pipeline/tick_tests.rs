@@ -4,8 +4,8 @@
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::pipeline::tick::{BoardPlan, Mode, TickPlan, TickUseCase, PROBE_DEGRADE_MIN_ROWS};
 use crate::ports::{
-    AgentSessionGateway, AnalystMaster, Clock, CommentRef, DecisionJudge, DreamerMark, JudgeCfg,
-    Liveness, PrGateway, PrProbe, PrState, QuotaProbe, SessionSpec, TaskBoardRepo, TickStateStore,
+    AgentSessionGateway, Clock, CommentRef, DecisionJudge, DreamerMark, JudgeCfg, Liveness,
+    PrGateway, PrProbe, PrState, QuotaProbe, SessionSpec, TaskBoardRepo, TickStateStore,
 };
 use crate::router::SessionRouter;
 use async_trait::async_trait;
@@ -105,6 +105,7 @@ impl TaskBoardRepo for FakeBoard {
         _p: Option<&str>,
         _a: Option<bool>,
         _d: Option<bool>,
+        _f: Option<bool>,
     ) -> UsecaseResult<()> {
         Ok(())
     }
@@ -276,11 +277,10 @@ struct FakeSessions {
     abort_fails: AtomicBool,
     /// Бюджетная проба spawn_allowed (false — преемпшен не начинается).
     spawn_probe: AtomicBool,
-    /// Журнал нативных компактов (#1626): re-entry доставки мастер-сессий.
+    /// Занятость окна контекста по сессиям (#1634): session -> pct.
+    usage: Mutex<std::collections::BTreeMap<String, f64>>,
+    /// Журнал нативных компактов (#1626 re-entry + #1634 compact_pass).
     compacted: Mutex<Vec<String>>,
-    /// Занятость окна контекста, % лимита модели (компакт-проход #1607):
-    /// None — не измерить (assistant-поворотов нет), как прод-дефолт.
-    usage_pct: Mutex<Option<f64>>,
 }
 
 /// Слепок живой сессии в фейке: (id, agent, directory, outcome, updated).
@@ -318,8 +318,9 @@ impl FakeSessions {
             switched: Mutex::default(),
             abort_fails: AtomicBool::new(false),
             spawn_probe: AtomicBool::new(true),
+            usage: Mutex::default(),
+
             compacted: Mutex::default(),
-            usage_pct: Mutex::default(),
         }
     }
     fn with_live(agent: &str) -> Self {
@@ -404,13 +405,6 @@ impl AgentSessionGateway for FakeSessions {
         self.compacted.lock().unwrap().push(session.to_string());
         Ok(())
     }
-    async fn context_usage_pct(
-        &self,
-        _session: &str,
-        _model: &uwuwu_domain::ModelRef,
-    ) -> UsecaseResult<Option<f64>> {
-        Ok(*self.usage_pct.lock().unwrap())
-    }
     async fn run_command(&self, _s: &str, _n: &str, _a: &str) -> UsecaseResult<()> {
         Ok(())
     }
@@ -470,6 +464,13 @@ impl AgentSessionGateway for FakeSessions {
             is_latest: true,
             finish: Some("stop".into()),
         }))
+    }
+    async fn context_usage_pct(
+        &self,
+        session: &str,
+        _model: &uwuwu_domain::ModelRef,
+    ) -> UsecaseResult<Option<f64>> {
+        Ok(self.usage.lock().unwrap().get(session).copied())
     }
     async fn list_sessions(&self) -> UsecaseResult<Vec<crate::ports::SessionInfo>> {
         if self.list_fails {
@@ -597,10 +598,12 @@ struct MemStateInner {
     spawn_ms: Vec<(u64, Slot, u64)>,
     /// Pending раунд-промпт мастер-сессии (#1626): number-журнал
     round_reentry: Vec<u64>,
-    /// Привязки мастер-сессий (#1607): «роль:проект» → привязка
-    analyst_masters: BTreeMap<String, AnalystMaster>,
     /// реестр серверных постов (own-тест self-эха #1204)
     own: BTreeMap<String, u64>,
+    /// мастер-привязки (#1634): (role, project, session, model_raw, checkout)
+    master: Vec<(String, String, String, String, String)>,
+    /// метки компакта мастер-привязок: (role, project, ms)
+    master_compact: Vec<(String, String, u64)>,
 }
 pub(crate) struct MemState(Mutex<MemStateInner>);
 
@@ -702,30 +705,6 @@ impl TickStateStore for MemState {
     }
     fn clear_round_reentry_pending(&self, _b: &str, n: u64) {
         self.0.lock().unwrap().round_reentry.retain(|num| *num != n);
-    }
-    fn analyst_master(&self, key: &str) -> Option<AnalystMaster> {
-        self.0.lock().unwrap().analyst_masters.get(key).cloned()
-    }
-    fn set_analyst_master(&self, key: &str, binding: AnalystMaster) {
-        self.0
-            .lock()
-            .unwrap()
-            .analyst_masters
-            .insert(key.to_string(), binding);
-    }
-    fn analyst_master_keys(&self) -> Vec<String> {
-        self.0
-            .lock()
-            .unwrap()
-            .analyst_masters
-            .keys()
-            .cloned()
-            .collect()
-    }
-    fn mark_analyst_compact(&self, key: &str, at_ms: u64) {
-        if let Some(row) = self.0.lock().unwrap().analyst_masters.get_mut(key) {
-            row.last_compact_ms = at_ms;
-        }
     }
     fn last_analys_ms(&self, b: &str, n: u64) -> Option<u64> {
         self.0
@@ -909,6 +888,83 @@ impl TickStateStore for MemState {
     }
     fn mark_own_comment(&self, id: &str, posted_ms: u64) {
         self.0.lock().unwrap().own.insert(id.to_string(), posted_ms);
+    }
+    fn master_binding(&self, role: &str, project: &str) -> Option<(String, String, String)> {
+        self.0
+            .lock()
+            .unwrap()
+            .master
+            .iter()
+            .rev()
+            .find(|(r, p, _, _, _)| r == role && p == project)
+            .map(|(_, _, s, m, c)| (s.clone(), m.clone(), c.clone()))
+    }
+    fn set_master_binding(
+        &self,
+        role: &str,
+        project: &str,
+        session: &str,
+        model_raw: &str,
+        checkout: &str,
+    ) {
+        let mut g = self.0.lock().unwrap();
+        if let Some(e) = g
+            .master
+            .iter_mut()
+            .find(|(r, p, _, _, _)| r == role && p == project)
+        {
+            *e = (
+                role.into(),
+                project.into(),
+                session.into(),
+                model_raw.into(),
+                checkout.into(),
+            );
+        } else {
+            g.master.push((
+                role.into(),
+                project.into(),
+                session.into(),
+                model_raw.into(),
+                checkout.into(),
+            ));
+        }
+    }
+    fn master_compact_ms(&self, role: &str, project: &str) -> u64 {
+        self.0
+            .lock()
+            .unwrap()
+            .master_compact
+            .iter()
+            .rev()
+            .find(|(r, p, _)| r == role && p == project)
+            .map(|(_, _, ms)| *ms)
+            .unwrap_or(0)
+    }
+    fn set_master_compact_ms(&self, role: &str, project: &str, ms: u64) {
+        let mut g = self.0.lock().unwrap();
+        if let Some(e) = g
+            .master_compact
+            .iter_mut()
+            .find(|(r, p, _)| r == role && p == project)
+        {
+            e.2 = ms;
+        } else {
+            g.master_compact.push((role.into(), project.into(), ms));
+        }
+    }
+    fn prune_master_role(
+        &self,
+        role: &str,
+        live_projects: &std::collections::HashSet<String>,
+    ) -> bool {
+        let mut g = self.0.lock().unwrap();
+        let before = g.master.len();
+        g.master
+            .retain(|(r, p, _, _, _)| r != role || live_projects.contains(p));
+        g.master_compact
+            .retain(|(r, p, _)| r != role || live_projects.contains(p));
+        g.master.len() != before
     }
     fn save(&self) -> UsecaseResult<()> {
         Ok(())
@@ -1432,8 +1488,9 @@ fn wake_usecase(
         aborted: Mutex::default(),
         abort_fails: AtomicBool::new(false),
         spawn_probe: AtomicBool::new(true),
+        usage: Mutex::default(),
+
         compacted: Mutex::default(),
-        usage_pct: Mutex::default(),
     });
     let u = TickUseCase {
         board,
@@ -1872,6 +1929,7 @@ impl TaskBoardRepo for CommentBoard {
         _p: Option<&str>,
         _a: Option<bool>,
         _d: Option<bool>,
+        _f: Option<bool>,
     ) -> UsecaseResult<()> {
         Ok(())
     }
@@ -3938,8 +3996,9 @@ async fn dead_stage_and_candidate_hold_blind_when_list_unavailable() {
         aborted: Mutex::default(),
         abort_fails: AtomicBool::new(false),
         spawn_probe: AtomicBool::new(true),
+        usage: Mutex::default(),
+
         compacted: Mutex::default(),
-        usage_pct: Mutex::default(),
     };
     let (u, _, _, _) = usecase_with_sessions(
         vec![dead, candidate],
@@ -4652,8 +4711,9 @@ async fn undelivered_comment_is_not_marked_seen() {
             aborted: Mutex::default(),
             abort_fails: AtomicBool::new(false),
             spawn_probe: AtomicBool::new(true),
+            usage: Mutex::default(),
+
             compacted: Mutex::default(),
-            usage_pct: Mutex::default(),
         });
         let prs = Arc::new(FakePrs {
             state: PrState::Missing,
@@ -4730,8 +4790,9 @@ async fn undelivered_comment_is_not_marked_seen() {
         aborted: Mutex::default(),
         abort_fails: AtomicBool::new(false),
         spawn_probe: AtomicBool::new(true),
+        usage: Mutex::default(),
+
         compacted: Mutex::default(),
-        usage_pct: Mutex::default(),
     });
     let u2 = TickUseCase {
         board: board.clone(),
@@ -4818,8 +4879,9 @@ async fn multi_comment_tail_delivered_together() {
         aborted: Mutex::default(),
         abort_fails: AtomicBool::new(false),
         spawn_probe: AtomicBool::new(true),
+        usage: Mutex::default(),
+
         compacted: Mutex::default(),
-        usage_pct: Mutex::default(),
     });
     let u = TickUseCase {
         board: board.clone(),
@@ -6472,47 +6534,67 @@ async fn analyst_multiboard_no_oversell_within_tick() {
     assert_eq!(specs[0].directory, "/checkout-1");
 }
 
-/// Билдер юзкейса сайдкара аналитики: доска + роутер + кап (общая
-/// механика для аналитика и ревьювера, ревью #1231 similar-code).
-macro_rules! sidecar_uc_with_cup {
-    ($fn_name:ident, $ty:ident $(, $field:ident : $value:expr)*) => {
-        fn $fn_name(
-            rows: Vec<Task>,
-            state: Arc<MemState>,
-            sessions: Arc<dyn AgentSessionGateway>,
-            cup: usize,
-        ) -> ($ty, Arc<FakeBoard>) {
-            let board = Arc::new(FakeBoard {
-                rows: rows.into(),
-                log: Mutex::default(),
-                comments: vec![],
-                fields_fails: false,
-                set_session_fails: false,
-                set_pr_fails: AtomicBool::new(false),
-                clear_session_fails: AtomicBool::new(false),
-                status_fails: AtomicBool::new(false),
-            });
-            let u = $ty {
-                board: board.clone(),
-                boards: vec![analyst_board()],
-                sessions: Arc::new(SessionRouter::uniform(sessions)),
-                state,
-                clock: Arc::new(FixedClock),
-                models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
-                cup,
-                $($field : $value,)*
-            };
-            (u, board.clone())
-        }
+fn analyst_uc_with_cup(
+    rows: Vec<Task>,
+    state: Arc<MemState>,
+    sessions: Arc<dyn AgentSessionGateway>,
+    cup: usize,
+) -> (AnalystUseCase, Arc<FakeBoard>) {
+    let board = Arc::new(FakeBoard {
+        rows: rows.into(),
+        log: Mutex::default(),
+        comments: vec![],
+        fields_fails: false,
+        set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
+        clear_session_fails: AtomicBool::new(false),
+        status_fails: AtomicBool::new(false),
+    });
+    let u = AnalystUseCase {
+        board: board.clone(),
+        boards: vec![analyst_board()],
+        sessions: Arc::new(SessionRouter::uniform(sessions)),
+        state,
+        clock: Arc::new(FixedClock),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        cup,
+        peak: PeakWindow {
+            enabled: false,
+            start_min: 0,
+            end_min: 0,
+        },
+        compact: None,
     };
+    (u, board.clone())
 }
-sidecar_uc_with_cup!(
-    analyst_uc_with_cup,
-    AnalystUseCase,
-    peak: PeakWindow { enabled: false, start_min: 0, end_min: 0 },
-    compact: None
-);
-sidecar_uc_with_cup!(review_uc_with_cup, AnalystReviewUseCase);
+fn review_uc_with_cup(
+    rows: Vec<Task>,
+    state: Arc<MemState>,
+    sessions: Arc<dyn AgentSessionGateway>,
+    cup: usize,
+) -> (AnalystReviewUseCase, Arc<FakeBoard>) {
+    let board = Arc::new(FakeBoard {
+        rows: rows.into(),
+        log: Mutex::default(),
+        comments: vec![],
+        fields_fails: false,
+        set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
+        clear_session_fails: AtomicBool::new(false),
+        status_fails: AtomicBool::new(false),
+    });
+    let u = AnalystReviewUseCase {
+        board: board.clone(),
+        boards: vec![analyst_board()],
+        sessions: Arc::new(SessionRouter::uniform(sessions)),
+        state,
+        clock: Arc::new(FixedClock),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        cup,
+        compact: None,
+    };
+    (u, board.clone())
+}
 
 /// Прогон тика аналитики с предзаряженным стейтом: возвращает стейт
 /// после тика (сценарии сброса/чистки гвардов).
@@ -7032,14 +7114,12 @@ async fn analyst_wave_reuses_live_master_session_1607() {
     // Мастер-сессия аналитика (#1607, срез 2б): волна едет промптом в
     // живую привязанную сессию — спавна нет, привязка не трогается.
     let state = Arc::new(MemState(Mutex::default()));
-    state.0.lock().unwrap().analyst_masters.insert(
-        "analyst:p".into(),
-        AnalystMaster {
-            session: "ses_master".into(),
-            model: Some("zai-coding-plan/glm-5.4#high".into()),
-            checkout: Some("/tmp/checkout".into()),
-            last_compact_ms: 0,
-        },
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_master",
+        "zai-coding-plan/glm-5.4#high",
+        "/tmp/checkout",
     );
     let sessions = Arc::new(FakeSessions::new());
     let (u, _) = analyst_uc(
@@ -7067,13 +7147,14 @@ async fn analyst_wave_reuses_live_master_session_1607() {
         prompts[0].contains("Analytics wave"),
         "промпт волны, не спавн-промпт стадии: {prompts:?}"
     );
-    let inner = state.0.lock().unwrap();
-    assert_eq!(inner.analys_loops.len(), 1, "захват волны отмечен");
+    {
+        let inner = state.0.lock().unwrap();
+        assert_eq!(inner.analys_loops.len(), 1, "захват волны отмечен");
+    }
     assert!(
-        inner
-            .analyst_masters
-            .get("analyst:p")
-            .is_some_and(|b| b.session == "ses_master"),
+        state
+            .master_binding("analyst", "p")
+            .is_some_and(|(s, _, _)| s == "ses_master"),
         "привязка не переписана при reuse"
     );
 }
@@ -7083,14 +7164,12 @@ async fn analyst_wave_respawns_dead_master_session_1607() {
     // Мёртвая мастер-сессия (#1607): волна спавнит новую сессию,
     // привязка перезаписывается (старая не гасится — статус-кво).
     let state = Arc::new(MemState(Mutex::default()));
-    state.0.lock().unwrap().analyst_masters.insert(
-        "analyst:p".into(),
-        AnalystMaster {
-            session: "ses_dead".into(),
-            model: Some("zai-coding-plan/glm-5.4#high".into()),
-            checkout: Some("/tmp/checkout".into()),
-            last_compact_ms: 0,
-        },
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_dead",
+        "zai-coding-plan/glm-5.4#high",
+        "/tmp/checkout",
     );
     let fake = FakeSessions::new();
     fake.dead_sessions.lock().unwrap().push("ses_dead".into());
@@ -7112,17 +7191,12 @@ async fn analyst_wave_respawns_dead_master_session_1607() {
         "новая сессия — на модели карты"
     );
     let bound = state
-        .0
-        .lock()
-        .unwrap()
-        .analyst_masters
-        .get("analyst:p")
-        .cloned()
+        .master_binding("analyst", "p")
         .expect("привязка перезаписана");
-    assert_eq!(bound.session, "ses_1", "привязка указывает на новую сессию");
+    assert_eq!(bound.0, "ses_1", "привязка указывает на новую сессию");
     assert_eq!(
-        bound.model.as_deref(),
-        Some("zai-coding-plan/glm-5.4#high"),
+        bound.1.as_str(),
+        "zai-coding-plan/glm-5.4#high",
         "модель рождения записана"
     );
 }
@@ -7132,14 +7206,12 @@ async fn analyst_wave_defers_on_unknown_master_session_1607() {
     // Liveness неизвестен (#1607): доска откладывается на тик — спавна
     // нет, кулдауны и цикл-гарды не заряжаются («failed spawn не заряжает»).
     let state = Arc::new(MemState(Mutex::default()));
-    state.0.lock().unwrap().analyst_masters.insert(
-        "analyst:p".into(),
-        AnalystMaster {
-            session: "ses_ghost".into(),
-            model: Some("zai-coding-plan/glm-5.4#high".into()),
-            checkout: Some("/tmp/checkout".into()),
-            last_compact_ms: 0,
-        },
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_ghost",
+        "zai-coding-plan/glm-5.4#high",
+        "/tmp/checkout",
     );
     let mut fake = FakeSessions::new();
     fake.liveness_unknown = true;
@@ -7153,17 +7225,18 @@ async fn analyst_wave_defers_on_unknown_master_session_1607() {
     assert_eq!(spawned, 0, "без зрения — ни спавна, ни reuse");
     assert!(sessions.spawned.lock().unwrap().is_empty(), "сессий нет");
     assert!(sessions.prompts.lock().unwrap().is_empty(), "промптов нет");
-    let inner = state.0.lock().unwrap();
+    {
+        let inner = state.0.lock().unwrap();
+        assert!(
+            inner.analys_loops.is_empty(),
+            "цикл-гард не заряжен отложкой"
+        );
+        assert!(inner.analys_ms.is_empty(), "кулдаун не заряжен отложкой");
+    }
     assert!(
-        inner.analys_loops.is_empty(),
-        "цикл-гард не заряжен отложкой"
-    );
-    assert!(inner.analys_ms.is_empty(), "кулдаун не заряжен отложкой");
-    assert!(
-        inner
-            .analyst_masters
-            .get("analyst:p")
-            .is_some_and(|b| b.session == "ses_ghost"),
+        state
+            .master_binding("analyst", "p")
+            .is_some_and(|(s, _, _)| s == "ses_ghost"),
         "привязка не тронута отложкой"
     );
 }
@@ -7173,14 +7246,12 @@ async fn analyst_master_recreated_on_model_divergence_1607() {
     // Расхождение с картой (C1 #1607): модель рождения ≠ карта —
     // пересоздание на модели карты, привязка перезаписывается.
     let state = Arc::new(MemState(Mutex::default()));
-    state.0.lock().unwrap().analyst_masters.insert(
-        "analyst:p".into(),
-        AnalystMaster {
-            session: "ses_old".into(),
-            model: Some("zai-coding-plan/glm-5.3-flash#high".into()),
-            checkout: Some("/tmp/checkout".into()),
-            last_compact_ms: 0,
-        },
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_old",
+        "zai-coding-plan/glm-5.3-flash#high",
+        "/tmp/checkout",
     );
     let sessions = Arc::new(FakeSessions::new());
     let (u, _) = analyst_uc(
@@ -7200,12 +7271,8 @@ async fn analyst_master_recreated_on_model_divergence_1607() {
     );
     assert!(
         state
-            .0
-            .lock()
-            .unwrap()
-            .analyst_masters
-            .get("analyst:p")
-            .is_some_and(|b| b.model.as_deref() == Some("zai-coding-plan/glm-5.4#high")),
+            .master_binding("analyst", "p")
+            .is_some_and(|(_, m, _)| m == "zai-coding-plan/glm-5.4#high"),
         "модель рождения в привязке обновлена"
     );
 }
@@ -7215,14 +7282,12 @@ async fn analyst_master_recreated_on_checkout_divergence_1607() {
     // Расхождение checkout (Low-1 р.4, прецедент ботов): каталог привязки
     // ≠ конфигу — пересоздание в актуальном каталоге.
     let state = Arc::new(MemState(Mutex::default()));
-    state.0.lock().unwrap().analyst_masters.insert(
-        "analyst:p".into(),
-        AnalystMaster {
-            session: "ses_old".into(),
-            model: Some("zai-coding-plan/glm-5.4#high".into()),
-            checkout: Some("/tmp/stale-checkout".into()),
-            last_compact_ms: 0,
-        },
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_old",
+        "zai-coding-plan/glm-5.4#high",
+        "/tmp/stale-checkout",
     );
     let sessions = Arc::new(FakeSessions::new());
     let (u, _) = analyst_uc(
@@ -7239,12 +7304,8 @@ async fn analyst_master_recreated_on_checkout_divergence_1607() {
     );
     assert!(
         state
-            .0
-            .lock()
-            .unwrap()
-            .analyst_masters
-            .get("analyst:p")
-            .is_some_and(|b| b.checkout.as_deref() == Some("/tmp/checkout")),
+            .master_binding("analyst", "p")
+            .is_some_and(|(_, _, c)| c == "/tmp/checkout"),
         "checkout в привязке обновлён"
     );
 }
@@ -7294,29 +7355,25 @@ fn compact_policy_1607() -> crate::bots::CompactPolicy {
     }
 }
 
-fn master_binding(session: &str) -> AnalystMaster {
-    AnalystMaster {
-        session: session.into(),
-        model: Some("zai-coding-plan/glm-5.3-flash#high".into()),
-        checkout: Some("/tmp/checkout".into()),
-        last_compact_ms: 0,
-    }
-}
-
 #[tokio::test]
 async fn analyst_compact_fires_on_idle_full_session_1607() {
     // Проход (#1607, срез 4): idle-сессия с занятостью выше доли —
     // нативная адмиссия, метка ДО POST (ADR-082).
     let state = Arc::new(MemState(Mutex::default()));
-    state
-        .0
-        .lock()
-        .unwrap()
-        .analyst_masters
-        .insert("analyst:p".into(), master_binding("ses_master"));
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_master",
+        "zai-coding-plan/glm-5.3-flash#high",
+        "/tmp/checkout",
+    );
     let mut fake = FakeSessions::new();
     fake.activity_ms = Some(0); // тишина = всё время тика
-    fake.usage_pct = Mutex::new(Some(70.0));
+    fake.usage.lock().unwrap().insert("ses_master".into(), 70.0);
+    fake.usage
+        .lock()
+        .unwrap()
+        .insert("ses_reviewer".into(), 70.0);
     let sessions = Arc::new(fake);
     let u = analyst_compact_uc(
         state.clone(),
@@ -7332,13 +7389,7 @@ async fn analyst_compact_fires_on_idle_full_session_1607() {
         "адмиссия в привязанную сессию"
     );
     assert!(
-        state
-            .0
-            .lock()
-            .unwrap()
-            .analyst_masters
-            .get("analyst:p")
-            .is_some_and(|b| b.last_compact_ms == 20_000_000),
+        state.master_compact_ms("analyst", "p") == 20_000_000,
         "метка коулдауна выставлена"
     );
 }
@@ -7347,15 +7398,20 @@ async fn analyst_compact_fires_on_idle_full_session_1607() {
 async fn analyst_compact_skips_fresh_session_1607() {
     // Свежая сессия (idle ниже порога) — проход молчит, метки нет.
     let state = Arc::new(MemState(Mutex::default()));
-    state
-        .0
-        .lock()
-        .unwrap()
-        .analyst_masters
-        .insert("analyst:p".into(), master_binding("ses_master"));
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_master",
+        "zai-coding-plan/glm-5.3-flash#high",
+        "/tmp/checkout",
+    );
     let mut fake = FakeSessions::new();
     fake.activity_ms = Some(20_000_000); // idle 0
-    fake.usage_pct = Mutex::new(Some(90.0));
+    fake.usage.lock().unwrap().insert("ses_master".into(), 90.0);
+    fake.usage
+        .lock()
+        .unwrap()
+        .insert("ses_reviewer".into(), 90.0);
     let sessions = Arc::new(fake);
     let u = analyst_compact_uc(
         state.clone(),
@@ -7370,13 +7426,7 @@ async fn analyst_compact_skips_fresh_session_1607() {
         "свежая сессия — адмиссии нет"
     );
     assert!(
-        state
-            .0
-            .lock()
-            .unwrap()
-            .analyst_masters
-            .get("analyst:p")
-            .is_some_and(|b| b.last_compact_ms == 0),
+        state.master_compact_ms("analyst", "p") == 0,
         "метка не выставлена"
     );
 }
@@ -7385,17 +7435,21 @@ async fn analyst_compact_skips_fresh_session_1607() {
 async fn analyst_compact_honours_cooldown_1607() {
     // Коулдаун прошлой адмиссии — повторного выстрела нет.
     let state = Arc::new(MemState(Mutex::default()));
-    let mut bound = master_binding("ses_master");
-    bound.last_compact_ms = 20_000_000 - 60_000; // минута назад
-    state
-        .0
-        .lock()
-        .unwrap()
-        .analyst_masters
-        .insert("analyst:p".into(), bound);
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_master",
+        "zai-coding-plan/glm-5.3-flash#high",
+        "/tmp/checkout",
+    );
+    state.set_master_compact_ms("analyst", "p", 20_000_000 - 60_000); // минута назад
     let mut fake = FakeSessions::new();
     fake.activity_ms = Some(0);
-    fake.usage_pct = Mutex::new(Some(90.0));
+    fake.usage.lock().unwrap().insert("ses_master".into(), 90.0);
+    fake.usage
+        .lock()
+        .unwrap()
+        .insert("ses_reviewer".into(), 90.0);
     let sessions = Arc::new(fake);
     let u = analyst_compact_uc(
         state.clone(),
@@ -7413,54 +7467,41 @@ async fn analyst_compact_honours_cooldown_1607() {
 
 #[tokio::test]
 async fn analyst_compact_held_when_cup_full_1607() {
-    // CUP полон — адмиссия аналитика откладывается без метки (бот-ветка
-    // вне гейта — UC-05; гейт только здесь, Low-6 р.4). Волна в
-    // приоритете: слот занимает она, проход ждёт. Привязки нет — волна
-    // спавнит и биндит; свежая привязка тут же попадает под проход.
+    // CUP полон на старте тика — проход откладывается целиком без метки
+    // (бот-ветка вне гейта — UC-05: «Ботов не гейти»; гейт только здесь,
+    // Low-6 р.4). Занятой слот держит чужая сессия (роль не analyst —
+    // alive-скип волны не срабатывает, волн в доске нет).
     let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_master",
+        "zai-coding-plan/glm-5.3-flash#high",
+        "/tmp/checkout",
+    );
     let mut fake = FakeSessions::new();
     fake.activity_ms = Some(0);
-    fake.usage_pct = Mutex::new(Some(90.0));
+    fake.usage.lock().unwrap().insert("ses_master".into(), 90.0);
+    fake.extra
+        .lock()
+        .unwrap()
+        .push(fake_session("ses_stage", "developer", "", 100, true));
     let sessions = Arc::new(fake);
-    let board = Arc::new(FakeBoard {
-        rows: std::sync::Mutex::new(vec![titled(75, "заявка", Status::Analys)]),
-        log: Mutex::default(),
-        comments: vec![],
-        fields_fails: false,
-        set_session_fails: false,
-        set_pr_fails: AtomicBool::new(false),
-        clear_session_fails: AtomicBool::new(false),
-        status_fails: AtomicBool::new(false),
-    });
-    let u = AnalystUseCase {
-        board,
-        boards: vec![analyst_board()],
-        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
-        state: state.clone(),
-        clock: Arc::new(LostClock),
-        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
-        cup: 1, // один слот — его забирает волна
-        peak: PeakWindow {
-            enabled: false,
-            start_min: 0,
-            end_min: 0,
-        },
-        compact: Some(compact_policy_1607()),
-    };
-    let spawned = u.tick().await.unwrap();
-    assert_eq!(spawned, 1, "волна забрала единственный слот");
+    let u = analyst_compact_uc(
+        state.clone(),
+        sessions.clone(),
+        Arc::new(LostClock),
+        Some(compact_policy_1607()),
+        1, // кап занят чужой сессией
+    );
+    u.tick().await.unwrap();
     assert!(
         sessions.compacted.lock().unwrap().is_empty(),
         "при полном капе адмиссии нет"
     );
-    assert!(
-        state
-            .0
-            .lock()
-            .unwrap()
-            .analyst_masters
-            .get("analyst:p")
-            .is_some_and(|b| b.last_compact_ms == 0),
+    assert_eq!(
+        state.master_compact_ms("analyst", "p"),
+        0,
         "отложка метку не ставит — ретрай следующим тиком"
     );
 }
@@ -7469,15 +7510,20 @@ async fn analyst_compact_held_when_cup_full_1607() {
 async fn analyst_compact_off_without_section_1607() {
     // Секции [compact] нет — проход off: idle-полная сессия не трогается.
     let state = Arc::new(MemState(Mutex::default()));
-    state
-        .0
-        .lock()
-        .unwrap()
-        .analyst_masters
-        .insert("analyst:p".into(), master_binding("ses_master"));
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_master",
+        "zai-coding-plan/glm-5.3-flash#high",
+        "/tmp/checkout",
+    );
     let mut fake = FakeSessions::new();
     fake.activity_ms = Some(0);
-    fake.usage_pct = Mutex::new(Some(90.0));
+    fake.usage.lock().unwrap().insert("ses_master".into(), 90.0);
+    fake.usage
+        .lock()
+        .unwrap()
+        .insert("ses_reviewer".into(), 90.0);
     let sessions = Arc::new(fake);
     let u = analyst_compact_uc(state, sessions.clone(), Arc::new(LostClock), None, 7);
     u.tick().await.unwrap();
@@ -7493,29 +7539,27 @@ async fn analyst_compact_ignores_foreign_role_bindings_1607() {
     // трогает привязки других ролей (префиксный матч lapнул бы
     // analyst-reviewer:* — проект был бы неверен).
     let state = Arc::new(MemState(Mutex::default()));
-    state
-        .0
-        .lock()
-        .unwrap()
-        .analyst_masters
-        .insert("analyst:p".into(), master_binding("ses_master"));
-    state
-        .0
-        .lock()
-        .unwrap()
-        .analyst_masters
-        .insert(
-            "analyst-reviewer:p".into(),
-            AnalystMaster {
-                session: "ses_reviewer".into(),
-                model: Some("zai-coding-plan/glm-5.4#high".into()),
-                checkout: Some("/tmp/checkout".into()),
-                last_compact_ms: 0,
-            },
-        );
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_master",
+        "zai-coding-plan/glm-5.3-flash#high",
+        "/tmp/checkout",
+    );
+    state.set_master_binding(
+        "analyst-reviewer",
+        "p",
+        "ses_reviewer",
+        "zai-coding-plan/glm-5.4#high",
+        "/tmp/checkout",
+    );
     let mut fake = FakeSessions::new();
     fake.activity_ms = Some(0);
-    fake.usage_pct = Mutex::new(Some(90.0));
+    fake.usage.lock().unwrap().insert("ses_master".into(), 90.0);
+    fake.usage
+        .lock()
+        .unwrap()
+        .insert("ses_reviewer".into(), 90.0);
     let sessions = Arc::new(fake);
     let u = analyst_compact_uc(
         state,
@@ -7949,7 +7993,7 @@ async fn reviewer_spawns_for_review_analys_wave() {
         uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.4#high")
             .unwrap()
             .model,
-        "модель ревьювера аналитики — карта сервера (#1154)"
+        "модель ревьювера аналитики — карта сервера (#1154, #1634 срез 4)"
     );
     assert_eq!(specs[0].variant.as_deref(), Some("high"));
 }
@@ -7978,6 +8022,497 @@ async fn reviewer_alive_skip_and_cooldown() {
         u.tick().await.unwrap(),
         0,
         "ретрай умершей сессии — не чаще 15 мин"
+    );
+}
+
+#[tokio::test]
+async fn reviewer_reuses_alive_master_session() {
+    // #1634 срез 2: живая привязка — волна едет в ту же сессию, спавна нет.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst-reviewer",
+        "p",
+        "ses_master",
+        "zai-coding-plan/glm-5.4#high",
+        "/tmp/checkout",
+    );
+    let sessions = Arc::new(FakeSessions::new());
+    let (u, _) = review_uc(
+        vec![titled(1, "проработанная", Status::ReviewAnalys)],
+        state.clone(),
+        sessions.clone(),
+    );
+    assert_eq!(u.tick().await.unwrap(), 1, "волна доставлена");
+    assert!(
+        sessions.spawned.lock().unwrap().is_empty(),
+        "спавна нет — reuse"
+    );
+    let prompts = sessions.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1, "ровно один промпт за вход");
+    assert!(
+        prompts[0].starts_with("ses_master|"),
+        "промпт в ту же сессию"
+    );
+}
+
+#[tokio::test]
+async fn reviewer_respawns_dead_master_session() {
+    // #1634 срез 2: мертвая привязка — create + перезапись привязки.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst-reviewer",
+        "p",
+        "ses_old",
+        "zai-coding-plan/glm-5.4#high",
+        "/tmp/checkout",
+    );
+    let sessions = Arc::new(FakeSessions::new());
+    sessions
+        .dead_sessions
+        .lock()
+        .unwrap()
+        .push("ses_old".into());
+    let (u, _) = review_uc(
+        vec![titled(1, "проработанная", Status::ReviewAnalys)],
+        state.clone(),
+        sessions.clone(),
+    );
+    assert_eq!(u.tick().await.unwrap(), 1);
+    assert_eq!(sessions.spawned.lock().unwrap().len(), 1, "один спавн");
+    let bound = state
+        .master_binding("analyst-reviewer", "p")
+        .expect("привязка жива");
+    assert_eq!(bound.0, "ses_1", "привязка перезаписана на новую сессию");
+    assert_ne!(bound.0, "ses_old");
+}
+
+#[tokio::test]
+async fn reviewer_defers_on_unknown_master_session() {
+    // #1634 срез 2: Unknown — ход отложен, привязка и гварды не тронуты.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst-reviewer",
+        "p",
+        "ses_master",
+        "zai-coding-plan/glm-5.4#high",
+        "/tmp/checkout",
+    );
+    let sessions = Arc::new(FakeSessions {
+        liveness_unknown: true,
+        ..FakeSessions::new()
+    });
+    let (u, _) = review_uc(
+        vec![titled(1, "проработанная", Status::ReviewAnalys)],
+        state.clone(),
+        sessions.clone(),
+    );
+    assert_eq!(u.tick().await.unwrap(), 0, "отложка — не спавн и не reuse");
+    assert!(sessions.spawned.lock().unwrap().is_empty());
+    assert!(sessions.prompts.lock().unwrap().is_empty());
+    let bound = state
+        .master_binding("analyst-reviewer", "p")
+        .expect("привязка цела");
+    assert_eq!(bound.0, "ses_master", "привязка не портится");
+    assert!(
+        state.0.lock().unwrap().analys_review_ms.is_empty(),
+        "кулдаун не заряжается отложкой"
+    );
+}
+
+#[tokio::test]
+async fn reviewer_recreates_on_model_divergence() {
+    // #1634 C1: модель рождения != карты — пересоздание.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst-reviewer",
+        "p",
+        "ses_old",
+        "zai-coding-plan/glm-5.3-flash#high",
+        "/tmp/checkout",
+    );
+    let sessions = Arc::new(FakeSessions::new());
+    let (u, _) = review_uc(
+        vec![titled(1, "проработанная", Status::ReviewAnalys)],
+        state.clone(),
+        sessions.clone(),
+    );
+    assert_eq!(u.tick().await.unwrap(), 1);
+    assert_eq!(sessions.spawned.lock().unwrap().len(), 1);
+    let bound = state
+        .master_binding("analyst-reviewer", "p")
+        .expect("привязка есть");
+    assert_eq!(
+        bound.1, "zai-coding-plan/glm-5.4#high",
+        "модель перезаписана картой"
+    );
+}
+
+#[tokio::test]
+async fn reviewer_recreates_on_checkout_divergence() {
+    // #1634 C1: checkout привязки != checkout конфига — пересоздание.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst-reviewer",
+        "p",
+        "ses_old",
+        "zai-coding-plan/glm-5.4#high",
+        "/stale/checkout",
+    );
+    let sessions = Arc::new(FakeSessions::new());
+    let (u, _) = review_uc(
+        vec![titled(1, "проработанная", Status::ReviewAnalys)],
+        state.clone(),
+        sessions.clone(),
+    );
+    assert_eq!(u.tick().await.unwrap(), 1);
+    let bound = state
+        .master_binding("analyst-reviewer", "p")
+        .expect("привязка есть");
+    assert_eq!(bound.2, "/tmp/checkout", "checkout перезаписан конфигом");
+}
+
+#[tokio::test]
+async fn reviewer_compact_fires_on_idle_master() {
+    // #1634 срез 3: idle + занятость — нативный compact мастер-сессии.
+    // e2e-контур: мок часов/порогов вместо реальных 240 мин idle.
+    use crate::bots::{compact_verdict, CompactFacts, CompactPolicy};
+    let policy = CompactPolicy {
+        idle_ms: 1,
+        min_context_pct: 1.0,
+        cooldown_ms: 0,
+    };
+    let facts = CompactFacts {
+        busy: false,
+        idle_ms: Some(2),
+        usage_pct: Some(50.0),
+        last_compact_ms: 0,
+        now_ms: 100,
+    };
+    assert!(compact_verdict(&facts, &policy).fire, "матрица стреляет");
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst-reviewer",
+        "p",
+        "ses_master",
+        "zai-coding-plan/glm-5.4#high",
+        "/tmp/checkout",
+    );
+    let sessions = Arc::new(FakeSessions {
+        activity_ms: Some(0),
+        ..FakeSessions::new()
+    });
+    sessions
+        .usage
+        .lock()
+        .unwrap()
+        .insert("ses_master".into(), 50.0);
+    let board = Arc::new(FakeBoard {
+        rows: vec![].into(),
+        log: Mutex::default(),
+        comments: vec![],
+        fields_fails: false,
+        set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
+        clear_session_fails: AtomicBool::new(false),
+        status_fails: AtomicBool::new(false),
+    });
+    let u = AnalystReviewUseCase {
+        board,
+        boards: vec![analyst_board()],
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        state: state.clone(),
+        clock: Arc::new(FixedClock),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        cup: 7,
+        compact: Some(policy),
+    };
+    assert_eq!(u.tick().await.unwrap(), 0, "волны нет — только компакт");
+    assert_eq!(
+        sessions.compacted.lock().unwrap().as_slice(),
+        ["ses_master"],
+        "одна адмиссия компакта"
+    );
+    assert!(state.master_compact_ms("analyst-reviewer", "p") > 0);
+}
+
+#[tokio::test]
+async fn reviewer_prompt_fail_in_reuse_charges_nothing() {
+    // Common-2 ревью: промпт в живую сессию упал — гварды и кулдаун
+    // не заряжаются, ретрай следующим тиком.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst-reviewer",
+        "p",
+        "ses_master",
+        "zai-coding-plan/glm-5.4#high",
+        "/tmp/checkout",
+    );
+    let sessions = Arc::new(FakeSessions {
+        prompt_fails: true,
+        ..FakeSessions::new()
+    });
+    let (u, _) = review_uc(
+        vec![titled(1, "проработанная", Status::ReviewAnalys)],
+        state.clone(),
+        sessions.clone(),
+    );
+    assert_eq!(u.tick().await.unwrap(), 0, "доставка не удалась");
+    assert!(sessions.spawned.lock().unwrap().is_empty(), "спавна нет");
+    assert!(
+        state.0.lock().unwrap().analys_review_ms.is_empty(),
+        "кулдаун не заряжается промпт-фейлом"
+    );
+    assert!(
+        state.0.lock().unwrap().analys_review_loops.is_empty(),
+        "цикл-гвард не заряжается промпт-фейлом"
+    );
+    assert_eq!(
+        state
+            .master_binding("analyst-reviewer", "p")
+            .expect("привязка цела")
+            .0,
+        "ses_master"
+    );
+}
+
+#[tokio::test]
+async fn reviewer_prompt_fail_in_recreate_keeps_binding_for_retry() {
+    // Common-2 ревью: create удался, промпт упал — привязка уже
+    // перезаписана (ретрай reuse), гварды не заряжены.
+    let state = Arc::new(MemState(Mutex::default()));
+    let sessions = Arc::new(FakeSessions {
+        prompt_fails: true,
+        ..FakeSessions::new()
+    });
+    let (u, _) = review_uc(
+        vec![titled(1, "проработанная", Status::ReviewAnalys)],
+        state.clone(),
+        sessions.clone(),
+    );
+    assert_eq!(u.tick().await.unwrap(), 0, "доставка не удалась");
+    assert_eq!(sessions.spawned.lock().unwrap().len(), 1, "спавн был");
+    assert!(
+        state.0.lock().unwrap().analys_review_ms.is_empty(),
+        "кулдаун не заряжается промпт-фейлом"
+    );
+    let bound = state
+        .master_binding("analyst-reviewer", "p")
+        .expect("привязка есть");
+    assert_eq!(bound.0, "ses_1", "следующий тик reuse-ит свежую сессию");
+}
+
+#[tokio::test]
+async fn reviewer_compact_skips_dead_binding() {
+    // Common-2 ревью: Dead-привязка компактом не трогается.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst-reviewer",
+        "p",
+        "ses_old",
+        "zai-coding-plan/glm-5.4#high",
+        "/tmp/checkout",
+    );
+    let sessions = Arc::new(FakeSessions {
+        activity_ms: Some(0),
+        ..FakeSessions::new()
+    });
+    sessions
+        .dead_sessions
+        .lock()
+        .unwrap()
+        .push("ses_old".into());
+    sessions
+        .usage
+        .lock()
+        .unwrap()
+        .insert("ses_old".into(), 90.0);
+    let board = Arc::new(FakeBoard {
+        rows: vec![].into(),
+        log: Mutex::default(),
+        comments: vec![],
+        fields_fails: false,
+        set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
+        clear_session_fails: AtomicBool::new(false),
+        status_fails: AtomicBool::new(false),
+    });
+    let policy = crate::bots::CompactPolicy {
+        idle_ms: 1,
+        min_context_pct: 1.0,
+        cooldown_ms: 0,
+    };
+    let u = AnalystReviewUseCase {
+        board,
+        boards: vec![analyst_board()],
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        state: state.clone(),
+        clock: Arc::new(FixedClock),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        cup: 7,
+        compact: Some(policy),
+    };
+    assert_eq!(u.tick().await.unwrap(), 0);
+    assert!(
+        sessions.compacted.lock().unwrap().is_empty(),
+        "адмиссий нет"
+    );
+}
+
+#[tokio::test]
+async fn reviewer_compact_skips_unknown_binding() {
+    // Common-2 ревью: Unknown-привязка компактом не трогается.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst-reviewer",
+        "p",
+        "ses_master",
+        "zai-coding-plan/glm-5.4#high",
+        "/tmp/checkout",
+    );
+    let sessions = Arc::new(FakeSessions {
+        liveness_unknown: true,
+        activity_ms: Some(0),
+        ..FakeSessions::new()
+    });
+    sessions
+        .usage
+        .lock()
+        .unwrap()
+        .insert("ses_master".into(), 90.0);
+    let board = Arc::new(FakeBoard {
+        rows: vec![].into(),
+        log: Mutex::default(),
+        comments: vec![],
+        fields_fails: false,
+        set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
+        clear_session_fails: AtomicBool::new(false),
+        status_fails: AtomicBool::new(false),
+    });
+    let policy = crate::bots::CompactPolicy {
+        idle_ms: 1,
+        min_context_pct: 1.0,
+        cooldown_ms: 0,
+    };
+    let u = AnalystReviewUseCase {
+        board,
+        boards: vec![analyst_board()],
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        state: state.clone(),
+        clock: Arc::new(FixedClock),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        cup: 7,
+        compact: Some(policy),
+    };
+    assert_eq!(u.tick().await.unwrap(), 0);
+    assert!(
+        sessions.compacted.lock().unwrap().is_empty(),
+        "адмиссий нет"
+    );
+}
+
+#[tokio::test]
+async fn reviewer_compact_held_when_cup_full() {
+    // Common-2 ревью: полный CUP откладывает весь компакт-проход.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst-reviewer",
+        "p",
+        "ses_master",
+        "zai-coding-plan/glm-5.4#high",
+        "/tmp/checkout",
+    );
+    let sessions = Arc::new(FakeSessions {
+        activity_ms: Some(0),
+        ..FakeSessions::new()
+    });
+    sessions
+        .usage
+        .lock()
+        .unwrap()
+        .insert("ses_master".into(), 90.0);
+    sessions
+        .extra
+        .lock()
+        .unwrap()
+        .push(fake_session("ses_busy", "developer", "", 0, true));
+    let board = Arc::new(FakeBoard {
+        rows: vec![].into(),
+        log: Mutex::default(),
+        comments: vec![],
+        fields_fails: false,
+        set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
+        clear_session_fails: AtomicBool::new(false),
+        status_fails: AtomicBool::new(false),
+    });
+    let policy = crate::bots::CompactPolicy {
+        idle_ms: 1,
+        min_context_pct: 1.0,
+        cooldown_ms: 0,
+    };
+    let u = AnalystReviewUseCase {
+        board,
+        boards: vec![analyst_board()],
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        state: state.clone(),
+        clock: Arc::new(FixedClock),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        cup: 1,
+        compact: Some(policy),
+    };
+    assert_eq!(u.tick().await.unwrap(), 0);
+    assert!(
+        sessions.compacted.lock().unwrap().is_empty(),
+        "проход отложен капом"
+    );
+    assert_eq!(
+        state.master_compact_ms("analyst-reviewer", "p"),
+        0,
+        "метка не ставится"
+    );
+}
+
+#[tokio::test]
+async fn reviewer_prunes_orphan_project_binding() {
+    // Low-1 ревью: проект ушел из конфига — сирота сносится, чужая роль цела.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding("analyst-reviewer", "gone", "ses_gone", "m", "/c");
+    state.set_master_binding("analyst-reviewer", "p", "ses_p", "m", "/c");
+    state.set_master_binding("analyst", "gone", "ses_a", "m", "/c");
+    let sessions = Arc::new(FakeSessions::new());
+    let board = Arc::new(FakeBoard {
+        rows: vec![].into(),
+        log: Mutex::default(),
+        comments: vec![],
+        fields_fails: false,
+        set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
+        clear_session_fails: AtomicBool::new(false),
+        status_fails: AtomicBool::new(false),
+    });
+    let u = AnalystReviewUseCase {
+        board,
+        boards: vec![analyst_board()],
+        sessions: Arc::new(SessionRouter::uniform(sessions)),
+        state: state.clone(),
+        clock: Arc::new(FixedClock),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        cup: 7,
+        compact: None,
+    };
+    assert_eq!(u.tick().await.unwrap(), 0);
+    assert!(
+        state.master_binding("analyst-reviewer", "gone").is_none(),
+        "сирота снесена"
+    );
+    assert!(
+        state.master_binding("analyst-reviewer", "p").is_some(),
+        "живая цела"
+    );
+    assert!(
+        state.master_binding("analyst", "gone").is_some(),
+        "чужая роль не тронута"
     );
 }
 
@@ -8131,6 +8666,7 @@ impl TaskBoardRepo for FakeMultiBoard {
         _p: Option<&str>,
         _a: Option<bool>,
         _d: Option<bool>,
+        _f: Option<bool>,
     ) -> UsecaseResult<()> {
         Ok(())
     }
@@ -8586,6 +9122,7 @@ impl TaskBoardRepo for CloseBoard {
         _p: Option<&str>,
         _a: Option<bool>,
         _d: Option<bool>,
+        _f: Option<bool>,
     ) -> UsecaseResult<()> {
         Ok(())
     }

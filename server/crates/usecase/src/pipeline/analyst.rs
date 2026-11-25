@@ -4,7 +4,7 @@
 
 use crate::bots::{compact_verdict, CompactFacts, CompactPolicy};
 use crate::error::UsecaseResult;
-use crate::ports::{AnalystMaster, SessionSpec, TaskBoardRepo, TickStateStore};
+use crate::ports::{SessionInfo, SessionSpec, TaskBoardRepo, TickStateStore};
 use crate::spawn_models::SpawnModels;
 use std::sync::Arc;
 use uwuwu_domain::{Agent, AgentSlot, PeakWindow, SpawnModel, Status, Task};
@@ -55,18 +55,18 @@ fn board_row_key(board: &str, number: u64) -> String {
 /// (mock_opencode::stage_action_of_prompt); правка промпта через него.
 pub const ANALYST_WAVE_MARKER: &str = "Analytics wave (project {project})";
 
-/// Ключ привязки мастер-сессии: перечисление «роль:проект» (#1607) —
-/// на ту же форму садится #1634 (analyst-reviewer) без второй карты.
-pub fn analyst_master_key(role: &str, project: &str) -> String {
-    format!("{role}:{project}")
+/// Роль мастер-привязки аналитика (#1607): та же форма «роль:проект»,
+/// что у ревьювера (#1634) — одна коллекция, один компакт-примитив.
+fn analyst_role() -> &'static str {
+    crate::naming::agent_name(Agent::Analyst)
 }
 
-/// Сырая строка модели карты («provider/id[#variant]») — значение поля
-/// модели рождения в привязке (C1: сравнение — парсингом, не строками).
-fn card_model_raw(model: &SpawnModel) -> String {
-    match &model.variant {
-        Some(v) => format!("{}/{}#{v}", model.model.provider(), model.model.id()),
-        None => format!("{}/{}", model.model.provider(), model.model.id()),
+/// Канонический raw модели спавна: provider/id[#variant] — контракт
+/// сравнения C1 (модель рождения против карты), как у ревьювера.
+fn model_raw(sm: &SpawnModel) -> String {
+    match &sm.variant {
+        Some(v) => format!("{}/{}#{v}", sm.model.provider(), sm.model.id()),
+        None => format!("{}/{}", sm.model.provider(), sm.model.id()),
     }
 }
 
@@ -87,6 +87,22 @@ impl AnalystUseCase {
                 executors = ?failed,
                 "Аналитика: часть исполнителей недоступна — волна по живому union"
             );
+        }
+        // Гигиена привязок (#1607, как у ревьювера #1634): проекты, ушедшие
+        // из конфига, не держат сирот в state.json. Вне компакт-прохода:
+        // работает и при выключенной секции [compact].
+        let live_projects: std::collections::HashSet<String> =
+            self.boards.iter().map(|b| b.project.clone()).collect();
+        if self.state.prune_master_role(analyst_role(), &live_projects) {
+            if let Err(e) = self.state.save() {
+                tracing::warn!(event = "analys.prune_save_failed", error = %e, "Гигиена привязок не персистится");
+            }
+        }
+        // Компакт-проход мастер-сессий (срез 4) — до busy/CUP-гардов:
+        // idle-привязки других проектов компактируются, даже когда
+        // волна ждёт (как у ревьювера #1634).
+        if let Some(policy) = &self.compact {
+            self.compact_pass(policy, &scan).await;
         }
         if crate::router::has_busy_agent(&scan, Agent::Analyst) {
             tracing::debug!(event = "analys.alive_skip", "Живой аналитик — волна ждёт");
@@ -220,121 +236,131 @@ impl AnalystUseCase {
             // tick_tests failed_spawn_does_not_charge_loop_or_cooldown):
             // сбой гейтвея не сжигает круг волны и не заряжает кулдаун.
             let sm = self.models.for_agent(Agent::Analyst);
-            // Сырая строка модели карты — в привязку (spec ниже забирает
-            // sm по частям, borrow после move невозможен).
-            let sm_raw = card_model_raw(&sm);
+            let expected = model_raw(&sm);
             let spec = SessionSpec {
                 directory: tb.checkout.clone(),
                 title: format!("{} аналитика волны", Agent::Analyst.emoji()),
                 agent: AgentSlot::Role(Agent::Analyst),
                 custom_agent: None,
-                model: sm.model.clone(),
-                variant: sm.variant.clone(),
+                model: sm.model,
+                variant: sm.variant,
                 bootstrap: false,
             };
-            let sessions = self.sessions.project(&tb.project);
-            // Мастер-сессия проекта (#1607, срез 2б): волна едет промптом
-            // в живую привязанную сессию; мёртвая или разошедшаяся с
-            // картой/конфигом — пересоздание с перезаписью привязки.
-            let key = analyst_master_key("analyst", &tb.project);
-            let mut reuse: Option<String> = None;
-            if let Some(bound) = self.state.analyst_master(&key) {
-                // Контракт расхождения (C1, прецедент ботов): модель
-                // рождения ≠ карта или checkout ≠ конфигу — пересоздание.
-                // Legacy-привязка (поля None) расхождением не считается.
-                let model_ok = bound
-                    .model
-                    .as_deref()
-                    .is_none_or(|raw| SpawnModel::parse(raw).ok().as_ref() == Some(&sm));
-                let checkout_ok = bound.checkout.as_deref().is_none_or(|c| c == tb.checkout);
-                if model_ok && checkout_ok {
-                    match sessions.liveness(&bound.session).await {
-                        crate::ports::Liveness::Alive => reuse = Some(bound.session),
-                        // Second source (#1072→#1163): проба солгала,
-                        // сессия жива в union-скане тика — респавн
-                        // отменён, волна едет в неё же.
-                        crate::ports::Liveness::Dead
-                            if scan.iter().any(|s| s.id == bound.session) =>
-                        {
-                            tracing::warn!(
-                                event = "analys.second_source_alive",
-                                session = %bound.session,
-                                "Проба Dead при живой сессии в union-скане — респавн отменён"
-                            );
-                            reuse = Some(bound.session);
-                        }
-                        // Dead без второго источника — пересоздание ниже.
-                        crate::ports::Liveness::Dead => {}
-                        // Unknown — доска откладывается на тик (канон
-                        // stage-wakeup: без зрения вслепую не работаем).
-                        crate::ports::Liveness::Unknown => {
-                            tracing::info!(
-                                event = "analys.deferred_unknown",
-                                project = %tb.project,
-                                session = %bound.session,
-                                "Мастер-сессия: liveness неизвестен — доска ждёт тика"
-                            );
-                            continue;
-                        }
+            let role = analyst_role();
+            let gateway = self.sessions.project(&tb.project);
+            let prompt = analyst_prompt(&tb.project, &wave);
+            enum WaveAct {
+                Reuse(String),
+                Recreate,
+                Defer,
+            }
+            // Мастер-сессия проекта (#1607, срез 2б; форма — #1634):
+            // привязка жива — волна едет в неё же; мёртвая или
+            // разошедшаяся с картой/конфигом — пересоздание.
+            let act = match self.state.master_binding(role, &tb.project) {
+                Some((session, bound_model, bound_checkout))
+                    if bound_model == expected && bound_checkout == tb.checkout =>
+                {
+                    match gateway.liveness(&session).await {
+                        crate::ports::Liveness::Alive => WaveAct::Reuse(session),
+                        crate::ports::Liveness::Dead => WaveAct::Recreate,
+                        crate::ports::Liveness::Unknown => WaveAct::Defer,
                     }
-                } else {
+                }
+                Some((session, _, _)) => {
                     tracing::info!(
                         event = "analys.diverged",
                         project = %tb.project,
-                        session = %bound.session,
+                        session = %session,
                         "Привязка разошлась с картой/конфигом — пересоздание"
                     );
+                    WaveAct::Recreate
+                }
+                None => WaveAct::Recreate,
+            };
+            match act {
+                WaveAct::Defer => {
+                    tracing::info!(
+                        event = "analys.deferred_unknown",
+                        project = %tb.project,
+                        "Волна отложена: состояние привязки неизвестно"
+                    );
+                    continue;
+                }
+                WaveAct::Reuse(session) => {
+                    if let Err(e) = gateway.prompt(&session, &prompt).await {
+                        tracing::warn!(
+                            event = "analys.prompt_failed",
+                            board = %tb.board,
+                            session = %session,
+                            error = %e,
+                            "Промпт в живую сессию не доставлен — ретрай следующим тиком"
+                        );
+                        continue;
+                    }
+                    busy += 1; // ход этого тика занимает слот капа
+                    for t in &wave {
+                        let rounds = self
+                            .state
+                            .analys_loop(&tb.board, t.number())
+                            .map(|(_, r)| r)
+                            .unwrap_or(0);
+                        self.state
+                            .set_analys_loop(&tb.board, t.number(), Status::Analys, rounds);
+                        self.state.mark_analys_spawn(&tb.board, t.number(), now);
+                    }
+                    tracing::info!(event = "analys.reused", board = %tb.board, rows = wave.len(),
+                        session = %session, "Analyst wave reused master session");
+                    continue;
+                }
+                WaveAct::Recreate => {
+                    let session = gateway.create_session(&spec).await?;
+                    // Привязка — до промпта: сбой промпта не теряет волну,
+                    // следующий тик reuse'ит свежую сессию и ретраит.
+                    self.state.set_master_binding(
+                        role,
+                        &tb.project,
+                        &session,
+                        &expected,
+                        &tb.checkout,
+                    );
+                    if let Err(e) = self.state.save() {
+                        tracing::warn!(
+                            event = "analys.state_save_failed",
+                            board = %tb.board,
+                            error = %e,
+                            "Привязка не персистится — рестарт может дать дубль"
+                        );
+                    }
+                    if let Err(e) = gateway.prompt(&session, &prompt).await {
+                        tracing::warn!(
+                            event = "analys.prompt_failed",
+                            board = %tb.board,
+                            session = %session,
+                            error = %e,
+                            "Промпт в новую сессию не доставлен — ретрай следующим тиком"
+                        );
+                        continue;
+                    }
+                    busy += 1; // спавн этого тика занимает слот капа
+                    for t in &wave {
+                        let rounds = self
+                            .state
+                            .analys_loop(&tb.board, t.number())
+                            .map(|(_, r)| r)
+                            .unwrap_or(0);
+                        // Захват волны круг не сжигает (#1241): пара только
+                        // фиксируется (свежие строки — (Analys, 0)), rounds не
+                        // растут — ретрай безвердиктной волны не является петлёй
+                        self.state
+                            .set_analys_loop(&tb.board, t.number(), Status::Analys, rounds);
+                        self.state.mark_analys_spawn(&tb.board, t.number(), now);
+                    }
+                    tracing::info!(event = "analys.spawned", board = %tb.board, rows = wave.len(),
+                        session = %session, "Analyst wave spawned");
+                    spawned += 1;
                 }
             }
-            if let Some(session) = reuse {
-                let prompt = analyst_prompt(&tb.project, &wave);
-                sessions.prompt(&session, &prompt).await?;
-                busy += 1; // ход этого тика занимает слот капа
-                for t in &wave {
-                    let rounds = self
-                        .state
-                        .analys_loop(&tb.board, t.number())
-                        .map(|(_, r)| r)
-                        .unwrap_or(0);
-                    self.state
-                        .set_analys_loop(&tb.board, t.number(), Status::Analys, rounds);
-                    self.state.mark_analys_spawn(&tb.board, t.number(), now);
-                }
-                tracing::info!(event = "analys.reused", board = %tb.board, rows = wave.len(),
-                    session = %session, "Analyst wave reused master session");
-                continue;
-            }
-            let session = sessions.create_session(&spec).await?;
-            let prompt = analyst_prompt(&tb.project, &wave);
-            sessions.prompt(&session, &prompt).await?;
-            // Привязка мастер-сессии: модель рождения — аргумент usage_pct
-            // прохода (C1), checkout — контракт пересоздания (Low-1 р.4).
-            self.state.set_analyst_master(
-                &key,
-                AnalystMaster {
-                    session: session.clone(),
-                    model: Some(sm_raw.clone()),
-                    checkout: Some(tb.checkout.clone()),
-                    last_compact_ms: 0,
-                },
-            );
-            busy += 1; // спавн этого тика занимает слот капа
-            for t in &wave {
-                let rounds = self
-                    .state
-                    .analys_loop(&tb.board, t.number())
-                    .map(|(_, r)| r)
-                    .unwrap_or(0);
-                // Захват волны круг не сжигает (#1241): пара только
-                // фиксируется (свежие строки — (Analys, 0)), rounds не
-                // растут — ретрай безвердиктной волны не является петлёй
-                self.state
-                    .set_analys_loop(&tb.board, t.number(), Status::Analys, rounds);
-                self.state.mark_analys_spawn(&tb.board, t.number(), now);
-            }
-            tracing::info!(event = "analys.spawned", board = %tb.board, rows = wave.len(),
-                session = %session, "Analyst wave spawned");
-            spawned += 1;
         }
         // гигиена состояния (R2-L3): счётчики обеих гвардов строк, ушедших
         // с досок (deleted/closed), из state.json вычищаются. Частичный сбой
@@ -343,22 +369,38 @@ impl AnalystUseCase {
         if !read_failed {
             self.state.prune_analys_guards(&live_rows);
         }
-        // Компакт-проход мастер-сессий (срез 4): после волн — волны в
-        // приоритете за слоты капа.
-        self.compact_pass(busy).await;
         Ok(spawned)
     }
 
-    /// Компакт-проход мастер-сессий (#1607, срез 4): расширение матрицы
-    /// вердикта ботов (`compact_verdict`, ADR-082) на привязки аналитики —
-    /// та же политика `[compact]`, тот же нативный `compact_session`.
-    /// Бот-ветка не затрагивается: гейт ниже — только для адмиссий
-    /// аналитика (UC-05: «Ботов не гейти»). Секция отсутствует — no-op.
-    /// Скан — по привязкам state (ключ «роль:проект»); занятость — от
-    /// модели рождения привязки (C1), не от карты.
-    async fn compact_pass(&self, busy: usize) {
-        let Some(policy) = &self.compact else { return };
-        // Пик-окно — как будильник: запуск хода откладывается целиком.
+    /// Сессия потеряна исполнителем (404-класс): liveness-проба различает
+    /// Dead от транспортного Unknown — пропуск только по Dead, Unknown
+    /// завершает проход пробой (эталон — бот-супервизор, #1634).
+    async fn session_gone(&self, project: &str, session: &str) -> bool {
+        matches!(
+            self.sessions.project(project).liveness(session).await,
+            crate::ports::Liveness::Dead
+        )
+    }
+
+    /// Компакт-проход мастер-сессий (#1607, срез 4; форма — #1634):
+    /// матрица вердикта ботов на привязки аналитика; скан — по проектам
+    /// досок (привязки чужих ролей не трогаем). Семантика проб — по эталону
+    /// бот-супервизора; гейт CUP — на адмиссии аналитика (волны тика уже
+    /// в счётчике busy вызывающего), пик — целиком как будильник.
+    async fn compact_pass(&self, policy: &CompactPolicy, scan: &[SessionInfo]) {
+        if crate::router::busy_count(scan) >= self.cup {
+            tracing::info!(
+                event = "analys.compact_held_cup",
+                active = crate::router::busy_count(scan),
+                cap = self.cup,
+                "Компакт-проход отложен: CUP cap"
+            );
+            return;
+        }
+        // Пик-окно — как будильник: запуск хода откладывается целиком
+        // (план #1607; у ревьювера #1634 пик-гейта нет — осознанное
+        // различие, не дрейф: волна аналитика пик-гейта тоже не несёт,
+        // компакт здесь строже).
         if self.peak.holds(self.clock.utc_minute()) {
             tracing::info!(
                 event = "analys.compact_deferred_peak",
@@ -366,58 +408,80 @@ impl AnalystUseCase {
             );
             return;
         }
-        let (scan, failed) = self.sessions.list_sessions_reachable().await;
-        if !failed.is_empty() {
-            tracing::warn!(
-                event = "analys.compact_list_degraded",
-                executors = ?failed,
-                "Компакт-проход: часть исполнителей недоступна — факты по живому union"
-            );
-        }
         let now = self.clock.now_ms();
-        let mut admitted = 0usize;
-        for key in self.state.analyst_master_keys() {
-            // Строго роль analyst: префиксный матч lapнул бы будущие
-            // ключи analyst-reviewer:* (#1634) — проект был бы неверен.
-            let Some(project) = key
-                .split_once(':')
-                .and_then(|(role, project)| (role == "analyst").then_some(project))
-            else {
+        let role = analyst_role();
+        let mut projects: Vec<&String> = self.boards.iter().map(|b| &b.project).collect();
+        projects.sort();
+        projects.dedup();
+        for project in projects {
+            let Some((session, bound_model, _)) = self.state.master_binding(role, project) else {
                 continue;
             };
-            let Some(bound) = self.state.analyst_master(&key) else {
+            let gateway = self.sessions.project(project);
+            match gateway.liveness(&session).await {
+                crate::ports::Liveness::Alive => {}
+                crate::ports::Liveness::Dead => {
+                    tracing::debug!(
+                        event = "analys.compact_dead_skip",
+                        project = %project,
+                        "Мёртвая привязка компактом не трогается"
+                    );
+                    continue;
+                }
+                crate::ports::Liveness::Unknown => {
+                    tracing::debug!(
+                        event = "analys.compact_unknown_skip",
+                        project = %project,
+                        "Состояние привязки неизвестно — компакт пропущен"
+                    );
+                    continue;
+                }
+            }
+            let Ok(model) = SpawnModel::parse(&bound_model) else {
+                tracing::warn!(
+                    event = "analys.compact_model_unparseable",
+                    project = %project,
+                    "Привязка с непарсящейся моделью — компакт пропущен"
+                );
                 continue;
             };
-            let sessions = self.sessions.project(project);
             let busy_flag = scan
                 .iter()
-                .find(|s| s.id == bound.session)
+                .find(|s| s.id == session)
                 .map(|s| s.busy)
                 .unwrap_or(false);
-            let idle_ms = match sessions.last_activity_ms(&bound.session).await {
+            let idle_ms = match gateway.last_activity_ms(&session).await {
                 Ok(ms) => ms.map(|ms| now.saturating_sub(ms)),
-                // Транспорт/потеря — пропуск до следующего тика (волна
-                // подхватит живую сессию; мёртвую — пересоздаст).
-                Err(_) => continue,
+                Err(e) => {
+                    if self.session_gone(project, &session).await {
+                        tracing::warn!(event = "analys.compact_session_gone", project = %project,
+                            session = %session, "Сессия потеряна исполнителем — привязка пропущена");
+                        continue;
+                    }
+                    tracing::warn!(event = "analys.compact_probe_failed", project = %project,
+                        error = %e, "Проба активности не удалась — компакт-проход завершён");
+                    return;
+                }
             };
-            let model = bound
-                .model
-                .as_deref()
-                .and_then(|raw| SpawnModel::parse(raw).ok())
-                .unwrap_or_else(|| self.models.for_agent(Agent::Analyst));
-            let usage_pct = match sessions
-                .context_usage_pct(&bound.session, &model.model)
-                .await
-            {
+            let usage_pct = match gateway.context_usage_pct(&session, &model.model).await {
                 Ok(u) => u,
-                Err(_) => continue,
+                Err(e) => {
+                    if self.session_gone(project, &session).await {
+                        tracing::warn!(event = "analys.compact_session_gone", project = %project,
+                            session = %session, "Сессия потеряна исполнителем — привязка пропущена");
+                        continue;
+                    }
+                    tracing::warn!(event = "analys.compact_probe_failed", project = %project,
+                        error = %e, "Проба занятости не удалась — компакт-проход завершён");
+                    return;
+                }
             };
             let verdict = compact_verdict(
                 &CompactFacts {
                     busy: busy_flag,
                     idle_ms,
                     usage_pct,
-                    last_compact_ms: bound.last_compact_ms,
+                    last_compact_ms: self.state.master_compact_ms(role, project),
                     now_ms: now,
                 },
                 policy,
@@ -425,43 +489,38 @@ impl AnalystUseCase {
             if !verdict.fire {
                 tracing::debug!(
                     event = "analys.compact_skip",
-                    key = %key,
+                    project = %project,
                     reason = %verdict.reason,
-                    "Компакт мастер-сессии: не стреляем"
+                    "Компакт: не стреляем"
                 );
                 continue;
             }
-            // CUP-гейт адмиссий аналитика: admitted этого прохода занимают
-            // слоты (волны тика — в счётчике busy вызывающего).
-            if busy + admitted >= self.cup {
-                tracing::info!(
-                    event = "analys.compact_held_cup",
-                    key = %key,
-                    active = busy + admitted,
-                    cap = self.cup,
-                    "Компакт мастер-сессии отложен: CUP cap"
-                );
-                break;
-            }
+            // Whole-pass CUP-гейт выше; per-admission счётчик не нужен
+            // (форма #1634: проход либо идёт целиком, либо отложен).
             // Метка ДО POST (ADR-082): коулдаун переживает рестарт сервера,
             // повторная адмиссия исключена.
-            self.state.mark_analyst_compact(&key, now);
-            match sessions.compact_session(&bound.session).await {
+            self.state.set_master_compact_ms(role, project, now);
+            if let Err(e) = self.state.save() {
+                tracing::warn!(event = "analys.compact_save_failed",
+                    project = %project, error = %e, "Метка компакта не персистится");
+            }
+            match gateway.compact_session(&session).await {
                 Ok(()) => {
-                    admitted += 1;
                     tracing::info!(
                         event = "analys.compacted",
-                        key = %key,
-                        session = %bound.session,
-                        "Компакт мастер-сессии admitted"
+                        project = %project,
+                        session = %session,
+                        reason = %verdict.reason,
+                        "Нативный compact admitted"
                     );
                 }
                 Err(e) => {
                     tracing::warn!(
                         event = "analys.compact_failed",
-                        key = %key,
+                        project = %project,
+                        session = %session,
                         error = %e,
-                        "Адмиссия компакта не удалась — метка держит коулдаун"
+                        "Адмиссия компакта не удалась — ретрай по коулдауну"
                     );
                 }
             }

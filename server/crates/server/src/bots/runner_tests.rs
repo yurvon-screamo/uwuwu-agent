@@ -13,8 +13,8 @@ use uwuwu_usecase::bots::{
     TgUpdate,
 };
 use uwuwu_usecase::{
-    AgentSessionGateway, AnalystMaster, AppendDocOutcome, AssistantReply, Clock, DreamerMark,
-    Liveness, SessionInfo, SessionSpec, TickStateStore, UsecaseError, UsecaseResult, WikiRepo,
+    AgentSessionGateway, AppendDocOutcome, AssistantReply, Clock, DreamerMark, Liveness,
+    SessionInfo, SessionSpec, TickStateStore, UsecaseError, UsecaseResult, WikiRepo,
 };
 
 use super::runner::{forward_line, process_message, spawn_bot_task, BotDeps, BotStructural};
@@ -611,14 +611,6 @@ impl TickStateStore for MemTickState {
     }
     fn set_round_reentry_pending(&self, _b: &str, _n: u64) {}
     fn clear_round_reentry_pending(&self, _b: &str, _n: u64) {}
-    fn analyst_master(&self, _key: &str) -> Option<AnalystMaster> {
-        None
-    }
-    fn set_analyst_master(&self, _key: &str, _binding: AnalystMaster) {}
-    fn analyst_master_keys(&self) -> Vec<String> {
-        Vec::new()
-    }
-    fn mark_analyst_compact(&self, _key: &str, _at_ms: u64) {}
     fn mark_spawn(&self, _b: &str, _n: u64, _s: Slot, _at: u64) {}
     fn last_analys_ms(&self, _b: &str, _n: u64) -> Option<u64> {
         None
@@ -663,6 +655,17 @@ impl TickStateStore for MemTickState {
         false
     }
     fn mark_own_comment(&self, _id: &str, _posted_ms: u64) {}
+    fn master_binding(&self, _: &str, _: &str) -> Option<(String, String, String)> {
+        None
+    }
+    fn set_master_binding(&self, _: &str, _: &str, _: &str, _: &str, _: &str) {}
+    fn master_compact_ms(&self, _: &str, _: &str) -> u64 {
+        0
+    }
+    fn set_master_compact_ms(&self, _: &str, _: &str, _: u64) {}
+    fn prune_master_role(&self, _: &str, _: &std::collections::HashSet<String>) -> bool {
+        false
+    }
     fn save(&self) -> UsecaseResult<()> {
         Ok(())
     }

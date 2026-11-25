@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use uwuwu_domain::{Slot, Status};
 use uwuwu_usecase::{
-    AgentSessionGateway, AnalystMaster, AppendDocOutcome, DreamerMark, Liveness, SessionInfo,
-    SessionSpec, TaskView, TaskWriteUseCase, TickStateStore, UsecaseResult, WikiRepo,
+    AgentSessionGateway, AppendDocOutcome, DreamerMark, Liveness, SessionInfo, SessionSpec,
+    TaskView, TaskWriteUseCase, TickStateStore, UsecaseResult, WikiRepo,
 };
 
 use crate::clock::SystemClock;
@@ -338,14 +338,6 @@ impl TickStateStore for StubState {
     }
     fn set_round_reentry_pending(&self, _: &str, _: u64) {}
     fn clear_round_reentry_pending(&self, _: &str, _: u64) {}
-    fn analyst_master(&self, _: &str) -> Option<AnalystMaster> {
-        None
-    }
-    fn set_analyst_master(&self, _: &str, _: AnalystMaster) {}
-    fn analyst_master_keys(&self) -> Vec<String> {
-        Vec::new()
-    }
-    fn mark_analyst_compact(&self, _: &str, _: u64) {}
     fn last_analys_ms(&self, _: &str, _: u64) -> Option<u64> {
         None
     }
@@ -389,6 +381,17 @@ impl TickStateStore for StubState {
         false
     }
     fn mark_own_comment(&self, _: &str, _: u64) {}
+    fn master_binding(&self, _: &str, _: &str) -> Option<(String, String, String)> {
+        None
+    }
+    fn set_master_binding(&self, _: &str, _: &str, _: &str, _: &str, _: &str) {}
+    fn master_compact_ms(&self, _: &str, _: &str) -> u64 {
+        0
+    }
+    fn set_master_compact_ms(&self, _: &str, _: &str, _: u64) {}
+    fn prune_master_role(&self, _: &str, _: &std::collections::HashSet<String>) -> bool {
+        false
+    }
     fn save(&self) -> UsecaseResult<()> {
         Ok(())
     }

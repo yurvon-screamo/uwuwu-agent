@@ -40,7 +40,7 @@ pub use goals::{gist_of, Goal, GoalsRepo, GoalsView};
 pub use naming::{
     agent_name, parse_agent, parse_priority, parse_status, parse_task_type, priority_name,
     schedule_label, slot_key, status_name, status_names, task_type_name, task_type_native_name,
-    F_AUTOMERGE, F_DIRECT, F_PRIORITY, TASK_TYPES,
+    F_AUTOMERGE, F_DIRECT, F_FACT_TRACK, F_PRIORITY, TASK_TYPES,
 };
 pub use pipeline::env_gc;
 pub use pipeline::sweeper;
@@ -53,8 +53,8 @@ pub use pipeline::{
     ANALYST_WAVE_MARKER, STAGE_PROMPTS,
 };
 pub use ports::{
-    AgentSessionGateway, AnalystMaster, AppendDocOutcome, AssistantReply, Clock, CommentRef,
-    CronRow, CronRunTrack, CronStateStore, DecisionJudge, DreamerMark, FmMutator, IssueDigest,
+    AgentSessionGateway, AppendDocOutcome, AssistantReply, Clock, CommentRef, CronRow,
+    CronRunTrack, CronStateStore, DecisionJudge, DreamerMark, FmMutator, IssueDigest,
     IssueFieldStore, IssueIndexSource, IssueView, JudgeCfg, JudgeContext, JudgeSessionTail,
     Liveness, PrGateway, PrProbe, PrState, QuotaProbe, QuotaSnapshot, SessionInfo, SessionSpec,
     StatusDelivery, TaskBoardRepo, TickStateStore, WikiRepo,
