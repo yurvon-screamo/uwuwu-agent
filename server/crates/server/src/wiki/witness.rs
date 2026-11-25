@@ -154,6 +154,14 @@ mod tests {
     }
 
     #[test]
+    fn blob_entry_without_sha_is_not_an_absence() {
+        let tree = json!({"tree": [
+            {"path": "docs/a.md", "type": "blob"}
+        ]});
+        assert!(blob_sha_for(&tree, "docs/a.md").is_err());
+    }
+
+    #[test]
     fn folder_with_doc_name_is_not_a_blob() {
         let tree = json!({"tree": [
             {"path": "docs/a.md", "type": "tree", "sha": "folder"}

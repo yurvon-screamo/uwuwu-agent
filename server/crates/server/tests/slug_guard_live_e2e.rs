@@ -44,6 +44,11 @@
 //!   11–12. нормализация слага («docs/…», «….md») — ответ называет
 //!      нормализованный слаг с разделителем «…»; финальный blob-набор
 //!      исключает двойника «….md.md» и сырые пути.
+//!   13. #1653: после записи ждём видимости файла в дереве (предусловие
+//!      свидетеля), затем повтор без fm → Carried и append → строка в
+//!      конце; сверка тела отличает свежую базу от предыдущей версии.
+//!      Прогон печатает, проявился ли лаг Contents (был ли упражнён
+//!      путь свидетеля).
 //!
 //! Гейты: UWUWU_E2E=1; GH_TOKEN со scope repo (создание/запись) и delete_repo.
 //! Внешнее репо не требуется: риг создаёт сам тест.
@@ -848,6 +853,24 @@ async fn run_scenario(dir: PathBuf, rig: RigGithub, stamp: String) {
     )
     .await;
     assert!(!err, "свежая запись с fm: {text}");
+    // Предусловие фикса: дерево уже видит коммит. Без этого ожидания
+    // проверка попадала бы в остаточное окно и краснела вне контракта #1653.
+    let fresh_path = format!("docs/{fresh}.md");
+    rig.wait_tree(std::slice::from_ref(&fresh_path)).await;
+    let lag = rig.read_file(&fresh_path).await.is_none();
+    println!(
+        "блок #1653: Contents {} — путь свидетеля {}",
+        if lag {
+            "ещё 404"
+        } else {
+            "уже видит файл"
+        },
+        if lag {
+            "упражнён"
+        } else {
+            "не упражнён (лага нет)"
+        }
+    );
     let (err, text) = write(fresh.clone(), "second body\n".into()).await;
     assert!(!err, "повторная запись после commit'а: {text}");
     assert!(
@@ -860,12 +883,18 @@ async fn run_scenario(dir: PathBuf, rig: RigGithub, stamp: String) {
         text.contains("appended to"),
         "ложный append-nonexistent в окне лага: {text}"
     );
-    let content = rig
-        .wait_file(&format!("docs/{fresh}.md"), "e2e probe line")
-        .await;
+    let content = rig.wait_file(&fresh_path, "e2e probe line").await;
     assert!(
         content.contains("title: witness-original"),
         "шапка потеряна при повторной записи: {content}"
+    );
+    assert!(
+        content.contains("second body"),
+        "append взял за базу предыдущую версию — свежая запись потеряна: {content}"
+    );
+    assert!(
+        !content.contains("first body"),
+        "append updatил старое тело вместо свежего: {content}"
     );
     assert!(
         content.trim_end().ends_with("e2e probe line"),

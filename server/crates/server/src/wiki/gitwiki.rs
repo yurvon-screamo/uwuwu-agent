@@ -66,7 +66,8 @@ impl GitWikiWriter {
         UsecaseError::Board(format!("gitwiki: {msg}"))
     }
 
-    /// Читает текущее содержимое файла (None — файла нет).
+    /// Читает текущее содержимое файла; на Contents-404 сверяется со
+    /// свежим деревом: None — файла нет и в дереве (#1653).
     pub async fn read(&self, path: &str) -> UsecaseResult<Option<String>> {
         let (status, body) = self
             .call(reqwest::Method::GET, &contents_url(&self.repo, path), None)
