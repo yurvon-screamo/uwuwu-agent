@@ -1233,7 +1233,6 @@ async fn task_body_strips_the_real_render_header_and_refuses_header_only() {
         .body;
     assert_eq!(stored, body, "тело без шапки: {stored}");
 
-    // Шапка без тела — ошибка копирования, не осознанная очистка (#1572)
     let header_only = &card[fm_start..body_at];
     let err = call(
         &tools,
@@ -1246,9 +1245,6 @@ async fn task_body_strips_the_real_render_header_and_refuses_header_only() {
         err.contains("effective content"),
         "отказ называет отсутствие эффективного контента: {err}"
     );
-    // Вариант без хвостового переноса (.trim() скрипта потребителя) —
-    // тоже отказ: KEYS матчится с терминалом-концом входа, короткая
-    // легаси-форма не матчится на префиксе (#1604, ревью раунд 2)
     let err2 = call(
         &tools,
         "task_body",

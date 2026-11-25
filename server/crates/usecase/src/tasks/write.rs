@@ -1970,9 +1970,6 @@ mod tests {
 
     #[test]
     fn create_body_strips_task_get_header_without_trailing_newline() {
-        // #1604 ревью раунд 2: копия шапки карточки без хвостового переноса
-        // (.trim() скрипта потребителя) на границе create — остаток
-        // последней строки («body_bytes: N») не становится телом задачи
         let header = "--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\ntype: feature\nbody_hash: h\nbody_bytes: 66";
         let out = render_create_body(&spec(header));
         assert!(
@@ -2011,10 +2008,6 @@ mod tests {
 
     #[test]
     fn task_get_header_only_without_trailing_newline_strips_to_empty() {
-        // #1604 ревью раунд 2: копия шапки без хвостового переноса (.trim()
-        // скрипта потребителя) — актуальная форма матчится целиком (KEYS
-        // с терминалом-концом входа), остаток последней строки не уезжает
-        // эффективным контентом; короткие легаси-формы — тоже пусто
         let h7 = "--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\ntype: feature\nbody_hash: h\nbody_bytes: 66";
         assert_eq!(strip_task_get_header(h7), "");
         let h6 =
