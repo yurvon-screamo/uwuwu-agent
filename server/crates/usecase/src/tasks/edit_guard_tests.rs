@@ -75,7 +75,8 @@ impl TaskBoardRepo for StaleBoard {
 
     async fn fresh_row_status(&self, _b: &str, n: u64) -> UsecaseResult<Option<Status>> {
         // #1437: свежее чтение носителя мимо кеш-вида — материал
-        // идемпотентного гарда edit().
+        // идемпотентного гарда edit() и отказной ветки канон-гарда
+        // #1615 (Low код-ревью conflict-kickoff: комментарий у́же кода).
         *self.fresh_reads.lock().unwrap() += 1;
         if self.fresh_err {
             return Err(crate::error::UsecaseError::Board(format!(
@@ -819,8 +820,9 @@ async fn stale_cache_rejection_verifies_fresh_carrier_passes_legal_edge() {
     // (REST items-индекс, read-лаг листа минутного масштаба) всё ещё
     // отдаёт до-записный «Analys», носитель живёт «Review Analys».
     // Легальное ребро Review Analys → Todo гард отвергал по кеш-виду —
-    // «Analys → Todo вне канона» три попытки подряд, вердикт ревьювера
-    // висел в воздухе. Отказная ветка обязана сверить current со свежим
+    // «Analys → Todo вне канона» дважды (T0+312с и T0+354с), прошла
+    // лишь третья попытка, вердикт ревьювера висел в воздухе (прод-лог
+    // Railway, раунд 1 код-ревью). Отказная ветка обязана сверить current со свежим
     // носителем (точечный GraphQL-рид #1437) и провести ребро по
     // свежему значению — инвариант #1235 на канон-пути: чтение current
     // гарда = носителю при любом возрасте последней статусной записи.
@@ -1026,6 +1028,73 @@ async fn fresh_transport_failure_on_unreadable_cache_branch_fails_closed() {
         11,
         Status::Todo,
         "транспортный отказ fresh-рида на нечитаемом кеш-виде — громкий fail-closed",
+    )
+    .await;
+}
+
+/// Пин fast path (Low код-ревью conflict-kickoff #1615): легальное
+/// ребро по сошедшемуся кеш-виду проходит БЕЗ fresh-рида — квотная
+/// дисциплина ADR-113/#1437 («fresh-рид не тратится на легальные
+/// переходы»); мутация «fresh-рид на каждом статусном edit» платит
+/// GraphQL на каждом переходе конвейера — пины её ловят. Кеш-вид и
+/// носитель сходятся (wt-щит #1346 в силе), запись ровно одна.
+async fn assert_cache_edge_no_fresh_read(
+    fields: Arc<dyn IssueFieldStore>,
+    carrier: Status,
+    target: Status,
+) -> Arc<StaleBoard> {
+    let board = board(carrier, carrier, Some(carrier), false);
+    edit_status_with(&board, fields, target)
+        .await
+        .expect("легальное ребро по кеш-виду проходит fast path");
+    assert_eq!(board.writes(), vec![(11, target)]);
+    assert_eq!(
+        board.fresh_reads(),
+        0,
+        "fast path не платит fresh-рид на легальном переходе"
+    );
+    board
+}
+
+#[tokio::test]
+async fn ordinary_cache_edge_spends_no_fresh_read() {
+    // Обычная строка, самый частый переход конвейера (дев сдал работу —
+    // In Progress → Ревью результата): гард решает по кеш-виду, ни
+    // одного fresh-рида. Мутант «fresh-рид на каждом статусном edit»
+    // красит этот пин (лишний GraphQL-рид на каждом легальном ребре).
+    assert_cache_edge_no_fresh_read(
+        Arc::new(FilledFields),
+        Status::InProgress,
+        Status::ReviewResult,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn direct_cache_edge_spends_no_fresh_read() {
+    // direct-строка (#1357), финализация по кеш-виду (In Progress →
+    // Review, ребро открыто только флагом Direct=on): флаг читается из
+    // кеш-ветки carrier_flags, fresh-ридов ноль. Мутант «direct-флаг не
+    // учтён на кеш-пути» уводит ребро на отказную ветку — лишний
+    // fresh-рид и ложное board.guard_stale_cache при честном кеш-виде;
+    // пин красит (счётчик 1 ≠ 0).
+    assert_cache_edge_no_fresh_read(
+        Arc::new(DirectFields),
+        Status::InProgress,
+        Status::UserReview,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn fact_track_cache_edge_spends_no_fresh_read() {
+    // fact_track-строка (#1631), финализация по кеш-виду (ReviewResult →
+    // Review, ребро открыто только флагом FactTrack=on): зеркальный
+    // direct-пину — флаг учитывается на кеш-пути без fresh-рида.
+    assert_cache_edge_no_fresh_read(
+        Arc::new(FactTrackFields),
+        Status::ReviewResult,
+        Status::UserReview,
     )
     .await;
 }
