@@ -3332,13 +3332,56 @@ async fn stage_transition_clears_dead_review_cell() {
     );
 }
 
+/// Локальный билдер фикстуры тестера (#1607): комменты журнала и часы
+/// задаются явно (usecase_with_state фиксирует FixedClock и пустой журнал).
+fn tester_usecase(
+    rows: Vec<Task>,
+    comments: Vec<CommentRef>,
+    sessions: FakeSessions,
+    state: Arc<MemState>,
+    clock: Arc<dyn Clock>,
+) -> (TickUseCase, Arc<FakeBoard>, Arc<FakeSessions>, Arc<FakePrs>) {
+    let board = Arc::new(FakeBoard {
+        rows: rows.into(),
+        log: Mutex::default(),
+        comments,
+        fields_fails: false,
+        set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
+        clear_session_fails: AtomicBool::new(false),
+        status_fails: AtomicBool::new(false),
+    });
+    let sessions = Arc::new(sessions);
+    let prs = Arc::new(FakePrs {
+        state: PrState::Missing,
+        merges: Mutex::default(),
+        merge_fails: AtomicBool::new(false),
+        probes: Mutex::default(),
+        url: Mutex::default(),
+    });
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        prs: prs.clone(),
+        clock,
+        state,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        boot_ms: 0,
+        judge: None,
+        judge_cfg: Default::default(),
+        quota: None,
+    };
+    (u, board, sessions, prs)
+}
+
 #[tokio::test]
-async fn test_slot_still_cleared_on_reentry_scope_1607() {
-    // Тест-слот — прежний канон: свежая сессия тестировщика на каждом
-    // входе в Testing (мастер-сессии тестера — скоуп #1607, не #1626).
-    // Пин защищает базу #1607 от случайного перевода на мастер-семантику
+async fn test_slot_reentry_keeps_master_session_and_delivers_delta_wake() {
+    // Мастер-сессия тестера (#1607, срез 2а): повторный вход в Testing при
+    // живой ячейке — сессия не снимается (никакого fresh-eyes-спавна),
+    // вход доставляет re-entry wake с дельта-промптом; нативного компакта
+    // нет — контекст прошлых раундов и есть ценность мастер-сессии.
     let state = Arc::new(MemState(Mutex::default()));
-    let mut t = task(38, Status::Testing);
+    let mut t = task(60, Status::Testing);
     let mut f = TaskFields::default();
     f.set_session(
         Slot::Test,
@@ -3350,15 +3393,139 @@ async fn test_slot_still_cleared_on_reentry_scope_1607() {
         .lock()
         .unwrap()
         .statuses
-        .push((38, Status::ReviewResult));
-    let (u, board, _, _) = usecase_with_state(vec![t], PrState::Missing, state);
+        .push((60, Status::InProgress));
+    let mut fake = FakeSessions::new();
+    fake.idle_reply = true;
+    let (u, board, sessions, _) = tester_usecase(
+        vec![t],
+        vec![],
+        fake,
+        state.clone(),
+        Arc::new(FixedClock),
+    );
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     let log = board.log.lock().unwrap();
     assert!(
-        log.iter().any(|l| l.starts_with("clear#38=")),
-        "тест-слот снят при входе в Testing (прежний канон): {log:?}"
+        !log.iter().any(|l| l.starts_with("clear#60=")),
+        "живая сессия тестера не снимается при re-entry: {log:?}"
     );
-    assert_eq!(out.spawns_done, 1, "свежий тестировщик заспавнен");
+    assert_eq!(out.spawns_done, 0, "спавна нет — сессия та же");
+    assert_eq!(out.wakeups, 1, "re-entry wake доставлен");
+    let prompts = sessions.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1, "одна доставка за вход: {prompts:?}");
+    assert!(
+        prompts[0].starts_with("ses_tester_live|"),
+        "wake уходит в ту же сессию: {prompts:?}"
+    );
+    assert!(
+        prompts[0].contains("Repeat testing round"),
+        "промпт входа — дельта, не спавн-промпт стадии: {prompts:?}"
+    );
+    assert!(
+        sessions.compacted.lock().unwrap().is_empty(),
+        "тестер без компакта на входе — контекст раундов живёт"
+    );
+    assert!(
+        !state.round_reentry_pending("B", 60),
+        "маркер погашен доставкой"
+    );
+}
+
+#[tokio::test]
+async fn test_slot_reentry_with_foreign_comments_wakeup_owns_entry() {
+    // Вход с чужим хвостом (#1607, контракт C2): доставкой владеет wakeup —
+    // вердикт едет обычным путём, re-entry wake молчит (ровно один промпт).
+    let state = Arc::new(MemState(Mutex::default()));
+    let mut t = task(61, Status::Testing);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Test,
+        uwuwu_domain::SessionRef::parse("ses_tester_live").unwrap(),
+    );
+    t.apply_fields(f);
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((61, Status::InProgress));
+    let mut fake = FakeSessions::new();
+    fake.idle_reply = true;
+    let comments = vec![CommentRef {
+        id: "c1".into(),
+        created_ms: 3000,
+        body: "вердикт ревьювера: правь".into(),
+    }];
+    let (u, _, sessions, _) = tester_usecase(
+        vec![t],
+        comments,
+        fake,
+        state.clone(),
+        Arc::new(FixedClock),
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.wakeups, 1, "wakeup доставлен");
+    assert_eq!(out.spawns_done, 0, "спавна нет — сессия та же");
+    let prompts = sessions.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1, "ровно один промпт за вход: {prompts:?}");
+    assert!(
+        prompts[0].contains("Wakeup"),
+        "чужой хвост доставлен wakeup-путём: {prompts:?}"
+    );
+    assert!(
+        !prompts[0].contains("Repeat testing round"),
+        "re-entry wake молчит при чужом хвосте: {prompts:?}"
+    );
+    assert!(
+        !state.round_reentry_pending("B", 61),
+        "маркер погашен wakeup-доставкой"
+    );
+}
+
+#[tokio::test]
+async fn test_slot_reentry_marker_open_skips_stall_pass() {
+    // Открытый маркер (#1607, Low-2 р.4): сессия занята (re-entry ждёт
+    // тика после ответа), тишина за порогом — сталл-пасс пропускается:
+    // пинг «переведи статус» ложен для держателя входа. Контроль — та же
+    // тишина без маркера: классический сталл-пинг стреляет.
+    let build = |n: u64, prev: Status| {
+        let state = Arc::new(MemState(Mutex::default()));
+        let mut t = task(n, Status::Testing);
+        let mut f = TaskFields::default();
+        f.set_session(
+            Slot::Test,
+            uwuwu_domain::SessionRef::parse("ses_tester_live").unwrap(),
+        );
+        t.apply_fields(f);
+        state.0.lock().unwrap().statuses.push((n, prev));
+        let mut fake = FakeSessions::new();
+        fake.activity_ms = Some(0);
+        // занята: ни re-entry, ни wakeup не доставляют — маркер/тишина
+        tester_usecase(vec![t], vec![], fake, state.clone(), Arc::new(LostClock))
+    };
+    // маркер взведён переходом In Progress → Testing
+    let (u, board, _, _) = build(62, Status::InProgress);
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    let log = board.log.lock().unwrap();
+    assert_eq!(out.soft_pings, 0, "мягкого пина нет при открытом маркере");
+    assert_eq!(out.stall_pings, 0, "классического пина нет при открытом маркере");
+    assert!(
+        !log.iter().any(|l| l.starts_with("comment#62=")),
+        "пинг-комментов нет при открытом маркере: {log:?}"
+    );
+    // контроль: та же тишина без перехода (маркера нет) — сталл стреляет
+    let (u2, board2, _, _) = build(63, Status::Testing);
+    let out2 = u2.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out2.stall_pings, 1, "без маркера классический пинг стреляет");
+    assert!(
+        board2
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("comment#63=")),
+        "контроль: пинг-коммент ушёл"
+    );
 }
 
 #[tokio::test]
@@ -6826,7 +6993,7 @@ async fn analyst_wave_one_session_for_all_rows() {
     );
     assert_eq!(
         specs[0].model,
-        uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.3-flash#high")
+        uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.4#high")
             .unwrap()
             .model,
         "модель аналитика — карта сервера (#1154)"
@@ -7237,7 +7404,7 @@ async fn reviewer_spawns_for_review_analys_wave() {
     ));
     assert_eq!(
         specs[0].model,
-        uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.3-flash#high")
+        uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.4#high")
             .unwrap()
             .model,
         "модель ревьювера аналитики — карта сервера (#1154)"

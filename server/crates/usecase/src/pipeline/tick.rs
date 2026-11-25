@@ -1220,16 +1220,16 @@ impl TickUseCase {
             // первое вхождение в стадию: ячейки нет — спавн понесёт промпт
             return Ok(None);
         };
-        // Тест-слот (тестировщик) — прежний канон: сессия снимается на
-        // каждом входе в Testing (мастер-сессии тестера — скоуп #1607,
-        // не этой задачи). Остальные слоты: снимается только мёртвая.
-        let keep = slot != Slot::Test
-            && self
-                .sessions
-                .project(&board.project)
-                .liveness(session)
-                .await
-                != Liveness::Dead;
+        // Канон мастер-сессий (#1626 + #1607): живая ячейка переживает
+        // вход в стадию — снимается только мёртвая (она блокирует
+        // разворот кика навсегда, #397). Ревьюверы — компакт + раунд-промпт
+        // в неё же; тестер (#1607) — re-entry wake с дельта-промптом.
+        let keep = self
+            .sessions
+            .project(&board.project)
+            .liveness(session)
+            .await
+            != Liveness::Dead;
         if keep {
             if slot.is_review() {
                 // Мастер-сессия ревьювера живёт: новый цикл = компакт +
@@ -1244,6 +1244,20 @@ impl TickUseCase {
                     slot = naming::slot_key(slot),
                     session = %session,
                     "Re-entry в ревью-стадию: сессия сохранена — компакт и раунд-промпт доставляются в неё же"
+                );
+            } else if slot == Slot::Test {
+                // Мастер-сессия тестера живёт: повторный вход в Testing —
+                // re-entry wake с дельта-промптом в неё же (#1607).
+                // Доставка — wakeup-путём, тот же pending-маркер (#1626):
+                // пустой хвост → re-entry wake, чужой хвост → wakeup.
+                self.state
+                    .set_round_reentry_pending(&board.board, task.number());
+                tracing::info!(
+                    event = "stage.reentry_keep",
+                    number = task.number(),
+                    slot = naming::slot_key(slot),
+                    session = %session,
+                    "Re-entry в Testing: сессия тестера сохранена — дельта-промпт доставляется в неё же"
                 );
             }
             return Ok(None);
@@ -1260,7 +1274,7 @@ impl TickUseCase {
             number = task.number(),
             slot = naming::slot_key(slot),
             session = %session,
-            "Переход стадии: ячейка снята (мёртвая сессия либо тест-слот) — спавн с новым промптом"
+            "Переход стадии: ячейка снята (мёртвая сессия) — спавн с новым промптом"
         );
         Ok(Some(cleared))
     }
@@ -1285,6 +1299,18 @@ impl TickUseCase {
         else {
             return Ok(StallAct::None);
         };
+        // Re-entry маркер открыт (#1607, #1626): вход ждёт доставки
+        // wakeup-путём (раунд-промпт/дельта) — мягкий пинг «переведи
+        // статус» сюда не ходит: инструкция ложна для держателя входа.
+        if self.state.round_reentry_pending(&board.board, task.number()) {
+            tracing::debug!(
+                event = "stall.reentry_open",
+                number = task.number(),
+                slot = naming::slot_key(slot),
+                "Сталл-пасс пропущен: re-entry маркер открыт — вход доставляется wakeup-путём"
+            );
+            return Ok(StallAct::None);
+        }
         // нет данных/ошибка чтения — не сталл (мёртвую сессию заберёт decide);
         // тишина короче мягкого порога — оба класса молчат, idle-пробу
         // (HTTP хвоста сообщений) не тратим на свежие строки
