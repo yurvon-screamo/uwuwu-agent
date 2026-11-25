@@ -2142,18 +2142,65 @@ mod tests {
         assert_eq!(strip_task_get_header(md), md);
     }
 
-    /// Негативы формы B: fm-блока за тайтлом нет, пустой строки перед
-    /// fm нет, CRLF-карточка (скоп #1637), «тайтл» не рендер-формы.
+    /// Карточка рендера с заданной тайтл-строкой и валидным fm-блоком:
+    /// всё, кроме самой тайтл-строки, удовлетворяет форме B — падение
+    /// теста однозначно называет сломанный барьер тайтла.
+    fn card_copy_with_title(title: &str) -> String {
+        format!(
+            "{title}\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: \
+             false\nfact_track: false\ntype: bug\nbody_hash: h\n\n## Постановка\nтекст"
+        )
+    }
+
+    /// fm-блока за тайтлом нет — не карточка, вход цел.
     #[test]
-    fn task_get_card_shaped_lookalikes_are_kept() {
+    fn task_get_title_without_fm_block_is_kept() {
         let md = "#1526 t — In Progress\n\n## Постановка\nтекст";
         assert_eq!(strip_task_get_header(md), md);
-        let md2 = "#1526 t — In Progress\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\n\nтекст";
-        assert_eq!(strip_task_get_header(md2), md2);
-        let md3 = "#1526 t — In Progress\r\n\r\n--- fm ---\r\nbranch: b\r\npr: —\r\nautomerge: true\r\ndirect: false\r\nfact_track: false\r\ntype: bug\r\nbody_hash: h\r\n\r\nтекст";
-        assert_eq!(strip_task_get_header(md3), md3);
-        let md4 = "## Постановка\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\n\nтекст";
-        assert_eq!(strip_task_get_header(md4), md4);
+    }
+
+    /// Пустой строки перед fm нет — не карточка, вход цел.
+    #[test]
+    fn task_get_title_without_blank_line_before_fm_is_kept() {
+        let md = "#1526 t — In Progress\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\n\nтекст";
+        assert_eq!(strip_task_get_header(md), md);
+    }
+
+    /// CRLF-карточка — скоп #1637, здесь барьер не срабатывает (строкий
+    /// LF-паттерн); тест изолирован, чтобы держатель #1637 перевернул
+    /// ровно его, не задевая LF-барьеры.
+    #[test]
+    fn task_get_crlf_card_header_is_kept() {
+        let md = "#1526 t — In Progress\r\n\r\n--- fm ---\r\nbranch: b\r\npr: —\r\nautomerge: true\r\ndirect: false\r\nfact_track: false\r\ntype: bug\r\nbody_hash: h\r\n\r\nтекст";
+        assert_eq!(strip_task_get_header(md), md);
+    }
+
+    /// «Тайтл» не рендер-формы (## Постановка) — вход цел.
+    #[test]
+    fn task_get_non_render_title_is_kept() {
+        let md = "## Постановка\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\n\nтекст";
+        assert_eq!(strip_task_get_header(md), md);
+    }
+
+    /// Барьер « — »: тайтл без разделителя статуса — не рендер.
+    #[test]
+    fn task_get_title_without_dash_separator_is_kept() {
+        let md = card_copy_with_title("#1526 t In Progress");
+        assert_eq!(strip_task_get_header(md.as_str()), md.as_str());
+    }
+
+    /// Барьер цифр: тайтл без номера — не рендер.
+    #[test]
+    fn task_get_title_without_digits_is_kept() {
+        let md = card_copy_with_title("# — In Progress");
+        assert_eq!(strip_task_get_header(md.as_str()), md.as_str());
+    }
+
+    /// Барьер пробела после номера: `#1526t` — не рендер.
+    #[test]
+    fn task_get_title_without_space_after_digits_is_kept() {
+        let md = card_copy_with_title("#1526t — In Progress");
+        assert_eq!(strip_task_get_header(md.as_str()), md.as_str());
     }
 
     #[test]
