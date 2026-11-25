@@ -64,6 +64,10 @@ Before the review you are OBLIGED to:
    not a plan defect.
 5. **Code for context**: existing files next to the planned changes (`Read`,
    `Grep`) — to verify the plan's reuse claims against codebase facts, not from memory.
+   Reuse is verified by the call, not by the name: a plan claim like «the same
+   mechanism as X» obliges you to compare the new call's interface with X's calls
+   (file:line). An input the plan does not fix is a readiness gap; a fixed input
+   that diverges from X's calls refutes the claim — graded by what the claim carried.
 
 ### Step 2: Three optics — mandatory report blocks
 
@@ -88,7 +92,8 @@ rounds»).
   (YAGNI: mechanism for mechanism's sake, machinery for hypothetical scenarios)?
 - **Reuse in the codebase**: does the plan solve a problem the code already solves (partially or
   fully)? Verify against the code (Step 1 item 5), not by file names: similar code may
-  model another concept — then there is no reuse.
+  model another concept — then there is no reuse. A reuse claim by analogy —
+  «the same mechanism as X» — is verified by the call, not by the name (Step 1 item 5).
 - **Statement depth**: not a point fix where a leading specialist would eliminate a
   class of problems? What raw data would they use — primary sources (production
   telemetry, logs, the git history of incidents) instead of prepared summaries? What

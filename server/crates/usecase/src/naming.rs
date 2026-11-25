@@ -157,6 +157,12 @@ pub const F_AUTOMERGE: &str = "Automerge";
 /// свойство рождения строки, task_edit его не принимает).
 pub const F_DIRECT: &str = "Direct";
 
+/// Единое имя поля fact_track (#1631): класс строк «без Design и без
+/// тестирования, только In Progress → Result review → Review».
+/// Как direct: пишется только create (свойство рождения, immutable),
+/// task_edit его не принимает (чужой ключ — громкий отказ #1572).
+pub const F_FACT_TRACK: &str = "FactTrack";
+
 /// Парсинг приоритета; пустое/неизвестное → Empty (ниже low в очереди CUP).
 /// Один парсер на все носители (snapshot, fm, enrichment): английские и
 /// русские варианты опций, регистр и пробелы не влияют.

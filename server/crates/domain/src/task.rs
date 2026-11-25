@@ -117,14 +117,27 @@ impl Status {
         )
     }
 
-    /// Канон + direct-класс (#1357): единственное новое ребро
+    /// Канон + direct-класс (#1357) + fact_track-класс (#1631):
     /// In Progress → Review открыто строке с флагом direct (прямое
-    /// поручение владельца — «сразу в ревью»). Обычные строки финализирует
-    /// ревью-конвейер (Ревью результата → Тестирование → Review); базовый
-    /// `can_transition` и его пин-тесты не тронуты.
-    pub fn can_transition_with(from: Self, to: Self, direct: bool) -> bool {
+    /// поручение владельца — «сразу в ревью»); ReviewResult → Review —
+    /// строке с флагом fact_track (укороченный пайп: дизайн и тест-контур
+    /// минуется, код-ревью обязательно); тест-контур (In Progress →
+    /// Testing, ReviewResult → Testing) fact_track-строке закрыт —
+    /// тестер по ней не спавнится. Базовый `can_transition` и его
+    /// пин-тесты не тронуты.
+    pub fn can_transition_with(from: Self, to: Self, direct: bool, fact_track: bool) -> bool {
         use Status as S;
-        (direct && from == S::InProgress && to == S::UserReview) || Self::can_transition(from, to)
+        if fact_track
+            && matches!(
+                (from, to),
+                (S::InProgress, S::Testing) | (S::ReviewResult, S::Testing)
+            )
+        {
+            return false;
+        }
+        (direct && from == S::InProgress && to == S::UserReview)
+            || (fact_track && from == S::ReviewResult && to == S::UserReview)
+            || Self::can_transition(from, to)
     }
 }
 
@@ -162,6 +175,18 @@ pub enum Slot {
 }
 
 impl Slot {
+    /// Ревью-слоты — носители мастер-сессий ревьюверов (#1626, владелец
+    /// 25.11.2026: «1 задача = 1 сессия на каждый этап ревью и между
+    /// циклами мы их не меняем»): живая сессия ведёт все циклы задачи
+    /// в пределах своей стадии. Три контура: план/код/тест-ревью —
+    /// разные сессии (изоляция этапов дословно из постановки).
+    pub fn is_review(self) -> bool {
+        matches!(
+            self,
+            Self::PlanReview | Self::ResultReview | Self::TestReview
+        )
+    }
+
     /// Эмодзи-маркер стадии в тайтле спавн-сессии (задача #1212).
     /// Design/Dev == 🔨 осознанно: оба слота — дефолтная сессия
     /// исполнителя; равенство с Agent::Developer.emoji() связано тестом.
@@ -398,6 +423,11 @@ pub struct Task {
     /// стадий. По образцу automerge: пишется на носитель явно (create),
     /// читается с колонки доски.
     direct: bool,
+    /// Укороченный пайп (#1631): строка без Design и без тестирования —
+    /// только In Progress → Result review → Review. Create-only, immutable
+    /// (как direct): пишется на носитель явно (create), task_edit его
+    /// не принимает.
+    fact_track: bool,
     /// Тип задачи (нативный issue Type — единственный носитель, #1271):
     /// None — не задан (native-null строки, неизвестное имя, дефолт Task).
     kind: Option<TaskType>,
@@ -417,6 +447,7 @@ impl Task {
             priority: Priority::Empty,
             automerge: false,
             direct: false,
+            fact_track: false,
             kind: None,
             closed_at: None,
             fields: TaskFields::default(),
@@ -425,9 +456,10 @@ impl Task {
 
     /// Переход статуса с каноном рёбер (см. Status::can_transition):
     /// запрещённый ребро — громкая ошибка, мутации нет. direct-строка
-    /// (#1357) несёт собственный флаг — гвард через can_transition_with.
+    /// (#1357) и fact_track-строка (#1631) несут собственные флаги —
+    /// гвард через can_transition_with.
     pub fn transition(&mut self, to: Status) -> Result<(), String> {
-        if !Status::can_transition_with(self.status, to, self.direct) {
+        if !Status::can_transition_with(self.status, to, self.direct, self.fact_track) {
             return Err(format!(
                 "transition {:?} → {:?} outside the pipeline canon (see Status::can_transition)",
                 self.status, to
@@ -470,6 +502,11 @@ impl Task {
         self.direct
     }
 
+    /// Флаг fact_track (create-only, immutable, #1631): укороченный пайп.
+    pub fn fact_track(&self) -> bool {
+        self.fact_track
+    }
+
     /// Тип задачи (нативный issue Type, #1271): None — не задан.
     pub fn kind(&self) -> Option<TaskType> {
         self.kind
@@ -501,6 +538,11 @@ impl Task {
     /// Запись флага direct с носителя (parse колонки доски).
     pub fn set_direct(&mut self, on: bool) {
         self.direct = on;
+    }
+
+    /// Запись флага fact_track с носителя (parse колонки доски, #1631).
+    pub fn set_fact_track(&mut self, on: bool) {
+        self.fact_track = on;
     }
 
     /// Дата закрытия issue (unix ms): None — открыт либо не сообщена.
@@ -540,7 +582,7 @@ impl Task {
     /// Заявка сессии (claim): терминальная строка не принимает заявок —
     /// конвейер закончился, спавн поверх Done — ошибка.
     /// Снятие сессии слота самой строкой (тик после clear_session доски —
-    /// локальный клон должен видеть свежие глаза).
+    /// локальный клон зеркалит носитель).
     pub fn clear_slot_session(&mut self, slot: Slot) {
         self.fields.clear_session(slot);
     }
@@ -924,21 +966,80 @@ mod tests {
         use Status as S;
         // direct-ребро (#1357): In Progress → Review только с флагом
         assert!(
-            S::can_transition_with(S::InProgress, S::UserReview, true),
+            S::can_transition_with(S::InProgress, S::UserReview, true, false),
             "direct-строка финализируется агентом сам"
         );
         assert!(
-            !S::can_transition_with(S::InProgress, S::UserReview, false),
+            !S::can_transition_with(S::InProgress, S::UserReview, false, false),
             "без флага — «Ревью результата» обязателен (канон)"
         );
         // флаг не открывает лишнего: остальные прямые — по канону
-        assert!(!S::can_transition_with(S::InProgress, S::Done, true));
-        assert!(!S::can_transition_with(S::Analys, S::UserReview, true));
+        assert!(!S::can_transition_with(S::InProgress, S::Done, true, false));
+        assert!(!S::can_transition_with(
+            S::Analys,
+            S::UserReview,
+            true,
+            false
+        ));
         // мутация на агрегате: флаг default false, сеттер пишет
         let mut t = Task::new(7, "direct-строка".into(), S::InProgress);
         assert!(!t.direct(), "по умолчанию строка не direct");
         assert!(t.transition(S::UserReview).is_err());
         t.set_direct(true);
+        assert!(t.transition(S::UserReview).is_ok());
+        assert_eq!(t.status(), S::UserReview);
+    }
+
+    #[test]
+    fn fact_track_edges() {
+        use Status as S;
+        // позитив (#1631): approve Ревью результата ведёт сразу в Review
+        assert!(
+            S::can_transition_with(S::ReviewResult, S::UserReview, false, true),
+            "fact_track-строка после код-ревью — сразу на приёмку"
+        );
+        // без флага ребро закрыто — канон UC-01 побайтово
+        assert!(
+            !S::can_transition_with(S::ReviewResult, S::UserReview, false, false),
+            "обычная строка идёт через Тестирование"
+        );
+        // негативы: тест-контур fact_track-строке закрыт
+        assert!(
+            !S::can_transition_with(S::InProgress, S::Testing, false, true),
+            "прямая отправка на тест запрещена — тестер не спавнится"
+        );
+        assert!(
+            !S::can_transition_with(S::ReviewResult, S::Testing, false, true),
+            "вердикт approve уводит в Review, не в Testing"
+        );
+        // request_changes — как в каноне
+        assert!(S::can_transition_with(
+            S::ReviewResult,
+            S::InProgress,
+            false,
+            true
+        ));
+        // флаг не открывает лишнего
+        assert!(!S::can_transition_with(S::InProgress, S::Done, false, true));
+        assert!(!S::can_transition_with(
+            S::Analys,
+            S::UserReview,
+            false,
+            true
+        ));
+        assert!(
+            !S::can_transition_with(S::InProgress, S::UserReview, false, true),
+            "прямой прыжок в Review мимо код-ревью закрыт и для fact_track"
+        );
+        // мутация на агрегате: default false, сеттер пишет, гвард держит
+        let mut t = Task::new(7, "fact_track-строка".into(), S::InProgress);
+        assert!(!t.fact_track(), "по умолчанию строка не fact_track");
+        assert!(t.transition(S::Testing).is_ok(), "без флага — канон");
+        let mut t = Task::new(8, "fact_track-строка".into(), S::InProgress);
+        t.set_fact_track(true);
+        assert!(t.transition(S::Testing).is_err());
+        assert_eq!(t.status(), S::InProgress, "запрет не мутировал");
+        t.transition(S::ReviewResult).expect("канонный ход");
         assert!(t.transition(S::UserReview).is_ok());
         assert_eq!(t.status(), S::UserReview);
     }

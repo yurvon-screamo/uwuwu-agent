@@ -4,7 +4,7 @@
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::naming;
 use crate::pipeline::tick::{
-    BoardPlan, RowContext, SpawnHold, TickOutcome, TickPlan, TickUseCase,
+    BoardPlan, CupGate, RowContext, SpawnHold, TickOutcome, TickPlan, TickUseCase,
     SESSION_LOST_ESCALATE_AFTER,
 };
 use crate::ports::{CommentRef, Liveness, SessionSpec};
@@ -92,7 +92,12 @@ impl TickUseCase {
         slot: Slot,
     ) -> UsecaseResult<String> {
         sessions
-            .run_command(bootstrap, "task-env", &task.number().to_string())
+            .run_command(
+                bootstrap,
+                "task-env",
+                &task.number().to_string(),
+                TASK_ENV_COMMAND_BUDGET_MS,
+            )
             .await?;
         // Фабрика пишет Branch-ячейку: env готов, ветка work/task-N
         // существует (ADR-041 «ячейки доски пишет фабрика»); без неё PR
@@ -134,14 +139,75 @@ impl TickUseCase {
             let _ = sessions.delete_session(&work).await;
             return Err(e);
         }
+        // Свежая сессия получила собственный промпт — pending раунд-промпт
+        // мастер-сессии погашен (#1626: мёртвая ячейка снимается переходом,
+        // пересоздание несёт промпт само; маркер без этого гашения дал бы
+        // двойную доставку в новую сессию).
+        self.state
+            .clear_round_reentry_pending(&board.board, task.number());
         tracing::info!(event = "spawn.done", number = task.number(), slot = ?slot,
             session = %work, env = %env_repo, "Spawn done");
         Ok(work)
     }
 
-    /// Wakeup: мёртвая сессия — респавн (dead-детект ПЕРВЫМ: даже без свежих
-    /// комментов — строка не висит, DS «dead-детект решает: будить или
-    /// респавнить»); живая — будим по свежим комментам (новее активности).
+    /// Раунд-промпт мастер-сессии ревьювера (#1626 срез 2): re-entry в
+    /// ревью-стадию при живой сессии доставляется в неё же — нативный
+    /// компакт (детерминированный триггер: каждый re-entry, владелец
+    /// 25.11: «автокомпактом этой сессии перед тем как делать к ней новый
+    /// цикл») и спавн-промпт стадии. Гейты те же, что у будильника: пик
+    /// проверен вызывающим, CUP — здесь; ход сессии в полёте — доставка
+    /// на тике после ответа (маркер persists). Some — раунд-промпт
+    /// решён (Woke/Deferred), None — pending нет, дальше по будильнику.
+    async fn deliver_round_prompt(
+        &self,
+        board: &BoardPlan,
+        task: &Task,
+        slot: Slot,
+        session: &str,
+        cup: CupGate,
+    ) -> UsecaseResult<Option<WakeAct>> {
+        if !slot.is_review()
+            || !self
+                .state
+                .round_reentry_pending(&board.board, task.number())
+        {
+            return Ok(None);
+        }
+        if cup.full() {
+            tracing::info!(
+                event = "wakeup.round_prompt_held_cup",
+                number = task.number(),
+                active = cup.active_now,
+                cap = cup.policy.cup,
+                tier = "continuation",
+                "Раунд-промпт отложен: CUP cap"
+            );
+            return Ok(Some(WakeAct::Deferred));
+        }
+        if !self.session_idle(board, session).await {
+            return Ok(Some(WakeAct::None));
+        }
+        let sessions = self.sessions.project(&board.project);
+        sessions.compact_session(session).await?;
+        // Пин агента слота перед ходом (#1300) — как на будильнике
+        if let Some(agent) = Agent::of_slot(slot) {
+            sessions.switch_agent(session, agent).await?;
+        }
+        sessions
+            .prompt(session, &spawn_prompt(board, task, slot))
+            .await?;
+        self.state
+            .clear_round_reentry_pending(&board.board, task.number());
+        tracing::info!(
+            event = "wakeup.round_prompt_delivered",
+            number = task.number(),
+            slot = naming::slot_key(slot),
+            session = %session,
+            "Раунд-промпт доставлен в мастер-сессию (компакт admitted перед новым циклом)"
+        );
+        Ok(Some(WakeAct::Woke))
+    }
+
     /// Wakeup: мёртвая сессия — респавн (dead-детект ПЕРВЫМ: даже без свежих
     /// комментов — строка не висит, DS «dead-детект решает: будить или
     /// респавнить»); живая — будим по свежим комментам (новее активности).
@@ -184,6 +250,23 @@ impl TickUseCase {
                         "Wakeup deferred: peak window"
                     );
                     return Ok(WakeAct::Deferred);
+                }
+                // Раунд-промпт мастер-сессии (#1626 срез 2) — та же политика
+                // запуска, что у будильника
+                if let Some(act) = self
+                    .deliver_round_prompt(
+                        board,
+                        task,
+                        slot,
+                        session,
+                        CupGate {
+                            policy,
+                            active_now: global_active,
+                        },
+                    )
+                    .await?
+                {
+                    return Ok(act);
                 }
             }
             Liveness::Unknown => {
@@ -324,6 +407,9 @@ impl TickUseCase {
                         number = task.number(),
                         active = global_active,
                         cap = policy.cup,
+                        // будильник достижим только при сессии на слоте
+                        // стадии — тир продолжений всегда
+                        tier = "continuation",
                         "Wakeup held: CUP cap"
                     );
                     return Ok(WakeAct::Deferred);
@@ -916,3 +1002,8 @@ pub(crate) fn spawn_prompt(board: &BoardPlan, task: &Task, slot: Slot) -> String
         project = board.project,
     )
 }
+
+/// Бюджет команды task-env (мс): подготовка env одного спавна укладывается —
+/// носитель числа, бывший общий таймаут клиента адаптера (opencode.rs);
+/// батч env-gc носит свой бюджет прохода (env_gc.rs). #1526.
+pub const TASK_ENV_COMMAND_BUDGET_MS: u64 = 20_000;
