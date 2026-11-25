@@ -2915,3 +2915,132 @@ async fn task_edit_owner_answer_lands_on_carrier() {
     .await
     .expect("прежнее ребро без ключа");
 }
+
+/// #1648: копия живого вывода task_get с хвостом комментов не несёт ленту
+/// на носитель. Оракул — body_bytes из того же вывода: носитель байт-в-байт
+/// равен телу, а не композитному рендеру.
+#[tokio::test]
+async fn task_body_strips_comments_tail_of_the_real_render() {
+    let (tools, memory) = hub();
+    let body = "## Постановка\n\nчистое тело карточки.\n";
+    let (number, _) = create_task(&tools, "t: хвост в task_body", body).await;
+    for i in 0..2 {
+        call(
+            &tools,
+            "task_comment",
+            json!({ "number": number, "text": format!("коммент {i}") }),
+        )
+        .await
+        .expect("comment");
+    }
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    assert!(card.contains("--- comments (latest 2 of 2) ---"), "{card}");
+    // create добавляет хвостовой перевод строки: оракул — срез тела из
+    // рендера, а не строка, переданная в create.
+    let body_at = card.find(body).expect("body in card");
+    let body_end = card
+        .find("\n\n--- comments (latest")
+        .expect("tail boundary");
+    let rendered_body = &card[body_at..body_end];
+    let copied = &card[card.find("--- fm ---").expect("fm")..];
+
+    let receipt = call(
+        &tools,
+        "task_body",
+        json!({ "number": number, "body": copied }),
+    )
+    .await
+    .expect("task_body ok");
+    assert!(receipt.contains("replaced"), "квитанция: {receipt}");
+
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert_eq!(stored, rendered_body, "тело без ленты: {stored}");
+    let declared_at = card.find("body_bytes: ").expect("fm") + "body_bytes: ".len();
+    let declared_end = declared_at + card[declared_at..].find('\n').expect("end");
+    let declared: usize = card[declared_at..declared_end].parse().expect("integer");
+    assert_eq!(stored.len(), declared, "размер = body_bytes из копии");
+}
+
+/// #1648: та же копия в task_create рождает строку без ленты комментов.
+#[tokio::test]
+async fn task_create_strips_comments_tail_of_the_real_render() {
+    let (tools, memory) = hub();
+    let body = "## Постановка\n\nтело для копии.\n";
+    let (number, _) = create_task(&tools, "t: источник для create", body).await;
+    call(
+        &tools,
+        "task_comment",
+        json!({ "number": number, "text": "коммент источника" }),
+    )
+    .await
+    .expect("comment");
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    let copied = &card[card.find("--- fm ---").expect("fm")..];
+
+    let receipt = call(
+        &tools,
+        "task_create",
+        json!({ "title": "t: копия с лентой", "body": copied }),
+    )
+    .await
+    .expect("create ok");
+    let created = receipt_number(&receipt);
+    let stored = memory
+        .read_issue("Задачи uwuwu", created)
+        .await
+        .expect("read")
+        .body;
+    assert!(
+        !stored.contains("--- comments (latest"),
+        "ленты нет: {stored}"
+    );
+    assert!(
+        !stored.contains("коммент источника"),
+        "коммента нет: {stored}"
+    );
+    assert!(stored.contains("тело для копии"), "тело на месте: {stored}");
+}
+
+/// #1648: секционная правка носителя с уже лежащим дампом снимает дамп и
+/// сохраняет дописанную секцию; гард сжатия не срабатывает на срезе.
+#[tokio::test]
+async fn task_body_section_keeps_new_section_after_existing_dump() {
+    let (tools, memory) = hub();
+    let base = "## Постановка\n\nтело до дампа.\n";
+    let dump = "\n\n--- comments (latest 1 of 1) ---\n---\n2026-11-24T04:59:18Z\nстарый коммент\n";
+    let polluted = format!("{base}{dump}");
+    let (number, hash) = create_task(&tools, "t: дамп + секция", &polluted).await;
+
+    let receipt = call(
+        &tools,
+        "task_body_section",
+        json!({
+            "number": number,
+            "section": "План",
+            "content": "новая секция",
+            "base_hash": hash,
+        }),
+    )
+    .await
+    .expect("section edit");
+    assert!(receipt.contains("appended"), "квитанция: {receipt}");
+
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert_eq!(
+        stored,
+        format!("{base}\n\n## План\nновая секция\n"),
+        "дамп снят, секция цела: {stored}"
+    );
+}

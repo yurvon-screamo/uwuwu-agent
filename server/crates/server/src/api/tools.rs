@@ -206,7 +206,7 @@ pub fn tool_descriptors() -> Value {
             object(json!({
                 "title": string("title (unique on the board)"),
                 "project": string("project; default uwuwu"),
-                "body": string("markdown body (problem statement…)"),
+                "body": string("markdown body (problem statement); a copied task_get header and comments tail are stripped"),
                 "type": string(&type_enum_list()),
                 "priority": string("high|medium|low; default medium"),
                 "automerge": json!({"type":"boolean","description":"automerge: merge the PR on entering Review, the row stays in Review; default true (direct — false)"}),
@@ -349,12 +349,14 @@ pub fn tool_descriptors() -> Value {
         tool(
             "task_body",
             "Full replacement of the task body (fm is not written into the body — fields are \
-             native; edit large bodies sectionally via task_body_section). Write, not read: \
-             without the body parameter — loud refusal; explicit empty string clears the body",
+             native; a copied task_get header and comments tail are stripped on write; edit \
+             large bodies sectionally via task_body_section). Write, not read: without the \
+             body parameter — loud refusal; explicit empty string clears the body",
             object(json!({
                 "number": integer("task number"),
                 "project": string("project; default uwuwu"),
-                "body": string("full markdown body (no fm); ABSENT parameter is a loud \
+                "body": string("full markdown body (no fm); a copied task_get header and \
+                              comments tail are stripped on write; ABSENT parameter is a loud \
                               refusal (read via task_get); empty or whitespace-only string — \
                               clear deliberately; fm/task_get-header-only input is refused \
                               (no effective content)")
@@ -371,9 +373,10 @@ pub fn tool_descriptors() -> Value {
                 "project": string("project; default uwuwu"),
                 "section": string("section heading; ATX prefix pins the level \
                                   («### X» — h3), bare/«## X» — default h2"),
-                "content": string("new section content without the heading; ABSENT \
-                                  parameter is a loud refusal (write, not read); empty \
-                                  string — clear the section deliberately"),
+                "content": string("new section content without the heading; a copied \
+                                  task_get comments tail is stripped after the body is \
+                                  assembled; ABSENT parameter is a loud refusal (write, not \
+                                  read); empty string — clear the section deliberately"),
                 "base_hash": string("body_hash of the body at read time (fm block of \
                                     task_get or a prior receipt); required"),
                 "confirm": json!({"type":"boolean","description":"true — deliberately \
