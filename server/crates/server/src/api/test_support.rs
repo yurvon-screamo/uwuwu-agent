@@ -166,7 +166,8 @@ pub(crate) struct StubJournals {
 }
 
 /// Pre-image журнал rename (#1447) в армах диспетчера: память на время
-/// пробы (персистентность покрывает пин rename_journal).
+/// пробы; персистентность `JsonStatusPreImages` пинится офлайн-юнитами
+/// в `rename_journal_tests.rs` (этот no-op контракт файла не проверяет).
 pub(crate) struct StubPreImages;
 
 impl uwuwu_usecase::StatusPreImageStore for StubPreImages {
