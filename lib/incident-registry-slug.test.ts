@@ -11,12 +11,25 @@ import { join } from "node:path"
 const ROOT = join(import.meta.dir, "..")
 const dreamer = readFileSync(join(ROOT, "agents", "dreamer.md"), "utf8")
 
+// Переносы строк в markdown не несут смысла — сводим пробелы, чтобы ловить
+// формулировку каждой точки, а не обёртку строки (конвенция
+// roles-split-contract.test.ts). Каждая точка пинится своим локальным
+// контекстом: счётчик вхождений по файлу ослабляется третьим упоминанием.
+function flat(s: string): string {
+  return s.replace(/\s+/g, " ")
+}
+
+const body = flat(dreamer)
 const FULL_SLUG = "Experience/platform/Инцидент-реестр конвейера"
 const BARE_SLUG = /(?<!Experience\/)platform\/Инцидент-реестр конвейера/
 
 describe("dreamer.md — полный слаг реестра инцидентов (#1622)", () => {
-  test("обе точки (чтение и создание) несут полный слаг", () => {
-    expect(dreamer.split(FULL_SLUG).length - 1).toBeGreaterThanOrEqual(2)
+  test("read-указатель несёт полный слаг", () => {
+    expect(body).toContain(`(the slug \`${FULL_SLUG}\`; if the read did not match`)
+  })
+
+  test("create-инструкция несёт полный слаг", () => {
+    expect(body).toContain(`No doc — create one (\`uwuwu_docs_write\` with the slug \`${FULL_SLUG}\`;`)
   })
 
   test("голого слага реестра в методичке нет", () => {
