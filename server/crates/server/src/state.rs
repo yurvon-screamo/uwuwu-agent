@@ -36,7 +36,7 @@ struct RowState {
     lost: Option<(String, u32)>,
     /// Pending раунд-промпт мастер-сессии ревьювера (#1626): re-entry в
     /// ревью-стадию с живой сессией ждёт доставки (компакт + промпт).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     round_reentry: bool,
 }
 
