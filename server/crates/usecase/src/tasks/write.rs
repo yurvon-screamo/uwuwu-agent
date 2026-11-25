@@ -1005,15 +1005,24 @@ fn strip_task_get_header(md: &str) -> &str {
 }
 
 /// Строгое совпадение набора/порядка ключей одного рендера; частичные
-/// шапки и посторонний контент — None.
+/// шапки и посторонний контент — None. У последнего ключа хвостовой
+/// перенос не обязателен: копия шапки проходит через .trim() скрипта
+/// потребителя — без этого KEYS (актуальная форма) не матчится, а
+/// короткая легаси-форма матчится на префиксе, и остаток последней
+/// строки («body_bytes: N») уезжает эффективным контентом (#1604,
+/// ревью раунд 2).
 fn strip_header_keys<'a>(rest: &'a str, keys: &[&str]) -> Option<&'a str> {
     let mut pos = rest;
-    for key in keys {
-        let line_end = pos.find('\n')?;
+    for (index, key) in keys.iter().enumerate() {
+        let line_end = match pos.find('\n') {
+            Some(at) => at,
+            None if index + 1 == keys.len() => pos.len(),
+            None => return None,
+        };
         if !pos[..line_end].starts_with(key) {
             return None;
         }
-        pos = &pos[line_end + 1..];
+        pos = pos[line_end..].strip_prefix('\n').unwrap_or("");
     }
     Some(pos.trim_start_matches('\n'))
 }
@@ -1959,6 +1968,19 @@ mod tests {
         assert_eq!(out.matches("## Постановка").count(), 1);
     }
 
+    #[test]
+    fn create_body_strips_task_get_header_without_trailing_newline() {
+        // #1604 ревью раунд 2: копия шапки карточки без хвостового переноса
+        // (.trim() скрипта потребителя) на границе create — остаток
+        // последней строки («body_bytes: N») не становится телом задачи
+        let header = "--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\ntype: feature\nbody_hash: h\nbody_bytes: 66";
+        let out = render_create_body(&spec(header));
+        assert!(
+            !out.contains("body_bytes"),
+            "остаток шапки не становится телом: {out}"
+        );
+    }
+
     /// Дисплей-шапка task_get срезается на границе записи (fm-стек
     /// инцидента #1331: агент копирует вывод task_get назад в task_body).
     /// Все три формы рендера — актуальная (#1604, с body_bytes) и две
@@ -1985,6 +2007,21 @@ mod tests {
             md,
             "«шапка» в середине тела — не наша граница"
         );
+    }
+
+    #[test]
+    fn task_get_header_only_without_trailing_newline_strips_to_empty() {
+        // #1604 ревью раунд 2: копия шапки без хвостового переноса (.trim()
+        // скрипта потребителя) — актуальная форма матчится целиком (KEYS
+        // с терминалом-концом входа), остаток последней строки не уезжает
+        // эффективным контентом; короткие легаси-формы — тоже пусто
+        let h7 = "--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\ntype: feature\nbody_hash: h\nbody_bytes: 66";
+        assert_eq!(strip_task_get_header(h7), "");
+        let h6 =
+            "--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\ntype: bug\nbody_hash: h";
+        assert_eq!(strip_task_get_header(h6), "");
+        let h5 = "--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\nbody_hash: h";
+        assert_eq!(strip_task_get_header(h5), "");
     }
 
     #[test]

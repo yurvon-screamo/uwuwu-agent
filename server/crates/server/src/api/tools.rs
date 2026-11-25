@@ -1293,8 +1293,6 @@ mod tests {
 
     #[test]
     fn status_and_priority_cells_map_empty_to_null() {
-        // #1604: Empty-варианты — null («нет значения»), не пустая строка
-        // и не мусорное имя; известные — канонные имена словаря.
         assert_eq!(status_cell(uwuwu_domain::Status::Empty), Value::Null);
         assert_eq!(
             status_cell(uwuwu_domain::Status::NeedsAttention),

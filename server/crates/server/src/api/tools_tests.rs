@@ -1246,12 +1246,26 @@ async fn task_body_strips_the_real_render_header_and_refuses_header_only() {
         err.contains("effective content"),
         "отказ называет отсутствие эффективного контента: {err}"
     );
+    // Вариант без хвостового переноса (.trim() скрипта потребителя) —
+    // тоже отказ: KEYS матчится с терминалом-концом входа, короткая
+    // легаси-форма не матчится на префиксе (#1604, ревью раунд 2)
+    let err2 = call(
+        &tools,
+        "task_body",
+        json!({ "number": number, "body": header_only.trim_end() }),
+    )
+    .await
+    .expect_err("шапка без переноса — тоже отказ");
+    assert!(
+        err2.contains("effective content"),
+        "отказ без хвостового переноса: {err2}"
+    );
     let intact = memory
         .read_issue("Задачи uwuwu", number)
         .await
         .expect("read")
         .body;
-    assert_eq!(intact, body, "отказ записи не трогает носитель");
+    assert_eq!(intact, body, "оба отказа не трогают носитель");
 }
 
 /// #1604 (ревью Low): null-хвост закреплён через хендлер task_list, не

@@ -9,10 +9,10 @@ use uwuwu_domain::Task;
 /// Сколько последних комментов несёт карточка задачи.
 const CARD_COMMENTS: usize = 10;
 
-/// Карточка task_get (#1604): носитель + размер ленты комментов до среза
-/// хвоста — граница «latest shown of total» заявляется в самом выводе.
-/// `comments_fetched` — сколько комментов прочитано с носителя (страница
-/// фетча, ≤100; честная пагинация — отдельное решение, вне #1604).
+/// Карточка task_get (#1604): носитель + `comments_fetched` — сколько
+/// комментов прочитано с носителя до среза хвоста (страница фетча, ≤100;
+/// честная пагинация — отдельное решение, вне #1604). Заголовок хвоста
+/// «latest shown of total» рендерится из пары этих чисел.
 pub struct CardView {
     pub issue: IssueView,
     pub comments_fetched: usize,
@@ -47,10 +47,9 @@ impl TaskView {
         Ok(self.board.read_board(board).await?)
     }
 
-    /// Карточка task_get: агрегат + тело + хвост комментов. `comments_fetched`
-    /// — размер ленты до среза: граница хвоста заявляется в выводе
-    /// (`latest shown of total`, #1604). Один клиент — tools.rs task_get,
-    /// поэтому обёртка здесь, а не поле в порте.
+    /// Карточка task_get: агрегат + тело + хвост комментов. Один клиент —
+    /// tools.rs task_get, поэтому обёртка здесь, а не поле в порте
+    /// (ревью #1604: без риппла по конструкторам IssueView).
     pub async fn card(&self, project: &str, number: u64) -> Result<CardView, ViewError> {
         let board = self.board_of(project).ok_or_else(|| {
             ViewError::NotFound(format!("project «{project}» is not in the config"))
