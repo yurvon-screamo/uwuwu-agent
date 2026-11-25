@@ -24,7 +24,8 @@ impl SpawnModels {
 
     /// Канон владельца — дефолт карты при отсутствии секции в конфиге.
     /// Синхрон с config.example (кросс-гвард): везде flash#high,
-    /// ревьюверы полный 5.3#high (поручение владельца 18.11, f1b9091c).
+    /// ревьюверы стадий + аналитика — glm-5.4#high (аналитика: санкция
+    /// владельца 24.11 в #1607, 3.6% токенов конвейера).
     pub fn canonical() -> Self {
         let mut map = HashMap::new();
         let mut put = |key: &str, raw: &str| {
@@ -39,8 +40,8 @@ impl SpawnModels {
         put("code-quality-reviewer", "zai-coding-plan/glm-5.4#high");
         put("tester", "zai-coding-plan/glm-5.3-flash#high");
         put("test-reviewer", "zai-coding-plan/glm-5.4#high");
-        put("analyst", "zai-coding-plan/glm-5.3-flash#high");
-        put("analyst-reviewer", "zai-coding-plan/glm-5.3-flash#high");
+        put("analyst", "zai-coding-plan/glm-5.4#high");
+        put("analyst-reviewer", "zai-coding-plan/glm-5.4#high");
         put("dreamer", "zai-coding-plan/glm-5.3-flash#high");
         Self { map }
     }
@@ -103,13 +104,24 @@ mod tests {
 
     #[test]
     fn canonical_carries_owner_model_map() {
-        // канон владельца 18.11 (#417): везде flash#high, ревьюверы —
-        // полный 5.3#high; карта = config.example verbatim (кросс-гвард)
+        // канон владельца: везде flash#high, ревьюверы стадий +
+        // аналитика — glm-5.4#high (#417 + санкция 24.11 в #1607);
+        // карта = config.example verbatim (кросс-гвард)
         let m = SpawnModels::canonical();
         assert_eq!(
             m.for_agent(Agent::PlanReviewer),
             SpawnModel::parse("zai-coding-plan/glm-5.4#high").unwrap(),
-            "ревьюверы — полный 5.3#high (канон #417)"
+            "ревьюверы стадий — glm-5.4#high (канон #417)"
+        );
+        assert_eq!(
+            m.for_agent(Agent::Analyst),
+            SpawnModel::parse("zai-coding-plan/glm-5.4#high").unwrap(),
+            "аналитика — glm-5.4#high (санкция 24.11, #1607)"
+        );
+        assert_eq!(
+            m.for_agent(Agent::AnalystReviewer),
+            SpawnModel::parse("zai-coding-plan/glm-5.4#high").unwrap(),
+            "ревью аналитики — glm-5.4#high (санкция 24.11, #1607)"
         );
         assert_eq!(
             m.for_agent(Agent::Dreamer),
