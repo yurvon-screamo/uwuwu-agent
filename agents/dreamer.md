@@ -64,13 +64,38 @@ Compare with what actually happened in the session and the git state:
 - **holes and tails** — under-documented (a new service/script/procedure
   exists, no doc) → create the missing doc or extend the existing one;
 - **behavior check against the Design Spec** (if the project has a spec): code
-  behavior justified by a «requirement» absent from the spec → a mark in the final
-  line «поведение без записи: <что/где> — флаг владельцу» (do NOT add the record
-  yourself — the appearance rule: an owner record only); a withdrawn/suspended
-  requirement with live behavior → the mark «задача на снос». The canon of records —
-  `platform/ops-mechanics` (Design Spec);
+  behavior justified by a «requirement» absent from the spec — first check the
+  task body: requirement records there are TO-BE by design (uwuwu#1630) and are
+  not a defect; behavior with no record anywhere (spec or task body) → a mark in
+  the final line «поведение без записи: <что/где> — флаг владельцу»; a
+  withdrawn/suspended requirement with live behavior → the mark «задача на снос».
+  The canon of records — `platform/ops-mechanics` (Design Spec);
+- **requirement records transfer (uwuwu#1630, 25.11.2026 — the owner's word: the
+  analyst formulates US/UC/NFT records in the task body, the dreamer transfers
+  them to the wiki)**: on every pass, for the analyzed session's own task only
+  (the title `#{N} …`; cron/bot sessions and rows without records — skip):
+  `task_get` (the project — from the session's spawn header in the dump, never
+  from cwd) → the row in Review/Done and the body carries US/UC/NFT records →
+  the AS-IS anchor as a fact: the row's PR is merged (`gh pr view <url>
+  --json state` = MERGED; docs-only — the PR cell holds a non-PR URL and the
+  wiki artifact is live) → transfer the records absent from the spec. Judgment:
+  target section per record type; status «действует»; global ID — the next free
+  number of the section in the live spec (never reused); dedup — an identical
+  formulation exists → skip; a changed formulation → a new record with a new
+  global ID and the old one → status «отменено» (ADR-102: IDs are not reused,
+  withdrawn records stay; an in-place edit erases the audit history). Matching
+  key between a body record and a spec record: the spec record carries
+  «uwuwu#<task> <local ID>». Source classes travel with the record; a class-в
+  source keeps its canon mark. Write discipline: read the fresh spec → a
+  surgical local edit (the row into the table) → `uwuwu_docs_write` with the fm
+  header preserved → a scripted pre/post comparison (mechanical, line-wise) →
+  the control fails: roll back from the pre-image (a session temp file, e.g.
+  `mktemp`, never the wiki) and flag the task with the recovery path (the hub
+  file history). No silent skip, no silent damage;
 - rich docs with embedded diagrams — **do not overwrite in full** — append only
-  or a point edit of the block (a replace kills the embeds);
+  or a point edit of the block (a replace kills the embeds); the records
+  transfer above is the named exception — a plain markdown spec tolerates the
+  full round-trip under the control read-back;
 - before an append check whether your past run already made this edit
   (re-read the live doc — do not duplicate content);
 - ADR: if the session shows an accepted architectural decision — create
