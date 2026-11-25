@@ -407,6 +407,123 @@ impl uwuwu_usecase::WikiRepo for TreeFailingWiki {
 }
 
 #[tokio::test]
+async fn docs_write_existing_doc_skips_tree() {
+    // горячий путь write (существующий док): быстрый путь без пробы дерева
+    let wiki = Arc::new(CountingWiki::new());
+    let (tools, _) = tool_hub(
+        wiki.clone(),
+        blob_usecase(),
+        Arc::new(StubCronState::default()),
+    );
+    call(
+        &tools,
+        "docs_write",
+        json!({ "slug": "Experience/x", "content": "# x\n" }),
+    )
+    .await
+    .expect("seed");
+    wiki.reset_lists();
+    let answer = call(
+        &tools,
+        "docs_write",
+        json!({ "slug": "Experience/x", "content": "# x2\n" }),
+    )
+    .await
+    .expect("write");
+    assert!(answer.contains("written"), "запись не состоялась: {answer}");
+    assert_eq!(
+        wiki.list_calls(),
+        0,
+        "быстрый путь существующего дока запросил дерево"
+    );
+}
+
+#[tokio::test]
+async fn docs_append_existing_doc_skips_tree() {
+    // горячий путь append (живой док): дерево в append не участвует
+    let wiki = Arc::new(CountingWiki::new());
+    let (tools, _) = tool_hub(
+        wiki.clone(),
+        blob_usecase(),
+        Arc::new(StubCronState::default()),
+    );
+    call(
+        &tools,
+        "docs_write",
+        json!({ "slug": "Experience/y", "content": "# y\n" }),
+    )
+    .await
+    .expect("seed");
+    wiki.reset_lists();
+    let answer = call(
+        &tools,
+        "docs_append",
+        json!({ "slug": "Experience/y", "line": "строка" }),
+    )
+    .await
+    .expect("append");
+    assert!(
+        answer.contains("appended to"),
+        "append не состоялся: {answer}"
+    );
+    assert_eq!(wiki.list_calls(), 0, "горячий путь append запросил дерево");
+}
+
+/// Счётчик обращений к дереву вики: пины «дерево не запрашивается» на
+/// горячих путях (быстрый путь write существующего, append к живому).
+struct CountingWiki {
+    inner: crate::mockhub::MemoryHub,
+    lists: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingWiki {
+    fn new() -> Self {
+        Self {
+            inner: crate::mockhub::MemoryHub::from_env(),
+            lists: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn list_calls(&self) -> usize {
+        self.lists.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn reset_lists(&self) {
+        self.lists.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl uwuwu_usecase::WikiRepo for CountingWiki {
+    async fn doc_shas(&self) -> uwuwu_usecase::UsecaseResult<Vec<(String, String)>> {
+        self.inner.doc_shas().await
+    }
+    async fn read_doc(&self, slug: &str) -> uwuwu_usecase::UsecaseResult<Option<String>> {
+        self.inner.read_doc(slug).await
+    }
+    async fn list_docs(&self, prefix: &str) -> uwuwu_usecase::UsecaseResult<Vec<String>> {
+        self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.list_docs(prefix).await
+    }
+    async fn write_doc(
+        &self,
+        slug: &str,
+        content: &str,
+        message: &str,
+    ) -> uwuwu_usecase::UsecaseResult<()> {
+        self.inner.write_doc(slug, content, message).await
+    }
+    async fn append_doc(
+        &self,
+        slug: &str,
+        line: &str,
+        message: &str,
+    ) -> uwuwu_usecase::UsecaseResult<usize> {
+        self.inner.append_doc(slug, line, message).await
+    }
+}
+
+#[tokio::test]
 async fn docs_write_requires_slug_and_content() {
     let tools = hub();
     let err = call(&tools, "docs_write", json!({ "slug": "x/y" }))
