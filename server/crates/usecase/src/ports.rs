@@ -92,8 +92,12 @@ pub trait TaskBoardRepo: Send + Sync {
     /// записанные значения сразу — write-through кешированного снапшота
     /// при живой строке, инвалидация при отсутствующей (окно create).
     /// None — ячейку не трогаем. Ветка/PR/Тип живут мимо снапшота —
-    /// идут через IssueFieldStore напрямую. direct (#1357) — как
-    /// automerge: состояние на носителе явно, write-through тот же.
+    /// идут через IssueFieldStore напрямую. direct (#1357) и fact_track
+    /// (#1631) — как automerge: состояние на носителе явно, write-through
+    /// тот же, оба пишутся только create (create-only, immutable).
+    /// прямое поручение владельца (#1357) и укороченный пайп (#1631):
+    /// оба пишутся только create (create-only, immutable), edit несёт
+    /// None — состояние на носителе явно, write-through тот же.
     async fn set_board_cells(
         &self,
         board: &str,
@@ -101,6 +105,7 @@ pub trait TaskBoardRepo: Send + Sync {
         priority: Option<&str>,
         automerge: Option<bool>,
         direct: Option<bool>,
+        fact_track: Option<bool>,
     ) -> UsecaseResult<()>;
 
     /// Очистить сессию слота строки (переход в раунд свежих глаз:

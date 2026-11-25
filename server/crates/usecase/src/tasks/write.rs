@@ -27,6 +27,11 @@ pub struct NewTask {
     /// сразу в In Progress (поля разбора create пишет явно), финализируется
     /// агентом в Review. Create-only: task_edit флаг не принимает.
     pub direct: bool,
+    /// fact_track-класс (#1631): укороченный пайп без Design и без
+    /// тестирования. Create-only, immutable: task_edit флаг не принимает
+    /// (чужой ключ — громкий отказ гарда #1572 на границе MCP).
+    /// Взаимоисключающ с direct (оба true — громкий отказ create).
+    pub fact_track: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,6 +332,14 @@ impl TaskWriter for TaskWriteUseCase {
                 cold[0]
             )));
         }
+        // direct (#1357) и fact_track (#1631) — взаимоисключающие классы:
+        // direct минует Result review, fact_track его требует; строка не
+        // может жить обоими пайпами сразу — отказ громкий, носитель чист
+        if spec.direct && spec.fact_track {
+            return Err(UsecaseError::Board(
+                "direct and fact_track are mutually exclusive — a row cannot bypass and require Result review at once".into(),
+            ));
+        }
         let number = self
             .board
             .create_issue(
@@ -342,12 +355,12 @@ impl TaskWriter for TaskWriteUseCase {
         // тип уехал в теле POST create (нативный issue Type, #1271):
         // атомарно, дрейф между issue и полем невозможен; тихий дроп
         // без push-доступа ловит сверка эха на границе носителя
-        // Приоритет/Automerge/Direct — ячейки снапшота доски: единая точка
-        // записи board-адаптера с кеш-гигиеной (#1258; add_to_board
+        // Приоритет/Automerge/Direct/FactTrack — ячейки снапшота доски:
+        // единая точка записи board-адаптера с кеш-гигиеной (#1258; add_to_board
         // инвалидирует ДО записи полей — окно кеша без полей закрывается
         // адаптером). Автомерж пишется всегда — состояние на носителе явно
-        // (канон #1232); direct тоже всегда (#1357: on/off, не умолчание
-        // чтения).
+        // (канон #1232); direct и fact_track тоже всегда (#1357, #1631:
+        // on/off, не умолчание чтения).
         let priority = if spec.priority.is_empty() {
             // direct-строке поля разбора пишет create (развилка 2 плана):
             // пустой priority → medium (дефолт владельца 13.11); обычная
@@ -367,6 +380,7 @@ impl TaskWriter for TaskWriteUseCase {
                 priority,
                 Some(spec.automerge),
                 Some(spec.direct),
+                Some(spec.fact_track),
             )
             .await?;
         // direct (#1357): строка рождается в In Progress — фабрика по ней
@@ -409,12 +423,14 @@ impl TaskWriter for TaskWriteUseCase {
         let mut status_delivery: Option<StatusDelivery> = None;
         if let Some(status) = patch.status {
             let current = self.guard_current(&board, number, status).await?;
-            // direct-класс (#1357): ребро In Progress → Review открыто
-            // только строке с флагом — флаг добывается свежим чтением
-            // носителя (семейство стейл-багов #1258/#1346: снапшоту
-            // здесь не верим), остальным рёбрам флаг не нужен
-            let direct = self.carrier_direct(number, current, status).await;
-            if !uwuwu_domain::Status::can_transition_with(current, status, direct) {
+            // Классовые рёбра (#1357, #1631): In Progress → Review открыто
+            // только direct-строке, ReviewResult → UserReview — только
+            // fact_track-строке, тест-контур fact_track-строке закрыт.
+            // Флаги добываются свежим чтением носителя (семейство
+            // стейл-багов #1258/#1346: снапшоту здесь не верим), остальным
+            // рёбрам флаги не нужны
+            let (direct, fact_track) = self.carrier_flags(number, current, status).await;
+            if !uwuwu_domain::Status::can_transition_with(current, status, direct, fact_track) {
                 tracing::warn!(
                     event = "board.guard_rejected",
                     number,
@@ -506,6 +522,7 @@ impl TaskWriter for TaskWriteUseCase {
                     number,
                     patch.priority.as_deref(),
                     patch.automerge,
+                    None,
                     None,
                 )
                 .await?;
@@ -958,15 +975,23 @@ where
     }
 }
 
-/// Дисплей-шапка task_get («--- fm ---» + branch/pr/automerge/body_hash)
-/// — рендер MCP-карточки, не носитель: агенты копируют вывод task_get
-/// назад в task_body, и шапка наслаивалась в теле (fm-стек инцидента
-/// #1331). Срезается на границе записи: инвариант ADR-105 «тело — чистый
-/// markdown» держит сервер, не дисциплина агента (прецедент #1151).
-/// Консервативно: строго набор/порядок ключей рендера, любой посторонний
-/// контент («--- fm ---» внутри текста) не трогается.
+/// Дисплей-шапка task_get («--- fm ---» + branch/pr/automerge/direct/
+/// fact_track/body_hash) — рендер MCP-карточки, не носитель: агенты
+/// копируют вывод task_get назад в task_body, и шапка наслаивалась в
+/// теле (fm-стек инцидента #1331). Срезается на границе записи:
+/// инвариант ADR-105 «тело — чистый markdown» держит сервер, не
+/// дисциплина агента (прецедент #1151). Консервативно: строго
+/// набор/порядок ключей рендера, любой посторонний контент
+/// («--- fm ---» внутри текста) не трогается.
 fn strip_task_get_header(md: &str) -> &str {
-    const KEYS: [&str; 5] = ["branch: ", "pr: ", "automerge: ", "direct: ", "body_hash: "];
+    const KEYS: [&str; 6] = [
+        "branch: ",
+        "pr: ",
+        "automerge: ",
+        "direct: ",
+        "fact_track: ",
+        "body_hash: ",
+    ];
     let Some(rest) = md.strip_prefix("--- fm ---\n") else {
         return md;
     };
@@ -1073,29 +1098,46 @@ impl TaskWriteUseCase {
         )
     }
 
-    /// direct-флаг с носителя (#1357): ребро In Progress → Review гвардится
-    /// флагом — на этом ребре (и только на нём) флаг читается свежим
-    /// fields.load, на остальных false. Отдельный метод: edit не несёт
-    /// редкой читающей ветки (smell-гигиена дельты).
-    async fn carrier_direct(&self, number: u64, current: Status, to: Status) -> bool {
-        if !(current == Status::InProgress && to == Status::UserReview) {
-            return false;
+    /// Флаги классов строк с носителя (#1357, #1631): direct гвардит
+    /// ребро In Progress → Review, fact_track — ReviewResult →
+    /// UserReview и запреты тест-контура. На этих рёбрах (и только на
+    /// них) флаги читаются свежим fields.load, на остальных (false,
+    /// false). Отдельный метод: edit не несёт редкой читающей ветки
+    /// (smell-гигиена дельты).
+    async fn carrier_flags(&self, number: u64, current: Status, to: Status) -> (bool, bool) {
+        use Status as S;
+        let relevant = matches!(
+            (current, to),
+            (S::InProgress, S::UserReview)
+                | (S::ReviewResult, S::UserReview)
+                | (S::InProgress, S::Testing)
+                | (S::ReviewResult, S::Testing)
+        );
+        if !relevant {
+            return (false, false);
         }
         match self.fields.load(number).await {
-            Ok(fields) => fields
-                .get(naming::F_DIRECT)
-                .map(|v| v == "on")
-                .unwrap_or(false),
-            // чтение полей упало — флаг неизвестен: ребро закрыто
-            // (консервативно), отказ громкий на следующем гарде канона
+            Ok(fields) => (
+                fields
+                    .get(naming::F_DIRECT)
+                    .map(|v| v == "on")
+                    .unwrap_or(false),
+                fields
+                    .get(naming::F_FACT_TRACK)
+                    .map(|v| v == "on")
+                    .unwrap_or(false),
+            ),
+            // чтение полей упало — флаги неизвестны: классовые рёбра
+            // закрыты (консервативно), отказ громкий на следующем
+            // гарде канона
             Err(e) => {
                 tracing::warn!(
-                    event = "board.direct_flag_unreadable",
+                    event = "board.class_flags_unreadable",
                     number,
                     error = %e,
-                    "Direct-флаг не прочитан — ребро In Progress → Review закрыто"
+                    "Флаги классов не прочитаны — классовые рёбра закрыты"
                 );
-                false
+                (false, false)
             }
         }
     }
@@ -1204,6 +1246,7 @@ mod tests {
             priority: String::new(),
             automerge: true,
             direct: false,
+            fact_track: false,
         }
     }
 
@@ -1241,6 +1284,7 @@ mod tests {
         priority: Option<String>,
         automerge: bool,
         direct: bool,
+        fact_track: bool,
         kind: Option<TaskType>,
         status: Status,
     }
@@ -1256,6 +1300,7 @@ mod tests {
                 priority: None,
                 automerge: false,
                 direct: false,
+                fact_track: false,
                 kind: None,
                 status: Status::Empty,
             }
@@ -1291,6 +1336,7 @@ mod tests {
             task.set_kind(self.kind);
             task.set_automerge(self.automerge);
             task.set_direct(self.direct);
+            task.set_fact_track(self.fact_track);
             IssueView {
                 task,
                 body: self.body.clone(),
@@ -1299,8 +1345,15 @@ mod tests {
         }
     }
 
-    /// Запись ячеек снапшота: номер + приоритет + automerge + direct (#1258).
-    type CellWrite = (u64, Option<String>, Option<bool>, Option<bool>);
+    /// Запись ячеек снапшота: номер + приоритет + automerge + direct +
+    /// fact_track (#1258, #1631).
+    type CellWrite = (
+        u64,
+        Option<String>,
+        Option<bool>,
+        Option<bool>,
+        Option<bool>,
+    );
 
     #[async_trait]
     impl TaskBoardRepo for FakeBoard {
@@ -1322,11 +1375,12 @@ mod tests {
             p: Option<&str>,
             a: Option<bool>,
             d: Option<bool>,
+            f: Option<bool>,
         ) -> UsecaseResult<()> {
             self.cells
                 .lock()
                 .expect("fake board")
-                .push((n, p.map(str::to_string), a, d));
+                .push((n, p.map(str::to_string), a, d, f));
             if !self.phantom {
                 let mut c = self.carrier.lock().expect("fake carrier");
                 c.priority = p.map(str::to_string);
@@ -1335,6 +1389,9 @@ mod tests {
                 }
                 if let Some(d) = d {
                     c.direct = d;
+                }
+                if let Some(f) = f {
+                    c.fact_track = f;
                 }
             }
             Ok(())
@@ -1647,7 +1704,7 @@ mod tests {
         let cells = board.cells.lock().expect("fake board").clone();
         assert_eq!(
             cells,
-            vec![(1, None, Some(true), Some(false))],
+            vec![(1, None, Some(true), Some(false), Some(false))],
             "create потерял automerge (мимо board-порта)"
         );
         // fields.store больше не несёт ячейку снапшота (Приоритет/Automerge —
@@ -1669,7 +1726,7 @@ mod tests {
         u.create("uwuwu", s).await.unwrap();
         assert_eq!(
             board.cells.lock().expect("fake board").clone(),
-            vec![(1, None, Some(false), Some(false))],
+            vec![(1, None, Some(false), Some(false), Some(false))],
         );
     }
 
@@ -1683,7 +1740,7 @@ mod tests {
         u.create("uwuwu", s).await.unwrap();
         assert_eq!(
             board.cells.lock().expect("fake board").clone(),
-            vec![(1, Some("low".into()), Some(true), Some(false))],
+            vec![(1, Some("low".into()), Some(true), Some(false), Some(false))],
         );
     }
 
@@ -1700,7 +1757,13 @@ mod tests {
         u.create("uwuwu", s).await.unwrap();
         assert_eq!(
             board.cells.lock().expect("fake board").clone(),
-            vec![(1, Some("medium".into()), Some(false), Some(true))],
+            vec![(
+                1,
+                Some("medium".into()),
+                Some(false),
+                Some(true),
+                Some(false)
+            )],
             "direct: medium/off/on — решение разбора на носителе явно"
         );
         let carrier = board.carrier.lock().expect("fake carrier");
@@ -1712,6 +1775,43 @@ mod tests {
         assert!(carrier.direct);
     }
 
+    /// fact_track-create (#1631): флаг пишется на board-порт явно
+    /// (on — не умолчание чтения); строка — обычная Analys (вход рукой,
+    /// вердикт Б), set_status не зовётся.
+    #[tokio::test]
+    async fn create_fact_track_writes_flag_and_stays_in_analys() {
+        let fields = Arc::new(FakeFields::default());
+        let (u, board) = writecase(fields);
+        let mut s = spec("тело");
+        s.fact_track = true;
+        u.create("uwuwu", s).await.unwrap();
+        assert_eq!(
+            board.cells.lock().expect("fake board").clone(),
+            vec![(1, None, Some(true), Some(false), Some(true))],
+            "fact_track on пишется явно — состояние на носителе"
+        );
+        let carrier = board.carrier.lock().expect("fake carrier");
+        assert_eq!(
+            carrier.status,
+            Status::Empty,
+            "fact_track-строка не уходит в In Progress сама (вердикт Б)"
+        );
+        assert!(carrier.fact_track);
+    }
+
+    /// direct + fact_track взаимоисключающи (#1631): отказ громкий,
+    /// строка не рождается.
+    #[tokio::test]
+    async fn create_direct_and_fact_track_conflict() {
+        let fields = Arc::new(FakeFields::default());
+        let (u, _) = writecase(fields);
+        let mut s = spec("тело");
+        s.direct = true;
+        s.fact_track = true;
+        let res = u.create("uwuwu", s).await;
+        assert!(res.is_err(), "оба флага — отказ");
+    }
+
     /// Обычная create-строка — канон как был: Analys (set_status не звался),
     /// direct off на носителе, priority не пишется (гейт требует явности).
     #[tokio::test]
@@ -1721,7 +1821,7 @@ mod tests {
         u.create("uwuwu", spec("тело")).await.unwrap();
         assert_eq!(
             board.cells.lock().expect("fake board").clone(),
-            vec![(1, None, Some(true), Some(false))],
+            vec![(1, None, Some(true), Some(false), Some(false))],
             "direct off пишется явно — состояние на носителе"
         );
         assert_eq!(
@@ -1823,7 +1923,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             board.cells.lock().expect("fake board").clone(),
-            vec![(1, None, Some(false), None)],
+            vec![(1, None, Some(false), None, None)],
             "edit direct не пишет — флаг create-only (#1357)"
         );
     }
@@ -1845,7 +1945,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             board.cells.lock().expect("fake board").clone(),
-            vec![(1, Some("high".into()), None, None)],
+            vec![(1, Some("high".into()), None, None, None)],
         );
     }
 
@@ -1928,14 +2028,14 @@ mod tests {
     /// инцидента #1331: агент копирует вывод task_get назад в task_body).
     #[test]
     fn task_get_display_header_is_stripped() {
-        let md = "--- fm ---\nbranch: work/task-1331\npr: —\nautomerge: true\ndirect: false\nbody_hash: 9de430c691c92328\n\n## Постановка\nтекст";
+        let md = "--- fm ---\nbranch: work/task-1331\npr: —\nautomerge: true\ndirect: false\nfact_track: false\nbody_hash: 9de430c691c92328\n\n## Постановка\nтекст";
         assert_eq!(strip_task_get_header(md), "## Постановка\nтекст");
     }
 
     #[test]
     fn task_get_header_in_middle_is_kept() {
         let md =
-            "## Секция\n\n--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\nbody_hash: h\n\nтекст";
+            "## Секция\n\n--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\nfact_track: false\nbody_hash: h\n\nтекст";
         assert_eq!(
             strip_task_get_header(md),
             md,

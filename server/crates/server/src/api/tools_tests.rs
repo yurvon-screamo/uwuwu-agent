@@ -721,6 +721,31 @@ fn descriptors_expose_automerge() {
     );
 }
 
+/// fact_track на MCP-поверхности (#1631): create рекламит ключ,
+/// task_edit — нет (create-only, immutable; чужой ключ режет гард #1572).
+#[test]
+fn descriptors_expose_fact_track_create_only() {
+    let list = tool_descriptors();
+    let find = |name: &str| {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("{name} на поверхности"))["inputSchema"]["properties"]
+            .clone()
+    };
+    let create = find("task_create");
+    assert!(
+        create.get("fact_track").is_some(),
+        "create рекламит fact_track: {create:?}"
+    );
+    let edit = find("task_edit");
+    assert!(
+        edit.get("fact_track").is_none(),
+        "edit не рекламит fact_track (create-only): {edit:?}"
+    );
+}
+
 /// Legacy-ключ `autodone` читается как automerge (back-compat MCP-клиентов
 /// 14.11); выключенный automerge создаёт строку без ошибок.
 #[tokio::test]
@@ -924,6 +949,118 @@ async fn task_edit_in_progress_to_review_rejected_without_direct() {
     )
     .await;
     assert!(res.is_err(), "без direct-флага ребро закрыто каноном");
+}
+
+/// fact_track-круг (#1631) на MemoryHub-носителе: create(fact_track)
+/// рождает обычную строку в Analys (fm несёт fact_track: true), вход —
+/// рукой через fast-track, дальше укороченный пайп: ReviewResult →
+/// Review открыто, а оба входа в Testing закрыты.
+#[tokio::test]
+async fn task_create_fact_track_short_pipe() {
+    let (tools, _memory) = hub();
+    let created = call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "fact_track: очевидное", "body": "б", "fact_track": true }),
+    )
+    .await
+    .expect("fact_track-create accepted");
+    assert!(created.contains("(Analys)"), "ответ тула честен: {created}");
+    let n: u64 = created
+        .trim()
+        .split('#')
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .and_then(|s| s.parse().ok())
+        .expect("номер в ответе");
+    let card = call(
+        &tools,
+        "task_get",
+        json!({ "project": "uwuwu", "number": n }),
+    )
+    .await
+    .expect("task_get ок");
+    assert!(card.contains("fact_track: true"), "fm fact_track: {card}");
+    // вход рукой: Analys → In Progress (гейт полей + fast-track)
+    call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": n, "priority": "medium", "automerge": true }),
+    )
+    .await
+    .expect("поля разбора заполнены (гейт Analys)");
+    for to in ["In Progress", "Result review"] {
+        call(
+            &tools,
+            "task_edit",
+            json!({ "project": "uwuwu", "number": n, "status": to }),
+        )
+        .await
+        .expect("ход {to} легален");
+    }
+    // вердикт approve — сразу Review, мимо Testing
+    call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": n, "status": "Review" }),
+    )
+    .await
+    .expect("fact_track-ребро ReviewResult → Review открыто");
+}
+
+/// fact_track-строке оба входа в тест-контур закрыты (#1631, негативы).
+#[tokio::test]
+async fn task_edit_fact_track_cannot_enter_testing() {
+    let (tools, _memory) = hub();
+    let created = call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "fact_track: без тестов", "body": "б", "fact_track": true }),
+    )
+    .await
+    .expect("create ок");
+    let n: u64 = created
+        .trim()
+        .split('#')
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .and_then(|s| s.parse().ok())
+        .expect("номер в ответе");
+    call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": n, "priority": "medium", "automerge": true }),
+    )
+    .await
+    .expect("поля разбора заполнены (гейт Analys)");
+    call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": n, "status": "In Progress" }),
+    )
+    .await
+    .expect("fast-track легален");
+    let res = call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": n, "status": "Testing" }),
+    )
+    .await;
+    assert!(res.is_err(), "прямая отправка на тест закрыта флагом");
+}
+
+/// direct + fact_track взаимоисключающи (#1631): create с обоими
+/// true — громкий отказ, строка не рождается.
+#[tokio::test]
+async fn task_create_direct_and_fact_track_are_mutually_exclusive() {
+    let (tools, _memory) = hub();
+    let res = call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "оба флага", "body": "б", "direct": true, "fact_track": true }),
+    )
+    .await;
+    assert!(res.is_err(), "оба флага — отказ: {res:?}");
 }
 
 /// task_edit с одним automerge — непустой патч: до фикса edit не нёс
@@ -1767,7 +1904,7 @@ async fn task_body_with_fm_only_body_refuses_without_write() {
     for fm_only in [
         "---\nbranch: work/task-1\n---\n",
         "---\ntitle: x\nstatus: Done\n---\n",
-        "--- fm ---\nbranch: work/task-1\npr: —\nautomerge: true\ndirect: false\nbody_hash: abc\n",
+        "--- fm ---\nbranch: work/task-1\npr: —\nautomerge: true\ndirect: false\nfact_track: false\nbody_hash: abc\n",
     ] {
         let err = call(
             &tools,
