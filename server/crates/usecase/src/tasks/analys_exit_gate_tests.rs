@@ -120,6 +120,7 @@ impl TaskBoardRepo for GateBoard {
             Default::default(),
             uwuwu_domain::Vcs::Local,
             priority,
+            false,
         ));
         if let Some(a) = a {
             task.set_automerge(a);

@@ -10,6 +10,8 @@ mod clean_journal;
 mod clock;
 mod config;
 mod diag;
+#[cfg(test)]
+mod direct_tick_tests;
 mod executor;
 #[cfg(test)]
 mod executor_signal_tests;

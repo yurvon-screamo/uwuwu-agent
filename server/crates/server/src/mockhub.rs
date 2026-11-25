@@ -429,6 +429,10 @@ impl TaskBoardRepo for MemoryHub {
             }
             if let Some(d) = direct {
                 task.set_direct(d);
+                // carrier-истина для проекции (#1616): read_board/issue_fields
+                // читают state.fields — без записи сюда apply_fields на каждом
+                // чтении доски молча сбрасывал бы флаг в дефолтный false
+                state.fields.entry(number).or_default().set_direct(d);
             }
             Ok(())
         })
@@ -957,6 +961,23 @@ impl IssueFieldStore for MemoryHub {
                     continue;
                 }
                 match (*name, value) {
+                    ("Direct", Some(v)) => {
+                        // флаг direct (#1357): поле строки + carrier-запись
+                        // state.fields (проекция issue_fields/read_board) —
+                        // симметрия set_board_cells, иначе enrichment видит
+                        // дефолтный false (#1616)
+                        let on = v == "on";
+                        if let Some(task) = state.tasks.get_mut(&number) {
+                            task.set_direct(on);
+                        }
+                        f.set_direct(on);
+                    }
+                    ("Direct", None) => {
+                        if let Some(task) = state.tasks.get_mut(&number) {
+                            task.set_direct(false);
+                        }
+                        f.set_direct(false);
+                    }
                     ("Branch", Some(v)) => {
                         if let Some(b) = uwuwu_domain::BranchName::parse(v) {
                             f.set_branch(b);

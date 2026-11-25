@@ -1037,7 +1037,16 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
         (None, Some(url)) => Vcs::Artifact { url },
         (None, None) => Vcs::Local,
     };
-    TaskFields::new(assignments, vcs, priority)
+    // Флаг direct (#1357): единственный честный рид — REST
+    // issue_field_values, виден на любой доске. Pv2-скан Direct не
+    // отдаёт: колонка не прилинкована ни к одной доске — blindness
+    // скана и есть механизм дубль-спавна #1616; apply_fields
+    // перезаписывает скановое значение безусловно.
+    let direct = raw
+        .get(uwuwu_usecase::F_DIRECT)
+        .map(|v| v == "on")
+        .unwrap_or(false);
+    TaskFields::new(assignments, vcs, priority, direct)
 }
 
 #[async_trait]
@@ -1269,13 +1278,6 @@ impl TaskBoardRepo for GitHubHub {
             .map(|v| v == "on" || v == "true")
             .unwrap_or(false);
         task.set_automerge(automerge);
-        // direct с носителя (#1357) — симметрично automerge: REST-путь MCP
-        // обязан быть честен, тик-путь читает item_values
-        let direct = raw
-            .get(uwuwu_usecase::F_DIRECT)
-            .map(|v| v == "on")
-            .unwrap_or(false);
-        task.set_direct(direct);
         // тип — нативный issue Type (верхний уровень GET issue, не
         // issue_field_values; #1271) — REST-путь MCP честен, как тик-путь
         task.set_kind(uwuwu_usecase::parse_task_type(
@@ -3170,6 +3172,24 @@ mod tests {
             ]}
         });
         assert!(item_values(&item).direct);
+    }
+
+    /// Флаг direct через enrichment (#1616): map_task_fields читает
+    /// REST issue_field_values — единственный честный рид (Pv2-скан
+    /// Direct не отдаёт: колонка не прилинкована ни к одной доске).
+    /// Отсутствие поля — «носитель не сказал — не direct».
+    #[test]
+    fn map_task_fields_carries_direct_from_rest_carrier() {
+        let mut on = Fields::new();
+        on.insert(uwuwu_usecase::F_DIRECT.to_string(), "on".into());
+        assert!(
+            map_task_fields(&on).direct(),
+            "REST Direct=on → TaskFields.direct"
+        );
+        assert!(
+            !map_task_fields(&Fields::new()).direct(),
+            "нет поля — не direct (дефолт false)"
+        );
     }
 
     #[test]

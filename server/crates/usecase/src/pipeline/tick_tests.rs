@@ -161,6 +161,10 @@ impl TaskBoardRepo for FakeBoard {
                         f.set_artifact(p);
                     }
                 }
+                // direct тоже переносим (#1616): apply_fields перезаписывает
+                // флаг безусловно — фейк без него молча сбрасывал бы
+                // set_direct снапшота на каждом enrichment
+                f.set_direct(t.direct());
                 f
             })
             .unwrap_or_default())
@@ -3228,6 +3232,44 @@ async fn kick_unfreezes_dead_dev_session() {
         "мёртвая дев-сессия снята при кике: {log:?}"
     );
     assert_eq!(out.spawns_done, 1, "свежий исполнитель заспавнен");
+}
+
+#[tokio::test]
+async fn direct_row_with_dead_session_is_never_respawned() {
+    // #1616 (срез 4): контракт #1357 безусловен — direct-строке фабрика
+    // никого не спавнит, включая респавн по мёртвой сессии; строка тихо
+    // ждёт владельца: ячейка не чистится, эскалаций нет
+    let state = Arc::new(MemState(Mutex::default()));
+    let mut t = task(50, Status::InProgress);
+    // флаг едет в полях носителя (#1616): apply_fields перезаписывает
+    // direct безусловно — set_direct до enrichment затёрся бы
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_direct_dead").unwrap(),
+    );
+    f.set_direct(true);
+    t.apply_fields(f);
+    // тот же раунд (prev=In Progress) — респавн-путь, не кик-разморозка
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((50, Status::InProgress));
+    let (u, board, sessions, _) = usecase_with_state(vec![t], PrState::Missing, state);
+    sessions
+        .dead_sessions
+        .lock()
+        .unwrap()
+        .push("ses_direct_dead".into());
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.spawns_done, 0, "direct-строка не респавнится");
+    let log = board.log.lock().unwrap();
+    assert!(
+        !log.iter().any(|l| l.starts_with("clear#50=")),
+        "ячейку direct-строки конвейер не чистит: {log:?}"
+    );
 }
 
 #[tokio::test]

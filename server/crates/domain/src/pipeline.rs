@@ -13,7 +13,7 @@ pub struct UtcMinute {
 }
 
 /// Пик-окно GLM: будни [start, end) минут UTC.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PeakWindow {
     pub enabled: bool,
     pub start_min: u32,
@@ -495,11 +495,33 @@ mod tests {
                 url: crate::task::PrUrl::parse("https://github.com/o/r/pull/7").unwrap(),
             },
             crate::task::Priority::Empty,
+            false,
         ));
         assert_eq!(
             decide(&t),
             Action::Automerge,
             "автомерж direct-строки не гасится флагом"
+        );
+    }
+
+    #[test]
+    fn decide_sees_direct_after_enrichment_overwrites_scan_blindness() {
+        // #1616: скан доски без линкованной колонки Direct несёт
+        // direct=false (set_direct не звался) — спавн-кандидат; enrichment
+        // (REST-носитель) перезаписывает флаг безусловно, и decide
+        // не спавнит обогащённую direct-строку
+        let mut t = task(Status::InProgress);
+        assert!(
+            matches!(decide(&t), Action::Spawn { .. }),
+            "скановая слепота: строка выглядит спавн-кандидатом"
+        );
+        let mut fields = crate::task::TaskFields::default();
+        fields.set_direct(true);
+        t.apply_fields(fields);
+        assert!(t.direct(), "apply_fields донёс флаг безусловно");
+        assert!(
+            matches!(decide(&t), Action::Observe { .. }),
+            "после enrichment direct-строка не спавнится"
         );
     }
 
@@ -511,6 +533,7 @@ mod tests {
             std::collections::BTreeMap::new(),
             crate::task::Vcs::Branch(branch),
             crate::task::Priority::Empty,
+            false,
         ));
         assert!(matches!(decide(&t), Action::Observe { .. }));
         t.set_automerge(true);
@@ -532,6 +555,7 @@ mod tests {
                     .unwrap(),
             },
             crate::task::Priority::Empty,
+            false,
         ));
         assert!(
             matches!(decide(&t), Action::Observe { .. }),
@@ -542,6 +566,7 @@ mod tests {
             std::collections::BTreeMap::new(),
             crate::task::Vcs::Branch(branch),
             crate::task::Priority::Empty,
+            false,
         ));
         assert_eq!(decide(&t), Action::Automerge);
     }
@@ -562,6 +587,7 @@ mod tests {
                     url: crate::task::PrUrl::parse(url).unwrap(),
                 },
                 crate::task::Priority::Empty,
+                false,
             )
         };
         t.apply_fields(fields("https://github.com/o/r/wiki/a"));
