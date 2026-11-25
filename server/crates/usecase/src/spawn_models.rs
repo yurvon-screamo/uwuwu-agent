@@ -25,8 +25,9 @@ impl SpawnModels {
 
     /// Канон владельца — дефолт карты при отсутствии секции в конфиге.
     /// Синхрон с config.example (кросс-гвард): flash-контуры на
-    /// opencode-go/hy4-flash-free#high (25.11, #1628), ревьюверы —
-    /// zai-coding-plan/glm-5.4#high (поручение владельца 18.11, f1b9091c).
+    /// opencode-go/hy4-flash-free#high (25.11, #1628 — supersedes санкцию
+    /// 24.11 в #1607 по ключу analyst), ревьюверы стадий + ревью
+    /// аналитики — zai-coding-plan/glm-5.4#high (поручение 18.11, f1b9091c).
     pub fn canonical() -> Self {
         let mut map = HashMap::new();
         let mut put = |key: &str, raw: &str| {
@@ -106,13 +107,24 @@ mod tests {
     #[test]
     fn canonical_carries_owner_model_map() {
         // канон владельца 25.11 (#1628): flash-контуры на
-        // opencode-go/hy4-flash-free#high, ревьюверы — glm-5.4#high;
+        // opencode-go/hy4-flash-free#high (supersedes санкцию 24.11 в #1607
+        // по ключу analyst), ревьюверы — glm-5.4#high;
         // карта = config.example verbatim (кросс-гвард)
         let m = SpawnModels::canonical();
         assert_eq!(
             m.for_agent(Agent::PlanReviewer),
             SpawnModel::parse("zai-coding-plan/glm-5.4#high").unwrap(),
             "ревьюверы — полный glm-5.4#high (канон #417)"
+        );
+        assert_eq!(
+            m.for_agent(Agent::Analyst),
+            SpawnModel::parse("opencode-go/hy4-flash-free#high").unwrap(),
+            "аналитик — flash-free (санкция 25.11 в #1628, без исключений)"
+        );
+        assert_eq!(
+            m.for_agent(Agent::AnalystReviewer),
+            SpawnModel::parse("zai-coding-plan/glm-5.4#high").unwrap(),
+            "ревью аналитики — glm-5.4#high (санкция 24.11, #1607)"
         );
         assert_eq!(
             m.for_agent(Agent::Dreamer),
