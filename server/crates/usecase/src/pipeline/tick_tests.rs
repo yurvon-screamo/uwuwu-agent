@@ -3849,6 +3849,85 @@ async fn direct_row_with_dead_session_is_never_respawned() {
 }
 
 #[tokio::test]
+async fn direct_row_with_lost_session_is_never_resurrected() {
+    // #1616 (срез 4, тестировщик): lost-resurrection-рука — тоже спавн;
+    // direct-строке запрещён контрактом #1357 безусловно. Гард стоит до
+    // hold/policy/resurrection: исход LostAct::Counted — тихий no-op,
+    // строка ждёт владельца (ни create, ни эскалации, ни чистки ячейки).
+    // Дифференциал от T2 (#1288): без гарда resurrection предпринимается
+    // на первом тике (create проходит) — тест падает.
+    let mut t = task(51, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_direct_lost").unwrap(),
+    );
+    f.set_direct(true);
+    t.apply_fields(f);
+    let mut sessions = FakeSessions::new();
+    // исполнитель подтвердил потерю: доставка 404 при пустом списке —
+    // маршрутизация уходит в lost-руку (не десинк, не blind)
+    sessions.prompt_lost_all = true;
+    let board = Arc::new(FakeBoard {
+        rows: std::sync::Mutex::new(vec![t]),
+        log: Mutex::default(),
+        comments: foreign_comment(),
+        fields_fails: false,
+        set_session_fails: false,
+        set_pr_fails: AtomicBool::new(false),
+        clear_session_fails: AtomicBool::new(false),
+        status_fails: AtomicBool::new(false),
+    });
+    let prs = Arc::new(FakePrs {
+        state: PrState::Missing,
+        merges: Mutex::default(),
+        merge_fails: AtomicBool::new(false),
+        probes: Mutex::default(),
+        url: Mutex::default(),
+    });
+    let sessions = Arc::new(sessions);
+    let u = TickUseCase {
+        board: board.clone(),
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        prs,
+        clock: Arc::new(FixedClock),
+        state: Arc::new(MemState(Mutex::default())),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        boot_ms: 0,
+        judge: None,
+        judge_cfg: Default::default(),
+        quota: None,
+    };
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.spawns_done, 0,
+        "resurrection direct-строки не предпринята"
+    );
+    assert!(
+        sessions.spawned.lock().unwrap().is_empty(),
+        "гард lost-руки: create не вызывался (LostAct::Counted до resurrection)"
+    );
+    assert!(
+        sessions.deleted.lock().unwrap().is_empty(),
+        "сирота-зачистки нет: спавн не начинался"
+    );
+    assert_eq!(
+        out.session_lost_flagged, 0,
+        "эскалаций нет — строка тихо ждёт владельца"
+    );
+    assert_eq!(
+        out.lost_deferred, 0,
+        "исход Counted, не Deferred — гард раньше policy-гейта"
+    );
+    assert_eq!(out.held_live, 0, "гард раньше hold по живой сестре");
+    let log = board.log.lock().unwrap();
+    assert!(
+        !log.iter().any(|l| l.starts_with("clear#51=")),
+        "ячейку direct-строки конвейер не чистит: {log:?}"
+    );
+}
+
+#[tokio::test]
 async fn dead_stage_session_does_not_hold_cup() {
     // #1200: кап держат живые LLM-работы, не статусы — строка с мёртвой
     // сессией не активна, и её слот достаётся следующему запуску
