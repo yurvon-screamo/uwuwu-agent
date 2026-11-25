@@ -160,6 +160,20 @@ pub struct SectionWrite<'a> {
     pub confirm: bool,
 }
 
+/// Чтение current для канон-гарда edit(): кеш-вид (wt/items — fast
+/// path, fresh-рид не оплачен) или свежий носитель (рид уже
+/// выполнен: идемпотентная ветка #1437, нечитаемый кеш-вид —
+/// Low дельта-раунда #1615). Различие несёт квоту гарда: Fresh не
+/// доплачивает повторный GraphQL-рид на отказной ветке.
+enum GuardView {
+    /// кеш-вид носителя; может отстать от носителя (REST items-индекс
+    /// пере-фетчится в wt-окне и при лаге листа несёт до-записный
+    /// статус минуты — инстанс #1612)
+    Cached(Status),
+    /// свежий носитель; повторная fresh-сверка не нужна
+    Fresh(Status),
+}
+
 /// Option<Status> с носителя → верифицируемый current гарда: строки
 /// нет и значение непарсящееся — громкие отказы (контракт #1235/#1236),
 /// запись без верифицированного current запрещена. Оба чтения гарда —
@@ -422,27 +436,7 @@ impl TaskWriter for TaskWriteUseCase {
         let mut want_automerge: Option<bool> = None;
         let mut status_delivery: Option<StatusDelivery> = None;
         if let Some(status) = patch.status {
-            let current = self.guard_current(&board, number, status).await?;
-            // Классовые рёбра (#1357, #1631): In Progress → Review открыто
-            // только direct-строке, ReviewResult → UserReview — только
-            // fact_track-строке, тест-контур fact_track-строке закрыт.
-            // Флаги добываются свежим чтением носителя (семейство
-            // стейл-багов #1258/#1346: снапшоту здесь не верим), остальным
-            // рёбрам флаги не нужны
-            let (direct, fact_track) = self.carrier_flags(number, current, status).await;
-            if !uwuwu_domain::Status::can_transition_with(current, status, direct, fact_track) {
-                tracing::warn!(
-                    event = "board.guard_rejected",
-                    number,
-                    from = %naming::status_name(current),
-                    to = %naming::status_name(status),
-                    "Гард канона: переход запрещён (fresh row_status)"
-                );
-                return Err(UsecaseError::Board(format!(
-                    "transition {:?} → {:?} outside the pipeline canon",
-                    current, status
-                )));
-            }
+            let current = self.guard_canon(&board, number, status).await?;
             // Гейт полноты полей на выходе из Analys (#1280): волна
             // аналитики обязана выпускать строки с явными Приоритетом
             // и Automerge — решение разбора, не пустота носителя.
@@ -978,16 +972,31 @@ where
 /// Дисплей-шапка task_get — рендер MCP-карточки, не носитель: агенты
 /// копируют вывод task_get назад в task_body, и шапка наслаивалась в
 /// теле (fm-стек инцидента #1331, инстансы #1526). Состав рендера
-/// (tools.rs task_get): тайтл-строка «#N title — status», пустая
-/// строка, fm-блок («--- fm ---» + branch/pr/automerge/direct/
-/// fact_track/type/body_hash). Срезается на границе записи: инвариант
-/// ADR-105 «тело — чистый markdown» держит сервер, не дисциплина
-/// агента (прецедент #1151). Консервативно: строго набор/порядок
-/// ключей рендера и форма карточки; срезаются все подряд идущие слои
-/// (стек, #1632); любой посторонний контент («--- fm ---» внутри
-/// текста) не трогается.
+/// (api/tools.rs task_get): тайтл-строка «#N title — status», пустая
+/// строка, fm-блок с ключами одного из рендеров ниже. Срезается на
+/// границе записи: инвариант ADR-105 «тело — чистый markdown» держит
+/// сервер, не дисциплина агента (прецедент #1151). Консервативно:
+/// строго набор/порядок ключей и форма карточки; срезаются все
+/// подряд идущие слои (стек, #1632); любой посторонний контент
+/// («--- fm ---» внутри текста) не трогается. Зеркало рендера: рендер
+/// меняется — менять формы здесь; пин в tools_tests собран из
+/// реального рендера и краснеет при расхождении (#1604 — body_bytes;
+/// #1631 — fact_track).
 fn strip_task_get_header(md: &str) -> &str {
-    const KEYS: [&str; 7] = [
+    // Актуальный рендер (#1604+#1631): branch/pr/automerge/direct/
+    // fact_track/type/body_hash/body_bytes
+    const KEYS: [&str; 8] = [
+        "branch: ",
+        "pr: ",
+        "automerge: ",
+        "direct: ",
+        "fact_track: ",
+        "type: ",
+        "body_hash: ",
+        "body_bytes: ",
+    ];
+    // Легаси-рендер #1631..#1604: fact_track без body_bytes
+    const LEGACY_KEYS: [&str; 7] = [
         "branch: ",
         "pr: ",
         "automerge: ",
@@ -996,8 +1005,29 @@ fn strip_task_get_header(md: &str) -> &str {
         "type: ",
         "body_hash: ",
     ];
+    // Легаси-рендер #1271..#1631: type без fact_track/body_bytes
+    const LEGACY_KEYS_6: [&str; 6] = [
+        "branch: ",
+        "pr: ",
+        "automerge: ",
+        "direct: ",
+        "type: ",
+        "body_hash: ",
+    ];
+    // Легаси-рендер до #1271: без type (старые выводы копируются
+    // агентами из старых сессий и статей опыта — срезаются тоже)
+    const LEGACY_KEYS_NO_TYPE: [&str; 5] =
+        ["branch: ", "pr: ", "automerge: ", "direct: ", "body_hash: "];
     let mut pos = md;
-    while let Some(rest) = strip_header_layer(pos, &KEYS) {
+    while let Some(rest) = strip_header_layer(
+        pos,
+        &[
+            &KEYS[..],
+            &LEGACY_KEYS[..],
+            &LEGACY_KEYS_6[..],
+            &LEGACY_KEYS_NO_TYPE[..],
+        ],
+    ) {
         pos = rest;
     }
     pos
@@ -1005,9 +1035,10 @@ fn strip_task_get_header(md: &str) -> &str {
 
 /// Один слой шапки в начале входа: fm-блок (форма A) либо полная
 /// карточка рендера — тайтл-строка + пустая строка + fm-блок (форма B,
-/// #1632). None — не слой шапки, вход не трогается.
-fn strip_header_layer<'a>(md: &'a str, keys: &[&str]) -> Option<&'a str> {
-    if let Some(rest) = strip_fm_block(md, keys) {
+/// #1632). Ключи сверяются со всеми наборами рендеров (актуальный +
+/// легаси). None — не слой шапки, вход не трогается.
+fn strip_header_layer<'a>(md: &'a str, key_sets: &[&[&str]]) -> Option<&'a str> {
+    if let Some(rest) = strip_fm_block(md, key_sets) {
         return Some(rest);
     }
     let (title_line, after_title) = md.split_once('\n')?;
@@ -1015,20 +1046,37 @@ fn strip_header_layer<'a>(md: &'a str, keys: &[&str]) -> Option<&'a str> {
         return None;
     }
     let after_blank = after_title.strip_prefix('\n')?;
-    strip_fm_block(after_blank, keys)
+    strip_fm_block(after_blank, key_sets)
 }
 
-/// fm-блок рендера: маркер + ключи строго по порядку; возврат — вход
-/// после шапки без ведущих пустых строк.
-fn strip_fm_block<'a>(md: &'a str, keys: &[&str]) -> Option<&'a str> {
+/// fm-блок рендера: маркер + ключи одного из наборов строго по
+/// порядку; возврат — вход после шапки без ведущих пустых строк.
+fn strip_fm_block<'a>(md: &'a str, key_sets: &[&[&str]]) -> Option<&'a str> {
     let rest = md.strip_prefix("--- fm ---\n")?;
+    key_sets
+        .iter()
+        .find_map(|keys| strip_header_keys(rest, keys))
+}
+
+/// Строгое совпадение набора/порядка ключей одного рендера; частичные
+/// шапки и посторонний контент — None. У последнего ключа хвостовой
+/// перенос не обязателен: копия шапки проходит через .trim() скрипта
+/// потребителя — без этого KEYS (актуальная форма) не матчится, а
+/// короткая легаси-форма матчится на префиксе, и остаток последней
+/// строки («body_bytes: N») уезжает эффективным контентом (#1604,
+/// ревью раунд 2).
+fn strip_header_keys<'a>(rest: &'a str, keys: &[&str]) -> Option<&'a str> {
     let mut pos = rest;
-    for key in keys {
-        let line_end = pos.find('\n')?;
+    for (index, key) in keys.iter().enumerate() {
+        let line_end = match pos.find('\n') {
+            Some(at) => at,
+            None if index + 1 == keys.len() => pos.len(),
+            None => return None,
+        };
         if !pos[..line_end].starts_with(key) {
             return None;
         }
-        pos = &pos[line_end + 1..];
+        pos = pos[line_end..].strip_prefix('\n').unwrap_or("");
     }
     Some(pos.trim_start_matches('\n'))
 }
@@ -1107,31 +1155,128 @@ impl EditExpectations {
 }
 
 impl TaskWriteUseCase {
-    /// Current для гарда канона edit(): wt-чтение носителя (свежее
-    /// против снапшота, #1235); идемпотентная переустановка (current ==
+    /// Чтение current для канон-гарда edit(): wt-чтение носителя (свежее
+    /// против снапшота, #1235). Идемпотентная переустановка (current ==
     /// target) доверяет только свежему носителю (#1437, симптом 2) —
-    /// wt/items-кеш могли показать цель там, где носитель живёт другим
-    /// статусом, и стейл-писец (повтор старого вердикта пробуждённой
-    /// сессией) проводил запрещённый переход как «переустановку» поверх
-    /// кеш-лага. Нелегальные на вид рёбра wt-щитом #1346 не тронуты —
-    /// свежее чтение только здесь. None/непарсящееся — громкие отказы
-    /// (verifiable_current, контракт #1235/#1236).
+    /// стейл-писец (повтор старого вердикта пробуждённой сессией)
+    /// разваливается на fresh-риде. Нечитаемый кеш-вид (строки нет в
+    /// лагающем REST-листе — свежесозданная строка, или поле пусто)
+    /// различается fresh-ридом: носитель читается — ребро идёт по нему,
+    /// отказ по читаемости честен (Low дельта-раунда #1615: прежний
+    /// «row #N is not on board» винил носитель за кеш-миссу). Кеш-вид,
+    /// отличный от цели, возвращается как Cached — свежую сверку на
+    /// отказной ветке делает guard_canon. Громкие отказы None/Empty —
+    /// только при подтверждённом fresh (verifiable_current,
+    /// контракт #1235/#1236).
     async fn guard_current(
         &self,
         board: &str,
         number: u64,
         target: Status,
-    ) -> UsecaseResult<Status> {
-        let current =
-            verifiable_current(board, number, self.board.row_status(board, number).await?)?;
-        if current != target {
-            return Ok(current);
+    ) -> UsecaseResult<GuardView> {
+        let cached = match self.board.row_status(board, number).await? {
+            Some(s) if s != Status::Empty => s,
+            _ => {
+                return Ok(GuardView::Fresh(verifiable_current(
+                    board,
+                    number,
+                    self.board.fresh_row_status(board, number).await?,
+                )?));
+            }
+        };
+        if cached != target {
+            return Ok(GuardView::Cached(cached));
         }
-        verifiable_current(
+        Ok(GuardView::Fresh(verifiable_current(
             board,
             number,
             self.board.fresh_row_status(board, number).await?,
-        )
+        )?))
+    }
+
+    /// Гард канона перехода edit(): попытка по кеш-виду (wt-щит #1346,
+    /// fast path — fresh-рид не тратится на легальные переходы);
+    /// грядущий отказ сверяется со свежим носителем (#1615): кеш-вид за
+    /// пределами wt-окна мог отстать от носителя — REST items-индекс
+    /// пере-фетчится внутри wt-окна и при read-лаге листа минутного
+    /// масштаба несёт до-записный статус ещё минуты (инстанс #1612:
+    /// честный носитель «Review Analys», кеш показывал «Analys»,
+    /// легальное ребро Review Analys → Todo трижды умерло отказом
+    /// «вне канона», вердикт ревьювера висел в воздухе). Отказ
+    /// конвейерной стадии дорог (ложная эскалация живой строки).
+    /// Квотная дисциплина ADR-113/#1437: точечный GraphQL-рид только
+    /// на редких ветках — отказная, идемпотентная, нечитаемый кеш-вид
+    /// (один рид на вызов, без повторов).
+    async fn guard_canon(&self, board: &str, number: u64, status: Status) -> UsecaseResult<Status> {
+        match self.guard_current(board, number, status).await? {
+            // Свежий носитель уже оплачен (рид #1437/нечитаемый кеш-вид):
+            // повторной fresh-сверки нет — канон-проверка по нему
+            GuardView::Fresh(current) => {
+                let (direct, fact_track) = self.carrier_flags(number, current, status).await;
+                if uwuwu_domain::Status::can_transition_with(current, status, direct, fact_track) {
+                    return Ok(current);
+                }
+                // отказ: кеш-вида как источника здесь нет (рид был свежим
+                // или кеш нечитаем) — расхождению докладывать нечего
+                Err(Self::reject_canon(number, current, None, status))
+            }
+            GuardView::Cached(cached) => {
+                let (direct, fact_track) = self.carrier_flags(number, cached, status).await;
+                if uwuwu_domain::Status::can_transition_with(cached, status, direct, fact_track) {
+                    return Ok(cached);
+                }
+                let fresh = verifiable_current(
+                    board,
+                    number,
+                    self.board.fresh_row_status(board, number).await?,
+                )?;
+                let (direct, fact_track) = self.carrier_flags(number, fresh, status).await;
+                if !uwuwu_domain::Status::can_transition_with(fresh, status, direct, fact_track) {
+                    return Err(Self::reject_canon(number, fresh, Some(cached), status));
+                }
+                tracing::warn!(
+                    event = "board.guard_stale_cache",
+                    number,
+                    cached = %naming::status_name(cached),
+                    fresh = %naming::status_name(fresh),
+                    "Кеш-вид гарда отстал от носителя — переход проведён по свежему чтению (#1615)"
+                );
+                Ok(fresh)
+            }
+        }
+    }
+
+    /// Честный отказ канона: текст по свежему значению носителя, а не по
+    /// кеш-виду; расхождение кеш-вида — в событие лога (догфуд, Low
+    /// дельта-раунда #1615: в квадранте «расходятся, носитель тоже
+    /// запрещает» кеш-видимое значение было невидимо).
+    fn reject_canon(
+        number: u64,
+        fresh: Status,
+        cached: Option<Status>,
+        to: Status,
+    ) -> UsecaseError {
+        match cached {
+            Some(cached) => tracing::warn!(
+                event = "board.guard_rejected",
+                number,
+                cached = %naming::status_name(cached),
+                from = %naming::status_name(fresh),
+                to = %naming::status_name(to),
+                "Гард канона: переход запрещён (свежий носитель подтвердил отказ)"
+            ),
+            None => tracing::warn!(
+                event = "board.guard_rejected",
+                number,
+                from = %naming::status_name(fresh),
+                to = %naming::status_name(to),
+                "Гард канона: переход запрещён (свежий носитель подтвердил отказ)"
+            ),
+        }
+        UsecaseError::Board(format!(
+            "transition {:?} → {:?} outside the pipeline canon",
+            fresh, to
+        ))
     }
 
     /// Флаги классов строк с носителя (#1357, #1631): direct гвардит
@@ -1368,6 +1513,7 @@ mod tests {
                 Default::default(),
                 vcs,
                 priority,
+                false,
             ));
             task.set_kind(self.kind);
             task.set_automerge(self.automerge);
@@ -2071,12 +2217,34 @@ mod tests {
         assert_eq!(out, "## Постановка\n\nТекст.\n");
     }
 
+    #[test]
+    fn create_body_strips_task_get_header_without_trailing_newline() {
+        let header = "--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\nfact_track: false\ntype: feature\nbody_hash: h\nbody_bytes: 66";
+        let out = render_create_body(&spec(header));
+        assert!(
+            !out.contains("body_bytes"),
+            "остаток шапки не становится телом: {out}"
+        );
+    }
+
     /// Дисплей-шапка task_get срезается на границе записи (fm-стек
     /// инцидента #1331: агент копирует вывод task_get назад в task_body).
+    /// Все четыре формы рендера — актуальная (#1604+#1631, fact_track и
+    /// body_bytes) и три легаси (#1631+, #1271+, до #1271).
     #[test]
     fn task_get_display_header_is_stripped() {
-        let md = "--- fm ---\nbranch: work/task-1331\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: —\nbody_hash: 9de430c691c92328\n\n## Постановка\nтекст";
+        // актуальный рендер (#1604+#1631): 8 ключей, body_bytes последним
+        let md = "--- fm ---\nbranch: work/task-1604\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: 9de430c691c92328\nbody_bytes: 36\n\n## Постановка\nтекст";
         assert_eq!(strip_task_get_header(md), "## Постановка\nтекст");
+        // легаси #1631..#1604: 7 ключей, fact_track без body_bytes
+        let md_legacy7 = "--- fm ---\nbranch: work/task-1331\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: —\nbody_hash: 9de430c691c92328\n\n## Постановка\nтекст";
+        assert_eq!(strip_task_get_header(md_legacy7), "## Постановка\nтекст");
+        // легаси #1271..#1631: 6 ключей, без fact_track/body_bytes
+        let md_legacy6 = "--- fm ---\nbranch: x\npr: —\nautomerge: true\ndirect: false\ntype: bug\nbody_hash: h\n\n## Т";
+        assert_eq!(strip_task_get_header(md_legacy6), "## Т");
+        // легаси до #1271: 5 ключей, без type
+        let md_legacy5 = "--- fm ---\nbranch: work/task-1331\npr: —\nautomerge: true\ndirect: false\nbody_hash: 9de430c691c92328\n\n## Постановка\nтекст";
+        assert_eq!(strip_task_get_header(md_legacy5), "## Постановка\nтекст");
     }
 
     /// fm-стек из чистых fm-блоков, без тайтл-строк (#1331): форма A
@@ -2123,23 +2291,24 @@ mod tests {
         assert_eq!(strip_task_get_header(&md), "## Постановка\nтело");
     }
 
-    /// Страж границы: внутренний слой с легаси-набором ключей (6, без
-    /// fact_track) набором этой ветки не распознаётся — остаётся до
-    /// посадки легаси-наборов #506.
+    /// Смешанный стек: внешний слой актуального рендера + внутренний
+    /// легаси (6 ключей, без fact_track/body_bytes) — срезаются ОБА:
+    /// легаси-наборы приземлились с #506 (#1604 в мастере), страж
+    /// границы перевёрнут (решение 6 плана #1632).
     #[test]
-    fn task_get_stacked_legacy_inner_layer_is_kept() {
+    fn task_get_stacked_mixed_render_and_legacy_layers_are_stripped() {
         let fresh = "#1 t — In Progress\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\n\n";
         let legacy = "#2 t — Todo\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\ntype: bug\nbody_hash: h\n\n";
         let md = format!("{fresh}{legacy}## Тело");
-        assert_eq!(strip_task_get_header(&md), format!("{legacy}## Тело"));
+        assert_eq!(strip_task_get_header(&md), "## Тело");
     }
 
-    /// Шапка без хвостового переноса не распознаётся — терминатор
-    /// «конец входа» не здесь: дельта #506 (1bb88cf4).
+    /// Шапка без хвостового переноса срезается: терминатор последнего
+    /// ключа — конец входа (#1604), дельта приземлилась с #506.
     #[test]
-    fn task_get_header_without_trailing_newline_is_kept() {
+    fn task_get_header_without_trailing_newline_is_stripped() {
         let md = "--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h";
-        assert_eq!(strip_task_get_header(md), md);
+        assert_eq!(strip_task_get_header(md), "");
     }
 
     /// Карточка рендера с заданной тайтл-строкой и валидным fm-блоком:
@@ -2222,6 +2391,19 @@ mod tests {
     }
 
     #[test]
+    fn task_get_header_only_without_trailing_newline_strips_to_empty() {
+        let h8 = "--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\nfact_track: false\ntype: feature\nbody_hash: h\nbody_bytes: 66";
+        assert_eq!(strip_task_get_header(h8), "");
+        let h7 = "--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h";
+        assert_eq!(strip_task_get_header(h7), "");
+        let h6 =
+            "--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\ntype: bug\nbody_hash: h";
+        assert_eq!(strip_task_get_header(h6), "");
+        let h5 = "--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\nbody_hash: h";
+        assert_eq!(strip_task_get_header(h5), "");
+    }
+
+    #[test]
     fn task_get_header_partial_or_foreign_is_kept() {
         // неполный набор ключей — не рендер task_get
         let md = "--- fm ---\nbranch: x\npr: y\n\n## Тело";
@@ -2232,6 +2414,10 @@ mod tests {
         // валидный fm старого канона — это fm_lite, не дисплей-шапка
         let md3 = "---\ntitle: x\n---\nтекст";
         assert_eq!(strip_task_get_header(md3), md3);
+        // лишний посторонний ключ в наборе — не рендер (актуальная
+        // 8-ключевая форма с чужой строкой между type и body_hash)
+        let md4 = "--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nслучайная строка\nbody_hash: h\nbody_bytes: 1\n\n## Т";
+        assert_eq!(strip_task_get_header(md4), md4);
     }
 
     // --- Честные квитанции: контрольное чтение носителя (#1331) ---

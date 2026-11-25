@@ -53,7 +53,9 @@ pub trait TaskBoardRepo: Send + Sync {
     /// Свежий статус строки с НОСИТЕЛЯ мимо всех серверных кешей
     /// (write-through и индексный): доказательство идемпотентного
     /// гарда edit() (#1437, симптом 2 — стейл-писец проводил
-    /// перезапись как «переустановку» поверх кеш-лага) и материал
+    /// перезапись как «переустановку» поверх кеш-лага), отказной
+    /// ветки канон-гарда (#1615 — отказ по кеш-виду подтверждается
+    /// носителем, легальное ребро идёт по свежему чтению) и материал
     /// verify статусной записи. Реализации без кешей могут не
     /// переопределять — дефолт делегирует row_status.
     async fn fresh_row_status(&self, board: &str, number: u64) -> UsecaseResult<Option<Status>> {
@@ -184,15 +186,6 @@ pub struct IssueView {
     pub comments: Vec<CommentRef>,
 }
 
-/// Итог append-мутации дока (#1353): честность ответа read-after-write.
-/// `created` — файла не было, док создан этой строкой (иначе — append к
-/// существующему телу); `lines` — строк в доке после записи.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AppendDocOutcome {
-    pub created: bool,
-    pub lines: usize,
-}
-
 /// Вики-репозиторий: чтение/запись доков (MCP docs_*, кроны, дример).
 #[async_trait]
 pub trait WikiRepo: Send + Sync {
@@ -207,15 +200,11 @@ pub trait WikiRepo: Send + Sync {
     async fn doc_shas(&self) -> UsecaseResult<Vec<(String, String)>>;
     /// Перезапись дока (commit в ветку, ff-only).
     async fn write_doc(&self, slug: &str, content: &str, message: &str) -> UsecaseResult<()>;
-    /// Append строки в конец дока (создаёт при отсутствии); возвращает
-    /// факт операции — создан или append к существующему, строк после
-    /// записи (#1353: ответ тула отражает факт, не эхо ввода).
-    async fn append_doc(
-        &self,
-        slug: &str,
-        line: &str,
-        message: &str,
-    ) -> UsecaseResult<AppendDocOutcome>;
+    /// Append строки в конец существующего дока (ff-only). Несуществующий
+    /// таргет — доменный отказ AppendMissing (#1613: append не создаёт,
+    /// создание — только docs_write); возвращает строк после записи
+    /// (#1353: ответ тула отражает факт, не эхо ввода).
+    async fn append_doc(&self, slug: &str, line: &str, message: &str) -> UsecaseResult<usize>;
 }
 
 /// Коммент задачи в терминах wakeup: идентичность + время создания.

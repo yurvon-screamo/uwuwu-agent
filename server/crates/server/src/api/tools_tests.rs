@@ -4,8 +4,8 @@
 //! квитанция полного task_body. Мок-hub — в памяти, без GitHub.
 
 use super::test_support::{
-    blob_usecase, blob_usecase_missing, fm_hash, receipt_number, tool_hub, StubCronState,
-    StubSessions, StubState, StubWiki,
+    blob_usecase, blob_usecase_missing, fm_hash, receipt_number, tool_hub, tool_hub_on_board,
+    StubCronState, StubSessions, StubState, StubWiki,
 };
 use super::tools::{tool_descriptors, ToolHub};
 use crate::clock::SystemClock;
@@ -1183,6 +1183,463 @@ async fn task_get_renders_foreign_vendor_pull_url() {
     assert!(card.contains("branch: —"), "{card}");
 }
 
+/// #1604 (срез 1): task_list отдаёт машиночитаемые JSON rows — массив
+/// объектов number/status/priority/type/title; двухсловный статус
+/// («Needs attention») выживает сериализацию целым полем, канонные имена
+/// из словаря MCP-поверхности. Факт до фикса: ответ — текстовая таблица,
+/// ручной колоночный парс рвал «Needs attention» на две колонки.
+#[tokio::test]
+async fn task_list_returns_json_rows_with_two_word_status_intact() {
+    let (tools, _memory) = hub();
+    // direct-create → In Progress: ребро In Progress → Needs attention
+    // легально без аналитик-гейта (тот требует Priority на выходе из Analys)
+    let created = call(
+        &tools,
+        "task_create",
+        json!({
+            "project": "uwuwu",
+            "title": "t: json rows",
+            "body": "## Постановка\n\nx.\n",
+            "direct": true
+        }),
+    )
+    .await
+    .expect("direct create");
+    let number: u64 = created
+        .trim()
+        .split('#')
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .and_then(|s| s.parse().ok())
+        .expect("номер в ответе");
+    call(
+        &tools,
+        "task_edit",
+        json!({ "number": number, "status": "Needs attention" }),
+    )
+    .await
+    .expect("needs attention edit");
+
+    let list = call(&tools, "task_list", json!({ "project": "uwuwu" }))
+        .await
+        .expect("list");
+    let rows: Value = serde_json::from_str(&list)
+        .unwrap_or_else(|e| panic!("ответ не JSON-массив rows: {e}: {list}"));
+    let arr = rows.as_array().expect("rows — JSON-массив");
+    let row = arr
+        .iter()
+        .find(|r| r["title"] == "t: json rows")
+        .expect("строка в списке");
+    assert_eq!(row["number"], json!(number), "номер строки: {row}");
+    assert_eq!(
+        row["status"],
+        json!("Needs attention"),
+        "двухсловный статус целым полем: {row}"
+    );
+    assert_eq!(
+        row["priority"],
+        json!("medium"),
+        "create-дефолт priority канонным именем: {row}"
+    );
+    assert_eq!(
+        row["type"],
+        json!("feature"),
+        "create-дефолт типа канонным именем (#1271): {row}"
+    );
+}
+
+/// #1604 (срез 1): «доска пуста» программно отличима от «ответ не читается» —
+/// пустая доска отдаёт JSON `[]`; отказ чтения идёт isError-конвертом и
+/// бросается в скрипте (вне этой поверхности).
+#[tokio::test]
+async fn task_list_empty_board_reads_as_empty_json_array() {
+    let (tools, _memory) = hub();
+    let list = call(&tools, "task_list", json!({ "project": "uwuwu" }))
+        .await
+        .expect("list");
+    let rows: Value = serde_json::from_str(&list).expect("пустая доска — JSON, не таблица");
+    assert_eq!(rows, json!([]), "пустая доска — пустой JSON-массив: {list}");
+}
+
+/// #1604 (срез 2): состав вывода task_get заявлен — body_bytes (точный
+/// размер тела в UTF-8; потребитель Code Mode сверяет через TextEncoder)
+/// и граница хвоста комментов «latest показано of всего». Инстанс 21.11:
+/// ложный сплит тела по заголовку-двойнику «## Комменты» стал бы виден
+/// сверкой (размер не сойдётся).
+#[tokio::test]
+async fn task_get_declares_body_bytes_and_comments_window_on_overflow() {
+    let (tools, _memory) = hub();
+    let body =
+        "## Постановка\n\nтело состава вывода.\n\n## Комменты\n\nзаголовок-двойник внутри тела.\n";
+    let (number, _) = create_task(&tools, "t: состав вывода", body).await;
+    for i in 0..12 {
+        call(
+            &tools,
+            "task_comment",
+            json!({ "number": number, "text": format!("коммент {i}") }),
+        )
+        .await
+        .expect("comment");
+    }
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+
+    // Потребительская сверка (аналог TextEncoder в Code Mode): заявленное
+    // body_bytes == байтам UTF-8 среза тела между fm-блоком и заголовком
+    // комментов. Носитель нормализует хвостовой перенос — входную строку
+    // не считаем, сверяем то, что реально в выводе.
+    let start = card.find("body_bytes: ").expect("fm несёт body_bytes") + "body_bytes: ".len();
+    let line_end = start + card[start..].find('\n').expect("конец строки body_bytes");
+    let declared: usize = card[start..line_end].parse().expect("body_bytes — целое");
+    let body_end = card
+        .find("\n\n--- comments (latest 10 of 12) ---")
+        .expect("граница хвоста комментов");
+    // после строки body_bytes в fm идёт пустая строка (\n\n) — тело с неё
+    assert_eq!(
+        card[line_end + 2..body_end].len(),
+        declared,
+        "срез тела == заявленному body_bytes: {card}"
+    );
+    assert!(
+        card.contains("--- comments (latest 10 of 12) ---"),
+        "граница хвоста комментов заявлена показано/всего: {card}"
+    );
+}
+
+/// #1604 (срез 2): в пределах окна состав заявлен без ложной
+/// усечённости — «latest N of N».
+#[tokio::test]
+async fn task_get_comments_window_full_when_within_limit() {
+    let (tools, _memory) = hub();
+    let (number, _) = create_task(&tools, "t: окно целиком", "## П\n\nx.\n").await;
+    for i in 0..2 {
+        call(
+            &tools,
+            "task_comment",
+            json!({ "number": number, "text": format!("к {i}") }),
+        )
+        .await
+        .expect("comment");
+    }
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    assert!(
+        card.contains("--- comments (latest 2 of 2) ---"),
+        "полное окно — без «усечённости»: {card}"
+    );
+}
+
+/// #1604 (тест-ревью Common-1): слово «latest» в заголовке хвоста —
+/// обещание состава и порядка: при переполнении окна под ним лежат
+/// именно последние N комментов в хронологическом порядке, старейшие
+/// остаются за границей.
+#[tokio::test]
+async fn task_get_comments_tail_carries_latest_ten_in_chronological_order() {
+    let (tools, _memory) = hub();
+    let (number, _) = create_task(&tools, "t: хвост latest", "## П\n\nx.\n").await;
+    for i in 0..12 {
+        call(
+            &tools,
+            "task_comment",
+            json!({ "number": number, "text": format!("коммент {i} из 12") }),
+        )
+        .await
+        .expect("comment");
+    }
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    let tail_at = card
+        .find("--- comments (latest 10 of 12) ---")
+        .expect("граница хвоста заявлена");
+    let tail = &card[tail_at..];
+    assert!(
+        !tail.contains("коммент 0 из 12"),
+        "старейший 0 за границей окна: {tail}"
+    );
+    assert!(
+        !tail.contains("коммент 1 из 12"),
+        "старейший 1 за границей окна: {tail}"
+    );
+    let mut at = 0;
+    for i in 2..12 {
+        let marker = format!("коммент {i} из 12");
+        let found = tail[at..]
+            .find(&marker)
+            .unwrap_or_else(|| panic!("{marker} в хвосте после предыдущего: {}", &tail[at..]));
+        at += found;
+    }
+}
+
+/// #1604 (тест-ревью Common-2): сериализация компактная — одна строка;
+/// pretty парсится так же и тесты проходят, но на большой доске съедает
+/// окно показа финального результата.
+#[tokio::test]
+async fn task_list_json_is_single_line_compact() {
+    let (tools, _memory) = hub();
+    create_task(&tools, "t: компакт", "## П\n\nx.\n").await;
+
+    let list = call(&tools, "task_list", json!({ "project": "uwuwu" }))
+        .await
+        .expect("list");
+    assert!(
+        !list.contains('\n'),
+        "компактный JSON — одна строка: {list}"
+    );
+    let rows: Value = serde_json::from_str(&list).expect("одна строка — валидный JSON");
+    assert!(
+        rows.as_array()
+            .expect("массив rows")
+            .iter()
+            .any(|r| r["title"] == "t: компакт"),
+        "строка в списке: {list}"
+    );
+}
+
+/// #1604 (тест-ревью Common-3): опечатка в проекте — громкий отказ
+/// с именем проекта для обоих тулов чтения, не тихий пустой список
+/// (симптом #1548) и не карточка чужой доски с тем же номером.
+#[tokio::test]
+async fn unknown_project_is_a_loud_error_for_list_and_get() {
+    let (tools, _memory) = hub();
+    let (number, _) = create_task(&tools, "t: опечатка в проекте", "## П\n\nx.\n").await;
+
+    let list_err = call(&tools, "task_list", json!({ "project": "опечатка" }))
+        .await
+        .expect_err("неизвестный проект — отказ");
+    assert!(
+        list_err.contains("опечатка"),
+        "имя проекта в отказе: {list_err}"
+    );
+    let get_err = call(
+        &tools,
+        "task_get",
+        json!({ "number": number, "project": "опечатка" }),
+    )
+    .await
+    .expect_err("неизвестный проект — отказ");
+    assert!(
+        get_err.contains("опечатка"),
+        "имя проекта в отказе: {get_err}"
+    );
+}
+
+/// #1604 (срез 2): body_bytes — байты UTF-8, а не символы. Проба несёт
+/// астральный эмодзи: только он разводит все три единицы — байты (4),
+/// chars (1) и UTF-16-единицы JS `.length` (2); без астральности третья
+/// единица совпадает с chars и проверка слепа.
+#[tokio::test]
+async fn task_get_body_bytes_counts_utf8_bytes_not_chars_on_astral_emoji() {
+    let (tools, _memory) = hub();
+    // Носитель нормализует хвостовой перенос — входную строку create не
+    // считаем; сверяем срез тела как он реально лежит в выводе.
+    let (number, _) = create_task(
+        &tools,
+        "t: байты, не символы",
+        "## Постановка\n\nзапуск 🚀 ок.\n",
+    )
+    .await;
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    // Комментов у карточки нет — секции хвоста нет и срез тела идёт до
+    // конца вывода; иначе в срез попал бы чужой контент.
+    assert!(
+        !card.contains("--- comments"),
+        "секции хвоста нет, срез до конца вывода: {card}"
+    );
+    let start = card.find("body_bytes: ").expect("fm несёт body_bytes") + "body_bytes: ".len();
+    let line_end = start + card[start..].find('\n').expect("конец строки body_bytes");
+    let declared: usize = card[start..line_end].parse().expect("body_bytes — целое");
+    let slice = &card[line_end + 2..];
+    assert_ne!(
+        slice.chars().count(),
+        slice.len(),
+        "проба обязана разводить символы и байты: {slice}"
+    );
+    assert_eq!(
+        declared,
+        slice.len(),
+        "заявлены байты UTF-8, не chars: {card}"
+    );
+    assert_ne!(
+        slice.encode_utf16().count(),
+        slice.chars().count(),
+        "эмодзи астральный: единицы UTF-16 и chars расходятся"
+    );
+}
+
+/// #1604 (срез 2): карточка без комментов не несёт секцию хвоста —
+/// заголовок «latest 0 of 0» вводил бы в заблуждение так же, как
+/// молчаливый сброс сверх 10 до среза 2.
+#[tokio::test]
+async fn task_get_without_comments_carries_no_comments_section() {
+    let (tools, _memory) = hub();
+    let (number, _) = create_task(&tools, "t: без комментов", "## Постановка\n\nтихо.\n").await;
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    assert!(
+        !card.contains("--- comments"),
+        "секции хвоста нет, а не «latest 0 of 0»: {card}"
+    );
+    assert!(
+        card.contains("body_bytes: "),
+        "состав заявлен и без хвоста: {card}"
+    );
+}
+
+/// #1632+#1604: зеркало шапки (strip_task_get_header в фазе записи)
+/// собрано из РЕАЛЬНОГО рендера task_get, не из рукописной шапки, и от
+/// card[0..] — тайтл-строка включительно, ровно то, что агент копирует
+/// из карточки (старт от fm_start не ловит дрейф «новая первая
+/// строка»): копия вывода карточки в task_body срезает шапку целиком
+/// (все наборы ключей, включая body_bytes), тело на носителе чистое
+/// (ADR-105); шапка без тела — отказ «нет эффективного контента»
+/// (#1572) с хвостовым переносом и без него (терминатор #1604),
+/// носитель цел.
+#[tokio::test]
+async fn task_body_strips_the_real_render_header_and_refuses_header_only() {
+    let (tools, memory) = hub();
+    let body = "## Постановка\n\nчистое тело носителя.\n";
+    let (number, _) = create_task(&tools, "t: зеркало шапки", body).await;
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    let body_at = card.find(body).expect("тело в выводе карточки");
+    let copied = &card[..body_at + body.len()];
+
+    let receipt = call(
+        &tools,
+        "task_body",
+        json!({ "number": number, "body": copied }),
+    )
+    .await
+    .expect("task_body ок");
+    assert!(receipt.contains("replaced"), "квитанция: {receipt}");
+
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert_eq!(stored, body, "тело без шапки: {stored}");
+
+    let header_only = &card[..body_at];
+    let err = call(
+        &tools,
+        "task_body",
+        json!({ "number": number, "body": header_only }),
+    )
+    .await
+    .expect_err("шапка без тела — отказ");
+    assert!(
+        err.contains("effective content"),
+        "отказ называет отсутствие эффективного контента: {err}"
+    );
+    let err2 = call(
+        &tools,
+        "task_body",
+        json!({ "number": number, "body": header_only.trim_end() }),
+    )
+    .await
+    .expect_err("шапка без переноса — тоже отказ");
+    assert!(
+        err2.contains("effective content"),
+        "отказ без хвостового переноса: {err2}"
+    );
+    let intact = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert_eq!(intact, body, "оба отказа не трогают носитель");
+}
+
+/// #1604 (ревью раунда 5, Low-2): строгость зеркала держится и на
+/// актуальной 8-ключевой форме (fact_track + body_bytes после слива
+/// #1631) — чужая строка между type и body_hash ломает срез, и вся
+/// копия карточки пишется телом целиком. Пин собран из реального
+/// рендера.
+#[tokio::test]
+async fn task_body_keeps_real_render_header_with_foreign_line() {
+    let (tools, memory) = hub();
+    let body = "## Постановка\n\nчистое тело.\n";
+    let (number, _) = create_task(&tools, "t: чужая строка в шапке", body).await;
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    let fm_start = card.find("--- fm ---").expect("fm-блок");
+    let body_at = card.find(body).expect("тело в выводе карточки");
+    let header = &card[fm_start..body_at];
+
+    let at = header.find("body_hash: ").expect("body_hash в шапке");
+    let poisoned = format!("{}чужой ключ: x\n{}", &header[..at], &header[at..]);
+    let payload = format!("{poisoned}{body}");
+
+    let receipt = call(
+        &tools,
+        "task_body",
+        json!({ "number": number, "body": &payload }),
+    )
+    .await
+    .expect("task_body ок");
+    assert!(receipt.contains("replaced"), "квитанция: {receipt}");
+
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert_eq!(
+        stored, payload,
+        "чужой ключ ломает срез — копия карточки пишется целиком: {stored}"
+    );
+}
+
+/// #1604 (ревью Low): null-хвост закреплён через хендлер task_list, не
+/// только юнит-тестом хелпера — сид-строка с Status::Empty,
+/// Priority::Empty и без типа даёт все три null-ячейки разом.
+#[tokio::test]
+async fn task_list_renders_null_cells_for_empty_status_priority_and_type() {
+    let memory = Arc::new(MemoryHub::with_seed(Some((7, uwuwu_domain::Status::Empty))));
+    let board: Arc<dyn uwuwu_usecase::TaskBoardRepo> = memory.clone();
+    let (tools, _aux) = tool_hub_on_board(
+        Arc::new(StubWiki),
+        blob_usecase(),
+        Arc::new(StubCronState::default()),
+        board,
+        memory,
+    );
+
+    let list = call(&tools, "task_list", json!({ "project": "uwuwu" }))
+        .await
+        .expect("list");
+    let rows: Value = serde_json::from_str(&list).expect("rows — JSON");
+    let row = rows
+        .as_array()
+        .expect("массив rows")
+        .iter()
+        .find(|r| r["number"] == json!(7))
+        .expect("сид-строка в списке");
+    assert_eq!(row["status"], Value::Null, "Status::Empty → null: {row}");
+    assert_eq!(
+        row["priority"],
+        Value::Null,
+        "Priority::Empty → null: {row}"
+    );
+    assert_eq!(row["type"], Value::Null, "тип отсутствует → null: {row}");
+}
+
 /// #1155 (поручение владельца): автомерж-ячейка живёт на mock-носителе —
 /// create пишет дефолт on, edit переключает, fm рендерит фактическое
 /// состояние (без хранения на носителе fm и тик стенда врали «false»).
@@ -1736,15 +2193,18 @@ async fn task_type_native_carrier_roundtrip_on_mcp_surface() {
     .expect("task_get ок");
     assert!(get.contains("type: docs"), "fm-шапка с типом: {get}");
 
-    // task_list: колонка типа
+    // task_list: тип канонным именем из носителя (#1604 — JSON rows)
     let list = call(&tools, "task_list", json!({ "project": "uwuwu" }))
         .await
         .expect("task_list ок");
-    let row_line = list
-        .lines()
-        .find(|l| l.contains("носитель типа"))
+    let list_rows: Value = serde_json::from_str(&list).expect("rows — JSON");
+    let list_row = list_rows
+        .as_array()
+        .expect("массив rows")
+        .iter()
+        .find(|r| r["title"] == "носитель типа")
         .expect("строка в списке");
-    assert!(row_line.contains(" docs "), "колонка типа: {row_line}");
+    assert_eq!(list_row["type"], json!("docs"), "тип в rows: {list_row}");
 
     // мусорный type в edit — громкий отказ, носитель не тронут
     let err = call(
@@ -1791,11 +2251,18 @@ async fn task_type_create_default_feature_renders_on_mcp_surface() {
     let list = call(&tools, "task_list", json!({ "project": "uwuwu" }))
         .await
         .expect("task_list ок");
-    let row_line = list
-        .lines()
-        .find(|l| l.contains("native-null строка"))
+    let list_rows: Value = serde_json::from_str(&list).expect("rows — JSON");
+    let list_row = list_rows
+        .as_array()
+        .expect("массив rows")
+        .iter()
+        .find(|r| r["title"] == "native-null строка")
         .expect("строка в списке");
-    assert!(row_line.contains(" feature "), "колонка типа: {row_line}");
+    assert_eq!(
+        list_row["type"],
+        json!("feature"),
+        "дефолт типа в rows (#1604): {list_row}"
+    );
     let rows = memory.read_board("Задачи uwuwu").await.unwrap();
     let row = rows.iter().find(|t| t.number() == number).unwrap();
     assert_eq!(row.kind(), Some(uwuwu_domain::TaskType::Feature));
@@ -1855,57 +2322,6 @@ fn body_with_fat_tail_section() -> String {
         ));
     }
     format!("## Постановка\n\nДержатель массы тела.\n\n## Хвост\n\n{tail}\n## Прочее\n\n{filler}")
-}
-
-/// #1632: полная копия карточки — от card[0..], тайтл-строка включительно
-/// (ровно то, что агент копирует из вывода task_get) — оставляет на
-/// носителе чистое тело; шапка без тела — отказ #1572, носитель цел.
-#[tokio::test]
-async fn task_body_strips_the_real_render_header_and_refuses_header_only() {
-    let (tools, memory) = hub();
-    let body = "## Постановка\n\nчистое тело носителя.\n";
-    let (number, _) = create_task(&tools, "t: зеркало шапки", body).await;
-
-    let card = call(&tools, "task_get", json!({ "number": number }))
-        .await
-        .expect("get");
-    let body_at = card.find(body).expect("тело в выводе карточки");
-    let copied = &card[..body_at + body.len()];
-
-    let receipt = call(
-        &tools,
-        "task_body",
-        json!({ "number": number, "body": copied }),
-    )
-    .await
-    .expect("task_body ок");
-    assert!(receipt.contains("replaced"), "квитанция: {receipt}");
-
-    let stored = memory
-        .read_issue("Задачи uwuwu", number)
-        .await
-        .expect("read")
-        .body;
-    assert_eq!(stored, body, "тело без шапки: {stored}");
-
-    let header_only = &card[..body_at];
-    let err = call(
-        &tools,
-        "task_body",
-        json!({ "number": number, "body": header_only }),
-    )
-    .await
-    .expect_err("шапка без тела — отказ");
-    assert!(
-        err.contains("effective content"),
-        "отказ называет отсутствие эффективного контента: {err}"
-    );
-    let intact = memory
-        .read_issue("Задачи uwuwu", number)
-        .await
-        .expect("read")
-        .body;
-    assert_eq!(intact, body, "отказ не трогает носитель");
 }
 
 /// Сценарий 1 (#1572, BDD): task_body без body — громкий отказ с длиной

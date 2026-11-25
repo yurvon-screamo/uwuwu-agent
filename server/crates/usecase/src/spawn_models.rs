@@ -1,9 +1,10 @@
 //! Карта моделей спавнов (#1154, решение владельца 17.11): единый
 //! механизм конфигурации — модель кладётся сервером в тело спавна
 //! (`SessionSpec.model`), деф-файлы агентов моделей не несут. Канон
-//! владельца (18.11, #417): везде flash#high, ревьюверы — полный
-//! glm-5.4#high; canonical() следует config.example дословно
-//! (кросс-гвард spawn_models_config_sync_test).
+//! владельца (25.11, #1628): flash-контуры (default/developer/tester/
+//! analyst/dreamer) — opencode-go/hy4-flash-free#high, ревьюверы — полный
+//! zai-coding-plan/glm-5.4#high (канон 18.11, #417). canonical() следует
+//! config.example дословно (кросс-гвард spawn_models_config_sync_test).
 //! Ключи карты — имена агентов (naming::agent_name) + "default"
 //! (bootstrap-сессии подготовки env; до #1300 — также дев-семья, после
 //! пина агента Design/Dev берут ключ "developer").
@@ -23,8 +24,10 @@ impl SpawnModels {
     }
 
     /// Канон владельца — дефолт карты при отсутствии секции в конфиге.
-    /// Синхрон с config.example (кросс-гвард): везде flash#high,
-    /// ревьюверы полный 5.3#high (поручение владельца 18.11, f1b9091c).
+    /// Синхрон с config.example (кросс-гвард): flash-контуры на
+    /// opencode-go/hy4-flash-free#high (25.11, #1628 — supersedes санкцию
+    /// 24.11 в #1607 по ключу analyst), ревьюверы стадий + ревью
+    /// аналитики — zai-coding-plan/glm-5.4#high (поручение 18.11, f1b9091c).
     pub fn canonical() -> Self {
         let mut map = HashMap::new();
         let mut put = |key: &str, raw: &str| {
@@ -33,15 +36,15 @@ impl SpawnModels {
                 SpawnModel::parse(raw).expect("канон-карта"),
             );
         };
-        put("default", "zai-coding-plan/glm-5.3-flash#high");
-        put("developer", "zai-coding-plan/glm-5.3-flash#high");
+        put("default", "opencode-go/hy4-flash-free#high");
+        put("developer", "opencode-go/hy4-flash-free#high");
         put("plan-reviewer", "zai-coding-plan/glm-5.4#high");
         put("code-quality-reviewer", "zai-coding-plan/glm-5.4#high");
-        put("tester", "zai-coding-plan/glm-5.3-flash#high");
+        put("tester", "opencode-go/hy4-flash-free#high");
         put("test-reviewer", "zai-coding-plan/glm-5.4#high");
-        put("analyst", "zai-coding-plan/glm-5.3-flash#high");
+        put("analyst", "opencode-go/hy4-flash-free#high");
         put("analyst-reviewer", "zai-coding-plan/glm-5.4#high");
-        put("dreamer", "zai-coding-plan/glm-5.3-flash#high");
+        put("dreamer", "opencode-go/hy4-flash-free#high");
         Self { map }
     }
 
@@ -103,30 +106,42 @@ mod tests {
 
     #[test]
     fn canonical_carries_owner_model_map() {
-        // канон владельца 18.11 (#417): везде flash#high, ревьюверы —
-        // полный 5.3#high; карта = config.example verbatim (кросс-гвард)
+        // канон владельца 25.11 (#1628): flash-контуры на
+        // opencode-go/hy4-flash-free#high (supersedes санкцию 24.11 в #1607
+        // по ключу analyst), ревьюверы — glm-5.4#high;
+        // карта = config.example verbatim (кросс-гвард)
         let m = SpawnModels::canonical();
         assert_eq!(
             m.for_agent(Agent::PlanReviewer),
             SpawnModel::parse("zai-coding-plan/glm-5.4#high").unwrap(),
-            "ревьюверы — полный 5.3#high (канон #417)"
+            "ревьюверы — полный glm-5.4#high (канон #417)"
+        );
+        assert_eq!(
+            m.for_agent(Agent::Analyst),
+            SpawnModel::parse("opencode-go/hy4-flash-free#high").unwrap(),
+            "аналитик — flash-free (санкция 25.11 в #1628, без исключений)"
+        );
+        assert_eq!(
+            m.for_agent(Agent::AnalystReviewer),
+            SpawnModel::parse("zai-coding-plan/glm-5.4#high").unwrap(),
+            "ревью аналитики — glm-5.4#high (санкция 24.11, #1607)"
         );
         assert_eq!(
             m.for_agent(Agent::Dreamer),
-            SpawnModel::parse("zai-coding-plan/glm-5.3-flash#high").unwrap()
+            SpawnModel::parse("opencode-go/hy4-flash-free#high").unwrap()
         );
         assert_eq!(
             m.for_agent(Agent::Tester),
-            SpawnModel::parse("zai-coding-plan/glm-5.3-flash#high").unwrap()
+            SpawnModel::parse("opencode-go/hy4-flash-free#high").unwrap()
         );
         assert_eq!(m.for_default(), m.for_agent(Agent::Developer));
     }
 
     #[test]
     fn model_string_parses_with_variant() {
-        let sm = SpawnModel::parse("zai-coding-plan/glm-5.3-flash#max").unwrap();
-        assert_eq!(sm.model.provider(), "zai-coding-plan");
-        assert_eq!(sm.model.id(), "glm-5.3-flash");
+        let sm = SpawnModel::parse("opencode-go/hy4-flash-free#max").unwrap();
+        assert_eq!(sm.model.provider(), "opencode-go");
+        assert_eq!(sm.model.id(), "hy4-flash-free");
         assert_eq!(sm.variant.as_deref(), Some("max"));
 
         let plain = SpawnModel::parse("p/id").unwrap();

@@ -612,7 +612,7 @@ mod tests {
         assert_eq!(plan.boards[1].board, "Задачи origa");
         assert_eq!(plan.boards[2].board, "Задачи true-washing");
         assert_eq!(plan.boards[3].board, "Задачи foilcap");
-        assert_eq!(plan.policy.cup, 7);
+        assert_eq!(plan.policy.cup, 10);
         assert_eq!(plan.mode, Mode::Observe);
     }
 

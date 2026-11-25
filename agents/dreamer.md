@@ -50,7 +50,10 @@ basename(cwd) or the git remote name = the project folder name. In doubt — cou
 as unmatched (do not invent correspondences). Not matched — doc hygiene (step 4)
 is skipped with the mark «проект не сматчился»; experience (step 5), the persona (step 6)
 and tasks (step 7)
-always run; the incident analysis (step 8) — the task run only.
+always run; the incident analysis (step 8) — the task run only. The one exception:
+the records transfer (step 4, uwuwu#1630) resolves its project from the analyzed
+session's spawn header in the dump (the session may work on any project) — the cwd
+rule above does not gate it.
 
 ### 4. Project documentation hygiene (if the project matched)
 
@@ -64,13 +67,66 @@ Compare with what actually happened in the session and the git state:
 - **holes and tails** — under-documented (a new service/script/procedure
   exists, no doc) → create the missing doc or extend the existing one;
 - **behavior check against the Design Spec** (if the project has a spec): code
-  behavior justified by a «requirement» absent from the spec → a mark in the final
-  line «поведение без записи: <что/где> — флаг владельцу» (do NOT add the record
-  yourself — the appearance rule: an owner record only); a withdrawn/suspended
-  requirement with live behavior → the mark «задача на снос». The canon of records —
-  `platform/ops-mechanics` (Design Spec);
+  behavior justified by a «requirement» absent from the spec — first check the
+  task body: requirement records there are TO-BE by design (uwuwu#1630) and are
+  not a defect; behavior with no record anywhere (spec or task body) → a mark in
+  the final line «поведение без записи: <что/где> — флаг владельцу»; a
+  withdrawn/suspended requirement with live behavior → the mark «задача на снос».
+  The canon of records — `platform/ops-mechanics` (Design Spec);
+- **requirement records transfer (uwuwu#1630, 25.11.2026 — the owner's word: the
+  analyst formulates US/UC/NFT records in the task body, the dreamer transfers
+  them to the wiki)**. Six contracts, one pass:
+  - **Scan** — the analyzed session's own task only: the title `#{N} …`; cron,
+    bot and non-task sessions — out of scope. One `task_get` per pass (the
+    project — from the session's spawn header in the dump, never from cwd).
+    No records in the body, row not in Review/Done — this pass has no transfer.
+  - **AS-IS anchor** — a fact, checked per the PR host in the row's PR cell:
+    `github.com` → `gh pr view <url> --json state` = MERGED (`GH_TOKEN` in the
+    session env); a Forgejo/Gitea host (`git.true-wash.com`, `git.l4a.ru`) →
+    `gt pr list --host <url> --repo <owner>/<repo> --state all` (tea CLI, its
+    config carries the tokens; the STATE column shows `merged` — both hosts
+    probe-verified 26.11.2026); docs-only — the PR cell holds a non-PR URL and
+    the wiki artifact is live. A host with no reachable route (no `gt` config
+    entry — the token grant is the owner's hands, Deployment): the transfer is
+    unavailable for it — records stay in the body, recorded here as a
+    limitation, no per-pass flags. The route exists but the check fails
+    (network, auth) → flag the task (a visible channel, same as the write
+    control below) — the outcome is neither yes nor no; never read a failed
+    check as «not merged».
+  - **Judgment** — target section per record type; status «действует»; global
+    ID — the next free number of the section in the live spec (never reused);
+    dedup — an identical formulation exists → skip; a changed formulation → a
+    new record with a new global ID and the old one → status «отменено»
+    (ADR-102: IDs are not reused, withdrawn records stay; an in-place edit
+    erases the audit history).
+  - **Source qualification travels** — the record transfers with its source as
+    written in the body: class labels (а)/(б)/(в) and the marks
+    (интерпретация / вывод из <doc> / не подтверждено / частично покрыто
+    цитатой) are carried into the spec row. A record covered by a quote only in
+    part keeps the per-part attribution — the transfer never re-attributes
+    mechanic wording (IDs, dedup, routes) to the owner's words.
+  - **Matching key** — the spec record's source carries «<project>#<task>
+    <local ID>» (example: uwuwu#1630 US-1); it links a body record to its spec
+    record and is the bridge for pre-transfer local citations.
+  - **Write discipline** — no spec in the project → skip the transfer (the
+    transition policy ADR-102; the records stay in the body). Read the fresh
+    spec → a surgical local edit (the row into the table) → `uwuwu_docs_write`
+    with the fm header preserved → a scripted pre/post comparison (mechanical,
+    line-wise) → the control fails: roll back from the pre-image and flag the
+    task with the recovery path (the hub file history). The pre-image is a
+    byte-exact copy obtained instrumentally — the raw hub blob (`gh api repos/
+    …/contents/…` → decode) or `cp` of the fetched file — sha256-checked
+    against the live blob before the edit; a model-retyped copy is not a
+    pre-image (it regenerates the corruption class the control catches).
+    No silent skip, no silent damage. A
+    spec with code fences or mermaid blocks is plain markdown — the full
+    round-trip survives it under the control; HTML embeds and database blocks
+    do not — such a spec is append/point-edit only and the transfer defers to
+    the owner (flag, don't force).
 - rich docs with embedded diagrams — **do not overwrite in full** — append only
-  or a point edit of the block (a replace kills the embeds);
+  or a point edit of the block (a replace kills the embeds); the records
+  transfer above is the named exception — a plain markdown spec tolerates the
+  full round-trip under the control read-back;
 - before an append check whether your past run already made this edit
   (re-read the live doc — do not duplicate content);
 - ADR: if the session shows an accepted architectural decision — create

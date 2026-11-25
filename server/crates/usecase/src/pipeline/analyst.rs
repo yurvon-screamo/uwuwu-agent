@@ -1,12 +1,13 @@
 //! Аналитика (замена триажа, #1135): все строки Analys досок образуют
-//! одну волну → одна fresh-сессия аналитика на волну (методичка
+//! одну волну → одна мастер-сессия аналитика на проект (методичка
 //! agents/analyst: sourcing, соразмерность рамок, вердикты через MCP).
 
+use crate::bots::{compact_verdict, CompactFacts, CompactPolicy};
 use crate::error::UsecaseResult;
-use crate::ports::{SessionSpec, TaskBoardRepo, TickStateStore};
+use crate::ports::{SessionInfo, SessionSpec, TaskBoardRepo, TickStateStore};
 use crate::spawn_models::SpawnModels;
 use std::sync::Arc;
-use uwuwu_domain::{Agent, AgentSlot, Status, Task};
+use uwuwu_domain::{Agent, AgentSlot, PeakWindow, SpawnModel, Status, Task};
 
 /// Кулдаун волны по строке (анти-шторм, как у спавнов слотов).
 const WAVE_COOLDOWN_MS: u64 = 15 * 60_000;
@@ -29,6 +30,12 @@ pub struct AnalystUseCase {
     /// Единый кап активных ходов исполнителя (policy.cup): волна не
     /// спавнится при полном капе (#1231).
     pub cup: usize,
+    /// Пик-окно GLM: компакт-проход откладывается целиком (политика
+    /// запуска будильника, UC-05). Волны пик-гейта не несут (канон #1135).
+    pub peak: PeakWindow,
+    /// Автокомпакт мастер-сессий (#1607, срез 4): расширение матрицы
+    /// ботов на привязки аналитики. None — проход off (safe default).
+    pub compact: Option<CompactPolicy>,
 }
 
 /// Доска аналитики: где искать очередь и где спавнить агента.
@@ -48,6 +55,21 @@ fn board_row_key(board: &str, number: u64) -> String {
 /// (mock_opencode::stage_action_of_prompt); правка промпта через него.
 pub const ANALYST_WAVE_MARKER: &str = "Analytics wave (project {project})";
 
+/// Роль мастер-привязки аналитика (#1607): та же форма «роль:проект»,
+/// что у ревьювера (#1634) — одна коллекция, один компакт-примитив.
+fn analyst_role() -> &'static str {
+    crate::naming::agent_name(Agent::Analyst)
+}
+
+/// Канонический raw модели спавна: provider/id[#variant] — контракт
+/// сравнения C1 (модель рождения против карты), как у ревьювера.
+fn model_raw(sm: &SpawnModel) -> String {
+    match &sm.variant {
+        Some(v) => format!("{}/{}#{v}", sm.model.provider(), sm.model.id()),
+        None => format!("{}/{}", sm.model.provider(), sm.model.id()),
+    }
+}
+
 impl AnalystUseCase {
     /// Один проход: по каждой доске — не больше одного спавна за тик,
     /// очередь доски летит в одну сессию пачкой (мультиборд: чекаут и
@@ -65,6 +87,22 @@ impl AnalystUseCase {
                 executors = ?failed,
                 "Аналитика: часть исполнителей недоступна — волна по живому union"
             );
+        }
+        // Гигиена привязок (#1607, как у ревьювера #1634): проекты, ушедшие
+        // из конфига, не держат сирот в state.json. Вне компакт-прохода:
+        // работает и при выключенной секции [compact].
+        let live_projects: std::collections::HashSet<String> =
+            self.boards.iter().map(|b| b.project.clone()).collect();
+        if self.state.prune_master_role(analyst_role(), &live_projects) {
+            if let Err(e) = self.state.save() {
+                tracing::warn!(event = "analys.prune_save_failed", error = %e, "Гигиена привязок не персистится");
+            }
+        }
+        // Компакт-проход мастер-сессий (срез 4) — до busy/CUP-гардов:
+        // idle-привязки других проектов компактируются, даже когда
+        // волна ждёт (как у ревьювера #1634).
+        if let Some(policy) = &self.compact {
+            self.compact_pass(policy, &scan).await;
         }
         if crate::router::has_busy_agent(&scan, Agent::Analyst) {
             tracing::debug!(event = "analys.alive_skip", "Живой аналитик — волна ждёт");
@@ -198,6 +236,7 @@ impl AnalystUseCase {
             // tick_tests failed_spawn_does_not_charge_loop_or_cooldown):
             // сбой гейтвея не сжигает круг волны и не заряжает кулдаун.
             let sm = self.models.for_agent(Agent::Analyst);
+            let expected = model_raw(&sm);
             let spec = SessionSpec {
                 directory: tb.checkout.clone(),
                 title: format!("{} аналитика волны", Agent::Analyst.emoji()),
@@ -207,27 +246,121 @@ impl AnalystUseCase {
                 variant: sm.variant,
                 bootstrap: false,
             };
-            let sessions = self.sessions.project(&tb.project);
-            let session = sessions.create_session(&spec).await?;
+            let role = analyst_role();
+            let gateway = self.sessions.project(&tb.project);
             let prompt = analyst_prompt(&tb.project, &wave);
-            sessions.prompt(&session, &prompt).await?;
-            busy += 1; // спавн этого тика занимает слот капа
-            for t in &wave {
-                let rounds = self
-                    .state
-                    .analys_loop(&tb.board, t.number())
-                    .map(|(_, r)| r)
-                    .unwrap_or(0);
-                // Захват волны круг не сжигает (#1241): пара только
-                // фиксируется (свежие строки — (Analys, 0)), rounds не
-                // растут — ретрай безвердиктной волны не является петлёй
-                self.state
-                    .set_analys_loop(&tb.board, t.number(), Status::Analys, rounds);
-                self.state.mark_analys_spawn(&tb.board, t.number(), now);
+            enum WaveAct {
+                Reuse(String),
+                Recreate,
+                Defer,
             }
-            tracing::info!(event = "analys.spawned", board = %tb.board, rows = wave.len(),
-                session = %session, "Analyst wave spawned");
-            spawned += 1;
+            // Мастер-сессия проекта (#1607, срез 2б; форма — #1634):
+            // привязка жива — волна едет в неё же; мёртвая или
+            // разошедшаяся с картой/конфигом — пересоздание.
+            let act = match self.state.master_binding(role, &tb.project) {
+                Some((session, bound_model, bound_checkout))
+                    if bound_model == expected && bound_checkout == tb.checkout =>
+                {
+                    match gateway.liveness(&session).await {
+                        crate::ports::Liveness::Alive => WaveAct::Reuse(session),
+                        crate::ports::Liveness::Dead => WaveAct::Recreate,
+                        crate::ports::Liveness::Unknown => WaveAct::Defer,
+                    }
+                }
+                Some((session, _, _)) => {
+                    tracing::info!(
+                        event = "analys.diverged",
+                        project = %tb.project,
+                        session = %session,
+                        "Привязка разошлась с картой/конфигом — пересоздание"
+                    );
+                    WaveAct::Recreate
+                }
+                None => WaveAct::Recreate,
+            };
+            match act {
+                WaveAct::Defer => {
+                    tracing::info!(
+                        event = "analys.deferred_unknown",
+                        project = %tb.project,
+                        "Волна отложена: состояние привязки неизвестно"
+                    );
+                    continue;
+                }
+                WaveAct::Reuse(session) => {
+                    if let Err(e) = gateway.prompt(&session, &prompt).await {
+                        tracing::warn!(
+                            event = "analys.prompt_failed",
+                            board = %tb.board,
+                            session = %session,
+                            error = %e,
+                            "Промпт в живую сессию не доставлен — ретрай следующим тиком"
+                        );
+                        continue;
+                    }
+                    busy += 1; // ход этого тика занимает слот капа
+                    for t in &wave {
+                        let rounds = self
+                            .state
+                            .analys_loop(&tb.board, t.number())
+                            .map(|(_, r)| r)
+                            .unwrap_or(0);
+                        self.state
+                            .set_analys_loop(&tb.board, t.number(), Status::Analys, rounds);
+                        self.state.mark_analys_spawn(&tb.board, t.number(), now);
+                    }
+                    tracing::info!(event = "analys.reused", board = %tb.board, rows = wave.len(),
+                        session = %session, "Analyst wave reused master session");
+                    continue;
+                }
+                WaveAct::Recreate => {
+                    let session = gateway.create_session(&spec).await?;
+                    // Привязка — до промпта: сбой промпта не теряет волну,
+                    // следующий тик reuse'ит свежую сессию и ретраит.
+                    self.state.set_master_binding(
+                        role,
+                        &tb.project,
+                        &session,
+                        &expected,
+                        &tb.checkout,
+                    );
+                    if let Err(e) = self.state.save() {
+                        tracing::warn!(
+                            event = "analys.state_save_failed",
+                            board = %tb.board,
+                            error = %e,
+                            "Привязка не персистится — рестарт может дать дубль"
+                        );
+                    }
+                    if let Err(e) = gateway.prompt(&session, &prompt).await {
+                        tracing::warn!(
+                            event = "analys.prompt_failed",
+                            board = %tb.board,
+                            session = %session,
+                            error = %e,
+                            "Промпт в новую сессию не доставлен — ретрай следующим тиком"
+                        );
+                        continue;
+                    }
+                    busy += 1; // спавн этого тика занимает слот капа
+                    for t in &wave {
+                        let rounds = self
+                            .state
+                            .analys_loop(&tb.board, t.number())
+                            .map(|(_, r)| r)
+                            .unwrap_or(0);
+                        // Захват волны круг не сжигает (#1241): пара только
+                        // фиксируется (свежие строки — (Analys, 0)), rounds не
+                        // растут — ретрай безвердиктной волны не является петлёй
+                        self.state
+                            .set_analys_loop(&tb.board, t.number(), Status::Analys, rounds);
+                        self.state.mark_analys_spawn(&tb.board, t.number(), now);
+                    }
+                    tracing::info!(event = "analys.spawned", board = %tb.board, rows = wave.len(),
+                        session = %session, "Analyst wave spawned");
+                    spawned += 1;
+                }
+            }
         }
         // гигиена состояния (R2-L3): счётчики обеих гвардов строк, ушедших
         // с досок (deleted/closed), из state.json вычищаются. Частичный сбой
@@ -237,6 +370,161 @@ impl AnalystUseCase {
             self.state.prune_analys_guards(&live_rows);
         }
         Ok(spawned)
+    }
+
+    /// Сессия потеряна исполнителем (404-класс): liveness-проба различает
+    /// Dead от транспортного Unknown — пропуск только по Dead, Unknown
+    /// завершает проход пробой (эталон — бот-супервизор, #1634).
+    async fn session_gone(&self, project: &str, session: &str) -> bool {
+        matches!(
+            self.sessions.project(project).liveness(session).await,
+            crate::ports::Liveness::Dead
+        )
+    }
+
+    /// Компакт-проход мастер-сессий (#1607, срез 4; форма — #1634):
+    /// матрица вердикта ботов на привязки аналитика; скан — по проектам
+    /// досок (привязки чужих ролей не трогаем). Семантика проб — по эталону
+    /// бот-супервизора; гейт CUP — на адмиссии аналитика (волны тика уже
+    /// в счётчике busy вызывающего), пик — целиком как будильник.
+    async fn compact_pass(&self, policy: &CompactPolicy, scan: &[SessionInfo]) {
+        if crate::router::busy_count(scan) >= self.cup {
+            tracing::info!(
+                event = "analys.compact_held_cup",
+                active = crate::router::busy_count(scan),
+                cap = self.cup,
+                "Компакт-проход отложен: CUP cap"
+            );
+            return;
+        }
+        // Пик-окно — как будильник: запуск хода откладывается целиком
+        // (план #1607; у ревьювера #1634 пик-гейта нет — осознанное
+        // различие, не дрейф: волна аналитика пик-гейта тоже не несёт,
+        // компакт здесь строже).
+        if self.peak.holds(self.clock.utc_minute()) {
+            tracing::info!(
+                event = "analys.compact_deferred_peak",
+                "Компакт-проход мастер-сессий отложен: пик-окно"
+            );
+            return;
+        }
+        let now = self.clock.now_ms();
+        let role = analyst_role();
+        let mut projects: Vec<&String> = self.boards.iter().map(|b| &b.project).collect();
+        projects.sort();
+        projects.dedup();
+        for project in projects {
+            let Some((session, bound_model, _)) = self.state.master_binding(role, project) else {
+                continue;
+            };
+            let gateway = self.sessions.project(project);
+            match gateway.liveness(&session).await {
+                crate::ports::Liveness::Alive => {}
+                crate::ports::Liveness::Dead => {
+                    tracing::debug!(
+                        event = "analys.compact_dead_skip",
+                        project = %project,
+                        "Мёртвая привязка компактом не трогается"
+                    );
+                    continue;
+                }
+                crate::ports::Liveness::Unknown => {
+                    tracing::debug!(
+                        event = "analys.compact_unknown_skip",
+                        project = %project,
+                        "Состояние привязки неизвестно — компакт пропущен"
+                    );
+                    continue;
+                }
+            }
+            let Ok(model) = SpawnModel::parse(&bound_model) else {
+                tracing::warn!(
+                    event = "analys.compact_model_unparseable",
+                    project = %project,
+                    "Привязка с непарсящейся моделью — компакт пропущен"
+                );
+                continue;
+            };
+            let busy_flag = scan
+                .iter()
+                .find(|s| s.id == session)
+                .map(|s| s.busy)
+                .unwrap_or(false);
+            let idle_ms = match gateway.last_activity_ms(&session).await {
+                Ok(ms) => ms.map(|ms| now.saturating_sub(ms)),
+                Err(e) => {
+                    if self.session_gone(project, &session).await {
+                        tracing::warn!(event = "analys.compact_session_gone", project = %project,
+                            session = %session, "Сессия потеряна исполнителем — привязка пропущена");
+                        continue;
+                    }
+                    tracing::warn!(event = "analys.compact_probe_failed", project = %project,
+                        error = %e, "Проба активности не удалась — компакт-проход завершён");
+                    return;
+                }
+            };
+            let usage_pct = match gateway.context_usage_pct(&session, &model.model).await {
+                Ok(u) => u,
+                Err(e) => {
+                    if self.session_gone(project, &session).await {
+                        tracing::warn!(event = "analys.compact_session_gone", project = %project,
+                            session = %session, "Сессия потеряна исполнителем — привязка пропущена");
+                        continue;
+                    }
+                    tracing::warn!(event = "analys.compact_probe_failed", project = %project,
+                        error = %e, "Проба занятости не удалась — компакт-проход завершён");
+                    return;
+                }
+            };
+            let verdict = compact_verdict(
+                &CompactFacts {
+                    busy: busy_flag,
+                    idle_ms,
+                    usage_pct,
+                    last_compact_ms: self.state.master_compact_ms(role, project),
+                    now_ms: now,
+                },
+                policy,
+            );
+            if !verdict.fire {
+                tracing::debug!(
+                    event = "analys.compact_skip",
+                    project = %project,
+                    reason = %verdict.reason,
+                    "Компакт: не стреляем"
+                );
+                continue;
+            }
+            // Whole-pass CUP-гейт выше; per-admission счётчик не нужен
+            // (форма #1634: проход либо идёт целиком, либо отложен).
+            // Метка ДО POST (ADR-082): коулдаун переживает рестарт сервера,
+            // повторная адмиссия исключена.
+            self.state.set_master_compact_ms(role, project, now);
+            if let Err(e) = self.state.save() {
+                tracing::warn!(event = "analys.compact_save_failed",
+                    project = %project, error = %e, "Метка компакта не персистится");
+            }
+            match gateway.compact_session(&session).await {
+                Ok(()) => {
+                    tracing::info!(
+                        event = "analys.compacted",
+                        project = %project,
+                        session = %session,
+                        reason = %verdict.reason,
+                        "Нативный compact admitted"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        event = "analys.compact_failed",
+                        project = %project,
+                        session = %session,
+                        error = %e,
+                        "Адмиссия компакта не удалась — ретрай по коулдауну"
+                    );
+                }
+            }
+        }
     }
 
     /// Тупик цикла: строка переведена в Needs attention + коммент владельцу.

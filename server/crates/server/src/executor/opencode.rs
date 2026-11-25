@@ -831,12 +831,12 @@ mod tests {
         // спавна несёт её всегда (деф-файлы моделей не несут)
         let with = create_session_body(&spec(
             AgentSlot::Role(Agent::Dreamer),
-            ModelRef::new("zai-coding-plan", "glm-5.3-flash"),
+            ModelRef::new("opencode-go", "hy4-flash-free"),
             Some("high"),
         ));
         assert_eq!(with["agent"], "dreamer");
-        assert_eq!(with["model"]["providerID"], "zai-coding-plan");
-        assert_eq!(with["model"]["id"], "glm-5.3-flash");
+        assert_eq!(with["model"]["providerID"], "opencode-go");
+        assert_eq!(with["model"]["id"], "hy4-flash-free");
         assert_eq!(with["model"]["variant"], "high");
 
         let without = create_session_body(&spec(

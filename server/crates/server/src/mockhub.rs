@@ -6,9 +6,9 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use uwuwu_domain::{PrUrl, Priority, Slot, Status, Task, TaskFields};
-use uwuwu_usecase::{AppendDocOutcome, UsecaseError, UsecaseResult};
 use uwuwu_usecase::{CommentRef, IssueView};
 use uwuwu_usecase::{IssueFieldStore, TaskBoardRepo};
+use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 /// Состояние мок-хаба: строки «доски» (все имена досок → один стенд).
 #[derive(Default)]
@@ -430,6 +430,10 @@ impl TaskBoardRepo for MemoryHub {
             }
             if let Some(d) = direct {
                 task.set_direct(d);
+                // carrier-истина для проекции (#1616): read_board/issue_fields
+                // читают state.fields — без записи сюда apply_fields на каждом
+                // чтении доски молча сбрасывал бы флаг в дефолтный false
+                state.fields.entry(number).or_default().set_direct(d);
             }
             if let Some(f) = fact_track {
                 task.set_fact_track(f);
@@ -846,24 +850,19 @@ impl uwuwu_usecase::WikiRepo for MemoryHub {
         })
     }
 
-    async fn append_doc(
-        &self,
-        slug: &str,
-        line: &str,
-        _message: &str,
-    ) -> UsecaseResult<AppendDocOutcome> {
+    async fn append_doc(&self, slug: &str, line: &str, _message: &str) -> UsecaseResult<usize> {
         self.with_state(|state| {
-            let existed = state.docs.contains_key(slug);
-            let entry = state.docs.entry(slug.to_string()).or_default();
+            let Some(entry) = state.docs.get_mut(slug) else {
+                return Err(UsecaseError::AppendMissing(format!(
+                    "doc does not exist: {slug}"
+                )));
+            };
             if !entry.is_empty() && !entry.ends_with('\n') {
                 entry.push('\n');
             }
             entry.push_str(line);
             entry.push('\n');
-            Ok(AppendDocOutcome {
-                created: !existed,
-                lines: entry.lines().count(),
-            })
+            Ok(entry.lines().count())
         })
     }
 }
@@ -966,6 +965,23 @@ impl IssueFieldStore for MemoryHub {
                     continue;
                 }
                 match (*name, value) {
+                    ("Direct", Some(v)) => {
+                        // флаг direct (#1357): поле строки + carrier-запись
+                        // state.fields (проекция issue_fields/read_board) —
+                        // симметрия set_board_cells, иначе enrichment видит
+                        // дефолтный false (#1616)
+                        let on = v == "on";
+                        if let Some(task) = state.tasks.get_mut(&number) {
+                            task.set_direct(on);
+                        }
+                        f.set_direct(on);
+                    }
+                    ("Direct", None) => {
+                        if let Some(task) = state.tasks.get_mut(&number) {
+                            task.set_direct(false);
+                        }
+                        f.set_direct(false);
+                    }
                     ("Branch", Some(v)) => {
                         if let Some(b) = uwuwu_domain::BranchName::parse(v) {
                             f.set_branch(b);

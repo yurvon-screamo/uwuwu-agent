@@ -1045,7 +1045,16 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
         (None, Some(url)) => Vcs::Artifact { url },
         (None, None) => Vcs::Local,
     };
-    TaskFields::new(assignments, vcs, priority)
+    // Флаг direct (#1357): единственный честный рид — REST
+    // issue_field_values, виден на любой доске. Pv2-скан Direct не
+    // отдаёт: колонка не прилинкована ни к одной доске — blindness
+    // скана и есть механизм дубль-спавна #1616; apply_fields
+    // перезаписывает скановое значение безусловно.
+    let direct = raw
+        .get(uwuwu_usecase::F_DIRECT)
+        .map(|v| v == "on")
+        .unwrap_or(false);
+    TaskFields::new(assignments, vcs, priority, direct)
 }
 
 #[async_trait]
@@ -1284,15 +1293,11 @@ impl TaskBoardRepo for GitHubHub {
             .map(|v| v == "on" || v == "true")
             .unwrap_or(false);
         task.set_automerge(automerge);
-        // direct с носителя (#1357) — симметрично automerge: REST-путь MCP
-        // обязан быть честен, тик-путь читает item_values
-        let direct = raw
-            .get(uwuwu_usecase::F_DIRECT)
-            .map(|v| v == "on")
-            .unwrap_or(false);
-        task.set_direct(direct);
-        // fact_track с носителя (#1631) — симметрично direct: REST-путь
-        // MCP честен, тик-путь читает item_values
+        task.set_automerge(automerge);
+        // fact_track с носителя (#1631) — симметрично automerge: REST-путь
+        // MCP честен, тик-путь читает item_values. direct (#1616) сюда не
+        // дублируется: apply_fields(map_task_fields) уже несёт его из
+        // того же raw — один механизм, один источник
         let fact_track = raw
             .get(uwuwu_usecase::F_FACT_TRACK)
             .map(|v| v == "on")
@@ -2739,6 +2744,7 @@ mod tests {
     // уборке — resume с оригинальным panic-location
     fn pin_report_outcome(
         n: u64,
+        tag: &str,
         probe: Result<(), Box<dyn std::any::Any + Send>>,
         cleanup: Result<(), Box<dyn std::any::Any + Send>>,
         close_err: Option<UsecaseError>,
@@ -2764,15 +2770,17 @@ mod tests {
                 }
                 unreachable!("один отказ без close-ошибки — это паника");
             }
-            _ => panic!(
-                "#{n}: строка пробы {}; отказы пина — {}",
-                if close_err.is_none() {
-                    "закрыта (close not_planned)"
+            _ => {
+                let close_state = if close_err.is_none() {
+                    "закрыта (close not_planned)".to_owned()
                 } else {
-                    "НЕ закрыта — убрать руками, поиск по тайтлу [pin #1437]"
-                },
-                parts.join(" | ")
-            ),
+                    format!("НЕ закрыта — убрать руками, поиск по тайтлу [{tag}]")
+                };
+                panic!(
+                    "#{n}: строка пробы {close_state}; отказы пина — {}",
+                    parts.join(" | ")
+                )
+            }
         }
     }
 
@@ -2895,7 +2903,210 @@ mod tests {
             //    независимо от исхода пробы, восстановления и ассертов
             let close_err = hub.close_issue_ext(n, true).await.err();
             // 6. сводка исходов
-            pin_report_outcome(n, probe, cleanup, close_err);
+            pin_report_outcome(n, "pin #1437", probe, cleanup, close_err);
+        });
+    }
+
+    /// #1615 живая догфуд-приёмка ребра Review Analys → Todo (процедура
+    /// честной квитанции, прецедент приёмки #1384): настоящий переход
+    /// через канон-гард usecase edit() против живого носителя sandbox —
+    /// весь путь гарда, не raw set_status. Инстанс #1612 (25.11): гард
+    /// отклонял легальное ребро по стейл кеш-виду за пределами wt-окна
+    /// щита #1346 («transition Analys → Todo outside the pipeline
+    /// canon») при честном носителе.
+    ///
+    /// Граница гарантии (Low дельта-раунда #1615): стейл-ветка гарда
+    /// срабатывает только если лаг REST-листа длиннее паузы
+    /// (STATUS_TTL + запас) — принудить лаг пин не может; при
+    /// сошедшемся кеш-виде гард идёт fast path и пин зелёный так же
+    /// без фикса. Детерминированный регресс класса несёт юнит
+    /// (edit_guard_tests на расщеплённой правде); этот пин — смоук
+    /// ребра после wt-окна (приёмка BDD-сценария) + отказной ветки
+    /// (ребро 3: Todo → Review отрезается). Подписчика tracing в
+    /// тест-гарнесе нет — какая ветка отработала (fast path /
+    /// board.guard_stale_cache), по прогону не видно.
+    ///
+    /// Фикстура/уборка — по прецеденту #1437: create_issue на
+    /// sandbox (дефолт Analys #1135), close not_planned на каждом
+    /// выходе, номер строки в каждом отказе.
+    #[test]
+    #[ignore] // живой прогон: GH_TOKEN + сеть; МУТАЦИЯ — настоящие переходы, строка убирается за собой (≈5 мин: пауза wt-окна)
+    fn live_edit_guard_passes_review_analys_to_todo_edge_after_wt_window() {
+        use futures::FutureExt as _;
+        use uwuwu_usecase::{
+            StatusDelivery, TaskPatch, TaskWriteUseCase, TaskWriter, UsecaseError,
+        };
+        let repo =
+            std::env::var("UWUWU_HUB_REPO").unwrap_or_else(|_| "yurvon-screamo/uwuwu-hub".into());
+        let token = std::env::var("GH_TOKEN").expect("GH_TOKEN");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let board = "Задачи sandbox";
+            let hub = std::sync::Arc::new(GitHubHub::new(repo.clone(), token.clone()));
+            let writer = std::sync::Arc::new(TaskWriteUseCase {
+                board: hub.clone() as std::sync::Arc<dyn uwuwu_usecase::TaskBoardRepo>,
+                fields: std::sync::Arc::new(crate::github::fields::IssueFields::new(
+                    repo.clone(),
+                    token.clone(),
+                )),
+                boards: vec![("sandbox".to_string(), board.to_string())],
+                clock: std::sync::Arc::new(crate::clock::SystemClock),
+                state: std::sync::Arc::new(crate::api::test_support::StubState),
+            });
+            // 1. фикстура пробой самой: строка на sandbox, дефолт Analys
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_secs();
+            let title = format!("[pin #1615] гард канона: ребро Review Analys → Todo {stamp}");
+            let n = hub
+                .create_issue(
+                    board,
+                    "sandbox",
+                    &title,
+                    "живая догфуд-приёмка #1615 (ребро Review Analys → Todo после wt-окна); \
+                     убирается за собой — close not_planned",
+                    None,
+                )
+                .await
+                .expect("фикстура: строка создана на доске sandbox");
+            // 2. проба — под catch_unwind; close ниже на каждом выходе
+            let probe = std::panic::AssertUnwindSafe(async {
+                // create-конвергенция: свежий рид носителя в бюджете #1437
+                // (GraphQL ~2с) — фикстура легла до первого ребра
+                let mut base = None;
+                for _ in 0..5u32 {
+                    base = hub
+                        .fresh_row_status(board, n)
+                        .await
+                        .unwrap_or_else(|e| panic!("#{n}: свежий рид после create упал: {e}"));
+                    if base == Some(uwuwu_domain::Status::Analys) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+                assert_eq!(
+                    base,
+                    Some(uwuwu_domain::Status::Analys),
+                    "#{n}: create-дефолт Analys (#1135) не прочитан за 5×1с — фикстура не легла"
+                );
+                // Ребро 1: Analys → Review Analys (легальное; гейт полноты
+                // #1280 кормится из патча). Свежесозданной строки может не
+                // быть в items-индексе, пока REST-лист лагает: бюджет
+                // 6×10с, каждый отказ громкий, последний всплывает наверх
+                let mut edge1 = Err(UsecaseError::Board("fixture: edit not attempted".into()));
+                for _ in 0..6u32 {
+                    edge1 = writer
+                        .edit(
+                            "sandbox",
+                            n,
+                            TaskPatch {
+                                status: Some(uwuwu_domain::Status::ReviewAnalys),
+                                priority: Some("medium".to_string()),
+                                automerge: Some(false),
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                    if edge1.is_ok() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                }
+                edge1.expect("#{n}: ребро Analys → Review Analys не прошло за бюджет create-конвергенции");
+                let fresh = pin_fresh_status(&hub, board, n, "рид после ребра 1").await;
+                assert_eq!(
+                    fresh,
+                    uwuwu_domain::Status::ReviewAnalys,
+                    "#{n}: носитель несёт Review Analys после ребра 1"
+                );
+                // Пауза переживает wt-окно щита #1346: STATUS_TTL + запас —
+                // у следующего гарда запись давняя, тот самый режим
+                // инстанса #1612. Привязка к константе (Low дельта-раунда
+                // #1615): рост TTL сам сдвигает пин за окно, молчаливой
+                // деградации в зелёный нет
+                std::thread::sleep(
+                    crate::github::pv2::STATUS_TTL + std::time::Duration::from_secs(5),
+                );
+                // Ребро 2 (пин #1615): Review Analys → Todo — легальное
+                // ребро UC-01 проходит без ложного «вне канона» при любом
+                // возрасте записи. Без ретрая: канон-отказ здесь = живой
+                // баг-класс (красный), транспортный — честный красный
+                let receipt = writer
+                    .edit(
+                        "sandbox",
+                        n,
+                        TaskPatch {
+                            status: Some(uwuwu_domain::Status::Todo),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("#{n}: легальное ребро Review Analys → Todo отклонено гардом — класс #1615 жив");
+                let delivery = receipt
+                    .status
+                    .expect("#{n}: статусный патч без квитанции");
+                match delivery {
+                    StatusDelivery::Confirmed { actual } => assert_eq!(
+                        uwuwu_usecase::parse_status(&actual),
+                        uwuwu_domain::Status::Todo,
+                        "#{n}: raw-имя носителя = Todo: {actual}"
+                    ),
+                    StatusDelivery::Unverified { reason } => {
+                        // честная ветка #1437: success не заявляется —
+                        // доказательство несёт свежий рид ниже
+                        eprintln!("#{n}: квитанция Unverified ({reason}) — доказывает свежий рид ниже");
+                    }
+                }
+                let mut seen = None;
+                for _ in 0..5u32 {
+                    seen = hub
+                        .fresh_row_status(board, n)
+                        .await
+                        .unwrap_or_else(|e| panic!("#{n}: свежий рид после ребра 2 упал: {e}"));
+                    if seen == Some(uwuwu_domain::Status::Todo) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+                assert_eq!(
+                    seen,
+                    Some(uwuwu_domain::Status::Todo),
+                    "#{n}: носитель не несёт Todo после ребра 2 — переход не доехал"
+                );
+                // Ребро 3 (отказная ветка пина): Todo → Review вне канона —
+                // fresh-сверка подтверждает кеш-вид, честный отказ, носитель
+                // не сдвинулся
+                let err = writer
+                    .edit(
+                        "sandbox",
+                        n,
+                        TaskPatch {
+                            status: Some(uwuwu_domain::Status::UserReview),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect_err("#{n}: незаконное ребро Todo → Review прошло канон-гард");
+                assert!(
+                    format!("{err}").contains("outside the pipeline canon"),
+                    "#{n}: текст отказа: {err}"
+                );
+                let fresh = pin_fresh_status(&hub, board, n, "рид после отказа").await;
+                assert_eq!(
+                    fresh,
+                    uwuwu_domain::Status::Todo,
+                    "#{n}: после отказа носитель не сдвинулся"
+                );
+            })
+            .catch_unwind()
+            .await;
+            // 3. уборка тотальная (#1437 L2): close на каждом выходе —
+            //    независимо от исхода пробы и ассертов
+            let close_err = hub.close_issue_ext(n, true).await.err();
+            // 4. сводка исходов (отдельной откатной стадии нет: строка
+            //    уходит в close прямо из Todo)
+            pin_report_outcome(n, "pin #1615", probe, Ok(()), close_err);
         });
     }
 
@@ -3200,6 +3411,24 @@ mod tests {
             ]}
         });
         assert!(item_values(&item).direct);
+    }
+
+    /// Флаг direct через enrichment (#1616): map_task_fields читает
+    /// REST issue_field_values — единственный честный рид (Pv2-скан
+    /// Direct не отдаёт: колонка не прилинкована ни к одной доске).
+    /// Отсутствие поля — «носитель не сказал — не direct».
+    #[test]
+    fn map_task_fields_carries_direct_from_rest_carrier() {
+        let mut on = Fields::new();
+        on.insert(uwuwu_usecase::F_DIRECT.to_string(), "on".into());
+        assert!(
+            map_task_fields(&on).direct(),
+            "REST Direct=on → TaskFields.direct"
+        );
+        assert!(
+            !map_task_fields(&Fields::new()).direct(),
+            "нет поля — не direct (дефолт false)"
+        );
     }
 
     /// Строковый контракт FactTrack на тик-пути снапшота (#1631, тестировщик):
