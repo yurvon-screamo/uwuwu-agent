@@ -186,11 +186,13 @@ fn session(id: &str, directory: &str, outcome: &str, updated_ms: u64) -> Session
 struct FakeBoard {
     statuses: Mutex<HashMap<u64, Status>>,
     row_status_fails: bool,
-    /// Номер → сколько вызовов row_status уже было; на n-м вызове строки
-    /// возвращает In Progress (ревайв на перепробе).
+    /// Номер → на n-м вызове строки fresh_row_status возвращает In
+    /// Progress (ревайв виден ТОЛЬКО живому чтению — пин L3/L-1:
+    /// откат перепробы на row_status красит
+    /// row_revived_between_cycles_is_dropped_from_batch).
     revive_on_call: Mutex<HashMap<u64, usize>>,
-    /// Номер → с какого вызова row_status возвращает Err (перепроба
-    /// отказывает при живом pre-flight).
+    /// Номер → с какого вызова (в обоих методах) статус-чтение возвращает
+    /// Err — отказ жив и на pre-flight, и на перепробе.
     fail_from_call: Mutex<HashMap<u64, usize>>,
     calls: Mutex<HashMap<u64, usize>>,
 }

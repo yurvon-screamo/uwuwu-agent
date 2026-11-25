@@ -201,7 +201,7 @@ pub(super) async fn collect_verdicts(
     targets: &[&Task],
     out: &mut EnvGcOutcome,
 ) {
-    let Some(text) = wait_feed(sessions, bootstrap).await else {
+    let Some(text) = wait_feed(sessions, bootstrap, board_name, targets.len()).await else {
         tracing::warn!(
             event = "env.verdict_read_failed",
             board = board_name,
@@ -284,7 +284,12 @@ pub(super) async fn collect_verdicts(
 /// страх-дедлайном. Транспортные Err опроса ретраит адаптер (цикл с
 /// паузой USER_MSG_POLL до дедлайна) — сюда доходит только исход.
 /// None — маркера нет за страх-дедлайн (Ok(None)) либо Err-исчерпание.
-async fn wait_feed(sessions: &Gateway, bootstrap: &str) -> Option<String> {
+async fn wait_feed(
+    sessions: &Gateway,
+    bootstrap: &str,
+    board_name: &str,
+    batch_size: usize,
+) -> Option<String> {
     let started = Instant::now();
     let mut retries = 0usize;
     loop {
@@ -301,6 +306,8 @@ async fn wait_feed(sessions: &Gateway, bootstrap: &str) -> Option<String> {
                 retries += 1;
                 tracing::warn!(
                     event = "env.verdict_read_retry",
+                    board = board_name,
+                    batch = batch_size,
                     retry = retries,
                     error = %e,
                     "Опрос ленты упал — ретрай до страх-дедлайна/капа"
