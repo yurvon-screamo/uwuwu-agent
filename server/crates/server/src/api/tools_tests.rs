@@ -3009,38 +3009,208 @@ async fn task_create_strips_comments_tail_of_the_real_render() {
     assert!(stored.contains("тело для копии"), "тело на месте: {stored}");
 }
 
-/// #1648: секционная правка носителя с уже лежащим дампом снимает дамп и
-/// сохраняет дописанную секцию; гард сжатия не срабатывает на срезе.
+/// #1648: дамп засевается прямо в носитель (create его уже срезал бы).
+/// Секционная правка грязного носителя даёт байт-в-байт то же тело, что
+/// правка чистого: оракул — контрольная строка чистого носителя.
+async fn hash_of(tools: &ToolHub, number: u64) -> String {
+    let card = call(tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    fm_hash(&card)
+}
+
+fn dumped_body(clean: &str) -> String {
+    format!(
+        "{clean}\n\n--- comments (latest 1 of 1) ---\n---\n2026-11-24T04:59:18Z\nстарый коммент\n"
+    )
+}
+
 #[tokio::test]
-async fn task_body_section_keeps_new_section_after_existing_dump() {
+async fn task_body_section_on_carrier_with_dump_matches_clean_carrier() {
     let (tools, memory) = hub();
-    let base = "## Постановка\n\nтело до дампа.\n";
-    let dump = "\n\n--- comments (latest 1 of 1) ---\n---\n2026-11-24T04:59:18Z\nстарый коммент\n";
-    let polluted = format!("{base}{dump}");
-    let (number, hash) = create_task(&tools, "t: дамп + секция", &polluted).await;
+    let seed = "## Постановка\n\nтело до дампа.\n";
+    let (clean_no, _) = create_task(&tools, "t: чистое плечо", seed).await;
+    let (dirty_no, _) = create_task(&tools, "t: грязное плечо", seed).await;
+    let clean_body = memory
+        .read_issue("Задачи uwuwu", clean_no)
+        .await
+        .expect("read")
+        .body;
+    let polluted = dumped_body(&clean_body);
+    memory
+        .replace_body(dirty_no, &polluted)
+        .await
+        .expect("seed dump");
+    let seeded = memory
+        .read_issue("Задачи uwuwu", dirty_no)
+        .await
+        .expect("read")
+        .body;
+    assert_eq!(seeded, polluted, "дамп реально лежит до правки");
+
+    for (number, hash) in [
+        (clean_no, hash_of(&tools, clean_no).await),
+        (dirty_no, hash_of(&tools, dirty_no).await),
+    ] {
+        let receipt = call(
+            &tools,
+            "task_body_section",
+            json!({
+                "number": number,
+                "section": "План",
+                "content": "новая секция",
+                "base_hash": hash,
+            }),
+        )
+        .await
+        .expect("section edit");
+        assert!(receipt.contains("appended"), "квитанция: {receipt}");
+    }
+
+    let clean_stored = memory
+        .read_issue("Задачи uwuwu", clean_no)
+        .await
+        .expect("read")
+        .body;
+    let dirty_stored = memory
+        .read_issue("Задачи uwuwu", dirty_no)
+        .await
+        .expect("read")
+        .body;
+    assert_eq!(
+        dirty_stored, clean_stored,
+        "грязное против чистого плеча: {dirty_stored}"
+    );
+    assert!(!dirty_stored.contains("старый коммент"), "дамп снят");
+    assert!(!dirty_stored.contains("--- comments"), "маркер снят");
+}
+
+/// #1648: дамп вне редактируемой секции снимается молча — гард сжатия
+/// судит по собранному телу до среза и не требует `confirm: true`.
+#[tokio::test]
+async fn task_body_section_silent_when_dump_is_outside_edited_section() {
+    let (tools, memory) = hub();
+    let (number, _) = create_task(
+        &tools,
+        "t: дамп в другой секции",
+        "## Постановка\n\nтело\n\n## Смежное\n\nссылка\n",
+    )
+    .await;
+    let clean_body = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    memory
+        .replace_body(number, &dumped_body(&clean_body))
+        .await
+        .expect("seed dump");
+    let hash = hash_of(&tools, number).await;
 
     let receipt = call(
         &tools,
         "task_body_section",
         json!({
             "number": number,
-            "section": "План",
-            "content": "новая секция",
+            "section": "Постановка",
+            "content": "новое тело",
             "base_hash": hash,
         }),
     )
     .await
     .expect("section edit");
-    assert!(receipt.contains("appended"), "квитанция: {receipt}");
-
+    assert!(receipt.contains("replaced"), "квитанция: {receipt}");
+    assert!(!receipt.contains("confirm"), "гард молчит: {receipt}");
     let stored = memory
         .read_issue("Задачи uwuwu", number)
         .await
         .expect("read")
         .body;
-    assert_eq!(
-        stored,
-        format!("{base}\n\n## План\nновая секция\n"),
-        "дамп снят, секция цела: {stored}"
+    assert!(stored.contains("новое тело"), "секция правлена: {stored}");
+    assert!(!stored.contains("--- comments"), "дамп снят: {stored}");
+}
+
+/// #1648: шапка + хвост без тела — отказ «no effective content», носитель цел.
+#[tokio::test]
+async fn task_body_refuses_header_and_tail_without_body() {
+    let (tools, memory) = hub();
+    let body = "## Постановка\n\nтело остаётся.\n";
+    let (number, _) = create_task(&tools, "t: отказ по хвосту", body).await;
+    call(
+        &tools,
+        "task_comment",
+        json!({ "number": number, "text": "коммент" }),
+    )
+    .await
+    .expect("comment");
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    let fm_start = card.find("--- fm ---").expect("fm");
+    let body_start = card.find(body).expect("body in card");
+    let header_and_tail = format!(
+        "{}{}",
+        &card[fm_start..body_start],
+        "\n\n--- comments (latest 1 of 1) ---\n---\n2026-11-24T04:59:18Z\nкоммент\n"
+    );
+    let err = call(
+        &tools,
+        "task_body",
+        json!({ "number": number, "body": header_and_tail }),
+    )
+    .await
+    .expect_err("отказ");
+    assert!(err.contains("effective content"), "причина отказа: {err}");
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert!(stored.contains("тело остаётся"), "носитель цел: {stored}");
+}
+
+/// #1648: копия карточки в `content` секции не оставляет ленту на носителе.
+#[tokio::test]
+async fn task_body_section_strips_copied_card_in_content() {
+    let (tools, memory) = hub();
+    let (number, _) = create_task(
+        &tools,
+        "t: копия в content",
+        "## Постановка\n\nтело.\n\n## План\n\nстарое.\n",
+    )
+    .await;
+    call(
+        &tools,
+        "task_comment",
+        json!({ "number": number, "text": "лента источника" }),
+    )
+    .await
+    .expect("comment");
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    let copied = &card[card.find("--- fm ---").expect("fm")..];
+    let receipt = call(
+        &tools,
+        "task_body_section",
+        json!({
+            "number": number,
+            "section": "План",
+            "content": copied,
+            "base_hash": hash_of(&tools, number).await,
+        }),
+    )
+    .await
+    .expect("section edit");
+    assert!(receipt.contains("replaced"), "квитанция: {receipt}");
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert!(!stored.contains("--- comments"), "маркер не лёг: {stored}");
+    assert!(
+        !stored.contains("лента источника"),
+        "лента не легла: {stored}"
     );
 }

@@ -358,8 +358,8 @@ pub fn tool_descriptors() -> Value {
                 "body": string("full markdown body (no fm); a copied task_get header and \
                               comments tail are stripped on write; ABSENT parameter is a loud \
                               refusal (read via task_get); empty or whitespace-only string — \
-                              clear deliberately; fm/task_get-header-only input is refused \
-                              (no effective content)")
+                              clear deliberately; fm/task_get-header-only input or a comments \
+                              tail without body is refused (no effective content)")
             }))
         ),
         tool(
