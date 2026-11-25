@@ -2709,6 +2709,7 @@ mod tests {
     // уборке — resume с оригинальным panic-location
     fn pin_report_outcome(
         n: u64,
+        tag: &str,
         probe: Result<(), Box<dyn std::any::Any + Send>>,
         cleanup: Result<(), Box<dyn std::any::Any + Send>>,
         close_err: Option<UsecaseError>,
@@ -2734,15 +2735,17 @@ mod tests {
                 }
                 unreachable!("один отказ без close-ошибки — это паника");
             }
-            _ => panic!(
-                "#{n}: строка пробы {}; отказы пина — {}",
-                if close_err.is_none() {
-                    "закрыта (close not_planned)"
+            _ => {
+                let close_state = if close_err.is_none() {
+                    "закрыта (close not_planned)".to_owned()
                 } else {
-                    "НЕ закрыта — убрать руками, поиск по тайтлу [pin #1437]"
-                },
-                parts.join(" | ")
-            ),
+                    format!("НЕ закрыта — убрать руками, поиск по тайтлу [{tag}]")
+                };
+                panic!(
+                    "#{n}: строка пробы {close_state}; отказы пина — {}",
+                    parts.join(" | ")
+                )
+            }
         }
     }
 
@@ -2865,7 +2868,7 @@ mod tests {
             //    независимо от исхода пробы, восстановления и ассертов
             let close_err = hub.close_issue_ext(n, true).await.err();
             // 6. сводка исходов
-            pin_report_outcome(n, probe, cleanup, close_err);
+            pin_report_outcome(n, "pin #1437", probe, cleanup, close_err);
         });
     }
 
@@ -2875,14 +2878,20 @@ mod tests {
     /// весь путь гарда, не raw set_status. Инстанс #1612 (25.11): гард
     /// отклонял легальное ребро по стейл кеш-виду за пределами wt-окна
     /// щита #1346 («transition Analys → Todo outside the pipeline
-    /// canon») три попытки подряд при честном носителе. Пауза между
-    /// рёбрами переживает wt-окно (STATUS_TTL 240с, pv2.rs) — у второго
-    /// гарда статусная запись давняя, режим инстанса: исход
-    /// детерминирован — ребро проходит без ложного отказа (инвариант
-    /// #1235 на канон-пути), квитанция честная; кеш-лаг ловит событие
-    /// board.guard_stale_cache. Третий вызов — отказная ветка: незаконное
-    /// ребро Todo → Review гард отрезает по fresh-подтверждению, записи
-    /// нет. Фикстура/уборка — по прецеденту #1437: create_issue на
+    /// canon») при честном носителе.
+    ///
+    /// Граница гарантии (Low дельта-раунда #1615): стейл-ветка гарда
+    /// срабатывает только если лаг REST-листа длиннее паузы
+    /// (STATUS_TTL + запас) — принудить лаг пин не может; при
+    /// сошедшемся кеш-виде гард идёт fast path и пин зелёный так же
+    /// без фикса. Детерминированный регресс класса несёт юнит
+    /// (edit_guard_tests на расщеплённой правде); этот пин — смоук
+    /// ребра после wt-окна (приёмка BDD-сценария) + отказной ветки
+    /// (ребро 3: Todo → Review отрезается). Подписчика tracing в
+    /// тест-гарнесе нет — какая ветка отработала (fast path /
+    /// board.guard_stale_cache), по прогону не видно.
+    ///
+    /// Фикстура/уборка — по прецеденту #1437: create_issue на
     /// sandbox (дефолт Analys #1135), close not_planned на каждом
     /// выходе, номер строки в каждом отказе.
     #[test]
@@ -2976,10 +2985,14 @@ mod tests {
                     uwuwu_domain::Status::ReviewAnalys,
                     "#{n}: носитель несёт Review Analys после ребра 1"
                 );
-                // Пауза переживает wt-окно щита #1346 (STATUS_TTL 240с):
-                // у следующего гарда запись давняя — тот самый режим
-                // инстанса #1612
-                std::thread::sleep(std::time::Duration::from_secs(245));
+                // Пауза переживает wt-окно щита #1346: STATUS_TTL + запас —
+                // у следующего гарда запись давняя, тот самый режим
+                // инстанса #1612. Привязка к константе (Low дельта-раунда
+                // #1615): рост TTL сам сдвигает пин за окно, молчаливой
+                // деградации в зелёный нет
+                std::thread::sleep(
+                    crate::github::pv2::STATUS_TTL + std::time::Duration::from_secs(5),
+                );
                 // Ребро 2 (пин #1615): Review Analys → Todo — легальное
                 // ребро UC-01 проходит без ложного «вне канона» при любом
                 // возрасте записи. Без ретрая: канон-отказ здесь = живой
@@ -3058,7 +3071,7 @@ mod tests {
             let close_err = hub.close_issue_ext(n, true).await.err();
             // 4. сводка исходов (отдельной откатной стадии нет: строка
             //    уходит в close прямо из Todo)
-            pin_report_outcome(n, probe, Ok(()), close_err);
+            pin_report_outcome(n, "pin #1615", probe, Ok(()), close_err);
         });
     }
 

@@ -92,7 +92,9 @@ const ITEMS_TTL: std::time::Duration = std::time::Duration::from_secs(240);
 /// максимум возраста items-карты, до-записное значение нашей строки
 /// не просачивается в гард-чтение, пока wt жив. Дрейф ниже ITEMS_TTL
 /// тихо открывает стейл-окно — живая проба приёмки #1346 его вернёт.
-const STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(240);
+/// pub(crate): пауза живого пина #1615 привязана к окну — рост TTL сам
+/// сдвигает пин за пределы wt-окна, магическая константа не дрейфует.
+pub(crate) const STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(240);
 const META_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 impl Pv2Rest {
