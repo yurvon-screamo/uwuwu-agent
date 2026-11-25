@@ -405,7 +405,7 @@ impl AgentSessionGateway for FakeSessions {
         self.compacted.lock().unwrap().push(session.to_string());
         Ok(())
     }
-    async fn run_command(&self, _s: &str, _n: &str, _a: &str) -> UsecaseResult<()> {
+    async fn run_command(&self, _s: &str, _n: &str, _a: &str, _b: u64) -> UsecaseResult<()> {
         Ok(())
     }
     async fn liveness(&self, s: &str) -> Liveness {
@@ -494,6 +494,7 @@ impl AgentSessionGateway for FakeSessions {
             .filter(|id| !dead.contains(*id))
             .map(|id| crate::ports::SessionInfo {
                 id: id.clone(),
+                title: String::new(),
                 agent: String::new(),
                 directory: String::new(),
                 updated_ms: 0,
@@ -507,6 +508,7 @@ impl AgentSessionGateway for FakeSessions {
             out.push(crate::ports::SessionInfo {
                 busy: busy.contains(&id),
                 id,
+                title: String::new(),
                 agent: s.agent.clone(),
                 directory: s.directory.clone(),
                 updated_ms: s.updated_ms,
@@ -1417,6 +1419,7 @@ pub(crate) fn gateway_with_busy_sessions(
         for i in 0..count {
             extra.push(crate::ports::SessionInfo {
                 id: format!("ses_busy_{i}"),
+                title: String::new(),
                 agent: String::new(),
                 directory: String::new(),
                 updated_ms: 0,
@@ -3685,6 +3688,7 @@ async fn round_prompt_held_when_cup_full_marker_persists() {
         .unwrap()
         .push(crate::ports::SessionInfo {
             id: "ses_other_busy".into(),
+            title: String::new(),
             agent: String::new(),
             directory: String::new(),
             updated_ms: 0,
@@ -4190,6 +4194,7 @@ async fn cup_counts_second_turn_sessions() {
         .unwrap()
         .push(crate::ports::SessionInfo {
             id: "ses_2nd_150".into(),
+            title: String::new(),
             agent: "developer".into(),
             updated_ms: 0,
             outcome: "succeeded".into(),
@@ -4219,6 +4224,7 @@ async fn cup_busy_counts_non_pipeline_sessions() {
         .unwrap()
         .push(crate::ports::SessionInfo {
             id: "ses_bot".into(),
+            title: String::new(),
             agent: String::new(),
             updated_ms: 0,
             outcome: String::new(),
@@ -4303,6 +4309,7 @@ async fn wakeup_held_when_cup_full() {
             .unwrap()
             .push(crate::ports::SessionInfo {
                 id: id.into(),
+                title: String::new(),
                 agent: String::new(),
                 directory: String::new(),
                 updated_ms: 0,
@@ -4381,6 +4388,7 @@ async fn wakeup_delivery_occupies_cup_slot() {
         .unwrap()
         .push(crate::ports::SessionInfo {
             id: "ses_wake_180".into(),
+            title: String::new(),
             agent: String::new(),
             updated_ms: 0,
             outcome: "succeeded".into(),
@@ -5174,6 +5182,7 @@ async fn soft_ping_held_when_cup_full_then_delivered_on_free_slot() {
     // кап полон: чужая busy-сессия занимает единственный слот
     sess.extra.lock().unwrap().push(crate::ports::SessionInfo {
         id: "ses_cap_filler".into(),
+        title: String::new(),
         agent: String::new(),
         directory: String::new(),
         updated_ms: 0,
@@ -6619,6 +6628,7 @@ fn fake_session(
 ) -> crate::ports::SessionInfo {
     crate::ports::SessionInfo {
         id: id.into(),
+        title: String::new(),
         agent: agent.into(),
         directory: String::new(),
         updated_ms: 0,
@@ -8569,7 +8579,7 @@ impl AgentSessionGateway for FailingCreate {
     async fn prompt(&self, _s: &str, _t: &str) -> UsecaseResult<()> {
         Ok(())
     }
-    async fn run_command(&self, _s: &str, _n: &str, _a: &str) -> UsecaseResult<()> {
+    async fn run_command(&self, _s: &str, _n: &str, _a: &str, _b: u64) -> UsecaseResult<()> {
         Ok(())
     }
     async fn delete_session(&self, _s: &str) -> UsecaseResult<()> {

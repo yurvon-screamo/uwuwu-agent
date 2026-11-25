@@ -26,8 +26,9 @@
 #   фаза 10 (дример #1306): revival отдрименной сессии → wakeup ТОЙ ЖЕ
 #     дример-сессии (ADR-005 1:1), без revival — тишина; watermark+линк
 #     в state.json.
-#   фаза 14 (env-gc #1431): observe логирует кандидатов, live сносит по
-#     вердикту мока; реальный task-env-gc.sh на фикстуре (вердикты сноса).
+#   фаза 14 (env-gc #1431, батч #1526): observe логирует кандидатов, live
+#     сносит кандидатов ОДНОЙ командой по вердиктам мока; реальный
+#     task-env-gc.sh на фикстурах (батч-вызов, FAIL/abort-изоляция строки).
 #   фаза 15 (судья #1364): wake без переноса на шуме, паркинг вердиктом,
 #     fallback на старую механику при отказе decision-API.
 #   фаза 16 (#1607): мастер-сессия тестера (1 спавн + re-entry wake в ту же
@@ -1068,8 +1069,9 @@ say "фаза 13 ок: lost-resurrection через lost-руку, луп-гва
 say "фаза 14: env-gc #1431 — observe логирует кандидатов, live сносит по вердикту мока"
 
 # env-gc: candidates из снапшота доски (терминальная + закрытие > 48 ч),
-# снос — bootstrap в чекауте + slash-команда task-env-gc, вердикт —
-# user-сообщение мока (командный канал эмулирует shell-исход).
+# снос — bootstrap в чекауте + прямой shell скрипта (без slash-команд
+# и LLM-поворотов, #1526 — user-сообщения «ENV-GC …» вырезаны), вердикты —
+# stdout shell-сообщения (parse-all).
 # 2060 закрыта 3 суток назад (кандидат), 2061 — сегодня (свежая);
 # done-сиды CUP не занимают, тик терминальные строки не спавнит
 CONFIG_EGC="$RUN_DIR/config.egc.toml"
@@ -1100,7 +1102,7 @@ repo = "yurvon-screamo/uwuwu-agent"
 checkout = "/home/yurvon/uwuwu-agent"
 env_root = "/home/yurvon/agents-env"
 EOF
-EGC_SEED="Задачи uwuwu:2060:Done:low:3;Задачи uwuwu:2061:Done:low:0"
+EGC_SEED="Задачи uwuwu:2060:Done:low:3;Задачи uwuwu:2061:Done:low:0;Задачи uwuwu:2062:Done:low:3"
 
 # 14a: observe-гейт (env_gc_observe = true): кандидаты в логе, команд нет
 sed 's/env_gc_observe = false/env_gc_observe = true/' "$CONFIG_EGC" > "$CONFIG_EGC.obs"
@@ -1121,49 +1123,64 @@ while [ $SEEN -lt 10 ]; do
 done
 grep -q '"event":"env.gc.observe"' "$LOG_SRV_EGC" \
   || fail "observe-env-gc не показал кандидатов (env.gc.observe нет за 40с)"
-grep -q 'task-env-gc' "$LOG_MOCK" \
-  && fail "observe-env-gc диспатчит команды (мутация в observe)"
+grep -q 'mock.shell' "$LOG_MOCK" \
+  && fail "observe-env-gc диспатчит shell (мутация в observe)"
 say "14a ок: observe показал кандидата, команд нет"
 
-# 14b: live — диспатч сноса, вердикт SWEPT через мок, свежая строка не тронута
+# 14b: live — прямой shell (#1526): ОДИН shell-вызов скрипта со всеми
+# строками-кандидатами, вердикты обеих через мок, свежая строка не тронута.
+# MOCK_CMD_DELAY_MS=25000 — shell держится дольше общего клиентского
+# таймаута 20с: per-request бюджет прохода должен его довезти, цикл
+# переживает медленный shell.
 kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
 wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
 SRV_PID=""; MOCK_PID=""
 rm -f "$STATE"
-MOCK_MODE=idle MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=100 \
+MOCK_MODE=idle MOCK_PORT=$PORT_MOCK MOCK_STEP_MS=100 MOCK_CMD_DELAY_MS=25000 \
   "$BIN_MOCK" >"$LOG_MOCK" 2>&1 &
 MOCK_PID=$!
 sleep 1
+T14B_START=$(date +%s)
 UWUWU_SERVER_CONFIG="$CONFIG_EGC" UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
   UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=mockpass \
   UWUWU_MOCK_SEED="$EGC_SEED" RUST_LOG=info "$BIN_SRV" >"$LOG_SRV_EGC" 2>&1 &
 SRV_PID=$!
 SEEN=0
-while [ $SEEN -lt 15 ]; do
+while [ $SEEN -lt 45 ]; do
   SEEN=$((SEEN + 1)); sleep 4
-  grep -q '"event":"env.swept"' "$LOG_SRV_EGC" && break
+  grep -q '"event":"env.gc.completed"' "$LOG_SRV_EGC" && break
 done
-grep -q '"event":"env.swept"' "$LOG_SRV_EGC" \
-  || fail "live-env-gc не получил вердикт SWEPT (env.swept нет за 60с)"
-grep -q '"event":"mock.command"' "$LOG_MOCK" && grep -q 'task-env-gc' "$LOG_MOCK" \
-  || fail "мок не принял команду task-env-gc"
 grep -q '"event":"env.gc.completed"' "$LOG_SRV_EGC" \
-  || fail "нет итогового env.gc.completed"
-# свежая строка (2061) не кандидат: счётчики completed сходятся
+  || fail "live-env-gc не дошёл до completed за 180с (медленный shell 25с не доехал — per-request бюджет не работает?)"
+# пин факта медленной команды (Low-5 ревью кода): от старта фазы до
+# completed прошло ≥ задержки — откажи MOCK_CMD_DELAY_MS молча, ассерт
+# ловит исчезновение покрытия per-request таймаута
+T14B_END=$(date +%s)
+ELAPSED_14B=$((T14B_END - T14B_START))
+[ "$ELAPSED_14B" -ge 24 ] \
+  || fail "14b отработала за ${ELAPSED_14B}с < 25с задержки shell — MOCK_CMD_DELAY_MS не применился, покрытие per-request таймаута исчезло"
+CMDS=$(grep -c '"event":"mock.shell"' "$LOG_MOCK")
+[ "$CMDS" = "1" ] || fail "shell-вызовов task-env-gc.sh за проход: $CMDS, ждём ровно один (батч #1526)"
+grep -q '"event":"env.swept"' "$LOG_SRV_EGC" \
+  || fail "live-env-gc не получил вердикт SWEPT"
+# свежая строка (2061) не кандидат; оба старых кандидата снесены одной
+# командой: счётчики completed сходятся
 COMPLETED=$(grep '"event":"env.gc.completed"' "$LOG_SRV_EGC" | tail -1)
-echo "$COMPLETED" | grep -q '"swept":1' || fail "completed без swept=1: $COMPLETED"
-echo "$COMPLETED" | grep -q '"candidates":1' \
-  || fail "completed насчитал не одного кандидата: $COMPLETED"
+echo "$COMPLETED" | grep -q '"swept":2' || fail "completed без swept=2 (батч не собран): $COMPLETED"
+echo "$COMPLETED" | grep -q '"candidates":2' \
+  || fail "completed насчитал не двух кандидатов: $COMPLETED"
+echo "$COMPLETED" | grep -q '"batch":2' \
+  || fail "completed не несёт факт батча: $COMPLETED"
 grep -q '"event":"mock.session_deleted"' "$LOG_MOCK" \
   || fail "bootstrap env-gc не погашен после прохода"
 kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
 wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
 SRV_PID=""; MOCK_PID=""
 sleep 1
-say "фаза 14 ок: observe без мутаций, live снёс кандидата по вердикту мока, свежая не тронута, bootstrap погашен"
+say "фаза 14 ок: observe без мутаций, live снёс двух кандидатов ОДНИМ shell-вызовом (батч #1526), свежая не тронута, bootstrap погашен"
 
 # 14c: реальный скрипт сноса на фикстуре — shell-граница под автотестом
-# (мок 14b эмулирует исход команды; гарды и грамматика самого
+# (мок 14b эмулирует исход shell; гарды и грамматика самого
 # task-env-gc.sh до этого проверялись только ручными смоуками)
 say "фаза 14c: реальный task-env-gc.sh — SWEPT/DIRTY/FOREIGN/NOREPO/ABSENT, идемпотентность"
 GC_FIX="$RUN_DIR/envgc-fixture"
@@ -1194,7 +1211,45 @@ V=$(gc_sweep 990004); [ "$V" = "ENV-GC 990004 NOREPO" ] || fail "env без repo
 [ -d "$GC_FIX/envs/990004" ] || fail "norepo-env снесён"
 # absent: каталога нет → ABSENT
 V=$(gc_sweep 990005); [ "$V" = "ENV-GC 990005 ABSENT" ] || fail "отсутствующий env не ABSENT: $V"
-say "14c ок: реальный скрипт вернул все вердикты, грязный/чужой/без-repo выжили, повтор ABSENT"
+# батч-вызов (#1526): одна команда со списком строк — все вердикт-строки
+# одного вызова; per-row форма (выше) жива для совместимости окон выкатки
+git -C "$GC_FIX/checkout" worktree add -q -b work/task-990011 "$GC_FIX/envs/990011/repo"
+git -C "$GC_FIX/checkout" worktree add -q -b work/task-990012 "$GC_FIX/envs/990012/repo"
+echo dirt > "$GC_FIX/envs/990012/repo/dirty.txt"
+mkdir -p "$GC_FIX/envs/990013/repo"; git -C "$GC_FIX/envs/990013/repo" init -q
+mkdir -p "$GC_FIX/envs/990014/repo"; echo '{"x":1}' > "$GC_FIX/envs/990014/repo/data.json"
+GC_BATCH=$( ( cd "$GC_FIX/checkout" && UWUWU_ENV_ROOT="$GC_FIX/envs" bash "$GC_SCRIPT" sweep 990011 990012 990013 990014 990015 ) )
+EXPECTED_BATCH="ENV-GC 990011 SWEPT
+ENV-GC 990012 DIRTY
+ENV-GC 990013 FOREIGN
+ENV-GC 990014 NOREPO
+ENV-GC 990015 ABSENT"
+[ "$GC_BATCH" = "$EXPECTED_BATCH" ] || fail "батч-вызов вернул не полный набор вердиктов: «$GC_BATCH»"
+# FAIL-продолжение: заблокированный ворктри — worktree remove отказывает
+# (FAIL-вердикт строки), вердикты остальных строк батча доезжают
+git -C "$GC_FIX/checkout" worktree add -q -b work/task-990016 "$GC_FIX/envs/990016/repo"
+git -C "$GC_FIX/checkout" worktree add -q -b work/task-990017 "$GC_FIX/envs/990017/repo"
+git -C "$GC_FIX/checkout" worktree lock "$GC_FIX/envs/990016/repo"
+GC_FAIL_BATCH=$( ( cd "$GC_FIX/checkout" && UWUWU_ENV_ROOT="$GC_FIX/envs" bash "$GC_SCRIPT" sweep 990016 990017 ) )
+echo "$GC_FAIL_BATCH" | grep -q '^ENV-GC 990016 FAIL (worktree remove)$' \
+  || fail "заблокированный ворктри не FAIL: «$GC_FAIL_BATCH»"
+echo "$GC_FAIL_BATCH" | grep -q '^ENV-GC 990017 SWEPT$' \
+  || fail "цикл не продолжился после FAIL строки: «$GC_FAIL_BATCH»"
+[ -d "$GC_FIX/envs/990017" ] && fail "последняя строка батча 990017 не снесена — FAIL соседа прервал цикл"
+# внезапный abort строки: инъекция явного return ≠ 0 в копии скрипта —
+# по контракту per-row функции страховка цикла ловит только не-ноль
+# статуса функции (|| гасит set -e внутри тела — см. хедер скрипта)
+GC_ABORT_COPY="$RUN_DIR/task-env-gc-abort-inject.sh"
+ABORT_ROW=990018
+GC_INJECT="s/^sweep_one() {\$/sweep_one() { [ \"\$1\" = \"$ABORT_ROW\" ] \&\& return 7;/"
+sed "$GC_INJECT" "$GC_SCRIPT" > "$GC_ABORT_COPY"
+grep -q 'return 7' "$GC_ABORT_COPY" || fail "инъекция abort не легла в копию скрипта (пин структуры: sweep_one() { на отдельной строке)"
+git -C "$GC_FIX/checkout" worktree add -q -b work/task-990018 "$GC_FIX/envs/990018/repo"
+git -C "$GC_FIX/checkout" worktree add -q -b work/task-990019 "$GC_FIX/envs/990019/repo"
+GC_ABORT=$( ( cd "$GC_FIX/checkout" && UWUWU_ENV_ROOT="$GC_FIX/envs" bash "$GC_ABORT_COPY" sweep 990018 990019 ) )
+echo "$GC_ABORT" | grep -q '^ENV-GC 990018 FAIL' || fail "abort-строка не изолирована FAIL: «$GC_ABORT»"
+echo "$GC_ABORT" | grep -q '^ENV-GC 990019 SWEPT$' || fail "после abort строки цикл потерял остальные: «$GC_ABORT»"
+say "14c ок: реальный скрипт вернул все вердикты, батч-вызов полный, FAIL/abort строки изолированы, повтор ABSENT"
 
 say "фаза 15: судья #1364 — wake без переноса на шуме, паркинг вердиктом, fallback при отказе"
 # PORT_JUDGE / PORT_JUDGE_DOWN заданы наверху скрипта (подбор/оверрайд):

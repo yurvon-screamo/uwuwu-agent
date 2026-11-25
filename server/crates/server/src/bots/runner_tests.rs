@@ -391,7 +391,7 @@ impl AgentSessionGateway for FakeSessions {
         }
         Ok(())
     }
-    async fn run_command(&self, _s: &str, _n: &str, _a: &str) -> UsecaseResult<()> {
+    async fn run_command(&self, _s: &str, _n: &str, _a: &str, _b: u64) -> UsecaseResult<()> {
         Ok(())
     }
     async fn liveness(&self, session: &str) -> Liveness {
@@ -463,6 +463,7 @@ impl AgentSessionGateway for FakeSessions {
             .into_iter()
             .map(|(id, b)| SessionInfo {
                 id,
+                title: String::new(),
                 agent: String::new(),
                 directory: String::new(),
                 updated_ms: 0,
