@@ -3214,3 +3214,138 @@ async fn task_body_section_strips_copied_card_in_content() {
         "лента не легла: {stored}"
     );
 }
+
+// ---- tester #1648: приёмочный прогон главного сценария на MCP-поверхности ----
+
+fn tester_fm_value(card: &str, key: &str) -> String {
+    let prefix = format!("{key}: ");
+    card.lines()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// Полный путь живого пользователя: прочитать карточку с комментами →
+/// скопировать вывод от `--- fm ---` → записать копию через `task_body` и
+/// через `task_create`. Оракул — `body_hash`/`body_bytes` из той же копии:
+/// носитель обязан нести только тело, байт-в-байт равное телу источника.
+#[tokio::test]
+async fn tester_copy_of_card_with_comments_is_clean_on_both_write_paths() {
+    let (tools, memory) = hub();
+    let src_body = "## Постановка\n\nтело для копии.\n";
+    let (src, _) = create_task(&tools, "t: источник с лентой", src_body).await;
+    call(
+        &tools,
+        "task_comment",
+        json!({ "number": src, "text": "первый коммент источника" }),
+    )
+    .await
+    .expect("comment 1");
+    call(
+        &tools,
+        "task_comment",
+        json!({ "number": src, "text": "второй коммент источника" }),
+    )
+    .await
+    .expect("comment 2");
+
+    let card = call(&tools, "task_get", json!({ "number": src }))
+        .await
+        .expect("get source");
+    assert!(
+        card.contains("--- comments (latest 2 of 2) ---"),
+        "лента есть: {card}"
+    );
+    let oracle_hash = tester_fm_value(&card, "body_hash");
+    let oracle_bytes: usize = tester_fm_value(&card, "body_bytes")
+        .parse()
+        .expect("body_bytes");
+    let copied = &card[card.find("--- fm ---").expect("fm")..];
+
+    // Путь 1: task_body на существующей строке.
+    let (target, _) = create_task(&tools, "t: цель task_body", "## Постановка\n\nстарое.\n").await;
+    let receipt = call(
+        &tools,
+        "task_body",
+        json!({ "number": target, "body": copied }),
+    )
+    .await
+    .expect("task_body");
+    assert!(
+        receipt.contains(&format!("{oracle_bytes} bytes")),
+        "квитанция несёт размер тела источника: {receipt}"
+    );
+    assert!(
+        receipt.contains(&oracle_hash),
+        "квитанция несёт хэш: {receipt}"
+    );
+    let stored = memory
+        .read_issue("Задачи uwuwu", target)
+        .await
+        .expect("read target")
+        .body;
+    // task_create добавляет хвостовой перевод строки к телу источника —
+    // оракул — body_bytes из прочитанной копии, а не строка, поданная в create.
+    assert_eq!(stored.len(), oracle_bytes, "размер = oracle body_bytes");
+    assert_eq!(
+        stored,
+        format!("{src_body}\n"),
+        "носитель = тело источника байт-в-байт"
+    );
+    assert!(!stored.contains("--- comments"), "маркер не лёг: {stored}");
+    assert!(
+        !stored.contains("коммент источника"),
+        "лента не легла: {stored}"
+    );
+
+    // Путь 2: та же копия в task_create рождает строку без ленты.
+    let receipt = call(
+        &tools,
+        "task_create",
+        json!({ "title": "t: цель task_create", "body": copied }),
+    )
+    .await
+    .expect("task_create");
+    let created = receipt_number(&receipt);
+    let stored_new = memory
+        .read_issue("Задачи uwuwu", created)
+        .await
+        .expect("read created")
+        .body;
+    assert!(
+        stored_new.starts_with(src_body.trim_end()),
+        "тело на месте: {stored_new}"
+    );
+    assert!(
+        !stored_new.contains("--- comments"),
+        "маркер не лёг: {stored_new}"
+    );
+    assert!(
+        !stored_new.contains("коммент источника"),
+        "лента не легла: {stored_new}"
+    );
+}
+
+/// Регресс-пин «не перерезать»: чистое тело и копия без ленты проходят
+/// границу байт-в-байт; срез не должен трогать текст без сигнатуры записи.
+#[tokio::test]
+async fn tester_clean_body_copy_is_not_overstripped() {
+    let (tools, memory) = hub();
+    let body = "## Постановка\n\nчистое тело.\n\n## План\n\nбез ленты.\n";
+    let (number, _) = create_task(&tools, "t: чистая копия", body).await;
+    let receipt = call(
+        &tools,
+        "task_body",
+        json!({ "number": number, "body": body }),
+    )
+    .await
+    .expect("task_body");
+    assert!(receipt.contains("bytes"), "квитанция: {receipt}");
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert_eq!(stored, body, "чистое тело не тронуто");
+}

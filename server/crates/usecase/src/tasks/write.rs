@@ -3214,4 +3214,76 @@ mod tests {
         );
         assert!(!out.contains("--- comments"), "маркер снят: {out}");
     }
+
+    // ---- tester #1648: независимые пины главного сценария и стыка ----
+
+    /// Полная копия карточки `task_get` от маркера fm до конца — то, что
+    /// агент вставляет в `task_body`. Оракул — байты исходного тела.
+    fn tester_copied_card(body: &str, tail: &str) -> String {
+        format!(
+            "#42 manual: источник — Testing\n\n--- fm ---\nbranch: —\npr: —\nautomerge: true\n\
+             direct: false\nfact_track: false\ntype: bug\nbody_hash: deadbeef\nbody_bytes: {}\n\n\
+             {body}{tail}",
+            body.len()
+        )
+    }
+
+    fn tester_chain(input: &str) -> String {
+        strip_comments_tail(crate::fm_lite::strip(strip_task_get_header(input)))
+    }
+
+    #[test]
+    fn tester_copied_card_written_back_is_exact_body() {
+        let body = "## Постановка\n\nтело для копии.\n";
+        let tail = "\n\n--- comments (latest 2 of 2) ---\n---\n2026-11-24T04:59:18Z\nпервый\n\
+                    ---\n2026-11-24T05:00:00Z\nвторой\n";
+        let cleaned = tester_chain(&tester_copied_card(body, tail));
+        assert_eq!(cleaned, body, "копия карточки пишется телом байт-в-байт");
+    }
+
+    #[test]
+    fn tester_legacy_marker_full_chain() {
+        let body = "## Постановка\n\nтело.\n";
+        let tail = "\n\n--- comments (latest) ---\n---\n2026-11-23T10:00:00Z\nлегаси\n";
+        assert_eq!(tester_chain(&tester_copied_card(body, tail)), body);
+    }
+
+    #[test]
+    fn tester_seam_exact_bytes_lf_and_crlf() {
+        let comment = "\n\n--- comments (latest 1 of 1) ---\n---\n2026-11-24T04:59:18Z\nкоммент\n";
+        let comment_crlf = "\r\n\r\n--- comments (latest 1 of 1) ---\r\n---\r\n2026-11-24T04:59:18Z\r\nкоммент\r\n";
+        for (base, tail, section, expected) in [
+            (
+                "## П\n\nтело\n",
+                comment,
+                "\n## План\n\nсекция\n",
+                "## П\n\nтело\n\n## План\n\nсекция\n",
+            ),
+            (
+                "## П\n\nтело",
+                comment,
+                "\n## План\n\nсекция\n",
+                "## П\n\nтело\n## План\n\nсекция\n",
+            ),
+            (
+                "## П\r\n\r\nтело\r\n",
+                comment_crlf,
+                "\r\n## План\r\n\r\nсекция\r\n",
+                "## П\r\n\r\nтело\r\n\r\n## План\r\n\r\nсекция\r\n",
+            ),
+        ] {
+            let assembled = format!("{base}{tail}{section}");
+            assert_eq!(strip_comments_tail(&assembled), expected, "base: {base:?}");
+        }
+    }
+
+    #[test]
+    fn tester_clean_body_roundtrip_is_untouched() {
+        for body in [
+            "## Постановка\n\nчистое тело без ленты.\n",
+            "--- comments (latest 1 of 1) ---\n\nцитата в прозе без записей\n",
+        ] {
+            assert_eq!(tester_chain(body), body, "не трогаем без сигнатуры ленты");
+        }
+    }
 }
