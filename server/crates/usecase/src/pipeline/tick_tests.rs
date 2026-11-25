@@ -3584,6 +3584,228 @@ async fn test_slot_reentry_marker_open_skips_stall_pass() {
 }
 
 #[tokio::test]
+async fn test_reentry_held_when_cup_full_marker_persists() {
+    // #1607 (тестер-пин): CUP-гейт deliver_tester_reentry — тот же контур,
+    // что у будильника. Кап полон — дельта-промпт откладывается (Deferred),
+    // компакт/промпт не выполняются, pending-маркер persists: доставка
+    // ретраится на свободном тике, вход не теряется.
+    let state = Arc::new(MemState(Mutex::default()));
+    let mut t = task(64, Status::Testing);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Test,
+        uwuwu_domain::SessionRef::parse("ses_tester_cup").unwrap(),
+    );
+    t.apply_fields(f);
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((64, Status::InProgress));
+    let mut fake = FakeSessions::new();
+    fake.idle_reply = true;
+    let (u, board, sessions, _) =
+        fixture_usecase(vec![t], vec![], state.clone(), Arc::new(FixedClock), fake);
+    // чужой ход в полёте — единый кап занят
+    sessions
+        .extra
+        .lock()
+        .unwrap()
+        .push(crate::ports::SessionInfo {
+            id: "ses_other_busy".into(),
+            title: String::new(),
+            agent: String::new(),
+            directory: String::new(),
+            updated_ms: 0,
+            outcome: String::new(),
+            total_tokens: 0,
+            busy: true,
+        });
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+    assert!(
+        sessions.compacted.lock().unwrap().is_empty(),
+        "при полном капе компакт тестера не выполняется"
+    );
+    assert!(
+        sessions.prompts.lock().unwrap().is_empty(),
+        "при полном капе дельта-промпт не доставляется"
+    );
+    assert_eq!(out.wakeups, 0, "доставки нет");
+    assert_eq!(out.wakeups_deferred, 1, "доставка отложена, не потеряна");
+    assert!(
+        state.round_reentry_pending("B", 64),
+        "маркер persists — ретрай на свободном тике"
+    );
+    assert!(
+        !board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("clear#64=")),
+        "ячейка не снята — сессия та же"
+    );
+    assert_eq!(out.spawns_done, 0, "спавна нет");
+}
+
+#[tokio::test]
+async fn test_reentry_delivered_on_empty_journal_with_marker() {
+    // #1607 (тестер-пин): пустой журнал при открытом маркере — будить
+    // нечем, вход доставляет re-entry wake с дельта-промптом (первая
+    // ветка wakeup_if_fresh). Контроль: та же тишина без маркера —
+    // тихий пропуск, никаких доставок (канон #1237).
+    let build = |n: u64, prev: Status| {
+        let state = Arc::new(MemState(Mutex::default()));
+        let mut t = task(n, Status::Testing);
+        let mut f = TaskFields::default();
+        f.set_session(
+            Slot::Test,
+            uwuwu_domain::SessionRef::parse("ses_tester_empty").unwrap(),
+        );
+        t.apply_fields(f);
+        state.0.lock().unwrap().statuses.push((n, prev));
+        let mut fake = FakeSessions::new();
+        fake.idle_reply = true;
+        fixture_usecase(vec![t], vec![], state.clone(), Arc::new(FixedClock), fake)
+    };
+    // маркер открыт (переход In Progress → Testing прошлого тика) —
+    // re-entry доставляется
+    let (u, _, sessions, _) = build(65, Status::InProgress);
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    {
+        let prompts = sessions.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1, "одна доставка за вход: {prompts:?}");
+        assert!(
+            prompts[0].starts_with("ses_tester_empty|"),
+            "wake уходит в ту же сессию: {prompts:?}"
+        );
+        assert!(
+            prompts[0].contains("Repeat testing round"),
+            "пустой журнал при маркере — дельта-промпт, не спавн: {prompts:?}"
+        );
+    }
+    assert_eq!(out.wakeups, 1, "re-entry доставлен");
+    assert_eq!(out.spawns_done, 0, "спавна нет — сессия та же");
+    // контроль: тот же раунд без перехода (маркера нет) — пустой журнал
+    // молчит (вход уже доставлен спавн-промптом, будить нечем)
+    let (u2, _, sessions2, _) = build(66, Status::Testing);
+    let out2 = u2.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert!(
+        sessions2.prompts.lock().unwrap().is_empty(),
+        "без маркера пустой журнал молчит"
+    );
+    assert_eq!(out2.wakeups, 0, "доставки нет без маркера");
+}
+
+#[tokio::test]
+async fn test_reentry_delivered_when_tail_fully_own_echo() {
+    // #1607 (тестер-пин): хвост целиком свой (self-эхо срезано, #1204)
+    // при открытом маркере — будить нечем, вход доставляет re-entry wake.
+    // Маркер гасится доставкой; seen не двигается (#1533: хвост ждёт
+    // следующего держателя).
+    let state = Arc::new(MemState(Mutex::default()));
+    state.mark_own_comment("own-echo", 10);
+    state.set_last_comment_id("B", 67, "old-seen");
+    let mut t = task(67, Status::Testing);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Test,
+        uwuwu_domain::SessionRef::parse("ses_tester_echo").unwrap(),
+    );
+    t.apply_fields(f);
+    state
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .push((67, Status::InProgress));
+    let mut fake = FakeSessions::new();
+    fake.idle_reply = true;
+    fake.activity_ms = Some(5000);
+    let (u, _, sessions, _) = fixture_usecase(
+        vec![t],
+        vec![
+            CommentRef {
+                id: "old-seen".into(),
+                created_ms: 1000,
+                body: "старое".into(),
+            },
+            CommentRef {
+                id: "own-echo".into(),
+                created_ms: 3000,
+                body: "мой отчёт тестера".into(),
+            },
+        ],
+        state.clone(),
+        Arc::new(FixedClock),
+        fake,
+    );
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    let prompts = sessions.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1, "одна доставка за вход: {prompts:?}");
+    assert!(
+        prompts[0].contains("Repeat testing round"),
+        "свой хвост — re-entry wake, не wakeup с эхом: {prompts:?}"
+    );
+    assert!(
+        !prompts[0].contains("мой отчёт"),
+        "свой коммент не доставляется: {prompts:?}"
+    );
+    drop(prompts);
+    assert_eq!(out.wakeups, 1, "re-entry доставлен");
+    assert!(
+        !state.round_reentry_pending("B", 67),
+        "маркер погашен доставкой"
+    );
+    assert_eq!(
+        state.0.lock().unwrap().comments.last().map(String::as_str),
+        Some("old-seen"),
+        "seen не двигается — хвост ждёт следующего держателя (#1533)"
+    );
+}
+
+#[tokio::test]
+async fn stall_pass_on_foreign_slot_not_suppressed_by_tester_marker() {
+    // #1607 (тестер-пин, C2 р.2): маркер раунда переживает уход строки
+    // из Testing (тестер так и не получил вход) — сталл-детект ЧУЖОЙ
+    // стадии (Dev) давиться им не должен: пинг «переведи статус» адресован
+    // деву и честен. Скоуп marker_stage (Test|review) — красная линия.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_round_reentry_pending("B", 68);
+    let mut t = task(68, Status::InProgress);
+    let mut f = TaskFields::default();
+    f.set_session(
+        Slot::Dev,
+        uwuwu_domain::SessionRef::parse("ses_dev_stall").unwrap(),
+    );
+    t.apply_fields(f);
+    state.0.lock().unwrap().statuses.push((68, Status::Testing));
+    let mut fake = FakeSessions::new();
+    fake.activity_ms = Some(0);
+    let (u, board, _, _) =
+        fixture_usecase(vec![t], vec![], state.clone(), Arc::new(LostClock), fake);
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(
+        out.stall_pings, 1,
+        "открытый маркер тестера не давит сталл чужой стадии (Dev)"
+    );
+    assert!(
+        board
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("comment#68=")),
+        "пинг-коммент ушёл деву — маркер чужой стадии не скоупится"
+    );
+    assert!(
+        state.round_reentry_pending("B", 68),
+        "маркер не тронут сталлом чужой стадии — вход тестера ретраится"
+    );
+}
+
+#[tokio::test]
 async fn review_reentry_cycle_one_session_two_rounds() {
     // Приёмочный цикл (#1626): In Progress → ReviewResult → In Progress →
     // ReviewResult — ревьювер один, два раунд-промпта, ноль ревью-спавнов
@@ -7583,6 +7805,86 @@ async fn analyst_compact_ignores_foreign_role_bindings_1607() {
         sessions.compacted.lock().unwrap().as_slice(),
         ["ses_master"],
         "проход тронул только свою роль"
+    );
+}
+
+#[tokio::test]
+async fn analyst_compact_probe_failure_aborts_whole_pass_1607() {
+    // #1607 (тестер-пин): отказ пробы активности по живой привязке —
+    // достоверности тишины нет (#1281), проход завершается ЦЕЛИКОМ,
+    // а не молча пропускает строку: остальные проекты не адмиссились
+    // на этом тике (эталон — бот-супервизор, Unknown ≠ Dead).
+    let state = Arc::new(MemState(Mutex::default()));
+    // проекты в порядке прохода (sorted): первый — с отказывающей пробой
+    state.set_master_binding(
+        "analyst",
+        "pa",
+        "ses_probe_err",
+        "zai-coding-plan/glm-5.3-flash#high",
+        "/tmp/checkout",
+    );
+    state.set_master_binding(
+        "analyst",
+        "pb",
+        "ses_pb_idle",
+        "zai-coding-plan/glm-5.3-flash#high",
+        "/tmp/checkout",
+    );
+    let mut fake = FakeSessions::new();
+    fake.activity_ms = Some(0); // idle достаточен — но проба pa врёт отказом
+    fake.activity_fails_sessions
+        .lock()
+        .unwrap()
+        .push("ses_probe_err".into());
+    fake.usage
+        .lock()
+        .unwrap()
+        .insert("ses_pb_idle".into(), 90.0);
+    let sessions = Arc::new(fake);
+    let u = AnalystUseCase {
+        board: Arc::new(FakeBoard {
+            rows: std::sync::Mutex::new(vec![]),
+            log: Mutex::default(),
+            comments: vec![],
+            fields_fails: false,
+            set_session_fails: false,
+            set_pr_fails: AtomicBool::new(false),
+            clear_session_fails: AtomicBool::new(false),
+            status_fails: AtomicBool::new(false),
+        }),
+        boards: vec![
+            AnalystBoard {
+                project: "pb".into(),
+                board: "B2".into(),
+                checkout: "/tmp/checkout".into(),
+            },
+            AnalystBoard {
+                project: "pa".into(),
+                board: "B".into(),
+                checkout: "/tmp/checkout".into(),
+            },
+        ],
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        state: state.clone(),
+        clock: Arc::new(LostClock),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        cup: 7,
+        peak: PeakWindow {
+            enabled: false,
+            start_min: 0,
+            end_min: 0,
+        },
+        compact: Some(compact_policy_1607()),
+    };
+    u.tick().await.unwrap();
+    assert!(
+        sessions.compacted.lock().unwrap().is_empty(),
+        "отказ пробы — адмиссий нет (проход завершён)"
+    );
+    assert!(
+        state.master_compact_ms("analyst", "pa") == 0
+            && state.master_compact_ms("analyst", "pb") == 0,
+        "метки не выставлены — ретрай следующим тиком без коулдауна"
     );
 }
 
