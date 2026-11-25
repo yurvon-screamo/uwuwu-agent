@@ -703,7 +703,8 @@ impl TaskWriter for TaskWriteUseCase {
             let current = self.board.read_issue(&board, number).await?;
             return Err(UsecaseError::Board(format!(
                 "body of #{number}: write refused — the `body` parameter carries no effective \
-                 content (only fm/task_get-header wrapping, stripped on the boundary); \
+                 content (only fm/task_get-header wrapping or a comments tail from a copied \
+                 card, stripped on the boundary); \
                  task_body REPLACES the whole carrier body (write, not read; current body: \
                  {} bytes). Read the body via task_get; to clear deliberately pass \
                  body: \"\"",
@@ -980,19 +981,6 @@ where
     }
 }
 
-/// Дисплей-шапка task_get — рендер MCP-карточки, не носитель: агенты
-/// копируют вывод task_get назад в task_body, и шапка наслаивалась в
-/// теле (fm-стек инцидента #1331, инстансы #1526). Состав рендера
-/// (api/tools.rs task_get): тайтл-строка «#N title — status», пустая
-/// строка, fm-блок с ключами одного из рендеров ниже. Срезается на
-/// границе записи: инвариант ADR-105 «тело — чистый markdown» держит
-/// сервер, не дисциплина агента (прецедент #1151). Консервативно:
-/// строго набор/порядок ключей и форма карточки; срезаются все
-/// подряд идущие слои (стек, #1632); любой посторонний контент
-/// («--- fm ---» внутри текста) не трогается. Зеркало рендера: рендер
-/// меняется — менять формы здесь; пин в tools_tests собран из
-/// реального рендера и краснеет при расхождении (#1604 — body_bytes;
-/// #1631 — fact_track).
 /// Хвост ленты комментов из полной копии карточки `task_get`.
 ///
 /// Граница записи держит инвариант ADR-105: тело не несёт композит чтения.
@@ -1110,6 +1098,19 @@ fn is_comment_stamp(line: &str) -> bool {
         .all(|&i| bytes[i].is_ascii_digit())
 }
 
+/// Дисплей-шапка task_get — рендер MCP-карточки, не носитель: агенты
+/// копируют вывод task_get назад в task_body, и шапка наслаивалась в
+/// теле (fm-стек инцидента #1331, инстансы #1526). Состав рендера
+/// (api/tools.rs task_get): тайтл-строка «#N title — status», пустая
+/// строка, fm-блок с ключами одного из рендеров ниже. Срезается на
+/// границе записи: инвариант ADR-105 «тело — чистый markdown» держит
+/// сервер, не дисциплина агента (прецедент #1151). Консервативно:
+/// строго набор/порядок ключей и форма карточки; срезаются все
+/// подряд идущие слои (стек, #1632); любой посторонний контент
+/// («--- fm ---» внутри текста) не трогается. Зеркало рендера: рендер
+/// меняется — менять формы здесь; пин в tools_tests собран из
+/// реального рендера и краснеет при расхождении (#1604 — body_bytes;
+/// #1631 — fact_track).
 fn strip_task_get_header(md: &str) -> &str {
     // Актуальный рендер (#1604+#1631): branch/pr/automerge/direct/
     // fact_track/type/body_hash/body_bytes
@@ -3191,5 +3192,26 @@ mod tests {
     fn comments_tail_marker_without_entries_is_kept() {
         let body = "## П\n\n--- comments (latest 1 of 1) ---\n\nцитата в теле\n";
         assert_eq!(strip_comments_tail(body), body);
+    }
+
+    #[test]
+    fn comments_tail_strip_keeps_section_when_heading_in_first_of_two_entries() {
+        let input = "## П\n\nтело\n\n\n--- comments (latest 2 of 2) ---\n---\n2026-11-24T04:59:18Z\nпервый\n\n## Внутри коммента\n\nещё\n---\n2026-11-24T05:00:00Z\nвторой\n\n## План\n\nсекция\n";
+        let out = strip_comments_tail(input);
+        assert!(out.contains("## План\n\nсекция"), "секция цела: {out}");
+    }
+
+    #[test]
+    fn comments_tail_strip_accepts_crlf_seam_before_section() {
+        let body = "## П\r\n\r\nтело\r\n";
+        let input = format!(
+            "{body}\r\n\r\n--- comments (latest 1 of 1) ---\r\n---\r\n2026-11-24T04:59:18Z\r\nкоммент\r\n\r\n## План\r\n\r\nсекция\r\n"
+        );
+        let out = strip_comments_tail(&input);
+        assert!(
+            out.contains("## План\r\n\r\nсекция"),
+            "CRLF-стык цел: {out}"
+        );
+        assert!(!out.contains("--- comments"), "маркер снят: {out}");
     }
 }
