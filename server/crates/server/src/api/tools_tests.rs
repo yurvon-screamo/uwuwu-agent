@@ -1196,6 +1196,68 @@ async fn task_get_comments_window_full_when_within_limit() {
     );
 }
 
+/// Тестировщик #1604: body_bytes — байты UTF-8, а не символы. Астральный
+/// эмодзи разводит все три единицы: 🚀 — 4 байта UTF-8, 1 char, 2 единицы
+/// JS `.length`; потребитель сверяет через TextEncoder (байты), поэтому
+/// `chars().count()` здесь — тихая рассинхронизация того же класса.
+#[tokio::test]
+async fn task_get_body_bytes_counts_utf8_bytes_not_chars_on_astral_emoji() {
+    let (tools, _memory) = hub();
+    // Носитель нормализует хвостовой перенос — входную строку create не
+    // считаем; сверяем срез тела как он реально лежит в выводе (как и
+    // потребитель: TextEncoder над срезом между fm и хвостом комментов).
+    let (number, _) = create_task(
+        &tools,
+        "t: байты, не символы",
+        "## Постановка\n\nзапуск 🚀 ок.\n",
+    )
+    .await;
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    let start = card.find("body_bytes: ").expect("fm несёт body_bytes") + "body_bytes: ".len();
+    let line_end = start + card[start..].find('\n').expect("конец строки body_bytes");
+    let declared: usize = card[start..line_end].parse().expect("body_bytes — целое");
+    let slice = &card[line_end + 2..];
+    assert_ne!(
+        slice.chars().count(),
+        slice.len(),
+        "проба обязана разводить символы и байты (🚀: 4 байта, 1 char)"
+    );
+    assert_eq!(
+        declared,
+        slice.len(),
+        "заявлены байты UTF-8 (TextEncoder), не chars: {card}"
+    );
+    assert_ne!(
+        declared,
+        slice.chars().count(),
+        "chars-вариант отвергнут (Common-3): на 🚀 разъедется с TextEncoder"
+    );
+}
+
+/// Тестировщик #1604: карточка без комментов не несёт секцию хвоста
+/// вообще — заголовок «latest 0 of 0» вводил бы в заблуждение так же,
+/// как молчаливый сброс сверх 10 до среза 2.
+#[tokio::test]
+async fn task_get_without_comments_carries_no_comments_section() {
+    let (tools, _memory) = hub();
+    let (number, _) = create_task(&tools, "t: без комментов", "## Постановка\n\nтихо.\n").await;
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    assert!(
+        !card.contains("--- comments"),
+        "секции хвоста нет, а не «latest 0 of 0»: {card}"
+    );
+    assert!(
+        card.contains("body_bytes: "),
+        "состав заявлен и без хвоста: {card}"
+    );
+}
+
 /// #1604 (ревью Common-1): зеркало шапки (strip_task_get_header в фазе
 /// записи) живёт по строгому набору ключей рендера — пин собирается из
 /// РЕАЛЬНОГО рендера task_get, не из рукописной шапки: копия вывода
