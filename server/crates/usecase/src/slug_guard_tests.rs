@@ -1,7 +1,7 @@
 //! Юнит-пины slug-гарда (#1613): ветки отказа, легаси-стем, деградация
 //! (пустой live — root жив, parent/suffix пропущены), граница сегментов.
 
-use crate::slug_guard::{check, suffix_candidates, SlugVerdict};
+use crate::slug_guard::{check, check_root, suffix_candidates, SlugVerdict};
 
 fn live(slugs: &[&str]) -> Vec<String> {
     slugs.iter().map(|s| s.to_string()).collect()
@@ -54,6 +54,19 @@ fn plain_file_parent_refused() {
     let v = check(
         "Projects/uwuwu/Design Spec/док",
         &live(&["Projects/uwuwu/README", "Projects/uwuwu/Design Spec"]),
+    );
+    assert_eq!(
+        v,
+        SlugVerdict::ParentCollision("Projects/uwuwu/Design Spec".to_string())
+    );
+}
+
+#[test]
+fn deep_path_under_plain_file_parent_refused() {
+    // ревью Low-3: путь глубже под живым файлом — та же пара «файл + папка»
+    let v = check(
+        "Projects/uwuwu/Design Spec/Architecture/C4",
+        &live(&["Projects/uwuwu/Design Spec"]),
     );
     assert_eq!(
         v,
@@ -118,6 +131,15 @@ fn degraded_empty_live_keeps_root_check() {
 fn degraded_empty_live_skips_parent_and_suffix() {
     // деградационное окно: parent/suffix-проверки дерева не видят
     assert_eq!(check("Experience/platform/x", &[]), SlugVerdict::Clear);
+}
+
+#[test]
+fn root_check_works_without_tree() {
+    // окно сбоя чтения/дерева: root-проверка не зависит от источников,
+    // кандидатов в этом окне нет
+    assert_eq!(check_root("cli/x"), Some(Vec::new()));
+    assert_eq!(check_root("Experience"), Some(Vec::new()));
+    assert_eq!(check_root("Experience/x"), None);
 }
 
 // --- suffix_candidates ---

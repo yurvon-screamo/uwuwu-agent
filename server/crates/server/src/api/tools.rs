@@ -566,9 +566,8 @@ impl ToolHub {
         let incoming = arg_str(args, "content");
         // fm-гвард (#1444): шапка вики-дока переживает replace. Текущий
         // док нужен веткам переноса/создания; сбой чтения громко рвёт
-        // запись — кроме входа с собственным fm, той ветке док не нужен.
-        // read Err при входе с fm оставляет существование неизвестным —
-        // слаг-гард пропускается (прежний контракт, строка таблицы сбоев).
+        // запись — кроме входа с собственным fm, той ветке док не нужен
+        // (read Err при входе с fm оставляет существование неизвестным).
         let (existing, read_failed) = match self.wiki.read_doc(&slug).await {
             Ok(doc) => (doc, false),
             Err(e) => {
@@ -580,12 +579,18 @@ impl ToolHub {
                 (None, true)
             }
         };
-        // слаг-гард (#1613): достоверно новый док — предикат коллизий по
-        // живому дереву; существующий — быстрый путь без пробы дерева
-        // (симметрия #1403). Сбой дерева — деградация: root-проверка
-        // жива (константа, дерево не нужно), parent/suffix пропущены.
+        // слаг-гард (#1613): достоверно новый док — предикат по живому
+        // дереву; существующий — быстрый путь без пробы дерева (симметрия
+        // #1403). Read Err при входе с fm — существование неизвестно,
+        // полный гард невозможен, но root-проверка (ни от чтения, ни от
+        // дерева) остаётся — тихого пути семьи не остаётся. Сбой дерева —
+        // деградация: root жив (константа), parent/suffix пропущены.
         let mut degraded = false;
-        if !read_failed && existing.is_none() {
+        if read_failed {
+            if let Some(candidates) = slug_guard::check_root(&slug) {
+                return Err(root_prefix_error(&slug, &candidates));
+            }
+        } else if existing.is_none() {
             let live = match self.wiki.list_docs("").await {
                 Ok(live) => live,
                 Err(_) => {
@@ -598,15 +603,10 @@ impl ToolHub {
                     return Err(root_prefix_error(&slug, &candidates));
                 }
                 slug_guard::SlugVerdict::ParentCollision(parent) => {
-                    return Err(format!(
-                        "refused: parent-collision — «{parent}» is a live doc (file, not a folder); pick another slug"
-                    ));
+                    return Err(parent_collision_error(&parent));
                 }
                 slug_guard::SlugVerdict::SuffixCollision(candidates) => {
-                    return Err(format!(
-                        "refused: suffix-collision — «{slug}» collides with live docs: {}; write with the full slug or a distinct name",
-                        candidates.join(", ")
-                    ));
+                    return Err(suffix_collision_error(&slug, &candidates));
                 }
                 slug_guard::SlugVerdict::Clear => {}
             }
@@ -1054,17 +1054,38 @@ fn append_missing_error(slug: &str, candidates: &[String]) -> String {
     out
 }
 
-/// Отказ root-prefix (#1613): имя ветки + канонический набор корня +
-/// кандидаты суффикса (класс «совпавший тайтл» #1219).
+/// Отказ root-prefix (#1613): имя ветки + факт ветки (для одно-сегментного
+/// таргета — файл в корне вики, корень держит только папки; для
+/// много-сегментного — вне канонического набора) + кандидаты суффикса.
 fn root_prefix_error(slug: &str, candidates: &[String]) -> String {
-    let mut out = format!(
-        "refused: root-prefix — «{slug}» is outside the wiki root ({})",
-        slug_guard::ROOT_FOLDERS.join(", ")
-    );
-    if !candidates.is_empty() {
-        out.push_str(&format!("; suffix candidates: {}", candidates.join(", ")));
+    let roots = slug_guard::ROOT_FOLDERS.join(", ");
+    let fact = if slug.contains('/') {
+        format!("refused: root-prefix — «{slug}» is outside the wiki root ({roots})")
+    } else {
+        format!(
+            "refused: root-prefix — «{slug}» would be a file in the wiki root; the root holds folders only ({roots})"
+        )
+    };
+    if candidates.is_empty() {
+        fact
+    } else {
+        format!("{fact}; suffix candidates: {}", candidates.join(", "))
     }
-    out
+}
+
+/// Отказ parent-collision (#1613): живой файл без детей на пути таргета.
+fn parent_collision_error(parent: &str) -> String {
+    format!(
+        "refused: parent-collision — «{parent}» is a live doc (file, not a folder); pick another slug"
+    )
+}
+
+/// Отказ suffix-collision (#1613): живой док с совпавшим путём-хвостом.
+fn suffix_collision_error(slug: &str, candidates: &[String]) -> String {
+    format!(
+        "refused: suffix-collision — «{slug}» collides with live docs: {}; write with the full slug or a distinct name",
+        candidates.join(", ")
+    )
 }
 
 fn str_arg(args: &Value, key: &str) -> Option<String> {

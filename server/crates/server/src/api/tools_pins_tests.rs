@@ -49,9 +49,9 @@ async fn docs_append_requires_slug_and_line() {
 }
 
 /// Гард append-семантики docs_append (#1353): дописывание сохраняет
-/// тело существующего дока (fm + контент), строка — в конец; ответ
-/// различает append и создание. Сид несёт fm явно (#1444: вход с fm
-/// пишется дословно — append-пин фиксирует append-семантику на fm-доке).
+/// тело существующего дока (fm + контент), строка — в конец. Сид несёт
+/// fm явно (#1444: вход с fm пишется дословно — append-пин фиксирует
+/// append-семантику на fm-доке).
 #[tokio::test]
 async fn docs_append_keeps_body_of_existing_doc() {
     let tools = hub();
@@ -311,6 +311,8 @@ async fn docs_write_refuses_suffix_collision_under_canonical_root() {
         err.contains("Experience/Projects/x"),
         "кандидат не назван в отказе: {err}"
     );
+    let read = call(&tools, "docs_read", json!({ "slug": "Projects/x" })).await;
+    assert!(read.is_err(), "файл-двойник создан: {read:?}");
 }
 
 #[tokio::test]
@@ -332,6 +334,12 @@ async fn docs_write_sanitizes_slug_like_docs_read() {
     let ls = call(&tools, "docs_ls", json!({ "path": "Experience/platform" }))
         .await
         .expect("ls");
+    // адрес записи: слаг «x» жив под каноничным префиксом; сырой слаг
+    // («docs/Experience/platform/x.md» → docs/docs/…md.md) под ним не виден
+    assert!(
+        ls.lines().any(|l| l == "Experience/platform/x"),
+        "док по нормализованному слагу отсутствует: {ls}"
+    );
     assert!(
         !ls.lines().any(|l| l.ends_with(".md")),
         "двойник .md.md создан: {ls}"
@@ -372,7 +380,8 @@ async fn docs_write_degraded_tree_keeps_root_check_and_flags_skip() {
 }
 
 /// Вики с мёртвым деревом: list_docs рвётся транспортом (502-шторм,
-/// инцидент 22–23.11) — read/write живы, деградация только коллизий.
+/// инцидент 22–23.11) — read/write живы; append-таргет мока отсутствует
+/// (писатель авторитетен), деградация только коллизий.
 struct TreeFailingWiki;
 #[async_trait::async_trait]
 impl uwuwu_usecase::WikiRepo for TreeFailingWiki {
@@ -391,7 +400,9 @@ impl uwuwu_usecase::WikiRepo for TreeFailingWiki {
         Ok(())
     }
     async fn append_doc(&self, _: &str, _: &str, _: &str) -> uwuwu_usecase::UsecaseResult<usize> {
-        Ok(0)
+        Err(uwuwu_usecase::UsecaseError::AppendMissing(
+            "doc does not exist (tree-failing wiki)".into(),
+        ))
     }
 }
 
@@ -402,6 +413,97 @@ async fn docs_write_requires_slug_and_content() {
         .await
         .expect_err("отказ");
     assert_eq!(err, "slug and content are required");
+}
+
+// --- слаг-гард: вырожденные входы и окна источников (Low р1-кода) ---
+
+#[tokio::test]
+async fn docs_write_refuses_slug_empty_after_sanitization() {
+    // план-ревью р3 L-5: слаг, пустой после санитайза, — отказ входа
+    let tools = hub();
+    let err = call(
+        &tools,
+        "docs_write",
+        json!({ "slug": "   ", "content": "# x\n" }),
+    )
+    .await
+    .expect_err("отказ");
+    assert!(
+        err.contains("nothing left after sanitization"),
+        "вырожденный слаг не назван: {err}"
+    );
+}
+
+#[tokio::test]
+async fn docs_write_docs_prefixed_foreign_root_refused() {
+    // гиркин-сценарий: docs/-форма с неканоничным корнем (санитайз стрипит
+    // только ведущий docs/) — отказ root-prefix, не запись
+    let tools = hub();
+    let err = call(
+        &tools,
+        "docs_write",
+        json!({ "slug": "docs/platform/x", "content": "# x\n" }),
+    )
+    .await
+    .expect_err("отказ");
+    assert!(
+        err.contains("root-prefix"),
+        "ветка не названа в отказе: {err}"
+    );
+    let read = call(&tools, "docs_read", json!({ "slug": "platform/x" })).await;
+    assert!(read.is_err(), "файл вне структуры создан: {read:?}");
+}
+
+#[tokio::test]
+async fn docs_append_sanitizes_slug_like_docs_read() {
+    // нормализация таргета на append: docs/+.md-форма попадает в живой док
+    let tools = hub();
+    let live_slug = "Experience/platform/x";
+    call(
+        &tools,
+        "docs_write",
+        json!({ "slug": live_slug, "content": "# x\n" }),
+    )
+    .await
+    .expect("seed");
+    let answer = call(
+        &tools,
+        "docs_append",
+        json!({ "slug": "docs/Experience/platform/x.md", "line": "строка" }),
+    )
+    .await
+    .expect("нормализованный append");
+    assert!(
+        answer.contains("«Experience/platform/x»"),
+        "ответ не называет нормализованный слаг: {answer}"
+    );
+}
+
+#[tokio::test]
+async fn docs_append_degraded_tree_refuses_without_candidates() {
+    // строка 4 таблицы сбоев: дерево Err + append на несуществующем —
+    // отказ append-nonexistent без кандидатов (отказ-факт от дерева
+    // не зависит, писатель авторитетен)
+    let (tools, _) = tool_hub(
+        Arc::new(TreeFailingWiki),
+        blob_usecase(),
+        Arc::new(StubCronState::default()),
+    );
+    let err = call(
+        &tools,
+        "docs_append",
+        json!({ "slug": "cli/x", "line": "строка" }),
+    )
+    .await
+    .expect_err("отказ");
+    assert!(
+        err.contains("append-nonexistent"),
+        "ветка не названа в отказе: {err}"
+    );
+    assert!(
+        !err.contains("suffix candidates"),
+        "кандидаты из мёртвого дерева: {err}"
+    );
 }
 
 // --- fm-гвард docs_write (#1444): шапка вики-дока переживает replace ---
@@ -566,7 +668,7 @@ async fn docs_write_read_failure_is_loud_without_fm_payload() {
     let err = call(
         &tools,
         "docs_write",
-        json!({ "slug": "x/y", "content": "тело без шапки\n" }),
+        json!({ "slug": "Experience/y", "content": "тело без шапки\n" }),
     )
     .await
     .expect_err("отказ");
@@ -574,15 +676,38 @@ async fn docs_write_read_failure_is_loud_without_fm_payload() {
         err.contains("fm-guard"),
         "отказ без вменяемого текста гварда: {err}"
     );
-    let payload = "---\ntitle: x\n---\n\nтело с шапкой\n";
+    let payload = "---\ntitle: y\n---\n\nтело с шапкой\n";
     let answer = call(
         &tools,
         "docs_write",
-        json!({ "slug": "x/y", "content": payload }),
+        json!({ "slug": "Experience/y", "content": payload }),
     )
     .await
     .expect("вход с fm не зависит от сбоя чтения");
     assert!(answer.contains("verbatim"), "ветка не названа: {answer}");
+}
+
+/// Окно сбоя чтения (#1613, ревью Low-1): существование неизвестно,
+/// полный гард невозможен — но root-проверка (ни от чтения, ни от
+/// дерева) остаётся: тихого пути семьи не остаётся.
+#[tokio::test]
+async fn docs_write_read_failure_keeps_root_check_with_fm() {
+    let (tools, _) = tool_hub(
+        Arc::new(ReadFailingWiki),
+        blob_usecase(),
+        Arc::new(StubCronState::default()),
+    );
+    let err = call(
+        &tools,
+        "docs_write",
+        json!({ "slug": "platform/x", "content": "---\ntitle: x\n---\n\nтело\n" }),
+    )
+    .await
+    .expect_err("отказ");
+    assert!(
+        err.contains("root-prefix"),
+        "root-проверка не пережила сбой чтения: {err}"
+    );
 }
 
 /// Вики-носитель с мёртвым чтением: write проходит, read рвётся транспортом.

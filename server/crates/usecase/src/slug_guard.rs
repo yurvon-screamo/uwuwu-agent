@@ -47,11 +47,19 @@ pub fn check(target: &str, live: &[String]) -> SlugVerdict {
     if !target.contains('/') || !ROOT_FOLDERS.contains(&root_segment(target)) {
         return SlugVerdict::RootPrefix(suffix_candidates(target, live));
     }
-    if let Some(parent) = parent_of(target) {
-        let is_file = live.iter().any(|l| l == parent);
-        let has_children = live.iter().any(|l| l.starts_with(&format!("{parent}/")));
-        if is_file && !has_children {
-            return SlugVerdict::ParentCollision(parent.to_string());
+    // parent-collision по всем префиксам пути: живой файл без детей на
+    // любом уровне делает запись под собой невозможной (файл ≠ папка) —
+    // иначе глубокий путь рождает папку рядом с файлом, новую пару
+    // «файл + папка» того же класса
+    let segments: Vec<&str> = target.split('/').collect();
+    for depth in 1..segments.len() {
+        let parent = segments[..depth].join("/");
+        if !live.iter().any(|l| l == &parent) {
+            continue;
+        }
+        let prefix = format!("{parent}/");
+        if !live.iter().any(|l| l.starts_with(&prefix)) {
+            return SlugVerdict::ParentCollision(parent);
         }
     }
     let candidates = suffix_candidates(target, live);
@@ -62,10 +70,17 @@ pub fn check(target: &str, live: &[String]) -> SlugVerdict {
     }
 }
 
-fn root_segment(target: &str) -> &str {
-    target.split('/').next().unwrap_or_default()
+/// Root-ветка без дерева: одно-сегментный таргет (файл в корне вики) или
+/// корень вне канона. Доступна при сбое чтения (существование неизвестно)
+/// — ни от чтения, ни от дерева не зависит; кандидатов в этом окне нет.
+/// None — root-проверка пройдена.
+pub fn check_root(target: &str) -> Option<Vec<String>> {
+    if target.contains('/') && ROOT_FOLDERS.contains(&root_segment(target)) {
+        return None;
+    }
+    Some(Vec::new())
 }
 
-fn parent_of(target: &str) -> Option<&str> {
-    target.rsplit_once('/').map(|(parent, _)| parent)
+fn root_segment(target: &str) -> &str {
+    target.split('/').next().unwrap_or_default()
 }
