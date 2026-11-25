@@ -2166,7 +2166,7 @@ mod tests {
         assert_eq!(strip_task_get_header(md), md);
     }
 
-    /// CRLF-карточка — скоп #1637, здесь барьер не срабатывает (строкий
+    /// CRLF-карточка — скоп #1637, здесь барьер не срабатывает (строгий
     /// LF-паттерн); тест изолирован, чтобы держатель #1637 перевернул
     /// ровно его, не задевая LF-барьеры.
     #[test]
@@ -2180,6 +2180,13 @@ mod tests {
     fn task_get_non_render_title_is_kept() {
         let md = "## Постановка\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\n\nтекст";
         assert_eq!(strip_task_get_header(md), md);
+    }
+
+    /// Барьер решётки: тайтл без `#` — не рендер; вход цел.
+    #[test]
+    fn task_get_title_without_hash_is_kept() {
+        let md = card_copy_with_title("1526 t — In Progress");
+        assert_eq!(strip_task_get_header(md.as_str()), md.as_str());
     }
 
     /// Барьер « — »: тайтл без разделителя статуса — не рендер.
