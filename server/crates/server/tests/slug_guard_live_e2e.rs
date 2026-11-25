@@ -2,10 +2,9 @@
 //! rig-репо, которое тест сам создаёт и сносит через REST
 //! (POST /user/repos → DELETE /repos/{owner}/{repo}), + живой uwuwu-server
 //! (прод-писатель GitWikiWriter на GitHub Git Data API, ADR-110: HTTP-моков
-//! нет). Проба ветки AppendMissing писателя — требование ревью #1613:
-//! юнитами она не покрыта.
+//! нет). Проба ветки AppendMissing писателя важна: юнитами она не покрыта.
 //!
-//! Детерминизм против GitHub (тест-ревью #1613): Contents API отстаёт от
+//! Детерминизм против GitHub: Contents API отстаёт от
 //! git-data (в дереве файл виден через ~2 с, через contents — до ~20 с),
 //! update_ref на частых коммитах изредка даёт 422 «competing commit», поэтому:
 //!   - сиды PUT до старта сервера, прогон ждёт их видимости в git/trees;
@@ -46,9 +45,8 @@
 //!      нормализованный слаг с разделителем «…»; финальный blob-набор
 //!      исключает двойника «….md.md» и сырые пути.
 //!
-//! Гейты: UWUWU_E2E=1; GH_TOKEN со scope repo (создание/запись) и
-//! delete_repo. UWUWU_E2E_HUB_REPO не используется (был в прошлом раунде:
-//! риг теперь создаёт сам тест, внешнее репо не предполагается).
+//! Гейты: UWUWU_E2E=1; GH_TOKEN со scope repo (создание/запись) и delete_repo.
+//! Внешнее репо не требуется: риг создаёт сам тест.
 //!
 //! Запуск:
 //!   UWUWU_E2E=1 cargo test -p uwuwu-server --test slug_guard_live_e2e -- --nocapture
@@ -57,15 +55,19 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// Верхняя граница ожидания видимости в GitHub: Contents отстаёт от
-/// git-data-коммита до десятков секунд (замеры тест-ревью #1613).
+/// git-data-коммита до десятков секунд.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(75);
 const POLL_STEP: Duration = Duration::from_secs(1);
 /// Пауза между MCP-записями: митигация гонки update_ref (422 «competing
-/// commit» без конкурента — тест-ревью #1613).
+/// commit» без конкурента).
 const WRITE_PAUSE: Duration = Duration::from_millis(1500);
+/// Ограниченный ретрай одиночных REST-чтений на транзиентный 5xx/сетевой сбой.
+const API_RETRIES: u32 = 3;
+const API_RETRY_PAUSE: Duration = Duration::from_secs(2);
 /// Буфер после первой видимости файла в contents: сервер читает тот же API,
 /// но ответы могут идти с разных узлов — страховка на гране.
 const VISIBILITY_GRACE: Duration = Duration::from_millis(1500);
@@ -106,15 +108,19 @@ fn log_tail(path: &Path) -> String {
 }
 
 struct Stand {
-    server: Child,
+    dir: PathBuf,
+    /// Mutex даёт `try_wait(&mut self)` через неизменяемую ссылку в mcp_call.
+    server: Mutex<Child>,
     port: u16,
     bearer: String,
 }
 
 impl Drop for Stand {
     fn drop(&mut self) {
-        let _ = self.server.kill();
-        let _ = self.server.wait();
+        if let Ok(mut child) = self.server.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -144,14 +150,15 @@ async fn spawn_server(dir: &Path, repo: &str) -> Stand {
         .env("UWUWU_HUB_REPO", repo)
         .env("RUST_LOG", "warn")
         // Окружение запустившего не протекает в стенд: GEMINI_API_KEY включает
-        // судью и LanceDB/FTS в каталоге стенда (тест-ревью #1613).
+        // судью и LanceDB/FTS в каталоге стенда.
         .env_remove("GEMINI_API_KEY")
         .stdout(Stdio::from(log.try_clone().expect("log clone")))
         .stderr(Stdio::from(log))
         .spawn()
         .expect("spawn uwuwu-server");
     let stand = Stand {
-        server,
+        dir: dir.to_path_buf(),
+        server: Mutex::new(server),
         port,
         bearer: bearer.into(),
     };
@@ -194,7 +201,17 @@ async fn mcp_call(
         .timeout(Duration::from_secs(30))
         .send()
         .await
-        .expect("mcp transport");
+        .unwrap_or_else(|e| {
+            let fate = match stand.server.lock().expect("server lock").try_wait() {
+                Ok(Some(status)) => format!("процесс завершился: {status}"),
+                Ok(None) => "процесс жив".to_string(),
+                Err(err) => format!("статус недоступен: {err}"),
+            };
+            panic!(
+                "mcp transport: {e}; сервер: {fate}\n{}",
+                log_tail(&stand.dir.join("server.log"))
+            );
+        });
     let body: Value = resp.json().await.expect("mcp json");
     let result = body
         .get("result")
@@ -222,6 +239,7 @@ async fn mcp_write(
 ) -> (bool, String) {
     let (err, text) = mcp_call(http, stand, tool, args.clone()).await;
     if err && text.contains("competing commit") {
+        println!("MCP {tool}: competing commit — повтор через 3 с");
         tokio::time::sleep(Duration::from_secs(3)).await;
         return mcp_call(http, stand, tool, args).await;
     }
@@ -244,16 +262,47 @@ async fn api_call(
     if let Some(b) = body {
         req = req.json(&b);
     }
-    let resp = req.send().await.expect("github transport");
+    let resp = match req.send().await {
+        Ok(resp) => resp,
+        // Сетевой сбой — транзиентный, как 5xx. Поллинг считает его «ещё не
+        // видно», одиночные чтения — ретраем, записи — своим ретраем.
+        Err(e) => {
+            return (
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                json!({"transport_error": e.to_string()}),
+            )
+        }
+    };
     let status = resp.status();
     let value = resp.json().await.unwrap_or(Value::Null);
     (status, value)
 }
 
+/// Ограниченный ретрай на 5xx и транспортные сбои для одиночных чтений.
+/// 4xx не ретраим: это честный отказ API, а не транзиент.
+async fn api_call_retry(
+    http: &reqwest::Client,
+    token: &str,
+    method: reqwest::Method,
+    path: &str,
+) -> (reqwest::StatusCode, Value) {
+    let mut last = (reqwest::StatusCode::SERVICE_UNAVAILABLE, Value::Null);
+    for attempt in 1..=API_RETRIES {
+        last = api_call(http, token, method.clone(), path, None).await;
+        if !last.0.is_server_error() {
+            return last;
+        }
+        if attempt < API_RETRIES {
+            tokio::time::sleep(API_RETRY_PAUSE).await;
+        }
+    }
+    last
+}
+
 /// Rig-репо: тест сам создаёт (POST /user/repos, приватное, auto-init) и сам
 /// сносит (DELETE /repos/{owner}/{repo}) — фикстура поднимается из репо и не
-/// оставляет следов (тест-ревью #1613). Имя только с префиксом
-/// `uwuwu-rig-e2e-`: POST создаёт, чужое/существующее репо подставить нельзя.
+/// оставляет следов. Имя только с префиксом `uwuwu-rig-e2e-`: POST создаёт,
+/// чужое/существующее репо подставить нельзя.
 #[derive(Clone)]
 struct RigGithub {
     http: reqwest::Client,
@@ -262,6 +311,26 @@ struct RigGithub {
     repo: String,
     /// ветка по умолчанию из ответа создания (не хардкод «main»)
     branch: String,
+    /// Проверки ответа создания: сценарий паникует уже после POST, чтобы
+    /// тест успел снести репо на любом исходе.
+    creation_error: Option<String>,
+}
+
+/// Если тест упал до вызова delete — громкая инструкция о ручном сносе.
+struct RigLease {
+    repo: String,
+    deleted: bool,
+}
+
+impl Drop for RigLease {
+    fn drop(&mut self) {
+        if !self.deleted && !self.repo.is_empty() {
+            eprintln!(
+                "ВНИМАНИЕ: риг {} не снесён — удали вручную: gh api -X DELETE /repos/{}",
+                self.repo, self.repo
+            );
+        }
+    }
 }
 
 impl RigGithub {
@@ -282,50 +351,44 @@ impl RigGithub {
             })),
         )
         .await;
-        assert!(
-            status.is_success(),
-            "rig-репо не создано: HTTP {status} — {body}"
-        );
-        let repo = body["full_name"].as_str().expect("full_name").to_string();
-        let branch = body["default_branch"]
-            .as_str()
-            .expect("default_branch")
-            .to_string();
-        assert!(
-            repo.ends_with(&format!("/uwuwu-rig-e2e-{stamp}")),
-            "имя рига не совпало с ожидаемым префиксом: {repo}"
-        );
-        assert_eq!(
-            body["private"].as_bool(),
-            Some(true),
-            "риг обязан быть приватным"
-        );
+        let repo = body["full_name"].as_str().unwrap_or("").to_string();
+        let branch = body["default_branch"].as_str().unwrap_or("").to_string();
+        // Ни одной паники после POST: ошибка ответа уходит в сценарий, который
+        // исполняется внутри spawn — teardown всё равно состоится.
+        let creation_error = if !status.is_success() {
+            Some(format!("rig-репо не создано: HTTP {status} — {body}"))
+        } else if !repo.ends_with(&format!("/uwuwu-rig-e2e-{stamp}")) {
+            Some(format!("имя рига не совпало с ожидаемым префиксом: {repo}"))
+        } else if body["private"].as_bool() != Some(true) {
+            Some("риг обязан быть приватным".to_string())
+        } else {
+            None
+        };
         Self {
             http: http.clone(),
             token: token.to_string(),
             repo,
             branch,
+            creation_error,
         }
     }
 
-    /// Снос рига. Без права удаления — громкая паника с командой ручного
-    /// сноса: disposable-репо не должно жить после прогона.
-    async fn delete(&self) {
-        let (status, body) = api_call(
+    /// Снос рига: ошибка возвращается, а не паникует — сообщение упавшего
+    /// сценария не должно теряться под паникой сноса. DELETE идемпотентен,
+    /// поэтому здесь ретрай на транзиентные сбои безопасен.
+    async fn delete(&self) -> Result<(), String> {
+        let (status, body) = api_call_retry(
             &self.http,
             &self.token,
             reqwest::Method::DELETE,
             &format!("/repos/{}", self.repo),
-            None,
         )
         .await;
-        assert!(
-            status.is_success(),
-            "риг-репо {} не снесено: HTTP {status} — {body}\n\
-             снеси руками: gh api -X DELETE /repos/{}",
-            self.repo,
-            self.repo
-        );
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(format!("HTTP {status} — {body}"))
+        }
     }
 
     fn contents_path(&self, path: &str) -> String {
@@ -375,7 +438,9 @@ impl RigGithub {
             None,
         )
         .await;
-        if status.as_u16() == 404 {
+        // 404 — ещё не видно; 5xx и transport (503) — тоже транзиент:
+        // поллинг продолжится до дедлайна, а не упадёт на первом сбое.
+        if status.as_u16() == 404 || status.is_server_error() || status.as_u16() == 429 {
             return None;
         }
         assert!(status.is_success(), "GET {path}: HTTP {status} — {body}");
@@ -400,6 +465,10 @@ impl RigGithub {
             None,
         )
         .await;
+        // Транзиентный 5xx/429 в поллинге дерева — «ещё не видно».
+        if status.is_server_error() || status.as_u16() == 429 {
+            return Vec::new();
+        }
         assert!(
             status.is_success(),
             "дерево не прочитано: HTTP {status} — {body}"
@@ -423,12 +492,11 @@ impl RigGithub {
     /// SHA ветки (git/ref/heads) — факт записи на уровне ref: сдвинулся —
     /// была запись, без зависимости от лага contents.
     async fn ref_sha(&self) -> String {
-        let (status, body) = api_call(
+        let (status, body) = api_call_retry(
             &self.http,
             &self.token,
             reqwest::Method::GET,
             &format!("/repos/{}/git/ref/heads/{}", self.repo, self.branch),
-            None,
         )
         .await;
         assert!(
@@ -460,18 +528,24 @@ impl RigGithub {
     }
 
     /// Положительное чтение после записи поллингом: contents отдаёт 404 до
-    /// ~20 с после git-data-коммита (тест-ревью #1613). Возвращает
-    /// прочитанное после грэйса (страховка до серверного чтения).
+    /// ~20 с после git-data-коммита. Возвращает прочитанное после грэйса
+    /// (страховка до серверного чтения); грэйс тоже поллится — 5xx в нём
+    /// не считается исчезновением файла.
     async fn wait_file(&self, path: &str, needle: &str) -> String {
         let deadline = tokio::time::Instant::now() + WAIT_TIMEOUT;
+        let mut visible_at: Option<tokio::time::Instant> = None;
         loop {
             if let Some(content) = self.read_file(path).await {
                 if content.contains(needle) {
-                    tokio::time::sleep(VISIBILITY_GRACE).await;
-                    return self
-                        .read_file(path)
-                        .await
-                        .unwrap_or_else(|| panic!("файл {path} исчез после видимости"));
+                    match visible_at {
+                        None => visible_at = Some(tokio::time::Instant::now()),
+                        Some(at) if tokio::time::Instant::now() >= at + VISIBILITY_GRACE => {
+                            return content
+                        }
+                        _ => {}
+                    }
+                } else {
+                    visible_at = None;
                 }
             }
             assert!(
@@ -505,6 +579,10 @@ impl RigGithub {
 }
 
 async fn run_scenario(dir: PathBuf, rig: RigGithub, stamp: String) {
+    // Паника здесь безопасна: сценарий уже в подзадаче, внешний тест снесёт риг.
+    if let Some(error) = &rig.creation_error {
+        panic!("{error}");
+    }
     let seed_doc = "---\ntitle: rig-article\ndate: 2026-01-01T00:00:00+09:00\nlastmod: 2026-01-01T00:00:00+09:00\n---\n\nseed body line\n";
     let seeds: Vec<String> = vec![
         format!("docs/Experience/cli/rig-{stamp}.md"),
@@ -659,8 +737,7 @@ async fn run_scenario(dir: PathBuf, rig: RigGithub, stamp: String) {
         !err,
         "легаси-стем «файл + папка» должен пустить запись: {text}"
     );
-    // Позитивное чтение содержимого: стем-запись состоялась по адресу (К4:
-    // вместо мёртвого отсутствия «….md.md», которое не могло возникнуть).
+    // Позитивное чтение содержимого: стем-запись состоялась по адресу.
     let content = rig.wait_file(&format!("docs/{adr}.md"), "adr body").await;
     assert!(
         content.starts_with("---\n"),
@@ -686,7 +763,7 @@ async fn run_scenario(dir: PathBuf, rig: RigGithub, stamp: String) {
     tokio::time::sleep(WRITE_PAUSE).await;
     let norm_slug = format!("Experience/rig{stamp}/norm");
     // Разделитель «…» в ответе отличает нормализованный слаг от сырого
-    // «docs/Experience/…» (К4: прежний contains пропускал сырую форму).
+    // «docs/Experience/…».
     let (err, text) = write(format!("docs/{norm_slug}"), "norm body".into()).await;
     assert!(!err, "docs/-форма должна нормализоваться: {text}");
     assert!(
@@ -706,6 +783,18 @@ async fn run_scenario(dir: PathBuf, rig: RigGithub, stamp: String) {
             "doc «{norm_slug}» written — fm header carried over"
         )),
         "существующий док — быстрый путь по нормализованному слагу: {text}"
+    );
+    // Последняя запись — чтение назад: тело заменено, fm-шапка сохранена.
+    let content = rig
+        .wait_file(&format!("docs/{norm_slug}.md"), "norm v2")
+        .await;
+    assert!(
+        content.starts_with("---\n"),
+        "fm-шапка после carried: {content}"
+    );
+    assert!(
+        !content.contains("norm body"),
+        "тело заменено полностью: {content}"
     );
 
     // --- финальная целостность: blob-набор дерева в точности ожидаемый.
@@ -740,23 +829,23 @@ async fn slug_guard_live_e2e_main_scenario() {
     let http = reqwest::Client::new();
 
     let rig = RigGithub::create(&http, &token, &stamp).await;
+    // Guard с именем рига: если между POST и сносом всё же случится unwinding,
+    // информация о ручном сносе не пропадёт.
+    let mut lease = RigLease {
+        repo: rig.repo.clone(),
+        deleted: false,
+    };
     println!(
         "риг создан: {} (ветка {}, стенд {dir:?})",
         rig.repo, rig.branch
     );
 
-    // Сценарий — в подзадаче: teardown (риг + каталог стенда) исполняется на
-    // любом исходе, упавший ассерт не оставляет репо/каталог; доказательства
-    // (хвост server.log) идут в сообщение паники (тест-ревью #1613).
+    // Сценарий — в подзадаче: teardown исполняется на любом исходе. Между POST
+    // и spawn нет паник: проверки ответа перенесены в сам сценарий.
     let outcome = tokio::spawn(run_scenario(dir.clone(), rig.clone(), stamp.clone())).await;
-    let log_tail = log_tail(&dir.join("server.log"));
-    let _ = std::fs::remove_dir_all(&dir);
-    rig.delete().await;
-    println!("риг снесён: {}", rig.repo);
-
-    if let Err(join) = outcome {
+    let scenario_error = outcome.err().map(|join| {
         let payload = join.into_panic();
-        let msg = payload
+        payload
             .downcast_ref::<String>()
             .cloned()
             .or_else(|| {
@@ -764,11 +853,31 @@ async fn slug_guard_live_e2e_main_scenario() {
                     .downcast_ref::<&'static str>()
                     .map(|s| (*s).to_string())
             })
-            .unwrap_or_else(|| "паника без сообщения".to_string());
-        panic!(
-            "сценарий рига упал (риг {} снесён, каталог стенда удалён)\n\
-             --- server.log (хвост) ---\n{log_tail}\n--- паника ---\n{msg}",
-            rig.repo
-        );
+            .unwrap_or_else(|| "паника без сообщения".to_string())
+    });
+    let log_tail = log_tail(&dir.join("server.log"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let delete_result = rig.delete().await;
+    lease.deleted = delete_result.is_ok();
+    if delete_result.is_ok() {
+        println!("риг снесён: {}", rig.repo);
     }
+
+    // Сначала сохраняем оба факта, затем одна громкая паника: отказ сноса
+    // не заменяет сообщение упавшего сценария.
+    let mut problems = Vec::new();
+    if let Some(msg) = scenario_error {
+        problems.push(format!(
+            "сценарий рига упал (каталог стенда удалён)\n\
+             --- server.log (хвост) ---\n{log_tail}\n--- паника ---\n{msg}"
+        ));
+    }
+    if let Err(error) = delete_result {
+        problems.push(format!(
+            "риг {repo} не снесён: {error}\n\
+             снеси руками: gh api -X DELETE /repos/{repo}",
+            repo = rig.repo
+        ));
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n\n"));
 }
