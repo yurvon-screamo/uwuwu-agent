@@ -22,7 +22,7 @@ use search::semantic::{GeminiEmbeddings, EMBED_MODEL};
 use search::semantic_backend::LanceSemanticBackend;
 use search::support::{lance_dir, FixedEmbedder, TempDirGuard};
 use serde_json::Value;
-use uwuwu_usecase::{AppendDocOutcome, SearchUseCase, SemanticBackend, UsecaseResult, WikiRepo};
+use uwuwu_usecase::{SearchUseCase, SemanticBackend, UsecaseResult, WikiRepo};
 
 /// Слаги живой вики для проб: латиница («Railway», «volume») и кириллица
 /// («эмбеддинги», «преемпшен») в тексте — оба носителя покрываются FTS.
@@ -161,12 +161,7 @@ impl WikiRepo for LiveWiki {
         ))
     }
 
-    async fn append_doc(
-        &self,
-        _slug: &str,
-        _line: &str,
-        _message: &str,
-    ) -> UsecaseResult<AppendDocOutcome> {
+    async fn append_doc(&self, _slug: &str, _line: &str, _message: &str) -> UsecaseResult<usize> {
         Err(uwuwu_usecase::UsecaseError::Board(
             "live probe wiki is read-only".into(),
         ))

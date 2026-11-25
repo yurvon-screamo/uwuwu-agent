@@ -82,20 +82,317 @@ async fn docs_append_keeps_body_of_existing_doc() {
     assert_eq!(stored, format!("{seeded}строка B\n"));
 }
 
+/// Слаг-гард (#1613, развилка Б): append на несуществующем доке —
+/// громкий отказ append-nonexistent со строкой-лекарством; файл не
+/// создаётся (класс «ловится только docs_ls после записи» умер).
 #[tokio::test]
-async fn docs_append_reports_creation_of_missing_doc() {
+async fn docs_append_refuses_missing_doc_with_creation_hint() {
+    let tools = hub();
+    let slug = "Experience/platform/нет-дока";
+    let err = call(
+        &tools,
+        "docs_append",
+        json!({ "slug": slug, "line": "строка" }),
+    )
+    .await
+    .expect_err("отказ");
+    assert!(
+        err.contains("append-nonexistent"),
+        "ветка не названа в отказе: {err}"
+    );
+    assert!(
+        err.contains("create it via docs_write"),
+        "лекарство не названо в отказе: {err}"
+    );
+    let read = call(&tools, "docs_read", json!({ "slug": slug })).await;
+    assert!(read.is_err(), "append создал файл: {read:?}");
+}
+
+/// Append по пути-суффиксу живой статьи: отказ называет кандидата
+/// (suffix_candidates), файл-сирота не создаётся.
+#[tokio::test]
+async fn docs_append_refuses_suffix_of_live_article_with_candidate() {
+    let tools = hub();
+    let live_slug = "Experience/cli/статья";
+    call(
+        &tools,
+        "docs_write",
+        json!({ "slug": live_slug, "content": "# статья\n" }),
+    )
+    .await
+    .expect("seed");
+    let err = call(
+        &tools,
+        "docs_append",
+        json!({ "slug": "cli/статья", "line": "строка" }),
+    )
+    .await
+    .expect_err("отказ");
+    assert!(
+        err.contains("append-nonexistent"),
+        "ветка не названа в отказе: {err}"
+    );
+    assert!(
+        err.contains(live_slug),
+        "кандидат не назван в отказе: {err}"
+    );
+    let read = call(&tools, "docs_read", json!({ "slug": "cli/статья" })).await;
+    assert!(read.is_err(), "append создал файл-сироту: {read:?}");
+}
+
+// --- слаг-гард docs_write (#1613): ветки отказа на достоверно новом доке ---
+
+#[tokio::test]
+async fn docs_write_refuses_unknown_root_without_file() {
+    // подкласс «уникальная статья в чужом корне» #1219/#1575: хвост не совпал
+    let tools = hub();
+    let err = call(
+        &tools,
+        "docs_write",
+        json!({ "slug": "cli/уникальная", "content": "# x\n" }),
+    )
+    .await
+    .expect_err("отказ");
+    assert!(
+        err.contains("root-prefix"),
+        "ветка не названа в отказе: {err}"
+    );
+    assert!(
+        err.contains("Experience, Projects, bot, cron, person"),
+        "канонический набор корня не назван: {err}"
+    );
+    let read = call(&tools, "docs_read", json!({ "slug": "cli/уникальная" })).await;
+    assert!(read.is_err(), "файл вне структуры создан: {read:?}");
+}
+
+#[tokio::test]
+async fn docs_write_root_refusal_carries_suffix_candidates() {
+    // класс «совпавший тайтл» #1219: кандидат называет живую статью
+    let tools = hub();
+    let live_slug = "Experience/platform/ops-mechanics";
+    call(
+        &tools,
+        "docs_write",
+        json!({ "slug": live_slug, "content": "# om\n" }),
+    )
+    .await
+    .expect("seed");
+    let err = call(
+        &tools,
+        "docs_write",
+        json!({ "slug": "platform/ops-mechanics", "content": "# om\n" }),
+    )
+    .await
+    .expect_err("отказ");
+    assert!(
+        err.contains("root-prefix"),
+        "ветка не названа в отказе: {err}"
+    );
+    assert!(
+        err.contains(&format!("suffix candidates: {live_slug}")),
+        "кандидаты не названы в отказе: {err}"
+    );
+    let read = call(
+        &tools,
+        "docs_read",
+        json!({ "slug": "platform/ops-mechanics" }),
+    )
+    .await;
+    assert!(read.is_err(), "файл-двойник создан: {read:?}");
+}
+
+#[tokio::test]
+async fn docs_write_refuses_single_segment_target() {
+    // L-5 р3: файл в корне вики — та же семья «файл рядом с папкой»
+    let tools = hub();
+    let err = call(
+        &tools,
+        "docs_write",
+        json!({ "slug": "Experience", "content": "# x\n" }),
+    )
+    .await
+    .expect_err("отказ");
+    assert!(
+        err.contains("root-prefix"),
+        "ветка не названа в отказе: {err}"
+    );
+    let read = call(&tools, "docs_read", json!({ "slug": "Experience" })).await;
+    assert!(read.is_err(), "файл в корне вики создан: {read:?}");
+}
+
+#[tokio::test]
+async fn docs_write_refuses_plain_file_parent() {
+    let tools = hub();
+    call(
+        &tools,
+        "docs_write",
+        json!({ "slug": "Projects/uwuwu/Design Spec", "content": "# ds\n" }),
+    )
+    .await
+    .expect("seed");
+    let err = call(
+        &tools,
+        "docs_write",
+        json!({ "slug": "Projects/uwuwu/Design Spec/док", "content": "# d\n" }),
+    )
+    .await
+    .expect_err("отказ");
+    assert!(
+        err.contains("parent-collision"),
+        "ветка не названа в отказе: {err}"
+    );
+    assert!(
+        err.contains("Projects/uwuwu/Design Spec"),
+        "родитель не назван в отказе: {err}"
+    );
+    let read = call(
+        &tools,
+        "docs_read",
+        json!({ "slug": "Projects/uwuwu/Design Spec/док" }),
+    )
+    .await;
+    assert!(read.is_err(), "файл под файлом создан: {read:?}");
+}
+
+#[tokio::test]
+async fn docs_write_allows_legacy_stem_parent() {
+    // H-1 р1: 20 живых пар «ADR.md + ADR/» — файл и папка одновременно;
+    // новый док под легаси-стемом пишется, отказ запрещён. Сеяние пары —
+    // ребёнок до файла: иначе ребёнок честно ловит parent-collision
+    // (родитель ещё файл без детей).
+    let tools = hub();
+    call(
+        &tools,
+        "docs_write",
+        json!({ "slug": "Projects/uwuwu/ADR/ADR-001", "content": "# A1\n" }),
+    )
+    .await
+    .expect("seed ребёнка");
+    call(
+        &tools,
+        "docs_write",
+        json!({ "slug": "Projects/uwuwu/ADR", "content": "# ADR\n" }),
+    )
+    .await
+    .expect("seed файла");
+    let answer = call(
+        &tools,
+        "docs_write",
+        json!({ "slug": "Projects/uwuwu/ADR/ADR-114: Новый", "content": "# A114\n" }),
+    )
+    .await
+    .expect("легаси-стем не должен отказывать");
+    assert!(answer.contains("written"), "запись не состоялась: {answer}");
+}
+
+#[tokio::test]
+async fn docs_write_refuses_suffix_collision_under_canonical_root() {
+    // вырожденный класс вложенного корнеимени (SuffixCollision-ветка)
+    let tools = hub();
+    call(
+        &tools,
+        "docs_write",
+        json!({ "slug": "Experience/Projects/x", "content": "# x\n" }),
+    )
+    .await
+    .expect("seed");
+    let err = call(
+        &tools,
+        "docs_write",
+        json!({ "slug": "Projects/x", "content": "# x\n" }),
+    )
+    .await
+    .expect_err("отказ");
+    assert!(
+        err.contains("suffix-collision"),
+        "ветка не названа в отказе: {err}"
+    );
+    assert!(
+        err.contains("Experience/Projects/x"),
+        "кандидат не назван в отказе: {err}"
+    );
+}
+
+#[tokio::test]
+async fn docs_write_sanitizes_slug_like_docs_read() {
+    // C-2 р1: асимметрия read/write закрыта — таргет нормализуется тем
+    // же sanitize_slug; двойник x.md.md не рождается
     let tools = hub();
     let answer = call(
         &tools,
-        "docs_append",
-        json!({ "slug": "Scratch/new#doc", "line": "первая строка" }),
+        "docs_write",
+        json!({ "slug": "docs/Experience/platform/x.md", "content": "# x\n" }),
     )
     .await
-    .expect("append");
+    .expect("нормализованный слаг не должен отказывать");
     assert!(
-        answer.contains("created"),
-        "создание не названо созданием: {answer}"
+        answer.contains("«Experience/platform/x»"),
+        "ответ не называет нормализованный слаг: {answer}"
     );
+    let ls = call(&tools, "docs_ls", json!({ "path": "Experience/platform" }))
+        .await
+        .expect("ls");
+    assert!(
+        !ls.lines().any(|l| l.ends_with(".md")),
+        "двойник .md.md создан: {ls}"
+    );
+}
+
+#[tokio::test]
+async fn docs_write_degraded_tree_keeps_root_check_and_flags_skip() {
+    // деградационная строка таблицы сбоев: root жив без дерева,
+    // parent/suffix пропущены, клоза называет пропуск честно
+    let (tools, _) = tool_hub(
+        Arc::new(TreeFailingWiki),
+        blob_usecase(),
+        Arc::new(StubCronState::default()),
+    );
+    let err = call(
+        &tools,
+        "docs_write",
+        json!({ "slug": "cli/x", "content": "# x\n" }),
+    )
+    .await
+    .expect_err("отказ");
+    assert!(
+        err.contains("root-prefix"),
+        "root-проверка не пережила деградацию дерева: {err}"
+    );
+    let answer = call(
+        &tools,
+        "docs_write",
+        json!({ "slug": "Experience/platform/y", "content": "# y\n" }),
+    )
+    .await
+    .expect("запись в шторм не должна блокироваться");
+    assert!(
+        answer.contains("collision checks skipped (tree unavailable)"),
+        "клоза деградации не названа в ответе: {answer}"
+    );
+}
+
+/// Вики с мёртвым деревом: list_docs рвётся транспортом (502-шторм,
+/// инцидент 22–23.11) — read/write живы, деградация только коллизий.
+struct TreeFailingWiki;
+#[async_trait::async_trait]
+impl uwuwu_usecase::WikiRepo for TreeFailingWiki {
+    async fn doc_shas(&self) -> uwuwu_usecase::UsecaseResult<Vec<(String, String)>> {
+        Ok(vec![])
+    }
+    async fn read_doc(&self, _slug: &str) -> uwuwu_usecase::UsecaseResult<Option<String>> {
+        Ok(None)
+    }
+    async fn list_docs(&self, _prefix: &str) -> uwuwu_usecase::UsecaseResult<Vec<String>> {
+        Err(uwuwu_usecase::UsecaseError::Board(
+            "wiki transport down: tree".into(),
+        ))
+    }
+    async fn write_doc(&self, _: &str, _: &str, _: &str) -> uwuwu_usecase::UsecaseResult<()> {
+        Ok(())
+    }
+    async fn append_doc(&self, _: &str, _: &str, _: &str) -> uwuwu_usecase::UsecaseResult<usize> {
+        Ok(0)
+    }
 }
 
 #[tokio::test]
@@ -311,16 +608,8 @@ impl uwuwu_usecase::WikiRepo for ReadFailingWiki {
     ) -> uwuwu_usecase::UsecaseResult<()> {
         Ok(())
     }
-    async fn append_doc(
-        &self,
-        _slug: &str,
-        _line: &str,
-        _message: &str,
-    ) -> uwuwu_usecase::UsecaseResult<uwuwu_usecase::AppendDocOutcome> {
-        Ok(uwuwu_usecase::AppendDocOutcome {
-            created: false,
-            lines: 0,
-        })
+    async fn append_doc(&self, _: &str, _: &str, _: &str) -> uwuwu_usecase::UsecaseResult<usize> {
+        Ok(0)
     }
 }
 

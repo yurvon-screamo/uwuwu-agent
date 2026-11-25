@@ -108,7 +108,10 @@ fn exact_match_is_not_a_collision_branch() {
 fn degraded_empty_live_keeps_root_check() {
     // 502-шторм: подкласс #1575 закрыт и без дерева
     assert_eq!(check("cli/x", &[]), SlugVerdict::RootPrefix(Vec::new()));
-    assert_eq!(check("Experience", &[]), SlugVerdict::RootPrefix(Vec::new()));
+    assert_eq!(
+        check("Experience", &[]),
+        SlugVerdict::RootPrefix(Vec::new())
+    );
 }
 
 #[test]
