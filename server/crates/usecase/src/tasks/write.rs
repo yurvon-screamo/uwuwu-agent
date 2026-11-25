@@ -2142,9 +2142,9 @@ mod tests {
         // валидный fm старого канона — это fm_lite, не дисплей-шапка
         let md3 = "---\ntitle: x\n---\nтекст";
         assert_eq!(strip_task_get_header(md3), md3);
-        // лишний посторонний ключ в наборе — не рендер (7-ключевая форма
-        // с чужой строкой между type и body_hash)
-        let md4 = "--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\ntype: bug\nслучайная строка\nbody_hash: h\nbody_bytes: 1\n\n## Т";
+        // лишний посторонний ключ в наборе — не рендер (актуальная
+        // 8-ключевая форма с чужой строкой между type и body_hash)
+        let md4 = "--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nслучайная строка\nbody_hash: h\nbody_bytes: 1\n\n## Т";
         assert_eq!(strip_task_get_header(md4), md4);
     }
 

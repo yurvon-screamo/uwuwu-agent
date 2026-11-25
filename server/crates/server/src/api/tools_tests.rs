@@ -1568,7 +1568,7 @@ async fn task_body_strips_the_real_render_header_and_refuses_header_only() {
 /// актуальной 8-ключевой форме (fact_track + body_bytes после слива
 /// #1631) — чужая строка между type и body_hash ломает срез, и вся
 /// копия карточки пишется телом целиком. Пин собран из реального
-/// рендера, не из призрачной 6-ключевой фикстуры md4 в write.rs.
+/// рендера.
 #[tokio::test]
 async fn task_body_keeps_real_render_header_with_foreign_line() {
     let (tools, memory) = hub();
