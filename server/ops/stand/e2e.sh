@@ -106,8 +106,8 @@ mcp() { # MCP-вызов на локальный сервер
     -H "Authorization: Bearer $BEARER" -H 'Content-Type: application/json' \
     -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"$1\",\"arguments\":$2}}"
 }
-task_status() { # статус seed-строки через task_get
-  mcp task_get "{\"number\":$SEED_N}" | python3 -c "
+task_status() { # статус строки через task_get (по умолчанию — seed фазы)
+  mcp task_get "{\"number\":${1:-$SEED_N}}" | python3 -c "
 import json,sys
 t = json.load(sys.stdin)['result']['content'][0]['text']
 print(t.split(chr(10))[0].split('— ')[-1])" 2>/dev/null
@@ -1534,13 +1534,18 @@ printf '%s' "$NEG" | grep -q 'owner_answer' \
 NEG_EMPTY=$(mcp task_edit '{"number":2063,"project":"uwuwu","status":"Design","owner_answer":"   "}')
 printf '%s' "$NEG_EMPTY" | grep -q '"isError":true' \
   || fail "пробельный ответ принят как факт (фаза 17)"
+[ "$(task_status 2063 2>/dev/null || true)" = "Needs attention" ] \
+  || fail "отказ изменил статус строки (фаза 17)"
 mcp task_edit '{"number":2063,"project":"uwuwu","status":"Design","owner_answer":"владелец: делай как в чате"}' | grep -q '"isError":false' \
   || fail "возврат с ответом владельца отклонён (фаза 17)"
-# task_get читает снапшот доски с TTL и может отстать на считанные милли-
-# секунды после записи (#1258/#1437); независимое доказательство — событие
-# гарда, принявшего ребро по свежему носителю.
+# Доказательство — и событие гарда, и ФАКТИЧЕСКИЙ статус носителя: событие
+# одно фиксирует решение гарда, но не запись. Без второй проверки фаза
+# проходила зелёной, хотя мок-носитель молча игнорировал новое ребро и
+# task_get продолжал показывать Needs attention (#1619, найдено тестером).
 grep -q '"event":"board.status_transition","number":2063,"from":"Needs attention","to":"Design"' "$LOG_SRV_1619" \
   || fail "гард не зафиксировал возврат Needs attention → Design (фаза 17)"
+[ "$(task_status 2063 2>/dev/null || true)" = "Design" ] \
+  || fail "гард пропустил ребро, но носитель не записал Design (фаза 17)"
 kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
 wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
 SRV_PID=""; MOCK_PID=""
