@@ -32,6 +32,10 @@ pub enum UsecaseError {
     BlobNotConfigured(String),
     /// Дедуп-ключ blob не прошёл доменный гард `BlobKey` (#1292).
     BlobBadKey(String),
+    /// Append в несуществующий док (#1613): запрет создания в писателе —
+    /// append дописывает живой носитель, создание — только docs_write.
+    /// Финальный, не временный: ретрай той же строкой бессмысленен.
+    AppendMissing(String),
     /// Эмбеддинг-маршрут упёрся в лимиты провайдера (HTTP 429, #1363):
     /// временная — ретрай осмыслен в том же часу; бэкофф из RetryInfo.
     RateLimited {
@@ -54,6 +58,7 @@ impl fmt::Display for UsecaseError {
             Self::BlobTooBig(m) => write!(f, "blob too big: {m}"),
             Self::BlobNotConfigured(m) => write!(f, "blob is not configured: {m}"),
             Self::BlobBadKey(m) => write!(f, "blob bad key: {m}"),
+            Self::AppendMissing(m) => write!(f, "append target missing: {m}"),
             Self::RateLimited {
                 service,
                 retry_after_secs,

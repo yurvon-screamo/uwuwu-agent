@@ -5,7 +5,7 @@
 use super::views::{DocsView, PersonView, PERSON_SLUG};
 use crate::error::UsecaseResult;
 use crate::error::ViewError;
-use crate::ports::{AppendDocOutcome, WikiRepo};
+use crate::ports::WikiRepo;
 use std::sync::{Arc, Mutex};
 
 struct MemWiki(Mutex<std::collections::HashMap<String, String>>);
@@ -35,20 +35,11 @@ impl WikiRepo for MemWiki {
         self.0.lock().unwrap().insert(slug.into(), content.into());
         Ok(())
     }
-    async fn append_doc(
-        &self,
-        slug: &str,
-        line: &str,
-        _m: &str,
-    ) -> UsecaseResult<AppendDocOutcome> {
+    async fn append_doc(&self, slug: &str, line: &str, _m: &str) -> UsecaseResult<usize> {
         let mut docs = self.0.lock().unwrap();
         let entry = docs.entry(slug.into()).or_default();
         entry.push_str(&format!("{line}\n"));
-        let lines = entry.lines().count();
-        Ok(AppendDocOutcome {
-            created: false,
-            lines,
-        })
+        Ok(entry.lines().count())
     }
 }
 

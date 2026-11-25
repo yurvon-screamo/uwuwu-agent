@@ -6,7 +6,6 @@ use serde_json::{json, Value};
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 use crate::wiki::encode_path;
-use uwuwu_usecase::AppendDocOutcome;
 
 pub struct GitWikiWriter {
     repo: String,
@@ -174,22 +173,20 @@ impl GitWikiWriter {
         Ok(())
     }
 
-    /// Append строки в конец файла (создаёт при отсутствии); возвращает
-    /// факт операции (#1353).
-    pub async fn append_line(
-        &self,
-        path: &str,
-        line: &str,
-        message: &str,
-    ) -> UsecaseResult<AppendDocOutcome> {
-        let current = self.read(path).await?;
-        let created = current.is_none();
+    /// Append строки в конец существующего файла (ff-only); возвращает
+    /// строк после записи (#1353). Несуществующий таргет — доменный
+    /// отказ AppendMissing (#1613: append не создаёт — создание остаётся
+    /// только у write-пути; писатель знает факт существования
+    /// авторитетно, до записи).
+    pub async fn append_line(&self, path: &str, line: &str, message: &str) -> UsecaseResult<usize> {
+        let Some(current) = self.read(path).await? else {
+            return Err(UsecaseError::AppendMissing(format!(
+                "doc does not exist: {path}"
+            )));
+        };
         let next = append_to(current, line);
         self.commit_file(path, &next, message).await?;
-        Ok(AppendDocOutcome {
-            created,
-            lines: next.lines().count(),
-        })
+        Ok(next.lines().count())
     }
 }
 
@@ -205,18 +202,13 @@ fn contents_url(repo: &str, path: &str) -> String {
 /// Append-конкатенация: тело дока сохраняется целиком, строка — в конец
 /// (гард «append не режет тело», инцидент #1353). Чистая функция —
 /// юнит-фикстура «док с fm и многострочным телом».
-fn append_to(current: Option<String>, line: &str) -> String {
-    match current {
-        Some(mut c) => {
-            if !c.ends_with('\n') {
-                c.push('\n');
-            }
-            c.push_str(line);
-            c.push('\n');
-            c
-        }
-        None => format!("{line}\n"),
+fn append_to(mut current: String, line: &str) -> String {
+    if !current.ends_with('\n') {
+        current.push('\n');
     }
+    current.push_str(line);
+    current.push('\n');
+    current
 }
 
 /// Стандартный base64-декодер (алфавит + /, с паддингом).
@@ -298,7 +290,7 @@ mod tests {
     #[test]
     fn append_keeps_fm_and_body() {
         let doc = "---\ntitle: Опыт\ndate: 2026-11-19\n---\n\n# Опыт\n\n## Форензика\nтело\n";
-        let next = append_to(Some(doc.to_string()), "строка B");
+        let next = append_to(doc.to_string(), "строка B");
         assert!(next.starts_with("---\ntitle: Опыт"), "fm потерян: {next}");
         assert!(next.contains("## Форензика\nтело"), "тело потеряно: {next}");
         assert!(
@@ -308,16 +300,8 @@ mod tests {
     }
 
     #[test]
-    fn append_creates_missing_file_as_single_line() {
-        assert_eq!(append_to(None, "строка B"), "строка B\n");
-    }
-
-    #[test]
     fn append_joins_unterminated_tail_with_newline() {
-        assert_eq!(
-            append_to(Some("без переноса".into()), "B"),
-            "без переноса\nB\n"
-        );
+        assert_eq!(append_to("без переноса".into(), "B"), "без переноса\nB\n");
     }
 }
 

@@ -5,8 +5,8 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use uwuwu_usecase::{
-    fm_guard, jst_stamp, BlobPlace, BlobUseCase, Clock, DocsView, PersonView, SectionWrite,
-    TaskView, TaskWriteUseCase, TaskWriter,
+    fm_guard, jst_stamp, sanitize_slug, slug_guard, BlobPlace, BlobUseCase, Clock, DocsView,
+    PersonView, SectionWrite, TaskView, TaskWriteUseCase, TaskWriter, UsecaseError,
 };
 
 pub struct ToolHub {
@@ -307,18 +307,18 @@ pub fn tool_descriptors() -> Value {
         ),
         tool(
             "docs_append",
-            "Append a line to the end of a wiki doc (experience articles, doc appendices; ff-only commit)",
+            "Append a line to the end of an EXISTING wiki doc (experience articles, doc appendices; ff-only commit). Never creates a file: a missing doc is refused append-nonexistent with suffix candidates and the hint to create via docs_write",
             object(json!({
-                "slug": string("doc slug (without docs/ and .md)"),
+                "slug": string("doc slug (without docs/ and .md); sanitized like docs_read"),
                 "line": string("the whole line (markdown)"),
                 "message": string("commit message; default append")
             }))
         ),
         tool(
             "docs_write",
-            "Write doc by slug (full replace); fm header survives: carried over with fresh lastmod, canonical one created when absent, fm in the payload kept verbatim",
+            "Write doc by slug (full replace); fm header survives: carried over with fresh lastmod, canonical one created when absent, fm in the payload kept verbatim. Slug is sanitized like docs_read. New docs are refused (nothing written) when outside the wiki root (root-prefix: Experience, Projects, bot, cron, person), under a live file that is not a folder (parent-collision), or colliding with a live doc by path suffix (suffix-collision) — each refusal names the branch and candidates",
             object(json!({
-                "slug": string("doc slug (without docs/ and .md)"),
+                "slug": string("doc slug (without docs/ and .md); sanitized like docs_read"),
                 "content": string("full markdown"),
                 "message": string("commit message; default write")
             }))
@@ -553,52 +553,91 @@ impl ToolHub {
 
     async fn docs_append(&self, args: &Value) -> Result<Value, String> {
         require_args(args, &["slug", "line"])?;
-        let slug = arg_str(args, "slug");
+        let slug = sanitize_slug(&arg_str(args, "slug"));
+        if slug.is_empty() {
+            return Err(empty_slug_error());
+        }
         let message = message_or(args, format!("append: {slug}"));
-        let outcome = self
+        // append не создаёт (#1613, развилка Б): несуществующий таргет —
+        // доменный отказ писателя; кандидаты суффикса — best-effort из
+        // дерева (сбой дерева → отказ без кандидатов, факт от дерева
+        // не зависит: писатель читает авторитетно)
+        match self
             .wiki
             .append_doc(&slug, &arg_str(args, "line"), &message)
             .await
-            .map_err(|e| e.to_string())?;
-        // честность ответа (#1353): append к существующему vs создание —
-        // разрушительный класс бага видно по ответу, а не только коммит-статом
-        let fact = if outcome.created {
-            format!("created «{slug}»: the file did not exist, one line written")
-        } else {
-            format!(
-                "appended to «{slug}» — append to an existing doc, lines in the doc: {}",
-                outcome.lines
-            )
-        };
-        ok_text(fact)
+        {
+            Ok(lines) => ok_text(format!("appended to «{slug}» — lines in the doc: {lines}")),
+            Err(UsecaseError::AppendMissing(_)) => {
+                let candidates = suffix_candidates_best_effort(self.wiki.as_ref(), &slug).await;
+                Err(append_missing_error(&slug, &candidates))
+            }
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     async fn docs_write(&self, args: &Value) -> Result<Value, String> {
         require_args(args, &["slug", "content"])?;
-        let slug = arg_str(args, "slug");
+        let slug = sanitize_slug(&arg_str(args, "slug"));
+        if slug.is_empty() {
+            return Err(empty_slug_error());
+        }
         let message = message_or(args, format!("write: {slug}"));
         let incoming = arg_str(args, "content");
         // fm-гвард (#1444): шапка вики-дока переживает replace. Текущий
         // док нужен веткам переноса/создания; сбой чтения громко рвёт
-        // запись — кроме входа с собственным fm, той ветке док не нужен.
-        let existing = match self.wiki.read_doc(&slug).await {
-            Ok(doc) => doc,
+        // запись — кроме входа с собственным fm, той ветке док не нужен
+        // (read Err при входе с fm оставляет существование неизвестным).
+        let (existing, read_failed) = match self.wiki.read_doc(&slug).await {
+            Ok(doc) => (doc, false),
             Err(e) => {
                 if fm_guard::split(&incoming).is_none() {
                     return Err(format!(
                         "fm-guard needs the current doc, read «{slug}» failed: {e}"
                     ));
                 }
-                None
+                (None, true)
             }
         };
+        // слаг-гард (#1613): достоверно новый док — предикат по живому
+        // дереву; существующий — быстрый путь без пробы дерева (симметрия
+        // #1403). Read Err при входе с fm — существование неизвестно,
+        // полный гард невозможен, но root-проверка (ни от чтения, ни от
+        // дерева) остаётся — тихого пути семьи не остаётся. Сбой дерева —
+        // деградация: root жив (константа), parent/suffix пропущены.
+        let mut degraded = false;
+        if read_failed {
+            if let Some(candidates) = slug_guard::check_root(&slug) {
+                return Err(root_prefix_error(&slug, &candidates));
+            }
+        } else if existing.is_none() {
+            let live = match self.wiki.list_docs("").await {
+                Ok(live) => live,
+                Err(_) => {
+                    degraded = true;
+                    Vec::new()
+                }
+            };
+            match slug_guard::check(&slug, &live) {
+                slug_guard::SlugVerdict::RootPrefix(candidates) => {
+                    return Err(root_prefix_error(&slug, &candidates));
+                }
+                slug_guard::SlugVerdict::ParentCollision(parent) => {
+                    return Err(parent_collision_error(&parent));
+                }
+                slug_guard::SlugVerdict::SuffixCollision(candidates) => {
+                    return Err(suffix_collision_error(&slug, &candidates));
+                }
+                slug_guard::SlugVerdict::Clear => {}
+            }
+        }
         let now = jst_stamp(crate::clock::SystemClock.now_ms());
         let (content, verdict) = fm_guard::guard(existing.as_deref(), &incoming, &slug, &now);
         self.wiki
             .write_doc(&slug, &content, &message)
             .await
             .map_err(|e| e.to_string())?;
-        ok_text(match verdict {
+        let mut fact = match verdict {
             fm_guard::FmGuard::Verbatim => {
                 format!("doc «{slug}» written — fm header from payload kept verbatim")
             }
@@ -608,7 +647,11 @@ impl ToolHub {
             fm_guard::FmGuard::Created => {
                 format!("doc «{slug}» written — canonical fm header created (title/date/lastmod)")
             }
-        })
+        };
+        if degraded {
+            fact.push_str(" — slug-guard degraded: collision checks skipped (tree unavailable)");
+        }
+        ok_text(fact)
     }
 
     async fn cron_list(&self, args: &Value) -> Result<Value, String> {
@@ -1008,6 +1051,70 @@ fn message_or(args: &Value, fallback: String) -> String {
     } else {
         given
     }
+}
+
+/// Слаг-гард (#1613): слаг, вырожденный после санитайза, — отказ входа.
+fn empty_slug_error() -> String {
+    "slug is required (nothing left after sanitization)".into()
+}
+
+/// Кандидаты суффикса для append-отказа: дерево best-effort — сбой
+/// деградирует отказ к форме без кандидатов, не к записи.
+async fn suffix_candidates_best_effort(
+    wiki: &dyn uwuwu_usecase::WikiRepo,
+    slug: &str,
+) -> Vec<String> {
+    wiki.list_docs("")
+        .await
+        .map(|live| slug_guard::suffix_candidates(slug, &live))
+        .unwrap_or_default()
+}
+
+/// Отказ append-nonexistent (#1613, развилка Б): имя ветки + строка-
+/// лекарство (детерминированный мост: создание — только docs_write)
+/// + кандидаты суффикса, если нашлись.
+fn append_missing_error(slug: &str, candidates: &[String]) -> String {
+    let mut out = format!(
+        "refused: append-nonexistent — doc «{slug}» does not exist; create it via docs_write"
+    );
+    if !candidates.is_empty() {
+        out.push_str(&format!("; suffix candidates: {}", candidates.join(", ")));
+    }
+    out
+}
+
+/// Отказ root-prefix (#1613): имя ветки + факт ветки (для одно-сегментного
+/// таргета — файл в корне вики, корень держит только папки; для
+/// много-сегментного — вне канонического набора) + кандидаты суффикса.
+fn root_prefix_error(slug: &str, candidates: &[String]) -> String {
+    let roots = slug_guard::ROOT_FOLDERS.join(", ");
+    let fact = if slug.contains('/') {
+        format!("refused: root-prefix — «{slug}» is outside the wiki root ({roots})")
+    } else {
+        format!(
+            "refused: root-prefix — «{slug}» would be a file in the wiki root; the root holds folders only ({roots})"
+        )
+    };
+    if candidates.is_empty() {
+        fact
+    } else {
+        format!("{fact}; suffix candidates: {}", candidates.join(", "))
+    }
+}
+
+/// Отказ parent-collision (#1613): живой файл без детей на пути таргета.
+fn parent_collision_error(parent: &str) -> String {
+    format!(
+        "refused: parent-collision — «{parent}» is a live doc (file, not a folder); pick another slug"
+    )
+}
+
+/// Отказ suffix-collision (#1613): живой док с совпавшим путём-хвостом.
+fn suffix_collision_error(slug: &str, candidates: &[String]) -> String {
+    format!(
+        "refused: suffix-collision — «{slug}» collides with live docs: {}; write with the full slug or a distinct name",
+        candidates.join(", ")
+    )
 }
 
 fn str_arg(args: &Value, key: &str) -> Option<String> {
