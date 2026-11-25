@@ -43,16 +43,22 @@ struct Fixture {
 
 /// Носитель кода: bare-origin + клон с маркерным коммитом на master.
 fn fixture() -> Fixture {
-    let uniq = format!(
-        "uwuwu-task-env-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
+    // Корень теста выдаётся атомарно: create_dir отказывает на занятом имени,
+    // поэтому совпадение меток у параллельных тестов не даёт общего корня.
+    let base = std::env::temp_dir();
+    let pid = std::process::id();
+    let root = loop {
+        let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("часы идут")
-            .as_nanos()
-    );
-    let root = std::env::temp_dir().join(uniq);
-    std::fs::create_dir_all(&root).expect("tmp корень создан");
+            .as_nanos();
+        let candidate = base.join(format!("uwuwu-task-env-test-{pid}-{nanos}"));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => break candidate,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => panic!("tmp корень не создан: {err}"),
+        }
+    };
     let bare = root.join("origin.git");
     git_out(
         &root,
