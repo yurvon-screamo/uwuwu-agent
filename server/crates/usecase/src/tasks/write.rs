@@ -62,6 +62,9 @@ pub struct BodyWriteReceipt {
 pub struct EditReceipt {
     /// Some — патч нёс статус, исход подтверждения носителем.
     pub status: Option<StatusDelivery>,
+    /// #1619: ответ был передан, но строка уже не была в Needs attention —
+    /// ключ проигнорирован, квитанция обязана сказать это явно.
+    pub owner_answer_ignored: bool,
 }
 
 /// Квитанция секционной правки (#1152): исход + тело после записи.
@@ -204,6 +207,9 @@ pub struct TaskPatch {
     /// Тип задачи (#1271): нативный issue Type, PATCH {"type": имя}.
     /// None — не трогать (снос значения патчем не предусмотрен).
     pub kind: Option<TaskType>,
+    /// Дословный ответ владельца (#1619): разрешает возврат из Needs
+    /// attention в стадию-источник. Сам по себе не мутация.
+    pub owner_answer: Option<String>,
 }
 
 impl TaskPatch {
@@ -219,6 +225,7 @@ impl TaskPatch {
                 title: None,
                 automerge: None,
                 kind: None,
+                owner_answer: None,
             }
         )
     }
@@ -435,8 +442,12 @@ impl TaskWriter for TaskWriteUseCase {
         let mut want_priority: Option<String> = None;
         let mut want_automerge: Option<bool> = None;
         let mut status_delivery: Option<StatusDelivery> = None;
+        let mut owner_answer_ignored = false;
         if let Some(status) = patch.status {
-            let current = self.guard_canon(&board, number, status).await?;
+            let answer = patch.owner_answer.as_deref();
+            let (current, answer_used) =
+                self.guard_canon(&board, number, status, answer).await?;
+            owner_answer_ignored = answer.is_some() && !answer_used;
             // Гейт полноты полей на выходе из Analys (#1280): волна
             // аналитики обязана выпускать строки с явными Приоритетом
             // и Automerge — решение разбора, не пустота носителя.
@@ -547,6 +558,7 @@ impl TaskWriter for TaskWriteUseCase {
         .await?;
         Ok(EditReceipt {
             status: status_delivery,
+            owner_answer_ignored,
         })
     }
 
@@ -1118,23 +1130,59 @@ impl TaskWriteUseCase {
     /// Квотная дисциплина ADR-113/#1437: точечный GraphQL-рид только
     /// на редких ветках — отказная, идемпотентная, нечитаемый кеш-вид
     /// (один рид на вызов, без повторов).
-    async fn guard_canon(&self, board: &str, number: u64, status: Status) -> UsecaseResult<Status> {
+    async fn guard_canon(
+        &self,
+        board: &str,
+        number: u64,
+        status: Status,
+        owner_answer: Option<&str>,
+    ) -> UsecaseResult<(Status, bool)> {
+        // bool — ответ владельца реально понадобился для ребра; квитанция
+        // обязана отличать его от ключа, переданного по привычке (#1619).
         match self.guard_current(board, number, status).await? {
             // Свежий носитель уже оплачен (рид #1437/нечитаемый кеш-вид):
             // повторной fresh-сверки нет — канон-проверка по нему
             GuardView::Fresh(current) => {
                 let (direct, fact_track) = self.carrier_flags(number, current, status).await;
-                if uwuwu_domain::Status::can_transition_with(current, status, direct, fact_track) {
-                    return Ok(current);
+                if uwuwu_domain::Status::can_transition_with(
+                    current,
+                    status,
+                    direct,
+                    fact_track,
+                ) {
+                    return Ok((current, false));
+                }
+                if uwuwu_domain::Status::can_transition_with_answer(
+                    current,
+                    status,
+                    direct,
+                    fact_track,
+                    owner_answer,
+                ) {
+                    return Ok((current, true));
                 }
                 // отказ: кеш-вида как источника здесь нет (рид был свежим
                 // или кеш нечитаем) — расхождению докладывать нечего
-                Err(Self::reject_canon(number, current, None, status))
+                Err(Self::reject_canon(number, current, None, status, owner_answer))
             }
             GuardView::Cached(cached) => {
                 let (direct, fact_track) = self.carrier_flags(number, cached, status).await;
-                if uwuwu_domain::Status::can_transition_with(cached, status, direct, fact_track) {
-                    return Ok(cached);
+                if uwuwu_domain::Status::can_transition_with(
+                    cached,
+                    status,
+                    direct,
+                    fact_track,
+                ) {
+                    return Ok((cached, false));
+                }
+                if uwuwu_domain::Status::can_transition_with_answer(
+                    cached,
+                    status,
+                    direct,
+                    fact_track,
+                    owner_answer,
+                ) {
+                    return Ok((cached, true));
                 }
                 let fresh = verifiable_current(
                     board,
@@ -1142,8 +1190,32 @@ impl TaskWriteUseCase {
                     self.board.fresh_row_status(board, number).await?,
                 )?;
                 let (direct, fact_track) = self.carrier_flags(number, fresh, status).await;
-                if !uwuwu_domain::Status::can_transition_with(fresh, status, direct, fact_track) {
-                    return Err(Self::reject_canon(number, fresh, Some(cached), status));
+                let answer_used = !uwuwu_domain::Status::can_transition_with(
+                    fresh,
+                    status,
+                    direct,
+                    fact_track,
+                ) && uwuwu_domain::Status::can_transition_with_answer(
+                    fresh,
+                    status,
+                    direct,
+                    fact_track,
+                    owner_answer,
+                );
+                if !uwuwu_domain::Status::can_transition_with_answer(
+                    fresh,
+                    status,
+                    direct,
+                    fact_track,
+                    owner_answer,
+                ) {
+                    return Err(Self::reject_canon(
+                        number,
+                        fresh,
+                        Some(cached),
+                        status,
+                        owner_answer,
+                    ));
                 }
                 tracing::warn!(
                     event = "board.guard_stale_cache",
@@ -1152,7 +1224,7 @@ impl TaskWriteUseCase {
                     fresh = %naming::status_name(fresh),
                     "Кеш-вид гарда отстал от носителя — переход проведён по свежему чтению (#1615)"
                 );
-                Ok(fresh)
+                Ok((fresh, answer_used))
             }
         }
     }
@@ -1166,6 +1238,7 @@ impl TaskWriteUseCase {
         fresh: Status,
         cached: Option<Status>,
         to: Status,
+        owner_answer: Option<&str>,
     ) -> UsecaseError {
         match cached {
             Some(cached) => tracing::warn!(
@@ -1184,9 +1257,19 @@ impl TaskWriteUseCase {
                 "Гард канона: переход запрещён (свежий носитель подтвердил отказ)"
             ),
         }
+        let hint = if fresh == Status::NeedsAttention
+            && !uwuwu_domain::Status::can_transition(fresh, to)
+            && owner_answer.map_or(true, |answer| answer.trim().is_empty())
+        {
+            // #1619: самообучающий отказ доезжает до живого агента, даже
+            // если его сессия заспавнена до деплоя новой клаузы промпта.
+            "; Needs attention → source stage requires owner_answer (the verbatim owner reply, fixed in the body/thread first)"
+        } else {
+            ""
+        };
         UsecaseError::Board(format!(
-            "transition {:?} → {:?} outside the pipeline canon",
-            fresh, to
+            "transition {:?} → {:?} outside the pipeline canon{}",
+            fresh, to, hint
         ))
     }
 
