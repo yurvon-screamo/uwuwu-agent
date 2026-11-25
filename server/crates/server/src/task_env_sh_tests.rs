@@ -203,20 +203,54 @@ fn task_env_reuses_classic_checkout_with_git_directory() {
 #[test]
 fn task_env_does_not_report_ready_over_stray_git_marker() {
     // Гард re-use требует не только наличия .git, но и настоящего git-носителя:
-    // инородная .git-запись не должна уходить в ветвь re-use с «env ready».
+    // указатель на несуществующий gitdir не должен молча считаться живым env.
+    // Оракул — код возврата, а не формулировка stdout.
     let fx = fixture();
     let env_root = fx.root.join("env");
     let repo = env_root.join("1504fx").join("repo");
     std::fs::create_dir_all(&repo).expect("repo-каталог создан");
-    std::fs::write(repo.join(".git"), "gitdir: /nonexistent\n").expect("stray .git записан");
+    let gone = fx.root.join("gone-gitdir");
+    std::fs::write(repo.join(".git"), format!("gitdir: {}\n", gone.display()))
+        .expect("stray .git записан");
 
     let out = run_task_env(&env_root, &fx.carrier, "1504fx");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
     assert!(
-        !stdout.contains("env ready"),
+        !out.status.success(),
         "сломанный .git не считается живым env: stdout={stdout} stderr={stderr}"
+    );
+    cleanup(fx);
+}
+
+#[test]
+fn task_env_creates_worktree_for_empty_dir_inside_foreign_git_tree() {
+    // Первая половина гарда: пустой repo без .git внутри чужого git-дерева —
+    // не env. Без проверки [ -e "$repo/.git" ] git нашёл бы родителя и
+    // ушёл в re-use, не создав ворктри.
+    let fx = fixture();
+    let env_root = fx.carrier.join("env-inside");
+    let repo = env_root.join("1504fx").join("repo");
+    std::fs::create_dir_all(&repo).expect("пустой repo-каталог создан");
+
+    let out = run_task_env(&env_root, &fx.carrier, "1504fx");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        repo.join(".git").exists(),
+        "пустой каталог внутри чужого git-дерева не считается env: stdout={stdout} stderr={stderr}"
+    );
+    let (branch, _) = git_out(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    assert_eq!(
+        branch.trim(),
+        "work/task-1504fx",
+        "создан ворктри с веткой задачи"
+    );
+    assert!(
+        repo.join("carrier-marker.txt").exists(),
+        "ворктри несёт код носителя"
     );
     cleanup(fx);
 }
