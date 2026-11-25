@@ -23,6 +23,7 @@ impl FakeGw {
                 ids.iter()
                     .map(|id| SessionInfo {
                         id: (*id).to_string(),
+                        title: String::new(),
                         agent: String::new(),
                         directory: String::new(),
                         updated_ms: 0,

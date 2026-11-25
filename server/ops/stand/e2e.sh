@@ -1065,8 +1065,9 @@ say "фаза 13 ок: lost-resurrection через lost-руку, луп-гва
 say "фаза 14: env-gc #1431 — observe логирует кандидатов, live сносит по вердикту мока"
 
 # env-gc: candidates из снапшота доски (терминальная + закрытие > 48 ч),
-# снос — bootstrap в чекауте + slash-команда task-env-gc, вердикт —
-# user-сообщение мока (командный канал эмулирует shell-исход).
+# снос — bootstrap в чекауте + прямой shell скрипта (без slash-команд
+# и LLM-поворотов, #1526 — user-сообщения «ENV-GC …» вырезаны), вердикты —
+# stdout shell-сообщения (parse-all).
 # 2060 закрыта 3 суток назад (кандидат), 2061 — сегодня (свежая);
 # done-сиды CUP не занимают, тик терминальные строки не спавнит
 CONFIG_EGC="$RUN_DIR/config.egc.toml"
@@ -1118,16 +1119,15 @@ while [ $SEEN -lt 10 ]; do
 done
 grep -q '"event":"env.gc.observe"' "$LOG_SRV_EGC" \
   || fail "observe-env-gc не показал кандидатов (env.gc.observe нет за 40с)"
-grep -q 'task-env-gc' "$LOG_MOCK" \
-  && fail "observe-env-gc диспатчит команды (мутация в observe)"
+grep -q 'mock.shell' "$LOG_MOCK" \
+  && fail "observe-env-gc диспатчит shell (мутация в observe)"
 say "14a ок: observe показал кандидата, команд нет"
 
-# 14b: live — батч-диспатч (#1526): ОДНА команда task-env-gc со всеми
+# 14b: live — прямой shell (#1526): ОДИН shell-вызов скрипта со всеми
 # строками-кандидатами, вердикты обеих через мок, свежая строка не тронута.
-# MOCK_CMD_DELAY_MS=25000 — команда держится дольше общего клиентского
-# таймаута 20с: per-request бюджет прохода должен её довезти (закрытие
-# High-2 ревью плана — ревью кода Common-3), цикл переживает медленную
-# команду.
+# MOCK_CMD_DELAY_MS=25000 — shell держится дольше общего клиентского
+# таймаута 20с: per-request бюджет прохода должен его довезти, цикл
+# переживает медленный shell.
 kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
 wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
 SRV_PID=""; MOCK_PID=""
@@ -1147,16 +1147,16 @@ while [ $SEEN -lt 45 ]; do
   grep -q '"event":"env.gc.completed"' "$LOG_SRV_EGC" && break
 done
 grep -q '"event":"env.gc.completed"' "$LOG_SRV_EGC" \
-  || fail "live-env-gc не дошёл до completed за 180с (медленная команда 25с не доехала — per-request бюджет не работает?)"
+  || fail "live-env-gc не дошёл до completed за 180с (медленный shell 25с не доехал — per-request бюджет не работает?)"
 # пин факта медленной команды (Low-5 ревью кода): от старта фазы до
 # completed прошло ≥ задержки — откажи MOCK_CMD_DELAY_MS молча, ассерт
 # ловит исчезновение покрытия per-request таймаута
 T14B_END=$(date +%s)
 ELAPSED_14B=$((T14B_END - T14B_START))
 [ "$ELAPSED_14B" -ge 24 ] \
-  || fail "14b отработала за ${ELAPSED_14B}с < 25с задержки команды — MOCK_CMD_DELAY_MS не применился, покрытие per-request таймаута исчезло"
-CMDS=$(grep -c '"event":"mock.command".*task-env-gc' "$LOG_MOCK")
-[ "$CMDS" = "1" ] || fail "команд task-env-gc за проход: $CMDS, ждём ровно одну (батч #1526)"
+  || fail "14b отработала за ${ELAPSED_14B}с < 25с задержки shell — MOCK_CMD_DELAY_MS не применился, покрытие per-request таймаута исчезло"
+CMDS=$(grep -c '"event":"mock.shell"' "$LOG_MOCK")
+[ "$CMDS" = "1" ] || fail "shell-вызовов task-env-gc.sh за проход: $CMDS, ждём ровно один (батч #1526)"
 grep -q '"event":"env.swept"' "$LOG_SRV_EGC" \
   || fail "live-env-gc не получил вердикт SWEPT"
 # свежая строка (2061) не кандидат; оба старых кандидата снесены одной
@@ -1173,10 +1173,10 @@ kill "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
 wait "$SRV_PID" "$MOCK_PID" 2>/dev/null || true
 SRV_PID=""; MOCK_PID=""
 sleep 1
-say "фаза 14 ок: observe без мутаций, live снёс двух кандидатов ОДНОЙ командой (батч #1526), свежая не тронута, bootstrap погашен"
+say "фаза 14 ок: observe без мутаций, live снёс двух кандидатов ОДНИМ shell-вызовом (батч #1526), свежая не тронута, bootstrap погашен"
 
 # 14c: реальный скрипт сноса на фикстуре — shell-граница под автотестом
-# (мок 14b эмулирует исход команды; гарды и грамматика самого
+# (мок 14b эмулирует исход shell; гарды и грамматика самого
 # task-env-gc.sh до этого проверялись только ручными смоуками)
 say "фаза 14c: реальный task-env-gc.sh — SWEPT/DIRTY/FOREIGN/NOREPO/ABSENT, идемпотентность"
 GC_FIX="$RUN_DIR/envgc-fixture"

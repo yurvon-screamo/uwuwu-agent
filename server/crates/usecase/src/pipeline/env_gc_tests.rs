@@ -5,6 +5,7 @@
 
 use super::env_gc::{
     sweep_envs, EnvGcCtx, EnvGcOutcome, EnvGcPolicy, ENV_GC_BATCH_CAP, ENV_GC_VERDICT_DEADLINE_MS,
+    TASK_ENV_GC_SCRIPT,
 };
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::ports::{
@@ -36,14 +37,10 @@ struct FakeGcSessions {
     /// Отсутствие записи для строки = вердикта в батч-сообщении нет
     /// (parse-all: строка failed).
     verdicts: Mutex<HashMap<String, String>>,
-    /// Переопределение текста ленты целиком (кейс «сообщение без нужных
-    /// вердикт-строк»); None — лента собирается по verdicts.
+    /// Переопределение текста вывода целиком (кейс «вывод без нужных
+    /// вердикт-строк»); None — вывод собирается по verdicts.
     feed_override: Mutex<Option<String>>,
-    /// Сколько первых ожиданий вернут Err (ретрай сбора, #1526).
-    wait_fail_first: Mutex<usize>,
-    /// Все ожидания Err (страх-дедлайн/кап исчерпан).
-    wait_always_fails: Mutex<bool>,
-    /// Ok(None) — дедлайн ожидания (вердиктов нет).
+    /// Ok(None) — дедлайн shell (вывода нет).
     wait_none: Mutex<bool>,
 }
 
@@ -59,6 +56,12 @@ fn fake_failing_list() -> Arc<FakeGcSessions> {
         list_fails: true,
         ..FakeGcSessions::default()
     })
+}
+
+/// Полная shell-команда батча (путь скрипта + sweep + строки).
+fn sweep_command(rows: &[u64]) -> String {
+    let list: Vec<String> = rows.iter().map(|r| r.to_string()).collect();
+    format!("{TASK_ENV_GC_SCRIPT} sweep {}", list.join(" "))
 }
 
 fn verdict_on(gw: &FakeGcSessions, row: &str, verdict: &str) {
@@ -80,24 +83,53 @@ impl AgentSessionGateway for FakeGcSessions {
         created.push(id.clone());
         Ok(id)
     }
+    /// Slash-команда больше не используется каналом env-gc (прямой shell
+    /// вместо task-env-gc #1526): заглушка, чтобы заметить случайный
+    /// возврат к старому транспорту.
+    async fn run_command(&self, _s: &str, _n: &str, _a: &str, _b: u64) -> UsecaseResult<()> {
+        panic!("env-gc больше не диспатчит slash-команды — только run_shell")
+    }
     async fn prompt(&self, _s: &str, _t: &str) -> UsecaseResult<()> {
         Ok(())
     }
-    /// Команда с батчем: args = все строки через пробел (tail-join $1
-    /// шаблона, проба #1526); бюджет носится юзкейсом.
-    async fn run_command(
+    /// Прямой shell без LLM (#1526): POST /session/:id/shell, вывод —
+    /// из shell-сообщения ленты; user-сообщений и assistant-поворотов
+    /// нет. Токены args после литерала sweep — строки батча.
+    async fn run_shell(
         &self,
         _s: &str,
-        _n: &str,
-        args: &str,
+        command: &str,
         budget_ms: u64,
-    ) -> UsecaseResult<()> {
+    ) -> UsecaseResult<Option<String>> {
         *self.last_budget_ms.lock().unwrap() = budget_ms;
-        self.commands.lock().unwrap().push(args.into());
+        self.commands.lock().unwrap().push(command.into());
         if *self.command_fails.lock().unwrap() {
-            return Err(UsecaseError::Session("команда не принята (мок)".into()));
+            return Err(UsecaseError::Session("shell не исполнен (мок)".into()));
         }
-        Ok(())
+        if *self.wait_none.lock().unwrap() {
+            return Ok(None);
+        }
+        if let Some(feed) = self.feed_override.lock().unwrap().clone() {
+            return Ok(Some(feed));
+        }
+        let map = self.verdicts.lock().unwrap();
+        // Строки батча — токены команды после литерала sweep
+        let rows: Vec<String> = command
+            .split_whitespace()
+            .skip_while(|t| *t != "sweep")
+            .skip(1)
+            .map(str::to_string)
+            .collect();
+        let mut lines: Vec<String> = Vec::new();
+        for row in rows {
+            if let Some(v) = map.get(&row).or_else(|| map.get("*")) {
+                lines.push(format!("ENV-GC {row} {v}"));
+            }
+        }
+        if lines.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(lines.join("\n")))
     }
     async fn liveness(&self, _s: &str) -> Liveness {
         Liveness::Alive
@@ -111,50 +143,6 @@ impl AgentSessionGateway for FakeGcSessions {
             return Err(UsecaseError::Session("исполнитель недоступен (мок)".into()));
         }
         Ok(self.list.clone())
-    }
-    /// Лента содержит все вердикт-строки батча одним user-сообщением
-    /// (вывод shell-блока шаблона); маркер сервера («ENV-GC ») в неё
-    /// входит. Пустые verdicts — None (путь страх-дедлайна Ok(None)).
-    async fn wait_user_message(
-        &self,
-        _s: &str,
-        _marker: &str,
-        _deadline_ms: u64,
-    ) -> UsecaseResult<Option<String>> {
-        let mut fail_first = self.wait_fail_first.lock().unwrap();
-        if *fail_first > 0 {
-            *fail_first -= 1;
-            return Err(UsecaseError::Session("опрос ленты упал (мок)".into()));
-        }
-        drop(fail_first);
-        if *self.wait_always_fails.lock().unwrap() {
-            return Err(UsecaseError::Session("опрос ленты упал (мок)".into()));
-        }
-        if *self.wait_none.lock().unwrap() {
-            return Ok(None);
-        }
-        if let Some(feed) = self.feed_override.lock().unwrap().clone() {
-            return Ok(Some(feed));
-        }
-        let map = self.verdicts.lock().unwrap();
-        // Порядок строк не важен: парсер матчит по токенам row
-        let mut lines: Vec<String> = Vec::new();
-        for row in self
-            .commands
-            .lock()
-            .unwrap()
-            .last()
-            .map(|a| a.split_whitespace().map(str::to_string).collect::<Vec<_>>())
-            .unwrap_or_default()
-        {
-            if let Some(v) = map.get(&row).or_else(|| map.get("*")) {
-                lines.push(format!("ENV-GC {row} {v}"));
-            }
-        }
-        if lines.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(lines.join("\n")))
     }
     async fn last_activity_ms(&self, _s: &str) -> UsecaseResult<Option<u64>> {
         Ok(None)
@@ -170,12 +158,27 @@ impl AgentSessionGateway for FakeGcSessions {
 fn session(id: &str, directory: &str, outcome: &str, updated_ms: u64) -> SessionInfo {
     SessionInfo {
         id: id.into(),
+        title: String::new(),
         agent: String::new(),
         directory: directory.into(),
         updated_ms,
         outcome: outcome.into(),
         total_tokens: 0,
         busy: false,
+    }
+}
+
+/// Сессия листинга с титулом — для рипера bootstrap-сессий env-gc.
+fn titled_session(id: &str, title: &str, busy: bool) -> SessionInfo {
+    SessionInfo {
+        id: id.into(),
+        title: title.into(),
+        agent: String::new(),
+        directory: String::new(),
+        updated_ms: 0,
+        outcome: String::new(),
+        total_tokens: 0,
+        busy,
     }
 }
 
@@ -444,7 +447,11 @@ async fn mature_done_row_dispatches_sweep_and_is_swept() {
     verdict_default(&gw, "SWEPT");
     let tasks = [done_closed(1431, THREE_DAYS, NOW)];
     let out = run(&tasks, &gw, &FakeBoard::all_done(), NOW, false).await;
-    assert_eq!(gw.commands.lock().unwrap().as_slice(), ["1431"]);
+    assert_eq!(
+        gw.commands.lock().unwrap().as_slice(),
+        [sweep_command(&[1431])],
+        "прямой shell скрипта с батчем строк, без slash-команды"
+    );
     assert_eq!(
         *gw.last_budget_ms.lock().unwrap(),
         ENV_GC_VERDICT_DEADLINE_MS,
@@ -564,8 +571,13 @@ async fn batch_cap_bounds_dispatch_per_pass_in_one_command() {
     assert_eq!(out.candidates, 25);
     assert_eq!(out.dispatched, ENV_GC_BATCH_CAP);
     let commands = gw.commands.lock().unwrap();
-    assert_eq!(commands.len(), 1, "одна команда на проход");
-    assert_eq!(commands[0].split_whitespace().count(), ENV_GC_BATCH_CAP);
+    assert_eq!(commands.len(), 1, "один shell на проход");
+    let rows: Vec<&str> = commands[0]
+        .split_whitespace()
+        .skip_while(|t| *t != "sweep")
+        .skip(1)
+        .collect();
+    assert_eq!(rows.len(), ENV_GC_BATCH_CAP);
 }
 
 #[tokio::test]
@@ -579,8 +591,8 @@ async fn oldest_candidates_are_dispatched_first_in_args() {
     run(&tasks, &gw, &FakeBoard::all_done(), NOW, false).await;
     assert_eq!(
         gw.commands.lock().unwrap().as_slice(),
-        ["1433 1432"],
-        "старейшие первыми внутри args (путь клина)"
+        [sweep_command(&[1433, 1432])],
+        "старейшие первыми внутри shell-команды (путь клина)"
     );
 }
 
@@ -682,34 +694,9 @@ async fn wait_deadline_counts_all_rows_failed() {
 }
 
 #[tokio::test]
-async fn read_err_retry_recovers_and_counts_verdicts() {
-    // Err опроса ленты: ретрай до страх-дедлайна — два упавших чтения,
-    // третье вернуло ленту → вердикты учтены (#1526, развилка 2)
-    let gw = fake(Vec::new());
-    verdict_default(&gw, "SWEPT");
-    *gw.wait_fail_first.lock().unwrap() = 2;
-    let tasks = [done_closed(1431, THREE_DAYS, NOW)];
-    let out = run(&tasks, &gw, &FakeBoard::all_done(), NOW, false).await;
-    assert_eq!(out.swept, 1);
-    assert_eq!(out.failed, 0);
-}
-
-#[tokio::test]
-async fn read_err_exhaustion_counts_all_failed() {
-    // Err всегда: кап ретраев/страх-дедлайн исчерпан — все failed
-    let gw = fake(Vec::new());
-    verdict_default(&gw, "SWEPT");
-    *gw.wait_always_fails.lock().unwrap() = true;
-    let tasks = [done_closed(1431, THREE_DAYS, NOW)];
-    let out = run(&tasks, &gw, &FakeBoard::all_done(), NOW, false).await;
-    assert_eq!(out.swept, 0);
-    assert_eq!(out.failed, 1);
-}
-
-#[tokio::test]
-async fn command_transport_failure_fails_all_rows_without_dispatch() {
-    // Транспортный отказ команды: скрипт убит посреди выполнения (проба
-    // #1526) — все failed, dispatched = 0, bootstrap гашен
+async fn shell_transport_failure_fails_all_rows_without_dispatch() {
+    // Транспортный отказ shell: скрипт не исполнен — все failed,
+    // dispatched = 0, bootstrap гашен
     let gw = fake(Vec::new());
     *gw.command_fails.lock().unwrap() = true;
     let tasks = [done_closed(1431, THREE_DAYS, NOW)];
@@ -719,7 +706,7 @@ async fn command_transport_failure_fails_all_rows_without_dispatch() {
     assert_eq!(
         gw.deleted.lock().unwrap().as_slice(),
         ["ses_gc_1"],
-        "bootstrap гасится и после отказа команды"
+        "bootstrap гасится и после отказа shell"
     );
 }
 
@@ -770,6 +757,55 @@ async fn no_ready_rows_means_no_bootstrap_and_no_command() {
 }
 
 #[tokio::test]
+async fn reaper_deletes_stale_bootstrap_of_same_board() {
+    // Рипер протухших bootstrap (#1526): idle-сессия с титулом прохода
+    // сносится, проход идёт дальше штатно
+    let stale = titled_session("ses_stale_1", "env-gc Задачи uwuwu", false);
+    let gw = fake(vec![stale]);
+    verdict_default(&gw, "SWEPT");
+    let tasks = [done_closed(1431, THREE_DAYS, NOW)];
+    let out = run(&tasks, &gw, &FakeBoard::all_done(), NOW, false).await;
+    assert_eq!(out.swept, 1);
+    let deleted = gw.deleted.lock().unwrap();
+    assert!(
+        deleted.contains(&"ses_stale_1".to_string()),
+        "протухший bootstrap снесён: {deleted:?}"
+    );
+    assert!(
+        deleted.contains(&"ses_gc_1".to_string()),
+        "bootstrap текущего прохода погашен штатно: {deleted:?}"
+    );
+}
+
+#[tokio::test]
+async fn reaper_keeps_busy_and_foreign_sessions() {
+    // Рипер трогает только idle-сессии со своим титулом: занятая (чужой
+    // живой проход) и чужая (другая доска/другой префикс) — целы
+    let gw = fake(vec![
+        titled_session("ses_busy_1", "env-gc Задачи uwuwu", true),
+        titled_session("ses_other_1", "env-gc Задачи origa", false),
+        titled_session("ses_manual_1", "ручная работа", false),
+    ]);
+    verdict_default(&gw, "SWEPT");
+    let tasks = [done_closed(1431, THREE_DAYS, NOW)];
+    let out = run(&tasks, &gw, &FakeBoard::all_done(), NOW, false).await;
+    assert_eq!(out.swept, 1);
+    let deleted = gw.deleted.lock().unwrap();
+    assert!(
+        !deleted.contains(&"ses_busy_1".to_string()),
+        "занятая сессия не тронута: {deleted:?}"
+    );
+    assert!(
+        !deleted.contains(&"ses_other_1".to_string()),
+        "сессия другой доски не тронута: {deleted:?}"
+    );
+    assert!(
+        !deleted.contains(&"ses_manual_1".to_string()),
+        "чужая сессия не тронута: {deleted:?}"
+    );
+}
+
+#[tokio::test]
 async fn revalidate_failure_skips_the_row_fail_safe() {
     // Перепроба отказала при живом pre-flight (Low-5 ревью кода):
     // «не знаю» на перепробе — строка не входит в батч, команды нет
@@ -804,25 +840,20 @@ async fn status_probe_failure_skips_the_row_fail_safe() {
     assert!(gw.commands.lock().unwrap().is_empty());
 }
 
-// ---------- пин контракта «шаблон ↔ args» (#1506, #1526) ----------
-
-/// Реальные шаблоны slash-команд. include_str! мёртвым путём —
-/// compile-error, не тишина (канон mock_route_coverage).
-const TASK_ENV_GC_TEMPLATE: &str = include_str!("../../../../../commands/task-env-gc.md");
-const TASK_ENV_TEMPLATE: &str = include_str!("../../../../../commands/task-env.md");
+// ---------- пин контракта вызова скрипта (без slash-команды) ----------
 
 #[test]
-fn sweep_template_carries_subcommand_literally_and_row_via_arg1() {
-    // shell-блок: «sweep $1» — подкоманда литерально в шаблоне, args =
-    // строки. Для однотокенового args $1 = строка (#1506), для батча $1
-    // = весь хвост (tail-join старшего placeholder, проба #1526) —
-    // текст шаблона не меняется ни в одной из форм.
+fn sweep_shell_command_carries_literal_sweep_prefix() {
+    // Прямой shell вместо slash-команды task-env-gc (вырезана #1526 —
+    // её user-сообщение плодило мусорные сессии): путь скрипта +
+    // литерал sweep + строки батча; путь не зависит от доски.
+    let cmd = sweep_command(&[1431, 1432]);
     assert!(
-        TASK_ENV_GC_TEMPLATE.contains("task-env-gc.sh sweep $1"),
-        "шаблон task-env-gc обязан нести «sweep $1»: подкоманда литерально в шаблоне"
+        cmd.starts_with(super::env_gc::TASK_ENV_GC_SCRIPT),
+        "команда начинается с пути скрипта сноса"
     );
     assert!(
-        TASK_ENV_TEMPLATE.contains("task-env.sh $1"),
-        "эталонный контракт task-env: args = row, без подкоманды в args"
+        cmd.ends_with(" sweep 1431 1432"),
+        "строки батча идут после литерала sweep в порядке диспатча, через пробел: {cmd}"
     );
 }

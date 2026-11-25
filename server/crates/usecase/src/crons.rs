@@ -871,6 +871,7 @@ mod tests {
             Ok((0..self.busy.load(std::sync::atomic::Ordering::SeqCst))
                 .map(|n| crate::ports::SessionInfo {
                     id: format!("ses_busy_{n}"),
+                    title: String::new(),
                     agent: String::new(),
                     directory: String::new(),
                     updated_ms: 0,
@@ -894,6 +895,7 @@ mod tests {
             let id = format!("ses_new_{}", self.0.lock().unwrap().len() + 1);
             self.0.lock().unwrap().push(crate::ports::SessionInfo {
                 id: id.clone(),
+                title: String::new(),
                 agent: String::new(),
                 directory: String::new(),
                 updated_ms: 0,
@@ -1262,6 +1264,7 @@ mod tests {
     fn sess(id: &str, outcome: &str, busy: bool) -> crate::ports::SessionInfo {
         crate::ports::SessionInfo {
             id: id.into(),
+            title: String::new(),
             agent: String::new(),
             directory: String::new(),
             updated_ms: 0,

@@ -109,18 +109,15 @@ impl AgentSessionGateway for BudgetedSessions {
         self.inner.last_activity_ms(session).await
     }
 
-    /// Канал вердиктов env-gc (#1431): чтение ленты — не спавн, тарификации
-    /// не касается (прецедент last_activity_ms); без делегирования дефолт
-    /// декоратора отдавал бы None, обходя живой адаптер.
-    async fn wait_user_message(
+    /// Прямой shell без LLM-поворота (#1526): детерминированный канал,
+    /// не спавн — тарификации не касается (прецедент last_activity_ms).
+    async fn run_shell(
         &self,
         session: &str,
-        marker: &str,
-        deadline_ms: u64,
+        command: &str,
+        budget_ms: u64,
     ) -> UsecaseResult<Option<String>> {
-        self.inner
-            .wait_user_message(session, marker, deadline_ms)
-            .await
+        self.inner.run_shell(session, command, budget_ms).await
     }
 
     /// Компакт-ручки (#1221): чтение занятости и адмиссия компакта —

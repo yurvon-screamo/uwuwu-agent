@@ -1,15 +1,16 @@
 //! env-gc (#1431): снос env терминальных строк по гардам — серверный
 //! аналог погибшего с ADR-104 cleanupEnv. Паттерн — клин холодного
 //! ящика (sweeper.rs): отбор из снапшота доски, батч-кап, observe.
-//! Исполнение — детерминированный shell-канал спавна: bootstrap-сессия
-//! в чекауте проекта → одна slash-команда task-env-gc на проход с
-//! батчем строк (#1526) → ops/task-env-gc.sh; вердикты строк сервер
-//! собирает из батч-сообщения ленты (wait_user_message + parse-all).
-
-use std::time::Instant;
+//! Исполнение — детерминированный shell-канал без LLM: bootstrap-сессия
+//! в чекауте проекта → один POST /session/:id/shell со скриптом
+//! ops/task-env-gc.sh sweep <rows> → вердикты из stdout shell-сообщения
+//! (parse-all). Никаких slash-команд и user-сообщений: команда
+//! task-env-gc вырезана (#1526 — её user-сообщение «ENV-GC … / Служебная
+//! команда…» плодило мусорные сессии в листинге исполнителя и жгло
+//! LLM-поворот на проход).
 
 use crate::error::UsecaseResult;
-use crate::ports::SessionSpec;
+use crate::ports::{SessionInfo, SessionSpec, TaskBoardRepo};
 use crate::router::Gateway;
 use crate::spawn_models::SpawnModels;
 use uwuwu_domain::{AgentSlot, SessionSighting, Task};
@@ -22,21 +23,26 @@ use row::{collect_verdicts, preflight_row, revalidate_row};
 pub const ENV_GC_BATCH_CAP: usize = 20;
 
 /// Бюджет прохода (мс): пост-батчинг это цена прохода, а не строки —
-/// скрипт батча исполняется внутри синхронного POST /command (проба
+/// скрипт батча исполняется внутри синхронного POST shell (проба
 /// #1526: ответ после полного завершения shell-блока), per-request
 /// таймаут команды обязан его покрывать; недождённые строки переезжают
 /// следующим проходом.
 pub const ENV_GC_VERDICT_DEADLINE_MS: u64 = 15 * 60_000;
 
-/// Страх-дедлайн сбора вердиктов (мс): при Ok команды сообщение уже в
-/// ленте, штатно сбор мгновенный; запас — на ретраи Err опроса.
-/// Транспортные Err опроса ретраит адаптер (wait_user_message лупит до
-/// дедлайна с паузой USER_MSG_POLL и Err наружу не отдаёт — L2 ревью
-/// кода); юзкейс-контур ниже — запасной кап, если носитель Err отдаёт.
-const VERDICT_READ_GRACE_MS: u64 = 5_000;
+/// Прямой вызов скрипта сноса в cwd bootstrap-сессии (чекаут проекта).
+/// Абсолютный $HOME-путь — как было в шаблоне slash-команды: носитель
+/// скрипта не зависит от проекта доски, cwd (чекаут) нужен только
+/// ownership-гарду worktree. Slash-команда вырезана (#1526): её
+/// user-сообщение «ENV-GC … / Служебная команда конвейера…» плодило
+/// мусорные сессии в листинге исполнителя и жгло LLM-поворот на проход.
+pub const TASK_ENV_GC_SCRIPT: &str = "$HOME/uwuwu-agent/server/ops/task-env-gc.sh";
 
-/// Кап запасных ретраев Err опроса ленты в юзкейсе.
-const VERDICT_READ_MAX_RETRIES: usize = 10;
+/// Титул bootstrap-сессии прохода по доске. Точный ключ рипера
+/// протухших сессий: матчинг только по нему (SessionInfo.title с
+/// носителя), каталог/агент для опознания не годятся.
+pub fn env_gc_bootstrap_title(board_name: &str) -> String {
+    format!("env-gc {board_name}")
+}
 
 /// Политика прохода: возраст-порог и observe-гейт (срез 4 плана #1431:
 /// проба перед live-флипом).
@@ -81,11 +87,103 @@ pub struct EnvGcCtx<'a> {
     pub sessions: &'a Gateway,
     pub models: &'a SpawnModels,
     /// Носитель доски — свежие пробы статуса строк (ревалидация ревайва).
-    pub board: &'a dyn crate::ports::TaskBoardRepo,
+    pub board: &'a dyn TaskBoardRepo,
 }
 
-/// Проход env-gc по одной доске: отбор → pre-flight → перепроба →
-/// одна команда с батчем строк → сбор вердиктов из батч-сообщения.
+/// Надёжное гашение bootstrap-сессии прохода: до 3 попыток, итог громко
+/// в лог (тихий `let _` давал утечку при занятой сессии — класс
+/// протухших «env-gc …» в листинге исполнителя, #1526). Без slash-команд
+/// в сессии LLM-ход не стартует — гашение штатное, ретрай на форс-мажор.
+async fn delete_bootstrap(sessions: &Gateway, bootstrap: &str, board_name: &str) {
+    for attempt in 1..=3u32 {
+        match sessions.delete_session(bootstrap).await {
+            Ok(()) => return,
+            Err(e) if attempt < 3 => {
+                tracing::warn!(
+                    event = "env.bootstrap_delete_retry",
+                    board = board_name,
+                    attempt,
+                    error = %e,
+                    "Гашение bootstrap не прошло — ретрай"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    event = "env.bootstrap_not_deleted",
+                    board = board_name,
+                    session = bootstrap,
+                    error = %e,
+                    "Bootstrap-сессия не погашена — снесёт рипер следующего прохода"
+                );
+            }
+        }
+    }
+}
+/// Рипер протухших bootstrap-сессий прохода (#1526): user-сообщения
+/// slash-команды плодили висяки «env-gc …» в листинге исполнителя
+/// (61 шт. в проде), тихий `let _` delete их не гасил. Точный ключ —
+/// титул прохода; чужие титулы и занятые сессии не трогаем.
+async fn reap_stale_bootstraps(sessions: &Gateway, board_name: &str, list: &[SessionInfo]) {
+    let title = env_gc_bootstrap_title(board_name);
+    for s in list {
+        if s.title != title || s.busy {
+            continue;
+        }
+        if let Err(e) = sessions.delete_session(&s.id).await {
+            tracing::warn!(
+                event = "env.gc_reaper_failed",
+                board = board_name,
+                session = %s.id,
+                error = %e,
+                "Протухшая bootstrap-сессия не снесена — попробует следующий проход"
+            );
+        } else {
+            tracing::info!(
+                event = "env.gc_reaped",
+                board = board_name,
+                session = %s.id,
+                "Протухшая bootstrap-сессия снесена"
+            );
+        }
+    }
+}
+/// Bootstrap-сессия прохода: cwd = чекаут проекта (в нём живёт
+/// ownership-гард скрипта); прямой shell, БЕЗ slash-команд и LLM.
+/// Пустой батч — None, команды нет.
+async fn ensure_bootstrap(ctx: &EnvGcCtx<'_>, batch_is_empty: bool) -> Option<String> {
+    if batch_is_empty {
+        return None;
+    }
+    let boot_model = ctx.models.for_default();
+    match ctx
+        .sessions
+        .create_session(&SessionSpec {
+            directory: ctx.checkout.to_string(),
+            title: env_gc_bootstrap_title(ctx.board_name),
+            custom_agent: None,
+            agent: AgentSlot::Default,
+            model: boot_model.model,
+            variant: boot_model.variant,
+            bootstrap: true,
+        })
+        .await
+    {
+        Ok(id) => Some(id),
+        Err(e) => {
+            tracing::warn!(
+                event = "env.gc.blind",
+                board = ctx.board_name,
+                error = %e,
+                "Bootstrap-сессия не создана — проход no-op"
+            );
+            None
+        }
+    }
+}
+
+/// Проход env-gc по одной доске: рипер протухших bootstrap → отбор →
+/// pre-flight → перепроба → один прямой shell с батчем строк → сбор
+/// вердиктов из stdout shell-сообщения → надёжное гашение bootstrap.
 pub async fn sweep_envs(ctx: &EnvGcCtx<'_>, policy: EnvGcPolicy) -> UsecaseResult<EnvGcOutcome> {
     let mut out = EnvGcOutcome::default();
     let mut candidates: Vec<&Task> = ctx
@@ -138,6 +236,9 @@ pub async fn sweep_envs(ctx: &EnvGcCtx<'_>, policy: EnvGcPolicy) -> UsecaseResul
         })
         .collect();
     let targets: Vec<&Task> = candidates.into_iter().take(ENV_GC_BATCH_CAP).collect();
+    // Рипер протухших bootstrap-сессий — до создания своей, чтобы не
+    // задеть текущий проход (титулы совпадают, своих id ещё нет).
+    reap_stale_bootstraps(ctx.sessions, ctx.board_name, &list).await;
     // Pre-flight без команд: ревалидация статуса, гарды сессий, гашение
     // завершённых; готовые строки — в батч.
     let pf = row::PreflightCtx {
@@ -160,78 +261,25 @@ pub async fn sweep_envs(ctx: &EnvGcCtx<'_>, policy: EnvGcPolicy) -> UsecaseResul
         revalidate_row(ctx.board, ctx.board_name, t, &mut out, &mut batch).await;
     }
     // Bootstrap-сессия на проход: cwd = чекаут проекта — в нём живёт
-    // ownership-гард скрипта; slash-команды = shell без LLM-решений.
+    // ownership-гард скрипта. Прямой shell, БЕЗ slash-команд и LLM:
+    // команда task-env-gc вырезана (#1526 — её user-сообщение «ENV-GC …
+    // / Служебная команда конвейера…» плодило мусорные сессии в листинге
+    // исполнителя и жгло LLM-поворот на проход).
     // Пустой батч (все строки pre-flight/перепробой сняты) — bootstrap
-    // не создаётся, команды нет.
-    let boot_model = ctx.models.for_default();
-    let bootstrap = if batch.is_empty() {
-        None
-    } else {
-        match ctx
-            .sessions
-            .create_session(&SessionSpec {
-                directory: ctx.checkout.to_string(),
-                title: format!("env-gc {}", ctx.board_name),
-                custom_agent: None,
-                agent: AgentSlot::Default,
-                model: boot_model.model,
-                variant: boot_model.variant,
-                bootstrap: true,
-            })
-            .await
-        {
-            Ok(id) => Some(id),
-            Err(e) => {
-                tracing::warn!(
-                    event = "env.gc.blind",
-                    board = ctx.board_name,
-                    error = %e,
-                    "Bootstrap-сессия не создана — проход no-op"
-                );
-                None
-            }
-        }
-    };
-    // Одна команда на проход: строки батча через пробел; скрипт циклит
-    // сам и печатает вердикт на каждую (tail-join $1 шаблона — проба #1526).
-    let started = Instant::now();
+    // не создаётся, шелла нет.
+    let bootstrap = ensure_bootstrap(ctx, batch.is_empty()).await;
+    // Один прямой shell на проход: скрипт циклит строки сам и печатает
+    // вердикт на каждую; итог — из stdout shell-сообщения (parse-all).
+    // Без user-сообщений и LLM-поворота (живая проба opencode 2.3.2:
+    // POST shell → 204, в ленте только type shell, токены 0).
     if let Some(bootstrap) = &bootstrap {
-        let args: String = batch
-            .iter()
-            .map(|t| t.number().to_string())
-            .collect::<Vec<_>>()
-            .join(" ");
-        match ctx
-            .sessions
-            .run_command(bootstrap, "task-env-gc", &args, ENV_GC_VERDICT_DEADLINE_MS)
-            .await
-        {
-            Ok(()) => {
-                out.dispatched = batch.len();
-                collect_verdicts(ctx.sessions, bootstrap, ctx.board_name, &batch, &mut out).await;
-            }
-            Err(e) => {
-                // Транспортный отказ: обрыв запроса убивает скрипт посреди
-                // выполнения (проба #1526, script.log) — сообщение не сядет,
-                // ждать нечего; все строки батча переедут следующим проходом.
-                // elapsed у бюджета — маршрут режет длинный запрос (детектор
-                // «Риски» плана), мгновенный — носитель недоступен.
-                out.failed += batch.len();
-                tracing::warn!(
-                    event = "env.gc_fail",
-                    board = ctx.board_name,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    budget_ms = ENV_GC_VERDICT_DEADLINE_MS,
-                    batch = batch.len(),
-                    error = %e,
-                    "Команда сноса не принята исполнителем — батч переедет следующим проходом"
-                );
-            }
-        }
+        collect_verdicts(ctx.sessions, bootstrap, ctx.board_name, &batch, &mut out).await;
     }
-    // Любой исход: bootstrap гасится (нет утечки сессий, как у спавна).
+    // Любой исход: bootstrap гасится с ретраем (тихий `let _` давал
+    // утечку при занятой сессии — класс протухших «env-gc …» в листинге).
+    // Без шелла в сессии LLM-ход не стартует — гашение штатное.
     if let Some(bootstrap) = &bootstrap {
-        let _ = ctx.sessions.delete_session(bootstrap).await;
+        delete_bootstrap(ctx.sessions, bootstrap, ctx.board_name).await;
     }
     tracing::info!(
         event = "env.gc.completed",

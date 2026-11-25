@@ -1,10 +1,10 @@
 //! Исполнение прохода env-gc (#1431, батч #1526): гарды сессий,
 //! перепроба носителя перед диспатчем, сбор вердикт-грамматики
-//! «ENV-GC <row> <verb>» из батч-сообщения ленты.
+//! «ENV-GC <row> <verb>» из stdout shell-сообщения (parse-all).
 
 use std::time::Instant;
 
-use super::{EnvGcOutcome, VERDICT_READ_GRACE_MS, VERDICT_READ_MAX_RETRIES};
+use super::{EnvGcOutcome, ENV_GC_VERDICT_DEADLINE_MS, TASK_ENV_GC_SCRIPT};
 use crate::router::Gateway;
 use uwuwu_domain::{sighting_is_live, SessionSighting, Task};
 
@@ -181,19 +181,16 @@ pub(super) async fn revalidate_row<'a>(
     }
 }
 
-/// Сбор вердиктов батча: одно wait_user_message по маркеру-префиксу
-/// «ENV-GC » (матчится любой вердикт-строкой) со страх-дедлайном, затем
-/// parse-all по готовым строкам. POST /command синхронен — на Ok команды
-/// сообщение уже в ленте; исходы ожидания (пин Design #1526):
+/// Сбор вердиктов батча: один прямой shell-зов скрипта сноса и parse-all
+/// его stdout по готовым строкам. POST /session/:id/shell синхронен —
+/// 204 после завершения shell-блока, user-сообщений и LLM-поворота нет
+/// (slash-команда вырезана #1526: мусорные сессии «ENV-GC …» в листинге
+/// исполнителя). Исходы (пин Design #1526):
 /// Ok(Some) → parse-all (недостающие — failed, каждый WARN env.gc_fail);
-/// Ok(None) — страх-дедлайн истёк без маркера (снос идёт, исходы не
-/// читаются — подпись класса дрейфа носителя, вскрывшего #1506) → все
+/// Ok(None) — дедлайн истёк без завершённого shell-сообщения → все
 /// failed + WARN env.verdict_read_failed + per-row WARN env.gc_fail;
-/// Err опроса — транспортный отказ чтения → все failed + WARN
-/// env.verdict_read_failed (не подмешивается в «снос не доведён»).
-/// Ретрай транспортных Err опроса живёт в адаптере (цикл
-/// wait_user_message с паузой USER_MSG_POLL до дедлайна) — юзкейс
-/// получает только исход.
+/// Err — транспортный отказ → все failed + WARN env.verdict_read_failed
+/// (не подмешивается в «снос не доведён» — класс #1506).
 pub(super) async fn collect_verdicts(
     sessions: &Gateway,
     bootstrap: &str,
@@ -201,19 +198,47 @@ pub(super) async fn collect_verdicts(
     targets: &[&Task],
     out: &mut EnvGcOutcome,
 ) {
-    let Some(text) = wait_feed(sessions, bootstrap, board_name, targets.len()).await else {
+    let command = batch_command(targets);
+    let started = Instant::now();
+    let output = match sessions
+        .run_shell(bootstrap, &command, ENV_GC_VERDICT_DEADLINE_MS)
+        .await
+    {
+        Ok(output) => {
+            out.dispatched += targets.len();
+            output
+        }
+        Err(e) => {
+            // Транспортный отказ: скрипт мог не стартовать вовсе —
+            // ждать нечего; все строки батча переедут следующим проходом.
+            // elapsed у бюджета — маршрут режет длинный запрос (детектор
+            // «Риски» плана), мгновенный — носитель недоступен.
+            out.failed += targets.len();
+            tracing::warn!(
+                event = "env.gc_fail",
+                board = board_name,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                budget_ms = ENV_GC_VERDICT_DEADLINE_MS,
+                batch = targets.len(),
+                error = %e,
+                "Скрипт сноса не исполнен — батч переедет следующим проходом"
+            );
+            return;
+        }
+    };
+    let Some(text) = output else {
         tracing::warn!(
             event = "env.verdict_read_failed",
             board = board_name,
             batch = targets.len(),
-            "Лента батч-команды не дала маркера за страх-дедлайн — вердикты не собраны"
+            "Shell-батч не дал завершённого вывода за дедлайн — вердикты не собраны"
         );
         for t in targets {
             tracing::warn!(
                 event = "env.gc_fail",
                 board = board_name,
                 number = t.number(),
-                "Вердикта нет за страх-дедлайн — переедет следующим проходом"
+                "Вердикта нет за дедлайн — переедет следующим проходом"
             );
         }
         out.failed += targets.len();
@@ -280,39 +305,11 @@ pub(super) async fn collect_verdicts(
     }
 }
 
-/// Ожидание батч-сообщения: wait_user_message с маркером «ENV-GC » и
-/// страх-дедлайном. Транспортные Err опроса ретраит адаптер (цикл с
-/// паузой USER_MSG_POLL до дедлайна) — сюда доходит только исход.
-/// None — маркера нет за страх-дедлайн (Ok(None)) либо Err-исчерпание.
-async fn wait_feed(
-    sessions: &Gateway,
-    bootstrap: &str,
-    board_name: &str,
-    batch_size: usize,
-) -> Option<String> {
-    let started = Instant::now();
-    let mut retries = 0usize;
-    loop {
-        let remaining = VERDICT_READ_GRACE_MS.saturating_sub(started.elapsed().as_millis() as u64);
-        if remaining == 0 || retries > VERDICT_READ_MAX_RETRIES {
-            return None;
-        }
-        match sessions
-            .wait_user_message(bootstrap, "ENV-GC ", remaining)
-            .await
-        {
-            Ok(found) => return found,
-            Err(e) => {
-                retries += 1;
-                tracing::warn!(
-                    event = "env.verdict_read_retry",
-                    board = board_name,
-                    batch = batch_size,
-                    retry = retries,
-                    error = %e,
-                    "Опрос ленты упал — ретрай до страх-дедлайна/капа"
-                );
-            }
-        }
-    }
+/// Команда батча: прямой вызов скрипта в cwd bootstrap-сессии (чекаут).
+/// Путь абсолютный $HOME-формой — как был в шаблоне slash-команды:
+/// носитель скрипта не зависит от доски, cwd нужен только
+/// ownership-гарду worktree.
+fn batch_command(targets: &[&Task]) -> String {
+    let rows: Vec<String> = targets.iter().map(|t| t.number().to_string()).collect();
+    format!("{} sweep {}", TASK_ENV_GC_SCRIPT, rows.join(" "))
 }

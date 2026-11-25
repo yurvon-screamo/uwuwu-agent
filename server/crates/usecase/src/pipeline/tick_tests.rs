@@ -462,6 +462,7 @@ impl AgentSessionGateway for FakeSessions {
             .filter(|id| !dead.contains(*id))
             .map(|id| crate::ports::SessionInfo {
                 id: id.clone(),
+                title: String::new(),
                 agent: String::new(),
                 directory: String::new(),
                 updated_ms: 0,
@@ -475,6 +476,7 @@ impl AgentSessionGateway for FakeSessions {
             out.push(crate::ports::SessionInfo {
                 busy: busy.contains(&id),
                 id,
+                title: String::new(),
                 agent: s.agent.clone(),
                 directory: s.directory.clone(),
                 updated_ms: s.updated_ms,
@@ -1250,6 +1252,7 @@ pub(crate) fn gateway_with_busy_sessions(
         for i in 0..count {
             extra.push(crate::ports::SessionInfo {
                 id: format!("ses_busy_{i}"),
+                title: String::new(),
                 agent: String::new(),
                 directory: String::new(),
                 updated_ms: 0,
@@ -2983,6 +2986,7 @@ async fn cup_counts_second_turn_sessions() {
         .unwrap()
         .push(crate::ports::SessionInfo {
             id: "ses_2nd_150".into(),
+            title: String::new(),
             agent: "developer".into(),
             updated_ms: 0,
             outcome: "succeeded".into(),
@@ -3012,6 +3016,7 @@ async fn cup_busy_counts_non_pipeline_sessions() {
         .unwrap()
         .push(crate::ports::SessionInfo {
             id: "ses_bot".into(),
+            title: String::new(),
             agent: String::new(),
             updated_ms: 0,
             outcome: String::new(),
@@ -3095,6 +3100,7 @@ async fn wakeup_held_when_cup_full() {
             .unwrap()
             .push(crate::ports::SessionInfo {
                 id: id.into(),
+                title: String::new(),
                 agent: String::new(),
                 directory: String::new(),
                 updated_ms: 0,
@@ -3169,6 +3175,7 @@ async fn wakeup_delivery_occupies_cup_slot() {
         .unwrap()
         .push(crate::ports::SessionInfo {
             id: "ses_wake_180".into(),
+            title: String::new(),
             agent: String::new(),
             updated_ms: 0,
             outcome: "succeeded".into(),
@@ -3925,6 +3932,7 @@ async fn soft_ping_held_when_cup_full_then_delivered_on_free_slot() {
     // кап полон: чужая busy-сессия занимает единственный слот
     sess.extra.lock().unwrap().push(crate::ports::SessionInfo {
         id: "ses_cap_filler".into(),
+        title: String::new(),
         agent: String::new(),
         directory: String::new(),
         updated_ms: 0,
@@ -4959,6 +4967,7 @@ fn fake_session(
 ) -> crate::ports::SessionInfo {
     crate::ports::SessionInfo {
         id: id.into(),
+        title: String::new(),
         agent: agent.into(),
         directory: String::new(),
         updated_ms: 0,

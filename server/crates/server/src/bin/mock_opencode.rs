@@ -82,10 +82,10 @@ struct MockSession {
     /// Хвост строится фазами пробы: стрим → ловушка (шаг finish='tool-calls')
     /// → финал (finish='stop').
     turn_ms: Option<u64>,
-    /// User-сообщения команд (created_ms, текст): канал вердиктов env-gc
-    /// (#1431) — POST /command с name task-env-gc кладёт вердикт-строку,
-    /// wait_user_message конвейера находит её в хвосте.
-    user_messages: Vec<(u64, String)>,
+    /// Shell-сообщения сессии (created_ms, команда, вывод): живой носитель
+    /// opencode 2.3.2 — POST /session/:id/shell → 204, в ленте type shell
+    /// со stdout; user-сообщений и assistant-поворота нет, токены 0.
+    shell_messages: Vec<(u64, String, String)>,
 }
 
 #[derive(Default)]
@@ -461,6 +461,31 @@ async fn main() {
         .route(
             "/api/session/{id}/command",
             post({
+                let mode = mode.clone();
+                move |Path(id): Path<String>, Json(body): Json<Value>| {
+                    let mode = mode.clone();
+                    async move {
+                        if mode == "gate" {
+                            return gate_post_reject();
+                        }
+                        // Прямой shell без LLM (#1526, вырезана slash-команда
+                        // task-env-gc): живой носитель отвечает 204 после
+                        // завершения shell-блока; в ленту ложится ОДНО
+                        // shell-сообщение со stdout, user-сообщений и
+                        // assistant-поворота нет. MOCK_CMD_DELAY_MS — ручка
+                        // задержки: e2e видит, что цикл переживает
+                        // медленный шелл (per-request бюджет покрывает
+                        // длительность скрипта).
+                        let name = body["name"].as_str().unwrap_or_default();
+                        tracing::info!(event = "mock.command", id = %id, name, "POST /command");
+                        (StatusCode::OK, Json(json!({}))).into_response()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/api/session/{id}/shell",
+            post({
                 let store = store.clone();
                 let mode = mode.clone();
                 move |Path(id): Path<String>, Json(body): Json<Value>| {
@@ -470,47 +495,45 @@ async fn main() {
                         if mode == "gate" {
                             return gate_post_reject();
                         }
-                        // bootstrap-команды детерминированы: task-env-gc —
-                        // батч-канал вердиктов env-gc (#1431/#1526): мок
-                        // эмулирует shell-исход user-сообщением, печатая
-                        // вердикт-строку на каждый токен args (tail-join
-                        // $1 шаблона). MOCK_CMD_DELAY_MS — ручка задержки
-                        // ответа: e2e видит, что цикл переживает
-                        // медленную команду (путь транспортного отказа
-                        // покрыт юнитом Err-ветки usecase). Прочие
-                        // принимаются без эмуляции shell.
-                        let name = body["name"].as_str().unwrap_or_default();
-                        tracing::info!(event = "mock.command", id = %id, name, "POST /command");
-                        if name == "task-env-gc" {
-                            let delay_ms: u64 = std::env::var("MOCK_CMD_DELAY_MS")
-                                .ok()
-                                .and_then(|v| v.parse().ok())
-                                .unwrap_or(0);
-                            if delay_ms > 0 {
-                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
-                                    .await;
-                            }
-                            let rows: Vec<String> = body["text"]
-                                .as_str()
-                                .unwrap_or_default()
-                                .split_whitespace()
-                                .map(str::to_string)
-                                .collect();
-                            let mut sessions = store.sessions.lock().expect("store");
-                            if let Some(s) = sessions.get_mut(&id) {
-                                // Один user-сообщение на батч: живой носитель
-                                // инлайнит весь STDOUT shell-блока одним
-                                // сообщением (проба #1526), не строку на токен
-                                let feed: Vec<String> = rows
-                                    .iter()
-                                    .map(|row| format!("ENV-GC {row} SWEPT"))
-                                    .collect();
-                                if !feed.is_empty() {
-                                    s.user_messages.push((now_ms(), feed.join("\n")));
-                                }
-                            }
+                        // Прямой shell без LLM (#1526): живой носитель
+                        // исполняет команду синхронно и отвечает 204;
+                        // в ленту ложится shell-сообщение со stdout.
+                        // Семантика эмуляции task-env-gc.sh: вердикт-строка
+                        // «ENV-GC <row> SWEPT» на каждый токен после
+                        // литерала sweep; FOREIGN/DIRTY и пр. — дело
+                        // реального скрипта (e2e 14c гоняет его живьём).
+                        let command = body["command"].as_str().unwrap_or_default().to_string();
+                        tracing::info!(event = "mock.shell", id = %id, command = %command, "POST /shell");
+                        let delay_ms: u64 = std::env::var("MOCK_CMD_DELAY_MS")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0);
+                        if delay_ms > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                         }
-                        (StatusCode::OK, Json(json!({}))).into_response()
+                        let mut sessions = store.sessions.lock().expect("store");
+                        let Some(s) = sessions.get_mut(&id) else {
+                            return (StatusCode::NOT_FOUND, Json(json!({ "status": "404" }))).into_response();
+                        };
+                        let created = now_ms();
+                        let rows: Vec<String> = command
+                            .split_whitespace()
+                            .skip_while(|t| *t != "sweep")
+                            .skip(1)
+                            .map(str::to_string)
+                            .collect();
+                        let output: String = rows
+                            .iter()
+                            .map(|row| format!("ENV-GC {row} SWEPT"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let output = if output.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{output}\n")
+                        };
+                        s.shell_messages.push((created, command, output));
+                        (StatusCode::NO_CONTENT, Json(json!(null))).into_response()
                     }
                 }
             }),
@@ -672,7 +695,7 @@ async fn create_session(
         dead: mode == "dead",
         reply: None,
         turn_ms: None,
-        user_messages: Vec::new(),
+        shell_messages: Vec::new(),
     };
     tracing::info!(event = "mock.session_created", id = %id,
         agent = %session.agent, title = %session.title, "POST /session");
@@ -1262,27 +1285,31 @@ async fn message_tail(store: Arc<Store>, id: String) -> Resp {
         Some(s) => {
             // Форма — живой опенкод 2.3 (пин #1254): хвост обёрнут
             // {data:[...]}, time.updated нет ни у одного события; ответ
-            // ассистента несёт created/firstToken/streamed/completed,
+            // ответ ассистента несёт created/firstToken/streamed/completed,
             // сессия без ответа открывается idle-событием (только
-            // created — активность хвоста по нему же). User-сообщения
-            // команд (вердикты env-gc, #1431/#1526) идут перед ним в
-            // desc — свежайший первым, как order=desc живого API. Форма
-            // user-сообщения — живой носитель: верхнеуровневый text без
-            // content[] (проба #1526 + прод-БД; content[]-форма была
-            // дрейфом мока — читатель адаптера на живом носителе
-            // возвращал None, канал вердиктов был глух); пин формы —
+            // created — активность хвоста по нему же). Shell-сообщения
+            // env-gc (#1526, без slash-команды и LLM): type shell со
+            // stdout исхода в output.output — идут перед idle в desc,
+            // свежайшее первым, как order=desc живого API. Форма —
+            // живой носитель 2.3.2 (throwaway-проба #1526): user-сообщений
+            // команда не создаёт, assistant-поворота нет; пин формы —
             // fixtures/executor_form_pin.json, юнит
-            // user_message_text_reads_live_carrier_shape
+            // shell_output_reads_live_carrier_shape
             let mut tail: Vec<Value> = s
-                .user_messages
+                .shell_messages
                 .iter()
                 .rev()
-                .map(|(created_ms, text)| {
+                .map(|(created_ms, command, output)| {
+                    let size = output.len() as u64;
                     json!({
-                        "id": format!("msg_u_{}", created_ms),
-                        "type": "user",
-                        "time": { "created": created_ms },
-                        "text": text,
+                        "id": format!("msg_sh_{}", created_ms),
+                        "type": "shell",
+                        "time": { "created": created_ms, "completed": created_ms },
+                        "shellID": format!("sh_{}", created_ms),
+                        "command": command,
+                        "status": "exited",
+                        "exit": 0,
+                        "output": { "output": output, "cursor": size, "size": size, "truncated": false },
                     })
                 })
                 .collect();

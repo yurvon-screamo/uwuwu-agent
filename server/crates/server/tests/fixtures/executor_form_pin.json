@@ -1,7 +1,7 @@
 {
   "opencode_version": "2.3.2",
-  "probed_at": "2026-11-24",
-  "source": "живая проба #1249 (дельта-раунд 17.11, basic-auth) + пин-семя PR #381 + ось user-сообщения из пробы #1526 (feed3.json + прод-БД)",
+  "probed_at": "2026-11-25",
+  "source": "живая проба #1249 (дельта-раунд 17.11, basic-auth) + пин-семя PR #381 + ось shell-сообщения из throwaway-пробы #1526 (POST shell → 204, в ленте type shell; user-сообщений и assistant-поворота нет)",
   "rule": "пин = дефолтная форма исполнителя; env-ручки-режимы стенда вне контракта",
   "refresh": "после апгрейда opencode — повторная проба по ранбуку «Проба формы executor-API (пин-файл)»",
   "message_tail": {
@@ -11,10 +11,10 @@
     "assistant_streaming_time": ["created", "firstToken", "streamed"],
     "idle_time": ["created"]
   },
-  "user_message": {
-    "form": "top-level text",
+  "shell_message": {
+    "form": "type shell with command/status/output.output",
     "forbidden_keys": ["content"],
-    "probe": "проба #1526 (scratch/probe-1526/feed3.json) + прод-БД: user-сообщения env-gc после мерджа #497 — 34/34 с text+time, без content"
+    "probe": "throwaway-проба #1526 (25.11): POST /api/session/:id/shell {command} → 204; хвост — одно сообщение type shell, command/status/exit/output.output, без content; user- и assistant-сообщений команда не создаёт"
   },
   "session_list": {
     "wrapper": "data",

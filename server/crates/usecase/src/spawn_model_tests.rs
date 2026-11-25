@@ -387,6 +387,7 @@ async fn dreamer_spawn_carries_model_from_server_map() {
     // Arrange: уснувшая dev-сессия с финалом и реальной работой
     let sessions = CaptureSessions::new(vec![SessionInfo {
         id: "ses_dev1".into(),
+        title: String::new(),
         agent: "developer".into(),
         directory: String::new(),
         updated_ms: 0,

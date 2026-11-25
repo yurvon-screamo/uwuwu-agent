@@ -8,8 +8,7 @@ use uwuwu_domain::ModelRef;
 use uwuwu_usecase::{AgentSessionGateway, AssistantReply, Liveness, SessionInfo, SessionSpec};
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
-/// Пауза опроса user-ленты в wait_user_message (канал вердиктов
-/// env-gc, #1431): редкий опрос не греет API исполнителя.
+/// Пауза опроса ленты сессии (канал вердиктов shell env-gc).
 const USER_MSG_POLL: Duration = Duration::from_millis(3_000);
 
 pub struct OpencodeClient {
@@ -59,18 +58,24 @@ fn message_array(resp: &Value) -> Option<&Vec<Value>> {
     resp.as_array().or_else(|| resp["data"].as_array())
 }
 
-/// Текст user-сообщения. Форма живого носителя (opencode 2.3.2, проба
-/// #1526 + прод-БД, пин ниже): верхнеуровневый `text` без content[] —
-/// {"id","time","text","type"}. Чтение content[] возвращало None на
-/// живом носителе — канал вердиктов env-gc был глух (#1506-класс:
-/// вердикты в ленте, сервер их не читает). Одна форма, один механизм:
-/// content[]-форма живым носителем для user-сообщений не даётся и не
-/// читается (assistant-сообщения content[] несут — их читают отдельные
-/// ручки).
-fn user_message_text(msg: &Value) -> Option<String> {
-    match msg["text"].as_str() {
-        Some(t) if !t.is_empty() => Some(t.to_string()),
-        _ => None,
+/// Текст shell-сообщения живой формы (opencode 2.3.2, живая проба #1526):
+/// {"type":"shell","command","status","output":{"output",...}}.
+/// None — сообщение ещё в полёте (status running) или чужое.
+fn shell_output(msg: &Value, command: &str) -> Option<String> {
+    if msg["type"].as_str()? != "shell" {
+        return None;
+    }
+    if msg["command"].as_str()? != command {
+        return None;
+    }
+    match msg["status"].as_str()? {
+        "running" => None,
+        _ => Some(
+            msg["output"]["output"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        ),
     }
 }
 
@@ -105,6 +110,7 @@ fn parse_session_page(
                     let busy = session_busy(s, now_ms);
                     Some(SessionInfo {
                         id: s["id"].as_str()?.to_string(),
+                        title: s["title"].as_str().unwrap_or_default().to_string(),
                         agent: s["agent"].as_str().unwrap_or_default().to_string(),
                         directory: s["location"]["directory"]
                             .as_str()
@@ -592,38 +598,44 @@ impl AgentSessionGateway for OpencodeClient {
         }))
     }
 
-    /// Канал вердиктов env-gc (#1431/#1526): поллинг user-ленты с паузами
-    /// — токенов не жжёт (bootstrap-реплай агента не участвует), паузы —
-    /// tokio-сны воркера, не блокировка потока. Транспортные Err опроса
-    /// ретраятся внутри цикла с той же паузой до дедлайна (#1526, ревью
-    /// кода Common-2: юзкейс-слой без сна — веер мгновенных ретраев не
-    /// покрывал эпизоды длиннее пары RTT); исход — Ok(Some(text)) при
-    /// маркере, Ok(None) по дедлайну; Err наружу не выходит.
-    async fn wait_user_message(
+    /// Прямой shell без LLM-поворота (#1526: вырезаем slash-команду
+    /// task-env-gc — её user-сообщение «ENV-GC … / Служебная команда…»
+    /// плодило мусорные сессии в листинге исполнителя и жгло поворот на
+    /// проход). POST /session/:id/shell синхронен (204 после завершения
+    /// shell-блока), per-request таймаут = budget_ms; итог — из хвоста
+    /// ленты: первое завершённое shell-сообщение своей команды.
+    /// None — за бюджет завершённого shell-сообщения нет. Err наружу не
+    /// выходит: транспортные сбои ретраятся внутри до дедлайна.
+    async fn run_shell(
         &self,
         session: &str,
-        marker: &str,
-        deadline_ms: u64,
+        command: &str,
+        budget_ms: u64,
     ) -> UsecaseResult<Option<String>> {
+        let (status, _) = self
+            .call(
+                Some(budget_ms),
+                &format!("/session/{session}/shell"),
+                reqwest::Method::POST,
+                Some(json!({ "command": command })),
+            )
+            .await?;
+        Self::check(status, &format!("shell {session}"))?;
         let started = std::time::Instant::now();
         loop {
-            match self.last_user_message_text(session).await {
-                Ok(Some(text)) => {
-                    if text.contains(marker) {
-                        return Ok(Some(text));
-                    }
-                }
+            match self.last_shell_output(session, command).await {
+                Ok(Some(text)) => return Ok(Some(text)),
                 Ok(None) => {}
                 Err(e) => {
                     tracing::warn!(
-                        event = "env.verdict_poll_retry",
+                        event = "env.shell_poll_retry",
                         session,
                         error = %e,
                         "Опрос ленты упал — ретрай до дедлайна"
                     );
                 }
             }
-            if started.elapsed().as_millis() as u64 >= deadline_ms {
+            if started.elapsed().as_millis() as u64 >= budget_ms {
                 return Ok(None);
             }
             tokio::time::sleep(USER_MSG_POLL).await;
@@ -674,29 +686,28 @@ impl AgentSessionGateway for OpencodeClient {
 }
 
 impl OpencodeClient {
-    /// Текст свежайшего user-сообщения сессии; None — user-сообщений нет.
-    /// Форма живого носителя (opencode 2.3.2, проба #1526 + прод-БД):
-    /// user-сообщение несёт верхнеуровневый `text` без content[] —
-    /// {"id","time","text","type"}; чтение content[] возвращало None на
-    /// живом носителе и канал вердиктов env-gc был глух (#1506-класс:
-    /// вердикты в ленте, сервер их не читает). Форма пинится в
-    /// контракт-контуре #1254; assistant-сообщения content[] несут — их
-    /// читают отдельные ручки.
-    async fn last_user_message_text(&self, session: &str) -> UsecaseResult<Option<String>> {
+    /// Вывод завершённого shell-сообщения своей команды из хвоста ленты;
+    /// None — такого сообщения нет (ещё в полёте / чужое). Форма живого
+    /// носителя (opencode 2.3.2, живая проба #1526): type shell несёт
+    /// command/status/output.output; user-сообщений команда не создаёт.
+    async fn last_shell_output(
+        &self,
+        session: &str,
+        command: &str,
+    ) -> UsecaseResult<Option<String>> {
         let (status, resp) = self
             .call(
                 None,
-                &format!("/session/{session}/message?limit=5&order=desc"),
+                &format!("/session/{session}/message?limit=10&order=desc"),
                 reqwest::Method::GET,
                 None,
             )
             .await?;
         Self::check(status, &format!("message tail {session}"))?;
-        let Some(msg) = message_array(&resp).and_then(|m| m.iter().find(|m| m["type"] == "user"))
-        else {
-            return Ok(None);
-        };
-        Ok(user_message_text(msg))
+        Ok(
+            message_array(&resp)
+                .and_then(|msgs| msgs.iter().find_map(|m| shell_output(m, command))),
+        )
     }
 
     /// Лимит окна контекста модели из каталога исполнителя GET /model
@@ -852,35 +863,51 @@ mod tests {
     }
 
     #[test]
-    fn user_message_text_reads_live_carrier_shape() {
-        // Живая форма user-сообщения opencode 2.3.2 (проба #1526
-        // feed3.json + прод-БД: 34/34 после мерджа #497): верхнеуровневый
-        // text без content[] — чтение content[] возвращало None и канал
-        // вердиктов env-gc был глух (класс #1506: вердикты в ленте,
-        // сервер их не читает)
+    fn shell_output_reads_live_carrier_shape() {
+        // Живая форма shell-сообщения opencode 2.3.2 (throwaway-проба
+        // #1526: POST shell → 204, в ленте type shell с output.output,
+        // user-сообщений и assistant-поворота нет, токены 0):
+        // завершённое сообщение своей команды — текст вывода, чужое и
+        // running — None
+        let cmd = "$HOME/uwuwu-agent/server/ops/task-env-gc.sh sweep 1431 1432";
         let live = serde_json::json!({
-            "id": "msg_x", "type": "user",
-            "time": { "created": 1795405007028u64 },
-            "text": "ENV-GC 990001 SWEPT\nENV-GC 990002 SWEPT\n\n\nСлужебная команда конвейера."
+            "id": "msg_x", "type": "shell",
+            "time": { "created": 1795587829146u64, "completed": 1795587829630u64 },
+            "shellID": "sh_x", "command": cmd,
+            "status": "exited", "exit": 0,
+            "output": { "output": "ENV-GC 1431 SWEPT\nENV-GC 1432 ABSENT\n", "cursor": 34, "size": 34, "truncated": false }
         });
         assert_eq!(
-            user_message_text(&live).as_deref(),
-            Some("ENV-GC 990001 SWEPT\nENV-GC 990002 SWEPT\n\n\nСлужебная команда конвейера."),
-            "живая форма: верхнеуровневый text"
+            shell_output(&live, cmd).as_deref(),
+            Some("ENV-GC 1431 SWEPT\nENV-GC 1432 ABSENT\n"),
+            "живая форма: output завершённого shell своей команды"
         );
-        // Одна форма, один механизм: content[]-форма живым носителем для
-        // user-сообщений не даётся и не читается (мок перекалиброван)
-        let content_only = serde_json::json!({
-            "id": "msg_y", "type": "user",
-            "content": [{ "type": "text", "text": "ENV-GC 1431 SWEPT" }]
+        let running = serde_json::json!({
+            "id": "msg_y", "type": "shell", "command": cmd,
+            "status": "running", "output": { "output": "", "cursor": 0, "size": 0, "truncated": false }
         });
         assert!(
-            user_message_text(&content_only).is_none(),
-            "content[]-форма user-сообщения не читается (живой носитель её не даёт)"
+            shell_output(&running, cmd).is_none(),
+            "running — исхода нет"
         );
-        // Пустой text — нет текста
-        let empty = serde_json::json!({ "id": "msg_z", "type": "user", "text": "" });
-        assert!(user_message_text(&empty).is_none());
+        let foreign = serde_json::json!({
+            "id": "msg_z", "type": "shell", "command": "other",
+            "status": "exited", "exit": 0,
+            "output": { "output": "x", "cursor": 1, "size": 1, "truncated": false }
+        });
+        assert!(
+            shell_output(&foreign, cmd).is_none(),
+            "чужая команда — не наш вывод"
+        );
+        // user-сообщения env-gc больше не существует: slash-команда
+        // вырезана (#1526 — мусорные сессии «ENV-GC … / Служебная
+        // команда…» в листинге исполнителя)
+        let user =
+            serde_json::json!({ "id": "msg_u", "type": "user", "text": "ENV-GC 1431 SWEPT" });
+        assert!(
+            shell_output(&user, cmd).is_none(),
+            "user-сообщение — не shell-вывод"
+        );
     }
 
     #[test]

@@ -463,6 +463,7 @@ impl AgentSessionGateway for FakeSessions {
             .into_iter()
             .map(|(id, b)| SessionInfo {
                 id,
+                title: String::new(),
                 agent: String::new(),
                 directory: String::new(),
                 updated_ms: 0,

@@ -2,7 +2,7 @@
 //! и нативных ошибках (UsecaseError); инфра (uwuwu-server) реализует их
 //! поверх gh/опенкода/ФС.
 
-use crate::error::UsecaseResult;
+use crate::error::{UsecaseError, UsecaseResult};
 use async_trait::async_trait;
 use uwuwu_domain::{
     Agent, AgentSlot, BranchName, ModelRef, Slot, Status, Task, TaskFields, UtcMinute,
@@ -279,12 +279,11 @@ pub trait AgentSessionGateway: Send + Sync {
         Ok(())
     }
     /// Slash-команда сессии (детерминированные shell-блоки — env-подготовка,
-    /// батч-снос env-gc #1526). Бюджет ожидания ответа: POST /command
-    /// синхронен — opencode отвечает после полного завершения shell-блока
-    /// (проба #1526: sleep 25с → 204 через 25.5с), per-request таймаут
-    /// обязан покрывать длительность скрипта; бюджет приходит от юзкейса
-    /// (симметрично deadline_ms в wait_user_message), общий клиентский
-    /// таймаут адаптера не трогается.
+    /// спавн стадий task-env #1431). Бюджет ожидания ответа: POST /command
+    /// синхронен — opencode отвечает после полного завершения shell-блока,
+    /// per-request таймаут обязан покрывать длительность скрипта; бюджет
+    /// приходит от юзкейса (та же механика, что у run_shell),
+    /// общий клиентский таймаут адаптера не трогается.
     async fn run_command(
         &self,
         session: &str,
@@ -292,6 +291,25 @@ pub trait AgentSessionGateway: Send + Sync {
         args: &str,
         budget_ms: u64,
     ) -> UsecaseResult<()>;
+    /// Прямой shell в рабочей директории сессии БЕЗ LLM-поворота (#1526:
+    /// вырезаем slash-команду task-env-gc — её user-сообщение
+    /// «ENV-GC … / Служебная команда конвейера…» плодило мусорные сессии
+    /// в листинге исполнителя и жгло поворот на проход). POST
+    /// /session/:id/shell синхронен (204 после завершения shell-блока);
+    /// per-request таймаут = budget_ms. Возврат: stdout shell-блока при
+    /// завершённом статусе; None — дедлайн (исхода нет). Транспортный Err
+    /// — отказ запроса (юзкейс считает строкой failed). Дефолт Err:
+    /// фейки без shell-ручки отказывают громко, не тихим None.
+    async fn run_shell(
+        &self,
+        _session: &str,
+        _command: &str,
+        _budget_ms: u64,
+    ) -> UsecaseResult<Option<String>> {
+        Err(UsecaseError::Session(
+            "run_shell не поддерживается гейтвеем".into(),
+        ))
+    }
     async fn liveness(&self, session: &str) -> Liveness;
     async fn delete_session(&self, session: &str) -> UsecaseResult<()>;
     /// Прервать активный ход сессии (преемпшен CUP #1259): opencode
@@ -332,22 +350,6 @@ pub trait AgentSessionGateway: Send + Sync {
     async fn last_activity_ms(&self, session: &str) -> UsecaseResult<Option<u64>>;
     /// Последний ассистентский ответ сессии (для ботов: ожидание реплая).
     async fn last_assistant_reply(&self, session: &str) -> UsecaseResult<Option<AssistantReply>>;
-    /// Дождаться user-сообщения сессии, содержащего `marker`, не дольше
-    /// `deadline_ms`; вердикты env-gc (#1431): shell-вывод slash-команды
-    /// доезжает user-сообщением bootstrap-сессии. None — дедлайн. Опрос
-    /// с паузами и ретрай транспортных Err — инфра-забота адаптера
-    /// (runtime), юзкейс агностичен: адаптер (#1526) глотает Err опроса
-    /// до дедлайна (ретрай с паузой USER_MSG_POLL) и наружу отдаёт
-    /// только Ok(Some)/Ok(None). Дефолт None: фейки без env-gc не
-    /// должны уметь канал.
-    async fn wait_user_message(
-        &self,
-        _session: &str,
-        _marker: &str,
-        _deadline_ms: u64,
-    ) -> UsecaseResult<Option<String>> {
-        Ok(None)
-    }
     /// Список сессий исполнителя (для дримера: idle-детект).
     async fn list_sessions(&self) -> UsecaseResult<Vec<SessionInfo>>;
     /// Экспорт сессии (сообщения/сводка) — контент для дримера.
@@ -358,6 +360,10 @@ pub trait AgentSessionGateway: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionInfo {
     pub id: String,
+    /// Заголовок сессии на носителе (bootstrap env-gc: «env-gc {доска}»;
+    /// точный ключ рипера протухших bootstrap-сессий #1526 — матчинг
+    /// только по нему, каталог/агент для опознания не годятся).
+    pub title: String,
     pub agent: String,
     /// Директория сессии (cwd); пустая — исполнитель не отдал location:
     /// вне раскладки гарда спавна (#1163), никогда не матчится.
