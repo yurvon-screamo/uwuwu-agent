@@ -24,6 +24,10 @@ struct StaleBoard {
     cached: Vec<Task>,
     /// Журнал записей set_status: (number, status) — «мутации нет»-пины.
     writes: Mutex<Vec<(u64, Status)>>,
+    /// Счётчик fresh-ридов: пин квоты «один точечный GraphQL-рид
+    /// на вызов edit» (Low дельта-раунда #1615 — двойной рид на
+    /// идемпотентной отказной ветке).
+    fresh_reads: Mutex<usize>,
 }
 
 impl StaleBoard {
@@ -33,6 +37,10 @@ impl StaleBoard {
 
     fn writes(&self) -> Vec<(u64, Status)> {
         self.writes.lock().unwrap().clone()
+    }
+
+    fn fresh_reads(&self) -> usize {
+        *self.fresh_reads.lock().unwrap()
     }
 }
 
@@ -65,6 +73,7 @@ impl TaskBoardRepo for StaleBoard {
     async fn fresh_row_status(&self, _b: &str, n: u64) -> UsecaseResult<Option<Status>> {
         // #1437: свежее чтение носителя мимо кеш-вида — материал
         // идемпотентного гарда edit().
+        *self.fresh_reads.lock().unwrap() += 1;
         Ok(self
             .carrier
             .iter()
@@ -363,6 +372,7 @@ async fn guard_reads_fresh_carrier_not_stale_snapshot() {
         carrier: vec![StaleBoard::task(11, Status::InProgress)],
         cached: vec![StaleBoard::task(11, Status::InProgress)],
         writes: Mutex::new(vec![]),
+        fresh_reads: Mutex::new(0),
     });
     // Агент волны: task_edit(Review Analys). На свежем носителе ребро
     // In Progress → Review Analys вне канона — громкий отказ, мутации нет.
@@ -385,6 +395,7 @@ async fn legal_transition_on_fresh_status_writes() {
         carrier: vec![StaleBoard::task(11, Status::Analys)],
         cached: vec![StaleBoard::task(11, Status::Analys)],
         writes: Mutex::new(vec![]),
+        fresh_reads: Mutex::new(0),
     });
     edit_status(&board, 11, Status::ReviewAnalys)
         .await
@@ -402,6 +413,7 @@ async fn dev_sends_to_testing_from_in_progress() {
         carrier: vec![StaleBoard::task(11, Status::InProgress)],
         cached: vec![StaleBoard::task(11, Status::InProgress)],
         writes: Mutex::new(vec![]),
+        fresh_reads: Mutex::new(0),
     });
     edit_status(&board, 11, Status::Testing)
         .await
@@ -418,6 +430,7 @@ async fn direct_row_finishes_to_review() {
         carrier: vec![StaleBoard::task(11, Status::InProgress)],
         cached: vec![StaleBoard::task(11, Status::InProgress)],
         writes: Mutex::new(vec![]),
+        fresh_reads: Mutex::new(0),
     });
     writer_with(board.clone(), Arc::new(DirectFields))
         .edit(
@@ -442,6 +455,7 @@ async fn ordinary_row_cannot_skip_to_review() {
         carrier: vec![StaleBoard::task(11, Status::InProgress)],
         cached: vec![StaleBoard::task(11, Status::InProgress)],
         writes: Mutex::new(vec![]),
+        fresh_reads: Mutex::new(0),
     });
     let res = writer_with(board.clone(), Arc::new(FilledFields))
         .edit(
@@ -469,6 +483,7 @@ async fn row_status_absent_is_fail_closed() {
         carrier: vec![],
         cached: vec![],
         writes: Mutex::new(vec![]),
+        fresh_reads: Mutex::new(0),
     });
     let err = edit_status(&board, 11, Status::InProgress)
         .await
@@ -487,6 +502,7 @@ async fn unparseable_carrier_status_is_fail_closed() {
         carrier: vec![StaleBoard::task(11, Status::Empty)],
         cached: vec![StaleBoard::task(11, Status::Empty)],
         writes: Mutex::new(vec![]),
+        fresh_reads: Mutex::new(0),
     });
     let err = edit_status(&board, 11, Status::ReviewAnalys)
         .await
@@ -506,6 +522,7 @@ async fn idempotent_same_status_still_writes() {
         carrier: vec![StaleBoard::task(11, Status::InProgress)],
         cached: vec![StaleBoard::task(11, Status::InProgress)],
         writes: Mutex::new(vec![]),
+        fresh_reads: Mutex::new(0),
     });
     edit_status(&board, 11, Status::InProgress)
         .await
@@ -526,6 +543,7 @@ async fn stale_writer_idempotent_reinstall_is_rejected_by_fresh_carrier() {
         carrier: vec![StaleBoard::task(11, Status::NeedsAttention)],
         cached: vec![StaleBoard::task(11, Status::Design)],
         writes: Mutex::new(vec![]),
+        fresh_reads: Mutex::new(0),
     });
     let err = edit_status(&board, 11, Status::Design)
         .await
@@ -539,6 +557,9 @@ async fn stale_writer_idempotent_reinstall_is_rejected_by_fresh_carrier() {
         "мутации не должно быть: {:?}",
         board.writes()
     );
+    // Один fresh-рид на вызов (Low дельта-раунда #1615): идемпотентная
+    // ветка уже вернула свежий носитель — отказ по нему без второго рида.
+    assert_eq!(board.fresh_reads(), 1);
 }
 
 #[tokio::test]
@@ -552,6 +573,7 @@ async fn stale_idempotent_lag_read_passes_as_legal_edge() {
         carrier: vec![StaleBoard::task(11, Status::InProgress)],
         cached: vec![StaleBoard::task(11, Status::ReviewResult)],
         writes: Mutex::new(vec![]),
+        fresh_reads: Mutex::new(0),
     });
     edit_status(&board, 11, Status::ReviewResult)
         .await
@@ -575,11 +597,68 @@ async fn stale_cache_rejection_verifies_fresh_carrier_passes_legal_edge() {
         carrier: vec![StaleBoard::task(11, Status::ReviewAnalys)],
         cached: vec![StaleBoard::task(11, Status::Analys)],
         writes: Mutex::new(vec![]),
+        fresh_reads: Mutex::new(0),
     });
     edit_status(&board, 11, Status::Todo).await.expect(
         "ребро Review Analys → Todo легально по свежему носителю — кеш-стейл не отказывает (#1615)",
     );
     assert_eq!(board.writes(), vec![(11, Status::Todo)]);
+    // Один fresh-рид: отказная сверка, кеш-вид Analys расходится с целью
+    assert_eq!(board.fresh_reads(), 1);
+}
+
+#[tokio::test]
+async fn unreadable_cache_view_falls_back_to_fresh_carrier() {
+    // Нечитаемый кеш-вид (Low дельта-раунда #1615): свежесозданной строки
+    // нет в лагающем REST-листе — row_status отвечает None, носитель
+    // (GraphQL) живёт Review Analys. Прежний отказ «row #N is not on
+    // board (no status on the carrier)» винил честный носитель за кеш-
+    // миссу; гард различает fresh-ридом и ведёт ребро по носителю.
+    let board = Arc::new(StaleBoard {
+        snapshot: vec![StaleBoard::task(11, Status::Analys)],
+        carrier: vec![StaleBoard::task(11, Status::ReviewAnalys)],
+        cached: vec![],
+        writes: Mutex::new(vec![]),
+        fresh_reads: Mutex::new(0),
+    });
+    edit_status(&board, 11, Status::Todo).await.expect(
+        "ребро Review Analys → Todo проходит при нечитаемом кеш-виде — fresh решает (#1615)",
+    );
+    assert_eq!(board.writes(), vec![(11, Status::Todo)]);
+    assert_eq!(board.fresh_reads(), 1);
+}
+
+#[tokio::test]
+async fn divergent_rejection_text_names_fresh_carrier_not_cache_view() {
+    // Квадрант «кеш-вид и носитель расходятся, носитель тоже запрещает»
+    // (Low дельта-раунда #1615): текст отказа обязан называть свежий
+    // носитель (NeedsAttention), не кеш-вид (Draft); расхождение видно
+    // в событии board.guard_rejected, мутации нет.
+    let board = Arc::new(StaleBoard {
+        snapshot: vec![StaleBoard::task(11, Status::Draft)],
+        carrier: vec![StaleBoard::task(11, Status::NeedsAttention)],
+        cached: vec![StaleBoard::task(11, Status::Draft)],
+        writes: Mutex::new(vec![]),
+        fresh_reads: Mutex::new(0),
+    });
+    let err = edit_status(&board, 11, Status::Design)
+        .await
+        .expect_err("NeedsAttention → Design запрещён носителем и кеш-видом");
+    let text = err.to_string();
+    assert!(
+        text.contains("NeedsAttention"),
+        "текст отказа по свежему носителю: {text}"
+    );
+    assert!(
+        !text.contains("Draft"),
+        "кеш-видимое значение не попадает в текст отказа: {text}"
+    );
+    assert!(
+        board.writes().is_empty(),
+        "мутации не должно быть: {:?}",
+        board.writes()
+    );
+    assert_eq!(board.fresh_reads(), 1);
 }
 
 #[tokio::test]
@@ -593,6 +672,7 @@ async fn rejection_stands_when_fresh_carrier_confirms_stale_cache() {
         carrier: vec![StaleBoard::task(11, Status::Analys)],
         cached: vec![StaleBoard::task(11, Status::Analys)],
         writes: Mutex::new(vec![]),
+        fresh_reads: Mutex::new(0),
     });
     let err = edit_status(&board, 11, Status::Todo)
         .await

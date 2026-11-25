@@ -155,6 +155,20 @@ pub struct SectionWrite<'a> {
     pub confirm: bool,
 }
 
+/// Чтение current для канон-гарда edit(): кеш-вид (wt/items — fast
+/// path, fresh-рид не оплачен) или свежий носитель (рид уже
+/// выполнен: идемпотентная ветка #1437, нечитаемый кеш-вид —
+/// Low дельта-раунда #1615). Различие несёт квоту гарда: Fresh не
+/// доплачивает повторный GraphQL-рид на отказной ветке.
+enum GuardView {
+    /// кеш-вид носителя; может отстать от носителя (REST items-индекс
+    /// пере-фетчится в wt-окне и при лаге листа несёт до-записный
+    /// статус минуты — инстанс #1612)
+    Cached(Status),
+    /// свежий носитель; повторная fresh-сверка не нужна
+    Fresh(Status),
+}
+
 /// Option<Status> с носителя → верифицируемый current гарда: строки
 /// нет и значение непарсящееся — громкие отказы (контракт #1235/#1236),
 /// запись без верифицированного current запрещена. Оба чтения гарда —
@@ -1028,31 +1042,43 @@ impl EditExpectations {
 }
 
 impl TaskWriteUseCase {
-    /// Current для гарда канона edit(): wt-чтение носителя (свежее
-    /// против снапшота, #1235); идемпотентная переустановка (current ==
+    /// Чтение current для канон-гарда edit(): wt-чтение носителя (свежее
+    /// против снапшота, #1235). Идемпотентная переустановка (current ==
     /// target) доверяет только свежему носителю (#1437, симптом 2) —
-    /// wt/items-кеш могли показать цель там, где носитель живёт другим
-    /// статусом, и стейл-писец (повтор старого вердикта пробуждённой
-    /// сессией) проводил запрещённый переход как «переустановку» поверх
-    /// кеш-лага. Отказные рёбра поверх этого сверяет guard_canon
-    /// (#1615). None/непарсящееся — громкие отказы
-    /// (verifiable_current, контракт #1235/#1236).
+    /// стейл-писец (повтор старого вердикта пробуждённой сессией)
+    /// разваливается на fresh-риде. Нечитаемый кеш-вид (строки нет в
+    /// лагающем REST-листе — свежесозданная строка, или поле пусто)
+    /// различается fresh-ридом: носитель читается — ребро идёт по нему,
+    /// отказ по читаемости честен (Low дельта-раунда #1615: прежний
+    /// «row #N is not on board» винил носитель за кеш-миссу). Кеш-вид,
+    /// отличный от цели, возвращается как Cached — свежую сверку на
+    /// отказной ветке делает guard_canon. Громкие отказы None/Empty —
+    /// только при подтверждённом fresh (verifiable_current,
+    /// контракт #1235/#1236).
     async fn guard_current(
         &self,
         board: &str,
         number: u64,
         target: Status,
-    ) -> UsecaseResult<Status> {
-        let current =
-            verifiable_current(board, number, self.board.row_status(board, number).await?)?;
-        if current != target {
-            return Ok(current);
+    ) -> UsecaseResult<GuardView> {
+        let cached = match self.board.row_status(board, number).await? {
+            Some(s) if s != Status::Empty => s,
+            _ => {
+                return Ok(GuardView::Fresh(verifiable_current(
+                    board,
+                    number,
+                    self.board.fresh_row_status(board, number).await?,
+                )?));
+            }
+        };
+        if cached != target {
+            return Ok(GuardView::Cached(cached));
         }
-        verifiable_current(
+        Ok(GuardView::Fresh(verifiable_current(
             board,
             number,
             self.board.fresh_row_status(board, number).await?,
-        )
+        )?))
     }
 
     /// Гард канона перехода edit(): попытка по кеш-виду (wt-щит #1346,
@@ -1064,48 +1090,83 @@ impl TaskWriteUseCase {
     /// честный носитель «Review Analys», кеш показывал «Analys»,
     /// легальное ребро Review Analys → Todo трижды умерло отказом
     /// «вне канона», вердикт ревьювера висел в воздухе). Отказ
-    /// конвейерной стадии дорог (ложная эскалация живой строки) —
-    /// fresh совпал с кеш-видом: отказ настоящий, текст по свежему
-    /// значению; расходится: переход идёт по свежему чтению (событие
-    /// board.guard_stale_cache). Квотная дисциплина ADR-113/#1437:
-    /// точечный GraphQL-рид только на редкой отказной ветке.
+    /// конвейерной стадии дорог (ложная эскалация живой строки).
+    /// Квотная дисциплина ADR-113/#1437: точечный GraphQL-рид только
+    /// на редких ветках — отказная, идемпотентная, нечитаемый кеш-вид
+    /// (один рид на вызов, без повторов).
     async fn guard_canon(&self, board: &str, number: u64, status: Status) -> UsecaseResult<Status> {
-        let cached = self.guard_current(board, number, status).await?;
-        // direct-класс (#1357): ребро In Progress → Review открыто
-        // только строке с флагом — флаг добывается свежим чтением
-        // носителя (семейство стейл-багов #1258/#1346: снапшоту
-        // здесь не верим), остальным рёбрам флаг не нужен
-        let direct = self.carrier_direct(number, cached, status).await;
-        if uwuwu_domain::Status::can_transition_with(cached, status, direct) {
-            return Ok(cached);
+        match self.guard_current(board, number, status).await? {
+            // Свежий носитель уже оплачен (рид #1437/нечитаемый кеш-вид):
+            // повторной fresh-сверки нет — канон-проверка по нему
+            GuardView::Fresh(current) => {
+                // direct-класс (#1357): ребро In Progress → Review открыто
+                // только строке с флагом — флаг добывается свежим чтением
+                // носителя, остальным рёбрам флаг не нужен
+                let direct = self.carrier_direct(number, current, status).await;
+                if uwuwu_domain::Status::can_transition_with(current, status, direct) {
+                    return Ok(current);
+                }
+                // отказ: кеш-вида как источника здесь нет (рид был свежим
+                // или кеш нечитаем) — расхождению докладывать нечего
+                Err(Self::reject_canon(number, current, None, status))
+            }
+            GuardView::Cached(cached) => {
+                let direct = self.carrier_direct(number, cached, status).await;
+                if uwuwu_domain::Status::can_transition_with(cached, status, direct) {
+                    return Ok(cached);
+                }
+                let fresh = verifiable_current(
+                    board,
+                    number,
+                    self.board.fresh_row_status(board, number).await?,
+                )?;
+                let direct = self.carrier_direct(number, fresh, status).await;
+                if !uwuwu_domain::Status::can_transition_with(fresh, status, direct) {
+                    return Err(Self::reject_canon(number, fresh, Some(cached), status));
+                }
+                tracing::warn!(
+                    event = "board.guard_stale_cache",
+                    number,
+                    cached = %naming::status_name(cached),
+                    fresh = %naming::status_name(fresh),
+                    "Кеш-вид гарда отстал от носителя — переход проведён по свежему чтению (#1615)"
+                );
+                Ok(fresh)
+            }
         }
-        let fresh = verifiable_current(
-            board,
-            number,
-            self.board.fresh_row_status(board, number).await?,
-        )?;
-        let direct = self.carrier_direct(number, fresh, status).await;
-        if !uwuwu_domain::Status::can_transition_with(fresh, status, direct) {
-            tracing::warn!(
+    }
+
+    /// Честный отказ канона: текст по свежему значению носителя, а не по
+    /// кеш-виду; расхождение кеш-вида — в событие лога (догфуд, Low
+    /// дельта-раунда #1615: в квадранте «расходятся, носитель тоже
+    /// запрещает» кеш-видимое значение было невидимо).
+    fn reject_canon(
+        number: u64,
+        fresh: Status,
+        cached: Option<Status>,
+        to: Status,
+    ) -> UsecaseError {
+        match cached {
+            Some(cached) => tracing::warn!(
+                event = "board.guard_rejected",
+                number,
+                cached = %naming::status_name(cached),
+                from = %naming::status_name(fresh),
+                to = %naming::status_name(to),
+                "Гард канона: переход запрещён (свежий носитель подтвердил отказ)"
+            ),
+            None => tracing::warn!(
                 event = "board.guard_rejected",
                 number,
                 from = %naming::status_name(fresh),
-                to = %naming::status_name(status),
+                to = %naming::status_name(to),
                 "Гард канона: переход запрещён (свежий носитель подтвердил отказ)"
-            );
-            return Err(UsecaseError::Board(format!(
-                "transition {:?} → {:?} outside the pipeline canon",
-                fresh, status
-            )));
+            ),
         }
-        tracing::warn!(
-            event = "board.guard_stale_cache",
-            number,
-            cached = %naming::status_name(cached),
-            fresh = %naming::status_name(fresh),
-            "Кеш-вид гарда отстал от носителя — переход проведён по свежему чтению (#1615)"
-        );
-        Ok(fresh)
+        UsecaseError::Board(format!(
+            "transition {:?} → {:?} outside the pipeline canon",
+            fresh, to
+        ))
     }
 
     /// direct-флаг с носителя (#1357): ребро In Progress → Review гвардится
