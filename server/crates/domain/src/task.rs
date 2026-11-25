@@ -135,9 +135,9 @@ impl Status {
         {
             return false;
         }
-        (direct && from == S::InProgress && to == S::UserReview)
-            || (fact_track && from == S::ReviewResult && to == S::UserReview)
-            || Self::can_transition(from, to)
+        let direct_review = direct && from == S::InProgress && to == S::UserReview;
+        let fact_track_review = fact_track && from == S::ReviewResult && to == S::UserReview;
+        direct_review || fact_track_review || Self::can_transition(from, to)
     }
 
     /// Стадии, из которых агент уходил в Needs attention с вопросом.
@@ -410,13 +410,12 @@ pub struct BranchName(String);
 impl BranchName {
     pub fn parse(name: &str) -> Option<Self> {
         let name = name.trim();
-        let safe = !name.is_empty()
-            && !name.contains(' ')
-            && !["..", "~", "^", ":", "?", "*", "[", "\\"]
-                .iter()
-                .any(|bad| name.contains(bad))
-            && !name.starts_with('-')
-            && !name.ends_with(".lock");
+        let has_bad_char = name.contains("..")
+            || name
+                .chars()
+                .any(|c| matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'));
+        let safe =
+            !name.is_empty() && !has_bad_char && !name.starts_with('-') && !name.ends_with(".lock");
         safe.then(|| Self(name.to_string()))
     }
 
