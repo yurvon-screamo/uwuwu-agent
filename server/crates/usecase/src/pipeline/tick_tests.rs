@@ -3370,48 +3370,6 @@ async fn stage_transition_clears_dead_review_cell() {
     );
 }
 
-/// Локальный билдер фикстуры тестера (#1607): комменты журнала и часы
-/// задаются явно (usecase_with_state фиксирует FixedClock и пустой журнал).
-fn tester_usecase(
-    rows: Vec<Task>,
-    comments: Vec<CommentRef>,
-    sessions: FakeSessions,
-    state: Arc<MemState>,
-    clock: Arc<dyn Clock>,
-) -> (TickUseCase, Arc<FakeBoard>, Arc<FakeSessions>, Arc<FakePrs>) {
-    let board = Arc::new(FakeBoard {
-        rows: rows.into(),
-        log: Mutex::default(),
-        comments,
-        fields_fails: false,
-        set_session_fails: false,
-        set_pr_fails: AtomicBool::new(false),
-        clear_session_fails: AtomicBool::new(false),
-        status_fails: AtomicBool::new(false),
-    });
-    let sessions = Arc::new(sessions);
-    let prs = Arc::new(FakePrs {
-        state: PrState::Missing,
-        merges: Mutex::default(),
-        merge_fails: AtomicBool::new(false),
-        probes: Mutex::default(),
-        url: Mutex::default(),
-    });
-    let u = TickUseCase {
-        board: board.clone(),
-        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
-        prs: prs.clone(),
-        clock,
-        state,
-        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
-        boot_ms: 0,
-        judge: None,
-        judge_cfg: Default::default(),
-        quota: None,
-    };
-    (u, board, sessions, prs)
-}
-
 #[tokio::test]
 async fn test_slot_reentry_keeps_master_session_and_delivers_delta_wake() {
     // Мастер-сессия тестера (#1607, срез 2а): повторный вход в Testing при
@@ -3435,7 +3393,7 @@ async fn test_slot_reentry_keeps_master_session_and_delivers_delta_wake() {
     let mut fake = FakeSessions::new();
     fake.idle_reply = true;
     let (u, board, sessions, _) =
-        tester_usecase(vec![t], vec![], fake, state.clone(), Arc::new(FixedClock));
+        fixture_usecase(vec![t], vec![], state.clone(), Arc::new(FixedClock), fake);
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     let log = board.log.lock().unwrap();
     assert!(
@@ -3490,7 +3448,7 @@ async fn test_slot_reentry_with_foreign_comments_wakeup_owns_entry() {
         body: "вердикт ревьювера: правь".into(),
     }];
     let (u, _, sessions, _) =
-        tester_usecase(vec![t], comments, fake, state.clone(), Arc::new(FixedClock));
+        fixture_usecase(vec![t], comments, state.clone(), Arc::new(FixedClock), fake);
     let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
     assert_eq!(out.wakeups, 1, "wakeup доставлен");
     assert_eq!(out.spawns_done, 0, "спавна нет — сессия та же");
@@ -3529,7 +3487,7 @@ async fn test_slot_reentry_marker_open_skips_stall_pass() {
         let mut fake = FakeSessions::new();
         fake.activity_ms = Some(0);
         // занята: ни re-entry, ни wakeup не доставляют — маркер/тишина
-        tester_usecase(vec![t], vec![], fake, state.clone(), Arc::new(LostClock))
+        fixture_usecase(vec![t], vec![], state.clone(), Arc::new(LostClock), fake)
     };
     // маркер взведён переходом In Progress → Testing
     let (u, board, _, _) = build(62, Status::InProgress);
