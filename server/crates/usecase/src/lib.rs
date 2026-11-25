@@ -19,6 +19,9 @@ mod router_tests;
 mod search;
 #[cfg(test)]
 mod search_tests;
+pub mod slug_guard;
+#[cfg(test)]
+mod slug_guard_tests;
 #[cfg(test)]
 mod spawn_model_tests;
 pub mod spawn_models;
