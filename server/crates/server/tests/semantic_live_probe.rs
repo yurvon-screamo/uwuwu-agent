@@ -294,9 +294,19 @@ async fn live_full_index_and_control_queries() {
     .await
     .expect("open lance backend");
 
-    let changed = backend.sync_index(400).await.expect("живой полный sync");
-    eprintln!("полный sync проиндексировал доков: {changed}");
-    assert!(changed > 100, "полный корпус должен дать >100 доков");
+    // Полный корпус строится итерациями, как прод (19 доков за тик), только
+    // крупнее шаг: один вызов упирается в бюджет тика и не доходит до задач.
+    let mut total = 0usize;
+    for tick in 1..=8 {
+        let changed = backend.sync_index(400).await.expect("живой полный sync");
+        eprintln!("тик {tick}: проиндексировано доков {changed}");
+        total += changed;
+        if changed == 0 {
+            break;
+        }
+    }
+    eprintln!("полный sync проиндексировал доков: {total}");
+    assert!(total > 1000, "полный корпус должен дать >1000 доков");
 
     // Контрольные запросы — тот же SearchUseCase, что рендерит MCP search.
     let uc = SearchUseCase {
