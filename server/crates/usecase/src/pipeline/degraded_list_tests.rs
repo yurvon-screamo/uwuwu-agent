@@ -7,9 +7,11 @@
 //! здесь пинит только событие роли, не дублируя поведенческие ассерты.
 //! dreamer-тест дополнительно пинит отложенный prune при частичном зрении.
 
+#[cfg(target_os = "linux")]
+use super::degraded_list_support::LAZY_INSTALL;
 use super::degraded_list_support::{
     assert_degraded, dreamer_target, has_exact_field, is_exact_degraded, router, trap_events,
-    RecordingGw, LAZY_INSTALL,
+    RecordingGw,
 };
 use crate::pipeline::analyst::AnalystUseCase;
 use crate::pipeline::analyst_review::AnalystReviewUseCase;
