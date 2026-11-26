@@ -1,10 +1,22 @@
-# uwuwu-server — memory-стенд: полный цикл конвейера без GitHub и rate-limit
+# uwuwu-server — memory-стенд для ручного MCP-прогона без GitHub и rate-limit
 # (доска/поля в памяти; вики/кроны — локальный git-клон).
-# Запуск:
-#   1) MOCK_MODE=agent MOCK_MCP_TOKEN=$UWUWU_SERVER_BEARER cargo run --bin mock_opencode
-#   2) UWUWU_SERVER_CONFIG=server/ops/config.memory.toml \
-#      UWUWU_SERVER_BEARER=… UWUWU_OPENCODE_PASSWORD=mockpass \
-#      UWUWU_MOCK_SEED="1148:Design" cargo run --bin uwuwu-server
+#
+# ВАЖНО: без мока на 8099 поднимай только в observe — задай переменную в команде:
+#   UWUWU_SERVER_MODE=observe
+# Переменная доминирует над mode = "live" в этом файле. Принимаются только точные
+# observe и live; любое другое значение тихо даёт live с реальными checkout/env_root.
+# Режим подтверждай строкой server.started в логе (cargo run печатает Finished/Running раньше).
+# Без мока на 8099 в логе будут WARN sessions.list_reachable_failed каждый тик и один
+# executor.unavailable_unnotified — это read-only, мутаций нет.
+# Live — только через ops/stand/e2e.sh: он поднимает мок на прогонном порту и сам
+# ставит пароль опенкода и переменную режима. Ручного live по этой шапке нет.
+# Если задан UWUWU_EXECUTOR_URL, он перекрывает [executor].url ниже.
+#
+# Запуск из каталога server/ (воркспейс server/Cargo.toml):
+#   UWUWU_SERVER_CONFIG=ops/config.memory.toml \
+#   UWUWU_SERVER_MODE=observe UWUWU_SERVER_BEARER=… \
+#   GH_TOKEN=$GH_TOKEN UWUWU_SERVER_STATE=<scratch>/state.json PORT=<свободный> \
+#   UWUWU_MOCK_SEED="1148:Design" cargo run --bin uwuwu-server
 mode = "live"
 poll_sec = 10
 port = 8090
