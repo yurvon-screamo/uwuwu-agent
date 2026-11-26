@@ -2711,29 +2711,16 @@ async fn radical_shrink_with_confirm_writes_and_receipt_carries_lengths() {
 /// опирается на прод-бакет и не закрепляет протухшие пресайны.
 #[tokio::test]
 async fn blob_put_presign_mode_e2e_over_mcp_wire_with_local_http_store() {
+    use super::test_support::{call_tool_wire, BlobHttpFake, BlobObjects};
     use crate::api::McpState;
-    use axum::extract::Path;
-    use axum::http::{header, HeaderMap, StatusCode};
-    use axum::response::Response;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    use tower::ServiceExt;
+    use axum::http::StatusCode;
 
-    type Objects = Arc<Mutex<HashMap<String, (Vec<u8>, String)>>>;
-
-    fn wire_response(status: StatusCode, ctype: Option<String>, body: Vec<u8>) -> Response {
-        let mut builder = Response::builder().status(status);
-        if let Some(ct) = ctype {
-            builder = builder.header(header::CONTENT_TYPE, ct);
-        }
-        builder
-            .body(axum::body::Body::from(body))
-            .expect("static response")
-    }
+    /// Пейлоад загрузки: та же строка служит иглой для оракула «байты не
+    /// едут в контекст» и телом PUT — иначе ассерт не может упасть.
+    const AGENT_BYTES: &[u8] = b"E2E-1537-agent-bytes";
 
     struct TestHttpStore {
-        port: u16,
-        objects: Objects,
+        fake: BlobHttpFake,
     }
 
     #[async_trait::async_trait]
@@ -2744,45 +2731,25 @@ async fn blob_put_presign_mode_e2e_over_mcp_wire_with_local_http_store() {
             content_type: &str,
             bytes: &[u8],
         ) -> uwuwu_usecase::UsecaseResult<()> {
-            self.objects.lock().expect("lock").insert(
+            self.fake.objects.lock().expect("lock").insert(
                 key.as_str().to_string(),
                 (bytes.to_vec(), content_type.to_string()),
             );
             Ok(())
         }
         fn presign_get_url(&self, key: &uwuwu_domain::BlobKey) -> String {
-            format!("http://127.0.0.1:{}/get/{}", self.port, key.as_str())
+            self.fake.agent_get_url(key.as_str())
         }
         fn presign_put_url(&self, key: &uwuwu_domain::BlobKey, _content_type: &str) -> String {
-            format!("http://127.0.0.1:{}/put/{}", self.port, key.as_str())
+            self.fake.agent_put_url(key.as_str())
         }
     }
 
+    /// Общий `tools/call` по проводу; эта приёмка ждёт успешный текст
+    /// квитанции, а не голый JSON-RPC.
     async fn wire_call(app: &axum::Router, name: &str, args: Value) -> String {
-        let payload = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": { "name": name, "arguments": args }
-        });
-        let response = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method(axum::http::Method::POST)
-                    .uri("/mcp")
-                    .header("authorization", "Bearer wire-bearer")
-                    .header("content-type", "application/json")
-                    .body(axum::body::Body::from(payload.to_string()))
-                    .expect("request ok"),
-            )
-            .await
-            .expect("service ok");
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), 32 * 1024 * 1024)
-            .await
-            .expect("body ok");
-        let msg: Value = serde_json::from_slice(&bytes).expect("json ok");
+        let (status, msg) = call_tool_wire(app, name, args, "wire-bearer").await;
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(msg["result"]["isError"], json!(false), "{msg}");
         msg["result"]["content"][0]["text"]
             .as_str()
@@ -2790,44 +2757,9 @@ async fn blob_put_presign_mode_e2e_over_mcp_wire_with_local_http_store() {
             .to_string()
     }
 
-    let objects: Objects = Arc::default();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    let app = axum::Router::new()
-        .route("/put/{*key}", axum::routing::put({
-            let objects = objects.clone();
-            move |Path(key): Path<String>, headers: HeaderMap, body: axum::body::Bytes| async move {
-                let ctype = headers
-                    .get("content-type")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or_default()
-                    .to_string();
-                objects
-                    .lock()
-                    .expect("lock")
-                    .insert(key, (body.to_vec(), ctype));
-                wire_response(StatusCode::OK, None, Vec::new())
-            }
-        }))
-        .route("/get/{*key}", axum::routing::get({
-            let objects = objects.clone();
-            move |Path(key): Path<String>| async move {
-                match objects.lock().expect("lock").get(&key).cloned() {
-                    Some((bytes, ctype)) => wire_response(StatusCode::OK, Some(ctype), bytes),
-                    None => wire_response(StatusCode::NOT_FOUND, None, Vec::new()),
-                }
-            }
-        }));
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("serve");
-    });
-
-    let store = Arc::new(TestHttpStore {
-        port,
-        objects: objects.clone(),
-    });
+    let fake = BlobHttpFake::start().await;
+    let objects: BlobObjects = fake.objects.clone();
+    let store = Arc::new(TestHttpStore { fake });
     let (tools, _memory) = tool_hub(
         Arc::new(StubWiki),
         Arc::new(uwuwu_usecase::BlobUseCase::ready(store)),
@@ -2882,15 +2814,27 @@ async fn blob_put_presign_mode_e2e_over_mcp_wire_with_local_http_store() {
         "GET подписан на тот же ключ: {receipt}"
     );
     assert_eq!(content_type, "image/png");
-    assert!(!receipt.contains("agent bytes"), "байты не едут в ответе");
+    // Оракул НФТ: в dehydrated-ответе — ключ и ссылки, не байты. Потолок
+    // размера ловит даже скрытый base64-пакет (мутация +450 КБ → красный),
+    // а игла — дословный пейлоад загрузки, а не похожая фраза.
+    assert!(
+        receipt.len() < 4096,
+        "квитанция несёт только ключ и URL, а не байты: {} байт",
+        receipt.len()
+    );
+    assert!(
+        !receipt.contains(std::str::from_utf8(AGENT_BYTES).expect("utf8 payload")),
+        "байты загрузки едут в квитанции"
+    );
 
-    // Шаг 2: байты идут из shell мимо контекста — здесь HTTP-клиент на
-    // URL из квитанции с подписанным Content-Type.
-    let bytes = b"E2E-1537-agent-bytes";
+    // Шаг 2: байты идут из shell мимо контекста — здесь HTTP-клиент на URL
+    // из квитанции с Content-Type из неё же. Саму подпись Content-Type
+    // держат пин адаптера в s3.rs и живой прогон Tigris; этот тест проверяет,
+    // что тип из квитанции доходит до носителя.
     let status = reqwest::Client::new()
         .put(&put_url)
         .header("content-type", &content_type)
-        .body(bytes.to_vec())
+        .body(AGENT_BYTES.to_vec())
         .send()
         .await
         .expect("PUT by presigned URL")
@@ -2901,17 +2845,25 @@ async fn blob_put_presign_mode_e2e_over_mcp_wire_with_local_http_store() {
             .lock()
             .expect("lock")
             .get(&key)
-            .is_some_and(|(b, ct)| b.as_slice() == bytes && ct == "image/png"),
-        "байты и тип дошли до носителя"
+            .is_some_and(|(b, ct)| b.as_slice() == AGENT_BYTES && ct == &content_type),
+        "байты и тип из квитанции дошли до носителя"
     );
 
-    // Шаг 3: ссылка из той же квитанции открывается; blob_get по ключу
-    // переподписывает GET и отдаёт те же байты.
-    let fetched = reqwest::get(&get_url)
+    // Шаг 3: GET-пресайн из той же квитанции открывается и возвращает
+    // залитые байты; blob_get по ключу переподписывает GET и отдаёт их же.
+    let from_receipt = reqwest::get(&get_url)
         .await
         .expect("GET by presigned URL")
-        .status();
-    assert_eq!(fetched, StatusCode::OK, "пресайн GET из квитанции");
+        .error_for_status()
+        .expect("пресайн GET из квитанции")
+        .bytes()
+        .await
+        .expect("body");
+    assert_eq!(
+        from_receipt.as_ref(),
+        AGENT_BYTES,
+        "пресайн GET из квитанции вернул залитые байты"
+    );
     let resign = wire_call(&mcp, "blob_get", json!({ "key": key })).await;
     let resign_url = resign
         .lines()
@@ -2927,5 +2879,5 @@ async fn blob_put_presign_mode_e2e_over_mcp_wire_with_local_http_store() {
         .bytes()
         .await
         .expect("body");
-    assert_eq!(got.as_ref(), bytes, "blob_get вернул залитые байты");
+    assert_eq!(got.as_ref(), AGENT_BYTES, "blob_get вернул залитые байты");
 }
