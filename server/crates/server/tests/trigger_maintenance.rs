@@ -12,10 +12,6 @@
 
 pub mod search {
     #[allow(dead_code)]
-    #[path = "../../src/search/budget.rs"]
-    pub mod budget;
-
-    #[allow(dead_code)]
     #[path = "../../src/search/fts.rs"]
     pub mod fts;
 

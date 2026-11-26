@@ -1,25 +1,33 @@
-//! Живой e2e клиента GeminiEmbeddings (#1363), гвард UWUWU_E2E=1 (культура
-//! репо — образец gitea_tests): реальный generativelanguage API, расход —
-//! два запроса (док-батч + query) на прогон. Без UWUWU_E2E=1 — сразу зелёный.
-//! Контракт: success-батч → векторы 1536; doc/query-префиксы в теле запроса;
-//! query-путь возвращает вектор той же размерности.
+//! Живой e2e клиента OllamaEmbeddings (#1687), гвард UWUWU_E2E=1:
+//! прямой адрес Ollama на kisa (private relay из tests недостижим), расход —
+//! два запроса на прогон. Контракт: батч → 768-dim, query → один 768-вектор.
 
-use crate::search::semantic::{Embedder, GeminiEmbeddings, EMBED_MODEL_DIMS};
+use crate::search::semantic::{Embedder, OllamaEmbeddings, EMBED_MODEL, EMBED_MODEL_DIMS};
+
+fn endpoint() -> String {
+    std::env::var("UWUWU_EMBED_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| {
+            if std::env::var("UWUWU_E2E").as_deref() == Ok("1") {
+                "http://127.0.0.1:11434".to_string()
+            } else {
+                "http://relay.railway.internal:2334".to_string()
+            }
+        })
+}
 
 #[tokio::test]
-async fn live_gemini_client_embeds_docs_and_query() {
+async fn live_ollama_client_embeds_docs_and_query() {
     if std::env::var("UWUWU_E2E").as_deref() != Ok("1") {
-        return; // живой пробе нужен мандат прогонщика
+        return;
     }
-    let key = std::env::var("GEMINI_API_KEY").expect("UWUWU_E2E=1: нужен GEMINI_API_KEY");
-    assert!(!key.trim().is_empty(), "GEMINI_API_KEY пуст");
-
-    let client = GeminiEmbeddings::new(key, "gemini-embedding-2".to_string());
+    let client = OllamaEmbeddings::new(endpoint(), EMBED_MODEL.to_string());
 
     let docs = vec![
         (
-            "Experience/platform/Лимиты Gemini".to_string(),
-            "RPD 1000".to_string(),
+            "Projects/uwuwu/README".to_string(),
+            "Семантика на локальных эмбеддингах".to_string(),
         ),
         (String::new(), "без тайтла".to_string()),
     ];

@@ -1,5 +1,5 @@
 //! Интеграционный пин #1363: dim-guard миграции индекса. Живой Lance-том
-//! с 1024-dim векторами (qwen3-эпоха) при open с клиентом 1536 сносится
+//! с 1536-dim векторами (Gemini-эпоха) при open с клиентом 768 сносится
 //! целиком (chunks + doc_meta + sha-персист), штатный sha-инкрементный sync
 //! перестраивает индекс из первоисточника — без ручных операций с volume.
 //! Повторный open со свежей таблицей — no-op (идемпотентность миграции).
@@ -20,7 +20,7 @@ use lancedb::arrow::arrow_schema::{DataType, Field as ArrowField, Schema as Arro
 use lancedb::connection::ConnectBuilder;
 use uwuwu_usecase::{SemanticBackend, WikiRepo};
 
-const LEGACY_DIM: i32 = 1024; // qwen3-embedding:0.6b — прежний маршрут
+const LEGACY_DIM: i32 = 1536; // gemini-embedding-2 — прежний маршрут (#1687)
 const SLUG: &str = "Experience/platform/Лимиты Gemini Embedding";
 const DOC_MD: &str =
     "# Лимиты\n\nFree tier: RPD 1000, ресет — полночь Pacific. 429 несёт RetryInfo.";
@@ -45,7 +45,7 @@ fn legacy_schema(dim: i32) -> Arc<ArrowSchema> {
     ]))
 }
 
-/// Физически сооружает volume «qwen3-эпохи»: chunks 1024-dim с одной строкой,
+/// Физически сооружает volume «Gemini-эпохи»: chunks 1536-dim с одной строкой,
 /// doc_meta и sha-персист — то, что остаётся на volume после отката
 /// revert'ом к прежнему маршруту (сценарий герхина «миграция прозрачна»).
 async fn seed_legacy_volume(path: &Path) {
@@ -108,7 +108,7 @@ async fn seed_legacy_volume(path: &Path) {
         .expect("add legacy meta");
     std::fs::write(
         path.join("semantic_shas.json"),
-        format!(r#"{{"{SLUG}": "sha-qwen3"}}"#),
+        format!(r#"{{"{SLUG}": "sha-gemini"}}"#),
     )
     .expect("write legacy shas");
 }
@@ -140,7 +140,7 @@ fn wiki_with_doc() -> Arc<dyn WikiRepo> {
 // ——— тесты ———
 
 #[tokio::test]
-async fn stale_1024_volume_is_dropped_and_rebuilt_by_sync() {
+async fn stale_1536_volume_is_dropped_and_rebuilt_by_sync() {
     let guard = TempDirGuard(lance_dir("migrate"));
     let dir = guard.0.clone();
     seed_legacy_volume(&dir).await;
@@ -148,7 +148,7 @@ async fn stale_1024_volume_is_dropped_and_rebuilt_by_sync() {
     let embeddings: Arc<dyn Embedder> = Arc::new(FixedEmbedder);
     let backend = LanceSemanticBackend::open(dir.clone(), wiki_with_doc(), None, embeddings)
         .await
-        .expect("open с 1536-клиентом");
+        .expect("open с 768-клиентом");
 
     // sha-персист снесён вместе с таблицами — двойной инкремент невозможен
     assert!(
@@ -179,7 +179,7 @@ async fn stale_1024_volume_is_dropped_and_rebuilt_by_sync() {
 }
 
 #[tokio::test]
-async fn fresh_1536_volume_survives_reopen() {
+async fn fresh_768_volume_survives_reopen() {
     let guard = TempDirGuard(lance_dir("fresh"));
     let dir = guard.0.clone();
     let embeddings: Arc<dyn Embedder> = Arc::new(FixedEmbedder);
