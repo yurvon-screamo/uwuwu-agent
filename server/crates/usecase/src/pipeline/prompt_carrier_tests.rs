@@ -16,10 +16,13 @@ fn agent_doc(name: &str) -> String {
         .unwrap_or_else(|e| panic!("agent def {} unreadable: {e}", path.display()))
 }
 
+const BOARD: &str = "BOARD-1647";
+const PROJECT: &str = "proj-1647";
+
 fn board() -> BoardPlan {
     BoardPlan {
-        board: "B".into(),
-        project: "p".into(),
+        board: BOARD.into(),
+        project: PROJECT.into(),
         repo: "a/c".into(),
         checkout: "/tmp/checkout".into(),
         env_root: "/tmp/env".into(),
@@ -35,19 +38,36 @@ fn agent_defs_carry_the_methodology_the_server_no_longer_sends() {
     let tester = agent_doc("tester");
     let developer = agent_doc("developer");
 
-    // Assert
-    assert!(analyst.contains("sourcing") && analyst.contains("TASK-TEMPLATE"));
-    assert!(reviewer.contains("Sourcing") && reviewer.contains("Verdicts"));
-    assert!(dreamer.contains("Experience"));
-    assert!(tester.contains("Delta mode"));
-    assert!(developer.contains("PLANNING") && developer.contains("IMPLEMENTATION"));
+    // Assert — клаузы, ушедшие из Rust, а не отдельные слова.
+    assert!(analyst.contains("## The main rule — sourcing (ADR-102)"));
+    assert!(analyst.contains("Verdicts: elaborated") && analyst.contains("into **Review Analys**"));
+    assert!(analyst.contains("You do not implement the task"));
+    assert!(analyst.contains("do not write into the project's Design Spec"));
+    assert!(analyst.contains("You do not create tasks"));
+    assert!(reviewer.contains("- Verdicts: approve → `task_edit` into **Todo**"));
+    assert!(reviewer.contains("The report — one comment per row"));
+    assert!(reviewer.contains("no separate wave summary posts"));
+    assert!(dreamer.contains("### 1. Dumps") && dreamer.contains("### 5. Experience (always)"));
+    assert!(tester.contains("**Delta mode (a re-entry after the bug loop)**"));
+    assert!(
+        developer.contains("# PHASE: PLANNING") && developer.contains("# PHASE: IMPLEMENTATION")
+    );
 }
 
 #[test]
 fn developer_def_maps_both_stage_markers_to_phases() {
+    // Arrange
     let developer = agent_doc("developer");
-    assert!(developer.contains("stage=developer/design"));
-    assert!(developer.contains("stage=developer/dev"));
+
+    // Act — позиции клауз и обоих заголовков фаз.
+    let planning = developer.find("# PHASE: PLANNING").unwrap();
+    let implementation = developer.find("# PHASE: IMPLEMENTATION").unwrap();
+    let design = developer.find("stage=developer/design").unwrap();
+    let dev = developer.find("stage=developer/dev").unwrap();
+
+    // Assert — перестановка маркеров между фазами ломает пин.
+    assert!(planning < design && design < implementation);
+    assert!(implementation < dev);
 }
 
 #[test]
@@ -84,7 +104,7 @@ fn spawn_prompt_carries_data_marker_pointer_and_contract() {
     let task = Task::new(7, "t".into(), Status::Design);
     let prompt = spawn_prompt(&board(), &task, uwuwu_domain::Slot::Design);
 
-    assert!(prompt.contains("#7") && prompt.contains("B") && prompt.contains("p"));
+    assert!(prompt.contains("#7") && prompt.contains(BOARD) && prompt.contains(PROJECT));
     assert!(prompt.contains("stage=developer/design"));
     assert!(prompt.contains("Methodology: agents/developer.md"));
     assert!(prompt.contains("SLEEPS after the reply"));
