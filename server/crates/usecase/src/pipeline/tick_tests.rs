@@ -8154,6 +8154,108 @@ async fn analyst_compact_skips_unknown_binding_1661() {
 }
 
 #[tokio::test]
+async fn compact_pass_keeps_each_role_event_prefix_1661() {
+    // #1661: компакт-проход один, но имена событий двух ролей обязаны
+    // остаться своими — префикс задаётся данными вызова, не каналом.
+    // Пин ловит случайный `analys.compacted` у ревьювера и наоборот:
+    // в обычном cargo test префиксы иначе не проверяются — только
+    // гейтованные UWUWU_E2E-стенды (замечание ревью #1661).
+    use super::degraded_list_support::trap_events;
+
+    let has_exact = |recs: &[String], ev: &str| {
+        let plain = format!("event={ev}");
+        let quoted = format!("event=\"{ev}\"");
+        recs.iter()
+            .any(|r| r.split(" | ").any(|f| f == plain || f == quoted))
+    };
+
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_analyst",
+        "opencode-go/hy4-flash-free#high",
+        "/tmp/checkout",
+    );
+    state.set_master_binding(
+        "analyst-reviewer",
+        "p",
+        "ses_reviewer",
+        "zai-coding-plan/glm-5.4#high",
+        "/tmp/checkout",
+    );
+    let mut fake = FakeSessions::new();
+    fake.activity_ms = Some(0);
+    fake.usage
+        .lock()
+        .unwrap()
+        .insert("ses_analyst".into(), 90.0);
+    fake.usage
+        .lock()
+        .unwrap()
+        .insert("ses_reviewer".into(), 90.0);
+    let sessions = Arc::new(fake);
+
+    let analyst = analyst_compact_uc(
+        state.clone(),
+        sessions.clone(),
+        Arc::new(LostClock),
+        Some(compact_policy_1607()),
+        7,
+    );
+    let reviewer = AnalystReviewUseCase {
+        board: Arc::new(FakeBoard {
+            rows: std::sync::Mutex::new(vec![]),
+            log: Mutex::default(),
+            comments: vec![],
+            fields_fails: false,
+            set_session_fails: false,
+            set_pr_fails: AtomicBool::new(false),
+            clear_session_fails: AtomicBool::new(false),
+            status_fails: AtomicBool::new(false),
+        }),
+        boards: vec![analyst_board()],
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        state: state.clone(),
+        clock: Arc::new(LostClock),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        cup: 7,
+        compact: Some(compact_policy_1607()),
+    };
+
+    let (guard_a, recs_a) = trap_events();
+    analyst.tick().await.unwrap();
+    drop(guard_a);
+    let (guard_r, recs_r) = trap_events();
+    reviewer.tick().await.unwrap();
+    drop(guard_r);
+
+    let a = recs_a.lock().unwrap();
+    let r = recs_r.lock().unwrap();
+    assert!(
+        has_exact(&a, "analys.compacted"),
+        "аналитик: нет analys.compacted: {a:?}"
+    );
+    assert!(
+        !has_exact(&a, "analys_review.compacted"),
+        "аналитик пишет событие ревьювера: {a:?}"
+    );
+    assert!(
+        has_exact(&r, "analys_review.compacted"),
+        "ревьювер: нет analys_review.compacted: {r:?}"
+    );
+    assert!(
+        !has_exact(&r, "analys.compacted"),
+        "ревьювер пишет событие аналитика: {r:?}"
+    );
+    assert_eq!(
+        sessions.compacted.lock().unwrap().as_slice(),
+        ["ses_analyst", "ses_reviewer"],
+        "обе роли адмитили свою привязку"
+    );
+}
+
+#[tokio::test]
 async fn analyst_wave_orders_by_priority() {
     let state = Arc::new(MemState(Mutex::default()));
     let sessions = Arc::new(FakeSessions::new());
