@@ -415,19 +415,16 @@ async fn run(
             "main".to_string(),
         )),
     };
-    // Семантика: LanceDB embedded + Gemini Embedding 2 (#1363; env GEMINI_API_KEY;
-    // нет ключа — поиск честно без семантического индекса)
-    let gemini_key = std::env::var("GEMINI_API_KEY")
+    // Семантика: LanceDB embedded + локальная Ollama через релей (#1687).
+    // Включение — наличием UWUWU_EMBED_URL; без неё поиск честно без индекса.
+    let embed_url = std::env::var("UWUWU_EMBED_URL")
         .ok()
         .filter(|v| !v.is_empty());
-    let semantic_backend: Option<Arc<dyn uwuwu_usecase::SemanticBackend>> = match gemini_key {
-        Some(key) => {
-            let embed: Arc<dyn search::Embedder> = Arc::new(search::GeminiEmbeddings::new(
-                key,
-                std::env::var("UWUWU_EMBED_MODEL")
-                    .ok()
-                    .filter(|v| !v.is_empty())
-                    .unwrap_or_else(|| search::EMBED_MODEL.to_string()),
+    let semantic_backend: Option<Arc<dyn uwuwu_usecase::SemanticBackend>> = match embed_url {
+        Some(url) => {
+            let embed: Arc<dyn search::Embedder> = Arc::new(search::OllamaEmbeddings::new(
+                url,
+                search::EMBED_MODEL.to_string(),
             ));
             // github-хаб индексирует и задачи (юзер-стори «по вики/задачам»)
             let issues: Option<Arc<dyn uwuwu_usecase::IssueIndexSource>> = github_hub
@@ -818,29 +815,10 @@ async fn run(
                     if now < *backoff.lock().expect("backoff lock") {
                         return Ok(());
                     }
-                    if !uwuwu_usecase::sync_allowed(clock.utc_minute()) {
-                        return Ok(());
-                    }
-                    // бюджет = производная замеров спайка #1363 (формула в теле
-                    // задачи): ток-бюджет тика ≤ TPM_факт × pacing, гард 120с сайдкара
+                    // Емкостный гард тика: docs/sync, 120 с сайдкара и соседние
+                    // модели на Ollama (#1687); квотных гейтов больше нет.
                     match b.sync_index(search::SEMANTIC_SYNC_BUDGET).await {
                         Ok(_) => Ok(()),
-                        Err(uwuwu_usecase::UsecaseError::RateLimited {
-                            retry_after_secs, ..
-                        }) => {
-                            let secs = retry_after_secs
-                                .unwrap_or(search::RATE_LIMIT_DEFAULT_SECS)
-                                .min(search::RATE_LIMIT_CAP_SECS);
-                            let until = now + secs * 1000;
-                            *backoff.lock().expect("backoff lock") = until;
-                            tracing::warn!(
-                                event = "semantic.backoff_rate_limited",
-                                until_ms = until,
-                                retry_after_secs = secs,
-                                "Semantic sync: 429, пауза в минутах"
-                            );
-                            Ok(())
-                        }
                         Err(e) => {
                             let until = now + 3_600_000;
                             *backoff.lock().expect("backoff lock") = until;

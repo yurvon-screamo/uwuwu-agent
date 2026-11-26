@@ -3,7 +3,7 @@
 //! Эмбеддинги — Gemini Embedding 2 через Embedder-трейт (#1363).
 //! Инкремент — doc_hash в мета-таблице.
 
-use crate::search::semantic::{chunk_text, Embedder, EMBED_BATCH, EMBED_MODEL_DIMS};
+use crate::search::semantic::{chunk_text, Embedder, EMBED_MODEL_DIMS};
 use async_trait::async_trait;
 use lancedb::arrow::arrow_array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, Int64Array, LargeStringArray,
@@ -41,16 +41,12 @@ fn slug_pred(slug: &str) -> String {
 enum DocSyncOutcome {
     Reindexed,
     Unchanged,
-    BudgetStop,
 }
 
 pub struct LanceSemanticBackend {
     wiki: Arc<dyn WikiRepo>,
     /// Персист sha-инкремента: /…/semantic_shas.json рядом с Lance-том.
     shas_file: PathBuf,
-    /// Суточный бюджет эмбеддингов синка (#1473): /…/semantic_budget.json
-    /// рядом с Lance-том — резерв дневной квоты Gemini для query-поисков.
-    budget_file: PathBuf,
     /// Задачи для индекса (юзер-стори «по вики/задачам/опыту»); None — стенд.
     issues: Option<Arc<dyn uwuwu_usecase::IssueIndexSource>>,
     db: Connection,
@@ -146,7 +142,6 @@ impl LanceSemanticBackend {
         let this = Self {
             wiki,
             shas_file,
-            budget_file: super::budget::budget_path(&path),
             issues,
             db,
             embeddings,
@@ -250,6 +245,23 @@ impl LanceSemanticBackend {
         self.shas_file.clone()
     }
 
+    /// Число строк таблицы — дешёвый read для события полноты индекса.
+    async fn table_rows(&self, name: &str) -> usize {
+        let Ok(table) = self.table_named(name).await else {
+            return 0;
+        };
+        let Ok(stream) = table.query().execute().await else {
+            return 0;
+        };
+        use futures::stream::StreamExt;
+        let mut stream = stream;
+        let mut rows = 0usize;
+        while let Some(Ok(batch)) = stream.next().await {
+            rows += batch.num_rows();
+        }
+        rows
+    }
+
     async fn known_hashes(&self) -> UsecaseResult<HashMap<String, i64>> {
         let stream = self
             .docs()
@@ -285,39 +297,6 @@ impl LanceSemanticBackend {
             h = h.wrapping_mul(0x100000001b3);
         }
         (h & 0x7fff_ffff_ffff_ffff) as i64
-    }
-
-    /// Cost реиндекса в запросах к Gemini: тексты режутся батчами по
-    /// EMBED_BATCH в embed_many — ceil(чанков/батч) точно повторяет разбиение.
-    fn embed_request_cost(chunks: usize) -> u64 {
-        chunks.div_ceil(EMBED_BATCH) as u64
-    }
-
-    /// Гард суточного бюджета (L1 #1473): cost учитывается ДО embed-вызова
-    /// без отката при 429 — консервативный перебор безопаснее недобора
-    /// (резерв query-поисков неприкосновенен). False — кап достигнут, синк
-    /// останавливается; отказ персиста не роняет индексацию (недоучёт
-    /// деградирует мягко через честный 429).
-    fn daily_budget_admits(&self, spend: &mut super::budget::BudgetState, chunks: usize) -> bool {
-        let cost = Self::embed_request_cost(chunks);
-        if spend.spent + cost > super::budget::SYNC_DAILY_CAP {
-            tracing::warn!(
-                event = "semantic.daily_budget_exhausted",
-                spent = spend.spent,
-                cap = super::budget::SYNC_DAILY_CAP,
-                "Суточный бюджет эмбеддингов синка исчерпан — до резета (полночь PT) поиски идут на резерве"
-            );
-            return false;
-        }
-        spend.spent += cost;
-        if let Err(e) = super::budget::write_state(&self.budget_file, spend) {
-            tracing::warn!(
-                event = "semantic.budget_persist_failed",
-                error = %e,
-                "Счётчик бюджета не записан — недоучёт расхода до рестарта"
-            );
-        }
-        true
     }
 
     async fn reindex_doc_chunks(
@@ -387,13 +366,12 @@ impl LanceSemanticBackend {
             .map_err(|e| err(format!("add meta {slug}: {e}")))?;
         Ok(())
     }
-    /// Синк вики-дока: чтение, хеш-гард, бюджет, ланс, sha-метка.
+    /// Синк вики-дока: чтение, хеш-гард, ланс, sha-метка.
     async fn sync_wiki_doc(
         &self,
         slug: &str,
         sha: &str,
         known: &HashMap<String, i64>,
-        spend: &mut super::budget::BudgetState,
     ) -> UsecaseResult<DocSyncOutcome> {
         let Some(md) = self.wiki.read_doc(slug).await? else {
             return Ok(DocSyncOutcome::Unchanged);
@@ -404,20 +382,16 @@ impl LanceSemanticBackend {
             return Ok(DocSyncOutcome::Unchanged);
         }
         let texts = chunk_text(&md);
-        if !self.daily_budget_admits(spend, texts.len()) {
-            return Ok(DocSyncOutcome::BudgetStop);
-        }
         self.reindex_doc_chunks(slug, texts, h).await?;
         self.mark_known_sha(slug, sha);
         Ok(DocSyncOutcome::Reindexed)
     }
 
-    /// Синк дайджеста задачи: текст «#N тайтл + тело», хеш-гард, бюджет.
+    /// Синк дайджеста задачи: текст «#N тайтл + тело», хеш-гард.
     async fn sync_issue_digest(
         &self,
         digest: &uwuwu_usecase::IssueDigest,
         known: &HashMap<String, i64>,
-        spend: &mut super::budget::BudgetState,
     ) -> UsecaseResult<DocSyncOutcome> {
         let slug = format!("task-{}", digest.number);
         let text = format!(
@@ -431,9 +405,6 @@ impl LanceSemanticBackend {
             return Ok(DocSyncOutcome::Unchanged);
         }
         let texts = chunk_text(&text);
-        if !self.daily_budget_admits(spend, texts.len()) {
-            return Ok(DocSyncOutcome::BudgetStop);
-        }
         self.reindex_doc_chunks(&slug, texts, h).await?;
         Ok(DocSyncOutcome::Reindexed)
     }
@@ -444,7 +415,6 @@ impl LanceSemanticBackend {
         budget: usize,
         changed: usize,
         known: &HashMap<String, i64>,
-        spend: &mut super::budget::BudgetState,
     ) -> UsecaseResult<usize> {
         let Some(issues) = &self.issues else {
             return Ok(changed);
@@ -454,9 +424,8 @@ impl LanceSemanticBackend {
             if changed >= budget {
                 break;
             }
-            match self.sync_issue_digest(&digest, known, spend).await? {
+            match self.sync_issue_digest(&digest, known).await? {
                 DocSyncOutcome::Reindexed => changed += 1,
-                DocSyncOutcome::BudgetStop => break,
                 DocSyncOutcome::Unchanged => {}
             }
         }
@@ -486,8 +455,6 @@ impl SemanticBackend for LanceSemanticBackend {
             self.wiki.doc_shas().await?.into_iter().collect();
         let known = self.known_hashes().await?;
         let known_shas = self.known_shas();
-        // Суточный бюджет эмбеддингов (#1473): чужой/битый день — счёт с нуля.
-        let mut spend = super::budget::read_state(&self.budget_file);
         let mut changed = 0usize;
         for (slug, sha) in &shas {
             if changed >= budget {
@@ -496,17 +463,25 @@ impl SemanticBackend for LanceSemanticBackend {
             if known_shas.get(slug).map(String::as_str) == Some(sha.as_str()) {
                 continue; // sha не шевелился — содержимое не читаем
             }
-            match self.sync_wiki_doc(slug, sha, &known, &mut spend).await? {
+            match self.sync_wiki_doc(slug, sha, &known).await? {
                 DocSyncOutcome::Reindexed => changed += 1,
-                DocSyncOutcome::BudgetStop => break,
                 DocSyncOutcome::Unchanged => {}
             }
         }
         // задачи в индекс (юзер-стори: «найти решённое раньше по вики/задачам»):
         // слаг task-N — выдача читается task_get по номеру
-        let changed = self
-            .sync_issues(budget, changed, &known, &mut spend)
-            .await?;
+        let changed = self.sync_issues(budget, changed, &known).await?;
+        // Полнота индекса (#1687): событие КАЖДЫЙ тик, включая changed = 0 —
+        // иначе «перестал расти» неотличимо от часового backoff.
+        let docs = self.table_rows(DOCS).await;
+        let chunks = self.table_rows(CHUNKS).await;
+        tracing::info!(
+            event = "semantic.index_state",
+            docs = docs,
+            chunks = chunks,
+            dim = EMBED_MODEL_DIMS,
+            "Lance index state"
+        );
         if changed > 0 {
             tracing::info!(
                 event = "semantic.sync",

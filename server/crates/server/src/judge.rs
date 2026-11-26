@@ -1,12 +1,12 @@
 //! Адаптер судьи (#1364): Gemini Decision 1 (`gemini-decision-1`, Google
 //! Decisions API free tier) за портом `DecisionJudge`. Контракт ответа —
 //! answers-map (choice+probabilities+confidence, noul), сверен живой
-//! пробой 20.11 и таблицей #1362. 429 — RetryInfo из тела (единый парсер
-//! с семантикой #1363), полоса вызовов — локальный скользящий лимит
-//! (квоты волны общие, TPM-пик массовой тишины не долбим).
+//! пробой 20.11 и таблицей #1362. 429 — RetryInfo из тела (парсер переехал
+//! сюда из клиента эмбеддингов вместе с константами #1687), полоса вызовов —
+//! локальный скользящий лимит (квоты волны общие, TPM-пик массовой тишины
+//! не долбим).
 
 use crate::github::HTTP_TIMEOUT;
-use crate::search::{parse_retry_delay, RATE_LIMIT_CAP_SECS, RATE_LIMIT_DEFAULT_SECS};
 use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -23,6 +23,33 @@ const ENV_ENDPOINT: &str = "UWUWU_JUDGE_URL";
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Окно скользящего лимита полосы вызовов.
 const RPM_WINDOW_MS: u64 = 60_000;
+
+/// Кап бэкоффа на 429 (RetryInfo может обещать и больше — не тише прод-тика).
+pub const RATE_LIMIT_CAP_SECS: u64 = 15 * 60;
+/// Дефолт бэкоффа 429 без RetryInfo в теле.
+pub const RATE_LIMIT_DEFAULT_SECS: u64 = 300;
+
+/// RetryInfo из тела 429: `details[]` с `retryDelay` ("26s", "1m").
+/// Возвращает секунды; без RetryInfo — None (вызывающая сторона ставит дефолт).
+pub(crate) fn parse_retry_delay(body: &serde_json::Value) -> Option<u64> {
+    let err = body.get("error")?;
+    for d in err.get("details")?.as_array()? {
+        let kind = d.get("@type")?.as_str()?;
+        if !kind.ends_with("RetryInfo") {
+            continue;
+        }
+        let raw = d.get("retryDelay")?.as_str()?;
+        let secs = if raw.ends_with('s') {
+            raw.trim_end_matches('s').parse::<f64>().ok()?.ceil() as u64
+        } else if raw.ends_with('m') {
+            (raw.trim_end_matches('m').parse::<f64>().ok()? * 60.0).ceil() as u64
+        } else {
+            return None;
+        };
+        return Some(secs);
+    }
+    None
+}
 
 /// Судья на Gemini Decision 1. Ключ — env `GEMINI_API_KEY`; нет ключа —
 /// конструктор None (контур выключен, тик живёт старой механикой).
@@ -558,5 +585,27 @@ mod tests {
             }
             other => panic!("ожидался структурный RateLimited, получен: {other:?}"),
         }
+    }
+
+    #[test]
+    fn retry_delay_minutes_and_absent() {
+        let mins = serde_json::json!({
+            "error": {"details": [{"@type": "google.rpc.RetryInfo", "retryDelay": "2m"}]}
+        });
+        assert_eq!(parse_retry_delay(&mins), Some(120));
+        let none = serde_json::json!({"error": {"message": "no details"}});
+        assert_eq!(parse_retry_delay(&none), None);
+    }
+
+    #[test]
+    fn retry_delay_fractional_duration_rounds_up() {
+        let frac = serde_json::json!({
+            "error": {"details": [{"@type": "google.rpc.RetryInfo", "retryDelay": "26.5s"}]}
+        });
+        assert_eq!(parse_retry_delay(&frac), Some(27));
+        let frac_min = serde_json::json!({
+            "error": {"details": [{"@type": "google.rpc.RetryInfo", "retryDelay": "1.5m"}]}
+        });
+        assert_eq!(parse_retry_delay(&frac_min), Some(90));
     }
 }

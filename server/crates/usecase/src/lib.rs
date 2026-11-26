@@ -69,7 +69,7 @@ pub use ports::{
     SessionSpec, StatusDelivery, TaskBoardRepo, TickStateStore, WikiRepo,
 };
 pub use router::SessionRouter;
-pub use search::{sync_allowed, SearchHit, SearchUseCase, SemanticBackend};
+pub use search::{SearchHit, SearchUseCase, SemanticBackend};
 pub use spawn_models::SpawnModels;
 pub use tasks::board_status::{
     BoardStatusRenameUseCase, BoardStatusRepo, RenameReport, StatusFieldImage, StatusOption,
