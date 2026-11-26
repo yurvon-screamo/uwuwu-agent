@@ -257,7 +257,7 @@ pub(crate) struct PreemptCandidate {
 }
 
 /// Пул жертв тика: собирается в run() из union-скана, расходуется
-/// HeldCup-ветками process_row (по одной жертве на отдачу слота).
+/// HeldCup-ветками spawn_branch (по одной жертве на отдачу слота).
 /// Mutex — не для параллелизма (доски обходятся последовательно):
 /// interior mutability для изъятия жертв между досками сквозь await
 /// и Send-ность будущего тика.
@@ -296,7 +296,7 @@ impl PreemptPool {
 /// упорядочиваются до обхода — сначала продолжения, затем новые;
 /// внутри тира — приоритет, доска в порядке конфига, порядок строк.
 /// Классификация по снапшоту до round_transition — см. домен.
-/// Дебаг-гейт одной строки (мок-Е2Е): `UWUWU_ONLY_TASK=<number>`.
+/// Дебаг-гейт одной строки (мок-E2E): `UWUWU_ONLY_TASK=<number>`.
 pub(crate) fn collect_candidates<'b>(
     boards: &mut [(&'b BoardPlan, Vec<Task>)],
     only: Option<u64>,
@@ -353,18 +353,19 @@ struct RowEffects<'a> {
     out: &'a mut TickOutcome,
 }
 
-/// Разрешённый спавн: слот и состояние луп-гарда — один вход для
-/// записи кулдауна и ячейки.
+/// Слот и состояние луп-гарда, переносимые в запись разрешённого
+/// спавна; создаётся только после вердикта гейта.
 struct SpawnAttempt {
     slot: Slot,
     guard: SpawnLoop,
 }
 
-/// Подготовка строки: `Proceed` несёт очищенный клон ячейки (тень
-/// round_transition), `Skip` — строка снята с тика (enrichment/кап
-/// ревью-раундов).
+/// Итог подготовки строки: `Snapshot` — работаем с исходным снапшотом,
+/// `Cleared` — с очищенной тенью после round_transition,
+/// `Skip` — строка снята с тика (enrichment/кап ревью-раундов).
 enum RowPreparation {
-    Proceed(Option<Task>),
+    Snapshot,
+    Cleared(Task),
     Skip,
 }
 
@@ -588,7 +589,7 @@ impl TickUseCase {
         // доска видит занятость через ссылку
         let mut active_now = global_active;
         // Глобальная очередь кандидатов (#1586) строится до обхода досок;
-        // дебаг-гейт одной строки (мок-Е2Е) — UWUWU_ONLY_TASK=<number>.
+        // дебаг-гейт одной строки (мок-E2E) — UWUWU_ONLY_TASK=<number>.
         let only = std::env::var("UWUWU_ONLY_TASK")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok());
@@ -674,17 +675,15 @@ impl TickUseCase {
         view: &RowView<'_>,
         effects: &mut RowEffects<'_>,
     ) -> UsecaseResult<()> {
-        let RowPreparation::Proceed(cleared_clone) = self.prepare_row(view, effects).await else {
-            return Ok(());
+        let prepared = self.prepare_row(view, effects).await;
+        let task: &Task = match &prepared {
+            RowPreparation::Skip => return Ok(()),
+            RowPreparation::Snapshot => view.task_ref,
+            RowPreparation::Cleared(cleared) => cleared,
         };
-        // тень: если слот снят переходом — работаем с очищенным клоном
-        let task: &Task = cleared_clone.as_ref().unwrap_or(view.task_ref);
         let action = decide(task);
         match action {
-            Action::Spawn { slot } => {
-                self.spawn_branch(view, effects, task, &action, slot)
-                    .await?
-            }
+            Action::Spawn { slot } => self.spawn_branch(view, effects, task, &action, slot).await,
             Action::Automerge => self.automerge_branch(view, effects, task).await?,
             Action::Observe { awaits } => self.observe_branch(view, effects, task, awaits).await,
         }
@@ -710,7 +709,7 @@ impl TickUseCase {
         // статусе строки, устарели (строка ушла и вернулась) — сброс.
         // Live-only: observe стейт не пишет.
         if view.plan.mode != Mode::Live {
-            return RowPreparation::Proceed(None);
+            return RowPreparation::Snapshot;
         }
         self.state.reset_stale_spawn_loops(
             &view.board.board,
@@ -729,7 +728,7 @@ impl TickUseCase {
             .state
             .last_seen_status(&view.board.board, view.task_ref.number());
         if prev.as_ref() == Some(&view.task_ref.status()) {
-            return RowPreparation::Proceed(None);
+            return RowPreparation::Snapshot;
         }
         let cleared = self
             .round_transition(view.board, view.task_ref, effects.out)
@@ -748,12 +747,16 @@ impl TickUseCase {
         {
             return RowPreparation::Skip;
         }
-        RowPreparation::Proceed(cleared)
+        match cleared {
+            Some(task) => RowPreparation::Cleared(task),
+            None => RowPreparation::Snapshot,
+        }
     }
 
     /// Плечо Spawn: анти-шторм, луп-гард, гард «одна живая», CUP-гейт
-    /// с преемпшеном и исполнение разрешённого спавна. Возврат — только
-    /// для транспортной ошибки automerge-ветки (общей для тика).
+    /// с преемпшеном и исполнение разрешённого спавна. Отказы ветки
+    /// изолированы построчно через `actions_failed`; ошибки наверх не
+    /// пробрасываются (в отличие от плеча automerge).
     async fn spawn_branch(
         &self,
         view: &RowView<'_>,
@@ -761,13 +764,12 @@ impl TickUseCase {
         task: &Task,
         action: &Action,
         slot: Slot,
-    ) -> UsecaseResult<()> {
-        let Some(guard) = self.spawn_loop_guard(view, effects, task, slot).await else {
-            return Ok(());
+    ) {
+        let Some(guard) = self.spawn_precheck(view, effects, task, slot).await else {
+            return;
         };
-        let attempt = SpawnAttempt { slot, guard };
-        if self.hold_spawn(view, effects, task, attempt.slot) {
-            return Ok(());
+        if self.apply_spawn_hold(view, effects, task, slot) {
+            return;
         }
         let mut gated = gate(
             task,
@@ -792,7 +794,8 @@ impl TickUseCase {
         }
         match gated {
             Gate::Allowed => {
-                self.spawn_allowed(view, effects, task, &attempt).await;
+                let attempt = SpawnAttempt { slot, guard };
+                self.dispatch_spawn(view, effects, task, &attempt).await;
             }
             Gate::HeldCup { active, cap } => {
                 effects.out.held_cup += 1;
@@ -821,12 +824,12 @@ impl TickUseCase {
                 );
             }
         }
-        Ok(())
     }
 
     /// Кулдаун слота и петля спавна: None — строка снята с тика
-    /// (observed/attention_flagged уже учтены), Some — дырка для gated.
-    async fn spawn_loop_guard(
+    /// (observed/attention_flagged уже учтены), Some — луп-гард для
+    /// последующей записи кулдауна при разрешённом спавне.
+    async fn spawn_precheck(
         &self,
         view: &RowView<'_>,
         effects: &mut RowEffects<'_>,
@@ -893,7 +896,7 @@ impl TickUseCase {
     /// сироты спавна, клеймы в гонке с тиком и невидимые ячейки не
     /// дублируют раунд; слепой скан — hold до восстановления списка.
     /// true — спавн удержан, счётчик и event уже записаны.
-    fn hold_spawn(
+    fn apply_spawn_hold(
         &self,
         view: &RowView<'_>,
         effects: &mut RowEffects<'_>,
@@ -925,9 +928,9 @@ impl TickUseCase {
         }
     }
 
-    /// Разрешённый гейтом спавн: observed-ветка observe-режима ничего
-    /// не пишет; live-ветка — сессия, кулдаун/луп-счётчик и ячейка.
-    async fn spawn_allowed(
+    /// Разрешённый гейтом спавн: observe-режим инкрементирует только
+    /// `spawns_allowed`; live-ветка — сессия, кулдаун/луп-счётчик и ячейка.
+    async fn dispatch_spawn(
         &self,
         view: &RowView<'_>,
         effects: &mut RowEffects<'_>,

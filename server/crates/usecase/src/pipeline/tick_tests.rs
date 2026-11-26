@@ -2762,6 +2762,53 @@ async fn observe_does_not_charge_spawn_loops() {
     );
 }
 
+/// Пять спавнов слота без смены статуса (#1046, порог >4 из домена):
+/// эскалация в Needs attention, коммент владельцу и ни одного нового
+/// спавна. Пин перенесённой ветки `spawn_precheck`: без него инверсия
+/// условия или потеря статуса/коммента не будет замечена.
+#[tokio::test]
+async fn spawn_loop_escalation_flags_attention_and_notifies_owner() {
+    // Arrange
+    let state = Arc::new(MemState(Mutex::default()));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .loops
+        .push((66, Slot::Dev, Status::InProgress, 4));
+    state.set_last_seen_status("B", 66, Status::InProgress);
+    let (u, board, sessions, _) = usecase_with_state(
+        vec![task(66, Status::InProgress)],
+        PrState::Missing,
+        state.clone(),
+    );
+
+    // Act
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+
+    // Assert
+    assert_eq!(
+        out.attention_flagged, 1,
+        "пятый спавн без прогресса — эскалация"
+    );
+    assert_eq!(out.spawns_allowed, 0, "эскалация до гейта — спавна нет");
+    assert_eq!(out.spawns_done, 0, "сессия не создана");
+    let log = board.log.lock().unwrap();
+    assert!(
+        log.iter().any(|l| l == "status#66=NeedsAttention"),
+        "строка снята с тика в Needs attention: {log:?}"
+    );
+    assert!(
+        log.iter()
+            .any(|l| l.starts_with("comment#66=") && l.contains("Spawn loop")),
+        "владелец получил дайджест петли: {log:?}"
+    );
+    assert!(
+        sessions.specs.lock().unwrap().is_empty(),
+        "эскалация не запускает сессию"
+    );
+}
+
 #[tokio::test]
 async fn status_journey_resets_loop_counter() {
     // Счётчик (In Progress, 2) пережил путь IP→Design→Ревью плана→IP:
@@ -13410,9 +13457,17 @@ fn candidate_queue_keeps_continuation_tier_and_priority_order() {
     newcomer_high.set_priority(Priority::High);
     let mut continuation_high = task(202, Status::InProgress);
     continuation_high.set_priority(Priority::High);
+    let continuation_low_b1 = task(103, Status::InProgress);
+    let continuation_low_b2 = task(203, Status::InProgress);
     let mut boards = vec![
-        (&b1, vec![newcomer_low, continuation_medium]),
-        (&b2, vec![newcomer_high, continuation_high]),
+        (
+            &b1,
+            vec![newcomer_low, continuation_medium, continuation_low_b1],
+        ),
+        (
+            &b2,
+            vec![newcomer_high, continuation_high, continuation_low_b2],
+        ),
     ];
 
     let rows = crate::pipeline::tick::collect_candidates(&mut boards, None);
@@ -13421,8 +13476,8 @@ fn candidate_queue_keeps_continuation_tier_and_priority_order() {
         rows.iter()
             .map(|(_, _, _, t)| t.number())
             .collect::<Vec<_>>(),
-        vec![202, 102, 201, 101],
-        "продолжения раньше новичков, внутри тира — приоритет"
+        vec![202, 102, 103, 203, 201, 101],
+        "продолжения раньше новичков; внутри тира — приоритет, затем доска"
     );
 }
 
