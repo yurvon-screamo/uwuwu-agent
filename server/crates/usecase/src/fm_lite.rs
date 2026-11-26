@@ -118,6 +118,18 @@ mod tests {
         assert_eq!(strip(md), md);
     }
 
+    /// #1664 (tester): незакрытый CRLF-fm не срезается — симметрия с LF.
+    /// Маркер без терминатора — это текст, а не шапка; срез не должен
+    /// пожирать тело только потому, что переносы стали CRLF.
+    #[test]
+    fn strip_unterminated_crlf_fm_is_kept() {
+        let md = "---\r\ntitle: x\r\nstatus: Draft\r\n";
+        assert_eq!(strip(md), md);
+        // смешанная форма: префикс CRLF, терминатора нет вообще
+        let mixed = "---\r\ntitle: x\nstatus: Draft\n";
+        assert_eq!(strip(mixed), mixed);
+    }
+
     /// #1664: CRLF-док — fm снимается, тело байт-в-байт. Здесь проверяется
     /// только `strip`: чистый CRLF-док до `parse` потребителей не доходит
     /// (пины реальных путей — в `bots/spec.rs` и `crons.rs`).
