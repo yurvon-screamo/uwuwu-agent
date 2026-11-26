@@ -110,6 +110,48 @@ fn canonical_matches_live_config_verbatim() {
     assert_matches_canonical(&path, "config.toml");
 }
 
+/// Главный сценарий владельца (US-1/UC-1): правка raw только у алиса из
+/// TOML-конфига меняет модель всей группы без правок по агентам. Граница
+/// файл → ExecutorCfg → from_config → плоская карта — под тестом.
+#[test]
+fn alias_raw_from_toml_moves_whole_group() {
+    let raw = r#"
+        name = "kisa"
+        url = "https://example.invalid"
+
+        [model_aliases]
+        flash = "p/new-flash#high"
+        common = "p/common#high"
+        smart = "p/smart#high"
+
+        [models]
+        default = "flash"
+        developer = "flash"
+        analyst = "flash"
+        tester = "common"
+        plan-reviewer = "smart"
+    "#;
+    let cfg: crate::config::ExecutorCfg = toml::from_str(raw).expect("валидный toml");
+    let models = SpawnModels::from_config(cfg.model_aliases.as_ref(), cfg.models.as_ref())
+        .expect("карта собирается");
+    let want = uwuwu_domain::SpawnModel::parse("p/new-flash#high").unwrap();
+    for key in ["default", "developer", "analyst"] {
+        assert_eq!(models.get(key), Some(&want), "{key} — новый flash");
+    }
+    let common = uwuwu_domain::SpawnModel::parse("p/common#high").unwrap();
+    assert_eq!(
+        models.get("tester"),
+        Some(&common),
+        "правка flash не задела common"
+    );
+    let smart = uwuwu_domain::SpawnModel::parse("p/smart#high").unwrap();
+    assert_eq!(
+        models.get("plan-reviewer"),
+        Some(&smart),
+        "правка flash не задела smart"
+    );
+}
+
 /// Связка ExecutorCfg → from_config: неизвестный алиас из TOML — ошибка
 /// старта с именем ключа, а не тихий канон.
 #[test]

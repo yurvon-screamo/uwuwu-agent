@@ -173,10 +173,15 @@ fn stand_drop_kills_and_reaps_both_children() {
 
 const CRON_SRC: &str = include_str!("cron_stand_e2e.rs");
 const QUOTA_SRC: &str = include_str!("quota_limit_pause_stand_e2e.rs");
+const ALIAS_SRC: &str = include_str!("model_alias_stand_e2e.rs");
 
 #[test]
 fn stands_consume_shared_harness_without_local_copies() {
-    for (name, src) in [("cron", CRON_SRC), ("quota", QUOTA_SRC)] {
+    for (name, src) in [
+        ("cron", CRON_SRC),
+        ("quota", QUOTA_SRC),
+        ("alias", ALIAS_SRC),
+    ] {
         assert!(src.contains("mod common;"), "{name}: нет mod common");
         assert!(
             src.contains("use common::stand"),

@@ -40,6 +40,7 @@ async fn cron_fire_machine_accounting_without_journal() {
             config_extra: "",
             pre_state: None,
             server_env: &[("UWUWU_MOCK_DOCS", &masters_json)],
+            capture_sessions: false,
         },
     )
     .await;
@@ -189,6 +190,7 @@ async fn corrupt_state_restart_anchors_without_catchup() {
             config_extra: "",
             pre_state: Some("{ corrupted accounting"),
             server_env: &[("UWUWU_MOCK_DOCS", &masters_json)],
+            capture_sessions: false,
         },
     )
     .await;

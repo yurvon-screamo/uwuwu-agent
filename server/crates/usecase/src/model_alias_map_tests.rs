@@ -141,6 +141,33 @@ fn both_sections_resolve_to_flat_models() {
 }
 
 #[test]
+fn custom_assignment_moves_agent_and_its_runtime_alias() {
+    let aliases = strings(&[
+        ("flash", "p/flash-custom#high"),
+        ("common", "p/common-custom#high"),
+        ("smart", "p/smart-custom#high"),
+    ]);
+    let assignments = strings(&[
+        ("default", "flash"),
+        ("tester", "flash"),
+        ("developer", "smart"),
+    ]);
+    let models = SpawnModels::from_config(Some(&aliases), Some(&assignments)).unwrap();
+    let flash = SpawnModel::parse("p/flash-custom#high").unwrap();
+    let smart = SpawnModel::parse("p/smart-custom#high").unwrap();
+    assert_eq!(models.for_agent(Agent::Tester), flash);
+    assert_eq!(models.alias_for_agent(Agent::Tester), ModelAlias::Flash);
+    assert_eq!(models.for_agent(Agent::Developer), smart);
+    assert_eq!(models.alias_for_agent(Agent::Developer), ModelAlias::Smart);
+    assert_eq!(models.get("default"), Some(&flash));
+    assert_eq!(
+        models.get("analyst"),
+        None,
+        "пропущенный ключ не должен тихо появляться в карте"
+    );
+}
+
+#[test]
 fn unknown_alias_in_assignment_is_loud() {
     let assignments = strings(&[("tester", "turbo")]);
     let error = SpawnModels::from_config(None, Some(&assignments)).unwrap_err();
@@ -152,8 +179,17 @@ fn unknown_alias_in_assignment_is_loud() {
 fn incomplete_alias_section_names_missing_key() {
     let aliases = strings(&[("flash", "p/flash#high"), ("common", "p/common#high")]);
     let error = SpawnModels::from_config(Some(&aliases), None).unwrap_err();
-    assert!(error.contains("executor.model_aliases"), "{error}");
-    assert!(error.contains("smart"), "{error}");
+    // Имя ключа в кавычках: счётчик «получено ключей 2» и безымённый
+    // «нет алиаса smart» этот пин не проходят.
+    assert_eq!(error, "[executor.model_aliases]: нет алиаса 'smart'");
+}
+
+#[test]
+fn two_missing_aliases_name_each() {
+    let aliases = strings(&[("flash", "p/flash#high")]);
+    let error = SpawnModels::from_config(Some(&aliases), None).unwrap_err();
+    assert!(error.contains("'common'"), "{error}");
+    assert!(error.contains("'smart'"), "{error}");
 }
 
 #[test]
