@@ -3171,3 +3171,169 @@ async fn offset_persisted_only_after_flush() {
     assert!(ok, "батч не сброшен");
     assert_eq!(state.bot_offset(SLUG), Some(41));
 }
+
+/// Правка в открытом окне перезапускает таймер: два апдейта — один батч
+/// с финальным текстом, а не один батч плюс отдельная правка.
+#[tokio::test]
+async fn edit_inside_window_restarts_timer_and_replaces_original() {
+    let tg = FakeTg::new(vec![private_update(70, "yurvon", "старый текст")]);
+    let sessions = FakeSessions::new();
+    let mut d = deps(
+        tg.clone(),
+        sessions.clone(),
+        Arc::new(FakeState::default()),
+        300,
+        10,
+        BotLive::new(Some("yurvon".into()), None, "м".into()),
+    );
+    d.debounce_ms = 250;
+    let task = spawn_bot_task(d);
+    sleep(Duration::from_millis(60)).await;
+    tg.inject(edited_update(71, 70, "yurvon", "новый текст"));
+    let ok = wait_until(|| sessions.prompts_snapshot().len() == 1, 2000).await;
+    sleep(Duration::from_millis(300)).await;
+    task.abort();
+    assert!(ok, "батч с правкой не сброшен");
+    let prompts = sessions.prompts_snapshot();
+    assert_eq!(
+        prompts.len(),
+        1,
+        "правка не перезапустила окно: {prompts:?}"
+    );
+    assert!(prompts[0].1.contains("новый текст"), "правка не доехала");
+    assert!(
+        !prompts[0].1.contains("старый текст"),
+        "оригинал продублирован"
+    );
+}
+
+/// Правка после сброса доезжает отдельным промптом с явной меткой —
+/// без молчаливой замены «на всякий случай».
+#[tokio::test]
+async fn edit_after_flush_is_separate_labelled_prompt() {
+    let tg = FakeTg::new(vec![private_update(80, "yurvon", "отправленный текст")]);
+    let sessions = FakeSessions::new();
+    let mut d = deps(
+        tg.clone(),
+        sessions.clone(),
+        Arc::new(FakeState::default()),
+        300,
+        10,
+        BotLive::new(Some("yurvon".into()), None, "м".into()),
+    );
+    d.debounce_ms = 100;
+    let task = spawn_bot_task(d);
+    assert!(
+        wait_until(|| sessions.prompts_snapshot().len() == 1, 2000).await,
+        "первый батч не сброшен"
+    );
+    sleep(Duration::from_millis(50)).await;
+    tg.inject(edited_update(81, 80, "yurvon", "исправленный текст"));
+    let ok = wait_until(|| sessions.prompts_snapshot().len() == 2, 2000).await;
+    task.abort();
+    assert!(ok, "правка после сброса не доставлена");
+    let prompts = sessions.prompts_snapshot();
+    assert!(
+        prompts[1]
+            .1
+            .contains("Правка сообщения: исправленный текст"),
+        "метка правки потеряна: {}",
+        prompts[1].1
+    );
+    assert!(
+        !prompts[1].1.contains("отправленный текст"),
+        "правка после сброса заменила предыдущий батч"
+    );
+}
+
+/// Отказ по медиа не обрывает батч: явный отказ владельцу и один промпт
+/// с остальным вводом, где материал всё равно стоит раньше команд.
+#[tokio::test]
+async fn media_refusal_keeps_rest_of_batch_and_material_order() {
+    let tg = FakeTg::new(vec![
+        media_update(
+            90,
+            "yurvon",
+            MediaKind::Document,
+            "big-doc",
+            None,
+            Some(30 * 1024 * 1024),
+        ),
+        private_update(91, "yurvon", "оформи задачу"),
+        private_update(92, "yurvon", "пост Hy-MT3"),
+    ]);
+    tg.queue.lock().expect("l")[2]
+        .message
+        .as_mut()
+        .expect("m")
+        .forward = Some("канал @ai".into());
+    let sessions = FakeSessions::new();
+    let mut d = deps(
+        tg.clone(),
+        sessions.clone(),
+        Arc::new(FakeState::default()),
+        300,
+        10,
+        BotLive::new(Some("yurvon".into()), None, "м".into()),
+    );
+    d.debounce_ms = 100;
+    let task = spawn_bot_task(d);
+    let ok = wait_until(|| sessions.prompts_snapshot().len() == 1, 2000).await;
+    task.abort();
+    assert!(ok, "батч с отказом не сброшен");
+    let prompts = sessions.prompts_snapshot();
+    assert_eq!(prompts.len(), 1, "отказ разорвал батч: {prompts:?}");
+    let p = &prompts[0].1;
+    let marker = p.find("[Пересланный пост — канал @ai]").expect("маркер");
+    let command = p.find("оформи задачу").expect("команда");
+    assert!(marker < command, "материал обогнан командой: {p}");
+    assert!(
+        tg.sent_snapshot()
+            .iter()
+            .any(|(_, t)| t.contains("слишком большой")),
+        "явный отказ по медиа не отправлен"
+    );
+}
+
+/// Рестарт посреди окна: offset ещё не персистирован, поэтому новая
+/// задача перечитывает апдейт и доставляет его одним промптом.
+#[tokio::test]
+async fn restart_inside_window_rereads_pending_input() {
+    let state = Arc::new(FakeState::default());
+    let tg = FakeTg::new(vec![private_update(100, "yurvon", "пережил рестарт")]);
+    let sessions = FakeSessions::new();
+    let mut first = deps(
+        tg.clone(),
+        sessions.clone(),
+        state.clone(),
+        300,
+        10,
+        BotLive::new(Some("yurvon".into()), None, "м".into()),
+    );
+    first.debounce_ms = 400;
+    let task = spawn_bot_task(first);
+    sleep(Duration::from_millis(80)).await;
+    assert!(
+        state.bot_offset(SLUG).is_none(),
+        "offset записан до сброса — рестарт потеряет ввод"
+    );
+    task.abort();
+    let mut second = deps(
+        tg,
+        sessions.clone(),
+        state.clone(),
+        300,
+        10,
+        BotLive::new(Some("yurvon".into()), None, "м".into()),
+    );
+    second.debounce_ms = 100;
+    let task = spawn_bot_task(second);
+    let ok = wait_until(|| sessions.prompts_snapshot().len() == 1, 2000).await;
+    let confirmed = wait_until(|| state.bot_offset(SLUG) == Some(101), 2000).await;
+    task.abort();
+    assert!(ok, "после рестарта ввод не доставлен");
+    assert!(confirmed, "offset не подтверждён после доставки");
+    let p = &sessions.prompts_snapshot()[0].1;
+    assert!(p.contains("пережил рестарт"), "апдейт потерян: {p}");
+    assert_eq!(state.bot_offset(SLUG), Some(101));
+}

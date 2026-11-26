@@ -122,6 +122,10 @@ class Api(BaseHTTPRequestHandler):
                     "chat": {"id": body.get("chat_id", 42), "type": body.get("chat_type", "private")},
                     "from": {"username": body.get("username", "yurvon")},
                     "text": body.get("text", ""),
+                    # Bot API всегда несёт message_id; без него правка в окне
+                    # не находит оригинал и стенд проверяет не замену, а
+                    # отдельный «неизвестный» апдейт (ревью #1596).
+                    "message_id": int(body.get("message_id", body["update_id"])),
                 },
             }
             if body.get("media"):

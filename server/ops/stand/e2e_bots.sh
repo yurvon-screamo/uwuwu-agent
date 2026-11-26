@@ -337,6 +337,29 @@ for _ in $(seq 1 20); do
   fi
 done
 [ -n "$BATCH_OK" ] || fail "батч ввода не доставлен одним промптом (лог: $LOG_MOCK)"
-say "батч доставлен одним промптом: материал первым, правка в окне обработана"
+# Содержимое батча сверяется по полному тексту промпта из лога мока:
+# маркер материала раньше команд, правка заменяет оригинал на его месте.
+python3 - "$LOG_MOCK" <<'PY'
+import json, sys
+prompts = []
+for line in open(sys.argv[1]):
+    try:
+        rec = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    fields = rec.get("fields", {})
+    if fields.get("event") == "mock.prompt":
+        prompts.append(fields.get("body", ""))
+batch = [p for p in prompts if "пост Hy-MT3" in p]
+assert len(batch) == 1, f"ожидался один батч с постом, получено {len(batch)}"
+lines = [ln.strip() for ln in batch[0].splitlines()]
+marker = "[Пересланный пост — канал @ai_machinelearning_big_data]"
+order = [marker, "пост Hy-MT3", "сообщение 50 исправлено", "сообщение 51", "сообщение 52"]
+pos = [lines.index(needle) for needle in order]
+assert pos == sorted(pos), f"порядок батча нарушен: {pos} ({lines})"
+assert "сообщение 50" not in lines, f"оригинал продублирован после правки: {lines}"
+print("[e2e-bots] батч: материал первым, правка заменила оригинал, порядок сохранён")
+PY
+say "батч доставлен одним промптом: материал первым, правка в окне обработана" 
 
 say "ИТОГ: E2E ботов зелёный (spawn → reply → greeting → state → рестарт → private-only → media → forward → batch)"

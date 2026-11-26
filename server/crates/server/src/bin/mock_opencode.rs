@@ -941,7 +941,7 @@ async fn prompt(
     }
     tracing::info!(event = "mock.prompt", %id, len = text.len(),
         head = text.lines().find(|l| !l.trim().is_empty()).unwrap_or_default(),
-        "POST /prompt");
+        body = %text, "POST /prompt");
     let mut sessions = store.sessions.lock().expect("store");
     if let Some(s) = sessions.get_mut(&id) {
         s.updated_ms = now_ms();
