@@ -109,3 +109,27 @@ fn canonical_matches_live_config_verbatim() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.toml");
     assert_matches_canonical(&path, "config.toml");
 }
+
+/// Связка ExecutorCfg → from_config: неизвестный алиас из TOML — ошибка
+/// старта с именем ключа, а не тихий канон.
+#[test]
+fn unknown_alias_from_toml_is_loud_at_startup() {
+    let raw = r#"
+        name = "kisa"
+        url = "https://example.invalid"
+
+        [model_aliases]
+        flash = "opencode-go/hy4-flash-free#high"
+        common = "opencode-go/muse-spark-1.3-contributor#high"
+        smart = "zai-coding-plan/glm-5.4#high"
+
+        [models]
+        default = "flash"
+        tester = "turbo"
+    "#;
+    let cfg: crate::config::ExecutorCfg = toml::from_str(raw).expect("валидный toml");
+    let error = SpawnModels::from_config(cfg.model_aliases.as_ref(), cfg.models.as_ref())
+        .expect_err("неизвестный алиас отклоняется");
+    assert!(error.contains("[executor.models].tester"), "{error}");
+    assert!(error.contains("turbo"), "{error}");
+}

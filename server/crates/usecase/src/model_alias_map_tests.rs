@@ -149,10 +149,27 @@ fn unknown_alias_in_assignment_is_loud() {
 }
 
 #[test]
-fn incomplete_alias_section_is_loud() {
+fn incomplete_alias_section_names_missing_key() {
     let aliases = strings(&[("flash", "p/flash#high"), ("common", "p/common#high")]);
     let error = SpawnModels::from_config(Some(&aliases), None).unwrap_err();
     assert!(error.contains("executor.model_aliases"), "{error}");
+    assert!(error.contains("smart"), "{error}");
+}
+
+#[test]
+fn extra_alias_key_is_loud() {
+    let mut aliases = canonical_raws();
+    aliases.insert("turbo".into(), "p/turbo#high".into());
+    let error = SpawnModels::from_config(Some(&aliases), None).unwrap_err();
+    assert!(error.contains("turbo"), "{error}");
+}
+
+#[test]
+fn bad_raw_in_alias_section_names_alias() {
+    let mut aliases = canonical_raws();
+    aliases.insert("smart".into(), "без-слэша".into());
+    let error = SpawnModels::from_config(Some(&aliases), None).unwrap_err();
+    assert!(error.contains("[executor.model_aliases].smart"), "{error}");
 }
 
 #[test]
@@ -168,12 +185,37 @@ fn missing_agent_key_falls_back_to_canon() {
 }
 
 #[test]
+fn missing_default_key_logs_key_missing_and_uses_canon() {
+    use crate::pipeline::degraded_list_support::{has_exact_field, trap_events};
+    let aliases = ModelAliases::canonical();
+    let assignments = HashMap::from([("developer".to_string(), ModelAlias::Flash)]);
+    let models = SpawnModels::new(aliases, assignments);
+
+    let (guard, records) = trap_events();
+    let model = models.for_default();
+    drop(guard);
+
+    assert_eq!(model, SpawnModels::canonical().for_default());
+    assert!(
+        has_exact_field(
+            &records.lock().unwrap(),
+            "event",
+            "spawn_models.key_missing"
+        ),
+        "пропуск default — громкий warn, не тихая подмена"
+    );
+}
+
+#[test]
 fn model_string_parses_with_variant() {
     let sm = SpawnModel::parse("opencode-go/hy4-flash-free#max").unwrap();
     assert_eq!(sm.model.provider(), "opencode-go");
     assert_eq!(sm.model.id(), "hy4-flash-free");
     assert_eq!(sm.variant.as_deref(), Some("max"));
+    let plain = SpawnModel::parse("p/id").unwrap();
+    assert_eq!(plain.variant, None);
     assert!(SpawnModel::parse("без-слэша").is_err());
+    assert!(SpawnModel::parse("/id").is_err());
 }
 
 #[test]

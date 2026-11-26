@@ -12,6 +12,8 @@ mod error;
 pub mod fm_guard;
 mod fm_lite;
 pub mod goals;
+#[cfg(test)]
+mod model_alias_map_tests;
 mod model_aliases;
 mod naming;
 mod pipeline;
@@ -28,8 +30,6 @@ mod slug_guard_tests;
 #[cfg(test)]
 mod spawn_model_tests;
 pub mod spawn_models;
-#[cfg(test)]
-mod spawn_models_tests;
 mod tasks;
 
 pub use blobs::{
@@ -74,7 +74,7 @@ pub use ports::{
 };
 pub use router::SessionRouter;
 pub use search::{sync_allowed, SearchHit, SearchUseCase, SemanticBackend};
-pub use spawn_models::{canonical_assignments, SpawnModels};
+pub use spawn_models::SpawnModels;
 pub use tasks::board_status::{
     BoardStatusRenameUseCase, BoardStatusRepo, RenameReport, StatusFieldImage, StatusOption,
     StatusPreImage, StatusPreImageStore, VERIFY_ATTEMPTS,

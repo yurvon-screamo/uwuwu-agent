@@ -1,7 +1,7 @@
 //! Карта моделей спавнов (#1154, #1684): raw-модель живёт на алиасе
 //! flash/common/smart, агенты и `default` ссылаются на алиас. Сервер кладёт
 //! модель в тело спавна (`SessionSpec.model`), деф-файлы агентов моделей
-//! не несут. Уровень алиса доступен в рантайме для сдвига из #1689.
+//! не несут. Уровень алиаса доступен в рантайме для сдвига из #1689.
 
 use crate::model_aliases::{ModelAlias, ModelAliases};
 use crate::naming;
@@ -117,7 +117,7 @@ impl SpawnModels {
     pub fn for_default(&self) -> SpawnModel {
         self.get("default")
             .cloned()
-            .unwrap_or_else(|| Self::canonical().get("default").cloned().expect("канон"))
+            .unwrap_or_else(|| self.fallback(Agent::Developer))
     }
 
     /// Отсутствие ключа — не тихий дефолт: громкий warn + канон. Падать

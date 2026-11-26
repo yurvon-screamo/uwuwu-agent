@@ -75,10 +75,26 @@ impl ModelAliases {
     /// `[executor.model_aliases]` → три алиаса. Неполный или лишний раздел
     /// отклоняется: тихой подмены одной из моделей быть не должно.
     pub fn from_map(raw: &HashMap<String, String>) -> Result<Self, String> {
-        if raw.len() != ModelAlias::ALL.len() {
+        let mut unknown: Vec<&str> = raw
+            .keys()
+            .map(String::as_str)
+            .filter(|key| ModelAlias::parse(key).is_err())
+            .collect();
+        unknown.sort_unstable();
+        if let Some(key) = unknown.first() {
             return Err(format!(
-                "[executor.model_aliases]: ожидаются flash/common/smart, получено ключей {}",
-                raw.len()
+                "[executor.model_aliases]: неизвестный алиас '{key}' (flash/common/smart)"
+            ));
+        }
+        let missing: Vec<&str> = ModelAlias::ALL
+            .iter()
+            .map(|alias| alias.as_str())
+            .filter(|name| !raw.contains_key(*name))
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "[executor.model_aliases]: нет алиаса '{}'",
+                missing.join("', '")
             ));
         }
         let value_of = |alias: ModelAlias| -> Result<SpawnModel, String> {
