@@ -3648,3 +3648,51 @@ async fn tester_clean_body_copy_is_not_overstripped() {
         .body;
     assert_eq!(stored, body, "чистое тело не тронуто");
 }
+
+/// Дельтовый пин Low-фикса (#1537): `data_base64: null` на проводе —
+/// резервирование (как отсутствие аргумента), не-строка — громкий отказ.
+/// Дев запинает диспетчер; здесь тот же контракт проверяется через
+/// JSON-RPC-роутер — тем вызовом, который делает агент.
+#[tokio::test]
+async fn blob_put_null_data_base64_reserves_over_wire_and_wrong_type_refuses() {
+    use super::test_support::call_tool_wire;
+    use crate::api::McpState;
+
+    let (tools, _memory) = hub();
+    let mcp = crate::api::mcp_router(Arc::new(McpState {
+        bearer: Arc::new("wire-bearer".to_string()),
+        tools,
+    }));
+
+    let (status, msg) = call_tool_wire(
+        &mcp,
+        "blob_put",
+        json!({ "filename": "null.png", "number": 1537, "data_base64": null }),
+        "wire-bearer",
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(msg["result"]["isError"], json!(false), "{msg}");
+    let receipt = msg["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(receipt.starts_with("key: blobs/uwuwu/1537/"), "{receipt}");
+    assert!(receipt.contains("PUT URL (TTL 300 s"), "{receipt}");
+    assert!(receipt.contains("URL (TTL 7 days): memory://"), "{receipt}");
+
+    let (_, wrong) = call_tool_wire(
+        &mcp,
+        "blob_put",
+        json!({ "filename": "a.png", "number": 1537, "data_base64": 42 }),
+        "wire-bearer",
+    )
+    .await;
+    assert_eq!(wrong["result"]["isError"], json!(true), "{wrong}");
+    assert!(
+        wrong["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("data_base64 must be a base64 string"),
+        "{wrong}"
+    );
+}
