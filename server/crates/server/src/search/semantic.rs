@@ -292,13 +292,15 @@ mod tests {
 
     #[tokio::test]
     async fn http_error_and_missing_embeddings_are_state_errors() {
-        let body = " boom ".to_string();
+        // JSON-тело: иначе разбор упадёт раньше проверки статуса и закрепит
+        // не ту ветку — мутация статуса на Session останется невидимой.
+        let body = r#"{"error":"boom"}"#.to_string();
         let len = body.len();
         let c = client(one_shot("HTTP/1.1 500 Internal Server Error", body, len));
         let err = c.embed_query("q").await.unwrap_err();
         assert!(
-            matches!(err, UsecaseError::State(_)),
-            "5xx -> State, факт: {err:?}"
+            matches!(&err, UsecaseError::State(m) if m.contains("HTTP 500")),
+            "5xx -> State с кодом в тексте, факт: {err:?}"
         );
 
         let body = "{}".to_string();

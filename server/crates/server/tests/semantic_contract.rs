@@ -14,9 +14,7 @@ use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use search::semantic::{
-    ClientTimeouts, Embedder, OllamaEmbeddings, EMBED_BATCH, EMBED_MODEL, EMBED_MODEL_DIMS,
-};
+use search::semantic::{ClientTimeouts, Embedder, OllamaEmbeddings, EMBED_MODEL, EMBED_MODEL_DIMS};
 use search::semantic_backend::LanceSemanticBackend;
 use search::support::{lance_dir, FakeWiki, FixedEmbedder, TempDirGuard};
 use serde_json::Value;
@@ -33,7 +31,7 @@ struct HttpRequest {
 }
 
 /// One-shot mock `/api/embed`: помнит request line и тело каждого вызова,
-/// отвечает векторами по числу присланных текстов.Deadline не даёт потоку
+/// отвечает векторами по числу присланных текстов. Deadline не даёт потоку
 /// ждать вечно, если клиент прислал меньше вызовов, чем ожидалось.
 struct MockEmbed {
     url: String,
@@ -221,20 +219,22 @@ async fn batch_size_and_timeouts_match_the_contract() {
 
     let mock = MockEmbed::spawn(2);
     let client = OllamaEmbeddings::new(mock.url.clone(), EMBED_MODEL.to_string());
-    let docs: Vec<_> = (0..EMBED_BATCH + 2)
+    // Литералы, не константа из прода: иначе мутация размера батча остаётся
+    // невидимой — тест считал бы 40 как EMBED_BATCH+2.
+    let docs: Vec<_> = (0..40)
         .map(|i| (format!("T{i}"), format!("текст {i}")))
         .collect();
     let vecs = client.embed_docs(&docs).await.expect("два батча");
-    assert_eq!(vecs.len(), EMBED_BATCH + 2);
+    assert_eq!(vecs.len(), 40);
 
     let requests = mock.requests();
-    assert_eq!(requests.len(), 2, " EMBED_BATCH+2 текста — два вызова");
+    assert_eq!(requests.len(), 2, "40 текстов — два вызова");
     assert_eq!(
         inputs(&requests[0].body).len(),
-        EMBED_BATCH,
-        "первый батч полный"
+        38,
+        "первый батч: 38 текстов"
     );
-    assert_eq!(inputs(&requests[1].body).len(), 2, "хвост второго батча");
+    assert_eq!(inputs(&requests[1].body).len(), 2, "второй батч: 2 текста");
 }
 
 /// NFT-1: URL задан, но Ollama недоступна — секция semantic честно пишет
@@ -298,7 +298,7 @@ fn legacy_budget_day() -> String {
 }
 
 /// Квотный реликт (#1687): файл в схеме настоящего ридера с капом 700
-/// (`day`/`spent`) больше не останавливает синок и не переписывается.
+/// (`day`/`spent`) больше не останавливает синк и не переписывает файл.
 #[tokio::test]
 async fn exhausted_legacy_budget_does_not_stop_sync() {
     let budget = format!(r#"{{"day":"{}","spent":700}}"#, legacy_budget_day());
@@ -325,7 +325,7 @@ async fn exhausted_legacy_budget_does_not_stop_sync() {
         .expect("open");
 
     assert_eq!(
-        backend.sync_index(19).await.expect("синок проходит кап"),
+        backend.sync_index(19).await.expect("синк проходит кап"),
         2,
         "старый суточный кап не блокирует индексацию"
     );
@@ -336,7 +336,8 @@ async fn exhausted_legacy_budget_does_not_stop_sync() {
     );
 }
 
-/// Емкостный гард `SEMANTIC_SYNC_BUDGET = 19` — не квота: тик ограничен 19 доками,
+/// Емкостный гард прод-тика (в проде — `SEMANTIC_SYNC_BUDGET = 19`) — не квота:
+/// тик ограничен 19 доками,
 /// остаток доезжает следующим тиком, третий тик — no-op.
 #[tokio::test]
 async fn sync_capacity_guard_limits_tick_to_19_docs() {
