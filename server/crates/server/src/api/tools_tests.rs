@@ -1880,10 +1880,29 @@ async fn task_body_crlf_fm_readback_is_clean_and_idempotent() {
         .expect("read")
         .body;
     assert_eq!(stored_again, body, "идемпотентность байт: {stored_again}");
+    // каждую квитанцию сверяем с хэшом записанного тела: если body_hash
+    // пропал хотя бы из одной, обе стороны Option были бы None и сравнение
+    // двух Options прошло бы зелёным (Low-1 тест-ревью)
+    let first_hash = first
+        .split("body_hash: ")
+        .nth(1)
+        .map(str::trim)
+        .expect("первая квитанция несёт body_hash");
+    let second_hash = second
+        .split("body_hash: ")
+        .nth(1)
+        .map(str::trim)
+        .expect("повторная квитанция несёт body_hash");
+    let expected_hash = uwuwu_usecase::body_hash(body);
     assert_eq!(
-        first.split("body_hash: ").nth(1).map(str::trim),
-        second.split("body_hash: ").nth(1).map(str::trim),
-        "идемпотентность хэша: {first} / {second}"
+        first_hash,
+        expected_hash.as_str(),
+        "хэш первой квитанции честный: {first}"
+    );
+    assert_eq!(
+        second_hash,
+        expected_hash.as_str(),
+        "хэш второй квитанции честный: {second}"
     );
 }
 

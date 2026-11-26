@@ -135,7 +135,9 @@ greeting: Привет!\nenabled: false\n---\n\n## Методичка\nсозд�
         assert_eq!(spec.manual, "## Методичка\r\nтекст");
     }
 
-    /// #1664: чистый CRLF-док до `parse` не доходит — парсер LF-строгий.
+    /// #1664: чистый CRLF-док доходит до `parse`, но LF-строгий парсер
+    /// возвращает пустую карту — потребитель отказывает; до `strip` док
+    /// не доходит.
     #[test]
     fn crlf_doc_is_rejected_by_lf_strict_parse() {
         let md = "---\r\nmodel: p/id\r\ntoken_env: TOK\r\nworkspace: /w\r\n---\r\n## Методичка";
