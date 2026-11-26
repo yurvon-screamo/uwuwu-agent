@@ -18,8 +18,26 @@ mod common;
 use common::stand::{e2e_enabled, log_tail, spawn_stand, StandOptions};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+/// Каталог стенда убирается и при красном прогоне (мутации/паника) —
+/// четыре прогона не оставляют хвост в системном temp.
+struct AliasTempDirGuard(PathBuf);
+
+impl AliasTempDirGuard {
+    fn new(tag: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("alias-e2e-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        Self(path)
+    }
+}
+
+impl Drop for AliasTempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 const ALIASES_V2: &str = "[executor.model_aliases]\n\
     flash = \"p/flash-v2#high\"\n\
@@ -37,7 +55,7 @@ const ASSIGNMENTS: &str = "[executor.models]\n\
     analyst = \"flash\"\n\
     tester = \"common\"\n\
     plan-reviewer = \"smart\"\n\
-    code-quality-reviewer = \"smart\"\n\
+    code-quality-reviewer = \"flash\"\n\
     test-reviewer = \"smart\"\n\
     analyst-reviewer = \"smart\"\n\
     dreamer = \"common\"\n\n";
@@ -109,18 +127,22 @@ async fn alias_layers_reach_live_spawns_and_one_edit_moves_whole_group() {
         return;
     }
 
-    let want_agents = ["default", "developer", "analyst", "tester", "plan-reviewer"];
+    let want_agents = [
+        "default",
+        "developer",
+        "analyst",
+        "tester",
+        "plan-reviewer",
+        "code-quality-reviewer",
+    ];
     let config_v2 = format!("{ALIASES_V2}{ASSIGNMENTS}");
     let config_v3 = format!("{ALIASES_V3}{ASSIGNMENTS}");
-    let v2_dir = std::env::temp_dir().join(format!("alias-e2e-v2-{}", std::process::id()));
-    let v3_dir = std::env::temp_dir().join(format!("alias-e2e-v3-{}", std::process::id()));
-    for dir in [&v2_dir, &v3_dir] {
-        let _ = std::fs::remove_dir_all(dir);
-    }
+    let dir_v2 = AliasTempDirGuard::new("v2");
+    let dir_v3 = AliasTempDirGuard::new("v3");
 
     // 1. Раскладка опроса доезжает до живых спавнов.
     let stand_v2 = spawn_stand(
-        &v2_dir,
+        &dir_v2.0,
         StandOptions {
             config_extra: &config_v2,
             pre_state: None,
@@ -129,12 +151,12 @@ async fn alias_layers_reach_live_spawns_and_one_edit_moves_whole_group() {
         },
     )
     .await;
-    let v2 = wait_models(&v2_dir, &want_agents).await;
+    let v2 = wait_models(&dir_v2.0, &want_agents).await;
     for agent in ["default", "developer", "analyst"] {
         assert_eq!(
             v2.get(agent).map(String::as_str),
             Some(FLASH_V2),
-            "{agent}: flash-группа не получила raw алиса flash"
+            "{agent}: flash-группа не получила raw алиаса flash"
         );
     }
     assert_eq!(
@@ -147,12 +169,20 @@ async fn alias_layers_reach_live_spawns_and_one_edit_moves_whole_group() {
         Some(SMART_V2),
         "ревьювер — smart"
     );
+    // Назначение неканоническое: код-ревьювер переназначен на flash.
+    // Именно этот слой доезжает до живого спавна и проверяется здесь;
+    // мутация клея, отдающая назначения как None, краснит этот ассерт.
+    assert_eq!(
+        v2.get("code-quality-reviewer").map(String::as_str),
+        Some(FLASH_V2),
+        "назначение code-quality-reviewer → flash не доехало до спавна"
+    );
     drop(stand_v2);
 
-    // 2. Одна правка raw у алиса flash: group едет на новой модели,
+    // 2. Одна правка raw у алиаса flash: группа едет на новой модели,
     //    назначения агентов и остальные алиасы не тронуты.
     let stand_v3 = spawn_stand(
-        &v3_dir,
+        &dir_v3.0,
         StandOptions {
             config_extra: &config_v3,
             pre_state: None,
@@ -161,12 +191,12 @@ async fn alias_layers_reach_live_spawns_and_one_edit_moves_whole_group() {
         },
     )
     .await;
-    let v3 = wait_models(&v3_dir, &want_agents).await;
+    let v3 = wait_models(&dir_v3.0, &want_agents).await;
     for agent in ["default", "developer", "analyst"] {
         assert_eq!(
             v3.get(agent).map(String::as_str),
             Some(FLASH_V3),
-            "{agent}: правка алиса flash не доехала до группы"
+            "{agent}: правка алиаса flash не доехала до группы"
         );
     }
     assert_eq!(
@@ -177,10 +207,12 @@ async fn alias_layers_reach_live_spawns_and_one_edit_moves_whole_group() {
     assert_eq!(
         v3.get("plan-reviewer").map(String::as_str),
         Some(SMART_V2),
-        "ревьювер не должен измениться от правки flash"
+        "ревьювер на smart не должен измениться от правки flash"
+    );
+    assert_eq!(
+        v3.get("code-quality-reviewer").map(String::as_str),
+        Some(FLASH_V3),
+        "ревьювер, переназначенный на flash, едет вместе с группой"
     );
     drop(stand_v3);
-
-    let _ = std::fs::remove_dir_all(&v2_dir);
-    let _ = std::fs::remove_dir_all(&v3_dir);
 }

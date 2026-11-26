@@ -148,18 +148,21 @@ fn custom_assignment_moves_agent_and_its_runtime_alias() {
         ("smart", "p/smart-custom#high"),
     ]);
     let assignments = strings(&[
-        ("default", "flash"),
+        ("default", "smart"),
         ("tester", "flash"),
-        ("developer", "smart"),
+        ("developer", "flash"),
     ]);
     let models = SpawnModels::from_config(Some(&aliases), Some(&assignments)).unwrap();
     let flash = SpawnModel::parse("p/flash-custom#high").unwrap();
     let smart = SpawnModel::parse("p/smart-custom#high").unwrap();
     assert_eq!(models.for_agent(Agent::Tester), flash);
     assert_eq!(models.alias_for_agent(Agent::Tester), ModelAlias::Flash);
-    assert_eq!(models.for_agent(Agent::Developer), smart);
-    assert_eq!(models.alias_for_agent(Agent::Developer), ModelAlias::Smart);
-    assert_eq!(models.get("default"), Some(&flash));
+    assert_eq!(models.for_agent(Agent::Developer), flash);
+    assert_eq!(models.alias_for_agent(Agent::Developer), ModelAlias::Flash);
+    // bootstrap идёт через for_default(), а не get(): default ≠ developer
+    // ловит и подмену моделью developer, и жёсткий flash-алиас в методе.
+    assert_eq!(models.for_default(), smart);
+    assert_eq!(models.alias_for_key("default"), Some(ModelAlias::Smart));
     assert_eq!(
         models.get("analyst"),
         None,

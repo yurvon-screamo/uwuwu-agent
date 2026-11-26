@@ -110,11 +110,11 @@ fn canonical_matches_live_config_verbatim() {
     assert_matches_canonical(&path, "config.toml");
 }
 
-/// Главный сценарий владельца (US-1/UC-1): правка raw только у алиса из
-/// TOML-конфига меняет модель всей группы без правок по агентам. Граница
-/// файл → ExecutorCfg → from_config → плоская карта — под тестом.
+/// Главный сценарий владельца (US-1/UC-1): raw алиаса flash задан один раз,
+/// а назначение tester — неканоническое — доезжает через ту же границу.
+/// Inline TOML → ExecutorCfg → from_config → плоская карта под тестом.
 #[test]
-fn alias_raw_from_toml_moves_whole_group() {
+fn alias_raw_from_toml_drives_whole_group_and_noncanonical_assignment() {
     let raw = r#"
         name = "kisa"
         url = "https://example.invalid"
@@ -128,7 +128,7 @@ fn alias_raw_from_toml_moves_whole_group() {
         default = "flash"
         developer = "flash"
         analyst = "flash"
-        tester = "common"
+        tester = "flash"
         plan-reviewer = "smart"
     "#;
     let cfg: crate::config::ExecutorCfg = toml::from_str(raw).expect("валидный toml");
@@ -138,11 +138,18 @@ fn alias_raw_from_toml_moves_whole_group() {
     for key in ["default", "developer", "analyst"] {
         assert_eq!(models.get(key), Some(&want), "{key} — новый flash");
     }
-    let common = uwuwu_domain::SpawnModel::parse("p/common#high").unwrap();
+    // Назначение tester = flash отлично от канона (common): потеря слоя
+    // назначений в клее подменила бы tester каноном и не была бы замечена.
     assert_eq!(
         models.get("tester"),
-        Some(&common),
-        "правка flash не задела common"
+        Some(&want),
+        "неканоническое назначение tester → flash не доехало"
+    );
+    let common = uwuwu_domain::SpawnModel::parse("p/common#high").unwrap();
+    assert_eq!(
+        models.model_for_alias(uwuwu_usecase::ModelAlias::Common),
+        &common,
+        "алиас common не тронут правкой flash"
     );
     let smart = uwuwu_domain::SpawnModel::parse("p/smart#high").unwrap();
     assert_eq!(

@@ -1,6 +1,7 @@
 //! Общий харнес e2e-стендов uwuwu-server: живой сервер + mock_opencode
 //! на свободных портах, ожидание health, MCP-вызовы и хвост лога.
-//! Вынесен из quota_limit_pause_stand_e2e.rs — делится с cron_stand_e2e.rs.
+//! Вынесен из quota_limit_pause_stand_e2e.rs — делится с e2e-стендами
+//! (cron, quota, model_alias).
 //! Каждый integration-таргет компилирует модуль целиком — не таргетные
 //! хелперы мертвы локально, не по факту (lint-уровень унаследован от common).
 
@@ -80,21 +81,8 @@ struct CapturedRequest {
     ctype: Option<String>,
 }
 
-/// Прочитать HTTP-запрос целиком: шапка, тело по Content-Length.
-async fn read_captured(client: &mut tokio::net::TcpStream) -> Option<CapturedRequest> {
-    let mut data = Vec::new();
-    let mut buf = [0u8; 4096];
-    let head_end = loop {
-        if let Some(pos) = find_subslice(&data, b"\r\n\r\n") {
-            break pos + 4;
-        }
-        let n = client.read(&mut buf).await.ok()?;
-        if n == 0 || data.len() > 1024 * 1024 {
-            return None;
-        }
-        data.extend_from_slice(&buf[..n]);
-    };
-    let head = String::from_utf8_lossy(&data[..head_end]).into_owned();
+/// Стартовая строка и нужные заголовки: (Content-Length, описание запроса).
+fn request_meta(head: &str) -> Option<(usize, CapturedRequest)> {
     let mut meta = CapturedRequest {
         method: String::new(),
         path: String::new(),
@@ -122,6 +110,25 @@ async fn read_captured(client: &mut tokio::net::TcpStream) -> Option<CapturedReq
             meta.ctype = Some(value.to_string());
         }
     }
+    Some((content_len, meta))
+}
+
+/// Прочитать HTTP-запрос целиком: шапка, тело по Content-Length.
+async fn read_captured(client: &mut tokio::net::TcpStream) -> Option<CapturedRequest> {
+    let mut data = Vec::new();
+    let mut buf = [0u8; 4096];
+    let head_end = loop {
+        if let Some(pos) = find_subslice(&data, b"\r\n\r\n") {
+            break pos + 4;
+        }
+        let n = client.read(&mut buf).await.ok()?;
+        if n == 0 || data.len() > 1024 * 1024 {
+            return None;
+        }
+        data.extend_from_slice(&buf[..n]);
+    };
+    let head = String::from_utf8_lossy(&data[..head_end]);
+    let (content_len, mut meta) = request_meta(&head)?;
     while data.len() < head_end + content_len {
         let n = client.read(&mut buf).await.ok()?;
         if n == 0 {
