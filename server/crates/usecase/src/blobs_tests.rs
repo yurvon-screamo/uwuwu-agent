@@ -6,25 +6,41 @@ use super::{
 };
 use crate::error::UsecaseError;
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use uwuwu_domain::BlobKey;
 
-struct RecordingStore;
+/// Пишет всё, что движок отдал наружу: реальные `put` (байты через сервер)
+/// и вызовы `presign_put_url` (подпись на ключ). Разделение нужно, чтобы
+/// пин пресайн-режима отличал «сервер получил байты» от «сервер только
+/// подписал ключ, байты пойдут из shell».
+#[derive(Default)]
+struct RecordingStore {
+    puts: Mutex<Vec<(String, Vec<u8>)>>,
+    put_signatures: Mutex<Vec<(String, String)>>,
+}
 
 #[async_trait]
 impl super::BlobStore for RecordingStore {
     async fn put(
         &self,
-        _key: &BlobKey,
+        key: &BlobKey,
         _content_type: &str,
-        _bytes: &[u8],
+        bytes: &[u8],
     ) -> crate::error::UsecaseResult<()> {
+        self.puts
+            .lock()
+            .expect("lock")
+            .push((key.as_str().to_string(), bytes.to_vec()));
         Ok(())
     }
     fn presign_get_url(&self, key: &BlobKey) -> String {
         format!("presigned://{}", key.as_str())
     }
-    fn presign_put_url(&self, key: &BlobKey, _content_type: &str) -> String {
+    fn presign_put_url(&self, key: &BlobKey, content_type: &str) -> String {
+        self.put_signatures
+            .lock()
+            .expect("lock")
+            .push((key.as_str().to_string(), content_type.to_string()));
         format!("presigned-put://{}", key.as_str())
     }
 }
@@ -37,8 +53,13 @@ fn place(filename: &str) -> BlobPlace {
     }
 }
 
+fn case_with_store() -> (BlobUseCase, Arc<RecordingStore>) {
+    let store = Arc::new(RecordingStore::default());
+    (BlobUseCase::ready(store.clone()), store)
+}
+
 fn ready_case() -> BlobUseCase {
-    BlobUseCase::ready(Arc::new(RecordingStore))
+    case_with_store().0
 }
 
 #[tokio::test]
@@ -75,13 +96,43 @@ fn reserve_builds_fresh_key_with_both_presigned_urls() {
         .strip_prefix("blobs/uwuwu/1292/")
         .unwrap_or_default();
     assert!(tail.ends_with("-скрин от МПНЧ.png"), "{tail}");
-    assert!(
-        tail.split('-').next().is_some_and(|id| id.len() == 8),
-        "UUID-сегмент: {tail}"
-    );
     assert_eq!(first.put_url, format!("presigned-put://{}", first.key));
     assert_eq!(first.url, format!("presigned://{}", first.key));
     assert_ne!(first.key, second.key, "каждая загрузка — новый ключ");
+}
+
+/// Главное НФТ смены: байты не проходят через сервер. Резервирование
+/// подписывает ключ, но не зовёт `put`; Content-Type в подписи совпадает
+/// с тем, что квитанция отдаёт агенту для shell-заливки. Сегмент ключа —
+/// настоящий UUID v4, а не любая 8-символьная строка.
+#[test]
+fn reserve_signs_one_key_per_upload_and_never_sends_bytes_to_store() {
+    let (case, store) = case_with_store();
+    let first = case.reserve(&place("скрин.png")).expect("first");
+    let second = case.reserve(&place("скрин.png")).expect("second");
+
+    assert!(
+        store.puts.lock().expect("lock").is_empty(),
+        "резервирование не шлёт байты на носитель — агент заливает их сам"
+    );
+    let signed = store.put_signatures.lock().expect("lock");
+    assert_eq!(signed.len(), 2, "одна PUT-подпись на каждый резерв");
+    assert_eq!(signed[0].0, first.key);
+    assert_eq!(signed[1].0, second.key);
+    assert_eq!(signed[0].1, first.content_type);
+    assert_eq!(signed[1].1, second.content_type);
+    drop(signed);
+
+    let tail = first
+        .key
+        .strip_prefix("blobs/uwuwu/1292/")
+        .expect("ключ в сегменте задачи");
+    let id = uuid::Uuid::parse_str(&tail[..36]).expect("UUID в сегменте ключа");
+    assert_eq!(id.get_version_num(), 4, "свежий UUID v4: {tail}");
+    assert!(
+        tail[36..].starts_with('-'),
+        "разделитель id и имени: {tail}"
+    );
 }
 
 #[test]

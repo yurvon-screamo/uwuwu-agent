@@ -209,6 +209,46 @@ mod tests {
         assert!(!url.contains(' '), "кириллица percent-encoded: {url}");
     }
 
+    /// PUT-пресайн подписан ровно на один ключ и один Content-Type:
+    /// смена любого из них меняет подпись, Path — тот же ключ, что в
+    /// квитанции (правило «пресайн ↔ ключ» изExperience/mcp 24.11).
+    #[test]
+    fn presign_put_url_binds_signature_to_one_key_and_content_type() {
+        let store = fake_store();
+        let a = BlobKey::parse("blobs/uwuwu/1537/f0f0f0f0-one.png").expect("ключ a");
+        let b = BlobKey::parse("blobs/uwuwu/1537/f0f0f0f1-two.png").expect("ключ b");
+        let url_a = store.presign_put_url(&a, "image/png");
+        let url_b = store.presign_put_url(&b, "image/png");
+        let url_a_other_ct = store.presign_put_url(&a, "application/octet-stream");
+
+        let path = |u: &str| u.split('?').next().unwrap_or_default().to_string();
+        let sig = |u: &str| {
+            u.split('&')
+                .find(|p| p.starts_with("X-Amz-Signature="))
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(
+            path(&url_a),
+            "https://uwuwu-blobs.t3.storageapi.dev/blobs/uwuwu/1537/f0f0f0f0-one.png"
+        );
+        assert_eq!(
+            path(&url_b),
+            "https://uwuwu-blobs.t3.storageapi.dev/blobs/uwuwu/1537/f0f0f0f1-two.png"
+        );
+        assert_eq!(
+            url_a.matches("X-Amz-Signature=").count(),
+            1,
+            "одна подпись в URL"
+        );
+        assert_ne!(sig(&url_a), sig(&url_b), "подпись привязана к ключу");
+        assert_ne!(
+            sig(&url_a),
+            sig(&url_a_other_ct),
+            "подпись привязана к Content-Type"
+        );
+    }
+
     #[tokio::test]
     async fn memory_store_roundtrips_key_bytes_and_content_type() {
         let store = MemoryBlobStore::default();

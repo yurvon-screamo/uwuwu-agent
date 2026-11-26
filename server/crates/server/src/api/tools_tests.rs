@@ -2703,3 +2703,229 @@ async fn radical_shrink_with_confirm_writes_and_receipt_carries_lengths() {
         "контент записан: {stored}"
     );
 }
+
+/// Приёмка пресайн-режима на проводе (#1537): тот же вызов, что делает
+/// агент (JSON-RPC `tools/call` через MCP-роутер), затем заливка байтов
+/// `reqwest::put` по URL из квитанции и чтение по GET-пресайну из неё же.
+/// Носитель — локальный HTTP-фейк: тест воспроизводим изолированно, не
+/// опирается на прод-бакет и не закрепляет протухшие пресайны.
+#[tokio::test]
+async fn blob_put_presign_mode_e2e_over_mcp_wire_with_local_http_store() {
+    use crate::api::McpState;
+    use axum::extract::Path;
+    use axum::http::{header, HeaderMap, StatusCode};
+    use axum::response::Response;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use tower::ServiceExt;
+
+    type Objects = Arc<Mutex<HashMap<String, (Vec<u8>, String)>>>;
+
+    fn wire_response(status: StatusCode, ctype: Option<String>, body: Vec<u8>) -> Response {
+        let mut builder = Response::builder().status(status);
+        if let Some(ct) = ctype {
+            builder = builder.header(header::CONTENT_TYPE, ct);
+        }
+        builder
+            .body(axum::body::Body::from(body))
+            .expect("static response")
+    }
+
+    struct TestHttpStore {
+        port: u16,
+        objects: Objects,
+    }
+
+    #[async_trait::async_trait]
+    impl uwuwu_usecase::BlobStore for TestHttpStore {
+        async fn put(
+            &self,
+            key: &uwuwu_domain::BlobKey,
+            content_type: &str,
+            bytes: &[u8],
+        ) -> uwuwu_usecase::UsecaseResult<()> {
+            self.objects.lock().expect("lock").insert(
+                key.as_str().to_string(),
+                (bytes.to_vec(), content_type.to_string()),
+            );
+            Ok(())
+        }
+        fn presign_get_url(&self, key: &uwuwu_domain::BlobKey) -> String {
+            format!("http://127.0.0.1:{}/get/{}", self.port, key.as_str())
+        }
+        fn presign_put_url(&self, key: &uwuwu_domain::BlobKey, _content_type: &str) -> String {
+            format!("http://127.0.0.1:{}/put/{}", self.port, key.as_str())
+        }
+    }
+
+    async fn wire_call(app: &axum::Router, name: &str, args: Value) -> String {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": args }
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/mcp")
+                    .header("authorization", "Bearer wire-bearer")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(payload.to_string()))
+                    .expect("request ok"),
+            )
+            .await
+            .expect("service ok");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 32 * 1024 * 1024)
+            .await
+            .expect("body ok");
+        let msg: Value = serde_json::from_slice(&bytes).expect("json ok");
+        assert_eq!(msg["result"]["isError"], json!(false), "{msg}");
+        msg["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    let objects: Objects = Arc::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let app = axum::Router::new()
+        .route("/put/{*key}", axum::routing::put({
+            let objects = objects.clone();
+            move |Path(key): Path<String>, headers: HeaderMap, body: axum::body::Bytes| async move {
+                let ctype = headers
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                objects
+                    .lock()
+                    .expect("lock")
+                    .insert(key, (body.to_vec(), ctype));
+                wire_response(StatusCode::OK, None, Vec::new())
+            }
+        }))
+        .route("/get/{*key}", axum::routing::get({
+            let objects = objects.clone();
+            move |Path(key): Path<String>| async move {
+                match objects.lock().expect("lock").get(&key).cloned() {
+                    Some((bytes, ctype)) => wire_response(StatusCode::OK, Some(ctype), bytes),
+                    None => wire_response(StatusCode::NOT_FOUND, None, Vec::new()),
+                }
+            }
+        }));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+
+    let store = Arc::new(TestHttpStore {
+        port,
+        objects: objects.clone(),
+    });
+    let (tools, _memory) = tool_hub(
+        Arc::new(StubWiki),
+        Arc::new(uwuwu_usecase::BlobUseCase::ready(store)),
+        Arc::new(StubCronState::default()),
+    );
+    let mcp = crate::api::mcp_router(Arc::new(McpState {
+        bearer: Arc::new("wire-bearer".to_string()),
+        tools,
+    }));
+
+    // Шаг 1 агента: резервирование без байтов — квитанция несёт только
+    // ключ и две ссылки (никакого payload в dehydrated-ответе).
+    let receipt = wire_call(
+        &mcp,
+        "blob_put",
+        json!({ "filename": "скрин 1537.png", "number": 1537 }),
+    )
+    .await;
+    let put_line = receipt
+        .lines()
+        .find(|l| l.starts_with("PUT URL "))
+        .expect("PUT URL в квитанции");
+    let put_url = put_line.rsplit(": ").next().expect("put url").to_string();
+    let content_type = put_line
+        .split("send Content-Type: ")
+        .nth(1)
+        .expect("content-type в подписи")
+        .split("):")
+        .next()
+        .expect("content-type value")
+        .to_string();
+    let get_url = receipt
+        .lines()
+        .find(|l| l.starts_with("URL (TTL 7 days): "))
+        .expect("GET URL в квитанции")
+        .rsplit(": ")
+        .next()
+        .expect("get url")
+        .to_string();
+    let key = receipt
+        .lines()
+        .find_map(|l| l.strip_prefix("key: "))
+        .expect("key в квитанции")
+        .to_string();
+    assert!(key.starts_with("blobs/uwuwu/1537/"), "{receipt}");
+    assert!(
+        put_url.contains(&key),
+        "PUT подписан на тот же ключ: {receipt}"
+    );
+    assert!(
+        get_url.contains(&key),
+        "GET подписан на тот же ключ: {receipt}"
+    );
+    assert_eq!(content_type, "image/png");
+    assert!(!receipt.contains("agent bytes"), "байты не едут в ответе");
+
+    // Шаг 2: байты идут из shell мимо контекста — здесь HTTP-клиент на
+    // URL из квитанции с подписанным Content-Type.
+    let bytes = b"E2E-1537-agent-bytes";
+    let status = reqwest::Client::new()
+        .put(&put_url)
+        .header("content-type", &content_type)
+        .body(bytes.to_vec())
+        .send()
+        .await
+        .expect("PUT by presigned URL")
+        .status();
+    assert_eq!(status, StatusCode::OK, "заливка через пресайн");
+    assert!(
+        objects
+            .lock()
+            .expect("lock")
+            .get(&key)
+            .is_some_and(|(b, ct)| b.as_slice() == bytes && ct == "image/png"),
+        "байты и тип дошли до носителя"
+    );
+
+    // Шаг 3: ссылка из той же квитанции открывается; blob_get по ключу
+    // переподписывает GET и отдаёт те же байты.
+    let fetched = reqwest::get(&get_url)
+        .await
+        .expect("GET by presigned URL")
+        .status();
+    assert_eq!(fetched, StatusCode::OK, "пресайн GET из квитанции");
+    let resign = wire_call(&mcp, "blob_get", json!({ "key": key })).await;
+    let resign_url = resign
+        .lines()
+        .next()
+        .expect("url line")
+        .rsplit(": ")
+        .next()
+        .expect("resigned url")
+        .to_string();
+    let got = reqwest::get(&resign_url)
+        .await
+        .expect("GET by resigned URL")
+        .bytes()
+        .await
+        .expect("body");
+    assert_eq!(got.as_ref(), bytes, "blob_get вернул залитые байты");
+}
