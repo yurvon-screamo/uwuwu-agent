@@ -13385,3 +13385,65 @@ fn analyst_wave_prompts_teach_owner_answer() {
         );
     }
 }
+
+/// После выноса очереди в хелпер порядок кандидатов (#1586) остаётся
+/// прежним: тир «продолжение» выше приоритета, внутри тира — приоритет,
+/// затем порядок досок.
+#[test]
+fn candidate_queue_keeps_continuation_tier_and_priority_order() {
+    fn plan(project: &str, board: &str) -> BoardPlan {
+        BoardPlan {
+            project: project.into(),
+            board: board.into(),
+            repo: "repo".into(),
+            checkout: "checkout".into(),
+            env_root: "env".into(),
+        }
+    }
+    let b1 = plan("p1", "B1");
+    let b2 = plan("p2", "B2");
+    let mut newcomer_low = task(101, Status::Design);
+    newcomer_low.set_priority(Priority::Low);
+    let mut continuation_medium = task(102, Status::InProgress);
+    continuation_medium.set_priority(Priority::Medium);
+    let mut newcomer_high = task(201, Status::Design);
+    newcomer_high.set_priority(Priority::High);
+    let mut continuation_high = task(202, Status::InProgress);
+    continuation_high.set_priority(Priority::High);
+    let mut boards = vec![
+        (&b1, vec![newcomer_low, continuation_medium]),
+        (&b2, vec![newcomer_high, continuation_high]),
+    ];
+
+    let rows = crate::pipeline::tick::collect_candidates(&mut boards, None);
+
+    assert_eq!(
+        rows.iter()
+            .map(|(_, _, _, t)| t.number())
+            .collect::<Vec<_>>(),
+        vec![202, 102, 201, 101],
+        "продолжения раньше новичков, внутри тира — приоритет"
+    );
+}
+
+/// Дебаг-гейт одной строки (UWUWU_ONLY_TASK) после выноса очереди
+/// по-прежнему оставляет в обходе только выбранную строку.
+#[test]
+fn candidate_queue_only_filter_keeps_single_row() {
+    let board = BoardPlan {
+        project: "p".into(),
+        board: "B".into(),
+        repo: "repo".into(),
+        checkout: "checkout".into(),
+        env_root: "env".into(),
+    };
+    let mut boards = vec![(
+        &board,
+        vec![task(7, Status::Design), task(8, Status::Design)],
+    )];
+
+    let rows = crate::pipeline::tick::collect_candidates(&mut boards, Some(8));
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].3.number(), 8);
+}
