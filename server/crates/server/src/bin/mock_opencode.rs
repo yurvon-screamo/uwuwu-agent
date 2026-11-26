@@ -671,6 +671,10 @@ async fn create_session(
         body["model"]["providerID"].as_str().unwrap_or_default(),
         body["model"]["id"].as_str().unwrap_or_default()
     );
+    let created_ms = now_ms();
+    let zombie_ms = body["busy_ms_ago"]
+        .as_u64()
+        .map(|ago| created_ms.saturating_sub(ago));
     let session = MockSession {
         id: id.clone(),
         agent: body["agent"].as_str().unwrap_or_default().to_string(),
@@ -680,17 +684,13 @@ async fn create_session(
             .unwrap_or_default()
             .to_string(),
         model,
-        updated_ms: now_ms(),
+        updated_ms: zombie_ms.unwrap_or(created_ms),
         outcome: String::new(),
         tokens_in: 0,
         tokens_out: 0,
         busy: false,
-        // дев-ручка стенда (#1313 V4): busy_ms в прошлом — зомби-флаг
-        // (busy > idle старше 30 мин не держит CUP-кап)
-        busy_ms: body["busy_ms_ago"]
-            .as_u64()
-            .map(|ago| now_ms().saturating_sub(ago))
-            .unwrap_or(0),
+        // dev endpoint (#1313 V4): a zombie has both busy and updates in the past.
+        busy_ms: zombie_ms.unwrap_or(0),
         idle_ms: 0,
         dead: mode == "dead",
         reply: None,

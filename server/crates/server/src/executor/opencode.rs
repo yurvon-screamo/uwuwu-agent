@@ -38,16 +38,17 @@ fn message_activity_ms(msg: &Value) -> Option<u64> {
         .or_else(|| t["created"].as_u64())
 }
 
-/// busy-вердикт сессии по времени (#1231 семантика + PR #409 зомби-гард):
-/// busy ⟺ busy > idle И флаг свежее 30 минут (оборванный ход оставляет
-/// busy>idle навсегда — крэш/рестарт исполнителя; 12 зомби на redmi
-/// держали глобальный кап при 1 работающей, 18.11).
+/// Session busy verdict (#1231 semantics, #409 zombie guard, #1547 liveness):
+/// busy iff busy > idle and the session keeps updating. The age of `time.busy`
+/// alone does not prove an aborted turn: a long live turn still writes messages,
+/// while a crashed turn keeps busy > idle forever but stops updating.
 fn session_busy(s: &serde_json::Value, now_ms: u64) -> bool {
     const ZOMBIE_BUSY_MS: u64 = 30 * 60_000;
     let busy_ms = s["time"]["busy"].as_u64();
     let idle_ms = s["time"]["idle"].as_u64();
-    busy_ms
-        .is_some_and(|b| idle_ms.is_none_or(|i| b > i) && now_ms.saturating_sub(b) < ZOMBIE_BUSY_MS)
+    let updated_ms = s["time"]["updated"].as_u64();
+    busy_ms.is_some_and(|b| idle_ms.is_none_or(|i| b > i))
+        && updated_ms.is_some_and(|u| now_ms.saturating_sub(u) < ZOMBIE_BUSY_MS)
 }
 
 /// Тело ответа message-эндпоинта opencode: голый массив ИЛИ обёртка
@@ -911,32 +912,59 @@ mod tests {
     }
 
     #[test]
-    fn zombie_busy_flag_expires_after_half_hour() {
-        // PR #409: busy-флаг оборванного хода (busy > idle навсегда после
-        // крэша/рестарта исполнителя) не должен держать кап: ход старше
-        // 30 минут без завершения — протух. Свежий busy — держит.
+    fn zombie_turn_stops_holding_slot_when_updates_stop() {
+        // #409/#1547: оборванный ход держит busy > idle навсегда, но
+        // перестаёт обновляться. Свежая сессия держит слот; протухшая — нет.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
         let fresh = serde_json::json!({
             "id": "s1", "agent": "developer",
-            "time": { "busy": now - 60_000, "idle": now - 120_000 }
+            "time": {
+                "busy": now - 60_000, "idle": now - 120_000,
+                "updated": now - 30_000
+            }
         });
         let stale = serde_json::json!({
             "id": "s2", "agent": "developer",
-            "time": { "busy": now - 31 * 60_000, "idle": now - 60 * 60_000 }
+            "time": {
+                "busy": now - 31 * 60_000, "idle": now - 60 * 60_000,
+                "updated": now - 31 * 60_000
+            }
         });
         let idle_cleared = serde_json::json!({
             "id": "s3", "agent": "developer",
-            "time": { "busy": now - 60 * 60_000, "idle": now - 5 * 60_000 }
+            "time": {
+                "busy": now - 60 * 60_000, "idle": now - 5 * 60_000,
+                "updated": now - 30_000
+            }
         });
         assert!(session_busy(&fresh, now), "свежий ход — busy");
-        assert!(!session_busy(&stale, now), "зомби-флаг протух — не busy");
+        assert!(!session_busy(&stale, now), "зомби-ход молчит — не busy");
         assert!(
             !session_busy(&idle_cleared, now),
             "idle новее busy — не busy"
         );
+    }
+
+    #[test]
+    fn long_running_turn_holds_slot_while_session_keeps_updating() {
+        // #1547: живой ход длиннее 30 минут держит слот, пока лента обновляется.
+        // Возраст time.busy сам по себе не означает оборванный ход.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let long_live = serde_json::json!({
+            "id": "s1", "agent": "developer",
+            "time": {
+                "busy": now - 35 * 60_000,
+                "idle": now - 36 * 60_000,
+                "updated": now - 30_000
+            }
+        });
+        assert!(session_busy(&long_live, now), "длинный живой ход — busy");
     }
 
     #[test]
@@ -1056,6 +1084,10 @@ mod tests {
         let mut item = page_item("s", "/x");
         item["time"]["busy"] = busy;
         item["time"]["idle"] = idle;
+        item["time"]["updated"] = serde_json::json!(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64);
         parse_session_page(&serde_json::json!({ "data": [item] }), 1)
             .0
             .remove(0)
