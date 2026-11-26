@@ -906,6 +906,7 @@ async fn env_gc_loop(args: EnvGcLoopArgs) {
         observe,
         poll_sec,
     } = args;
+    let gone = uwuwu_usecase::env_gc::EnvGcGone::default();
     loop {
         for b in &boards {
             let tasks = match usecase.board.read_board(&b.board).await {
@@ -934,6 +935,7 @@ async fn env_gc_loop(args: EnvGcLoopArgs) {
                 sessions,
                 models: &usecase.models,
                 board: usecase.board.as_ref(),
+                gone: &gone,
             };
             if let Err(e) = uwuwu_usecase::env_gc::sweep_envs(&ctx, policy).await {
                 tracing::warn!(

@@ -4,7 +4,7 @@
 
 use std::time::Instant;
 
-use super::{EnvGcOutcome, ENV_GC_VERDICT_DEADLINE_MS, TASK_ENV_GC_SCRIPT};
+use super::{EnvGcGone, EnvGcOutcome, ENV_GC_VERDICT_DEADLINE_MS, TASK_ENV_GC_SCRIPT};
 use crate::router::Gateway;
 use uwuwu_domain::{sighting_is_live, SessionSighting, Task};
 
@@ -191,13 +191,22 @@ pub(super) async fn revalidate_row<'a>(
 /// failed + WARN env.verdict_read_failed + per-row WARN env.gc_fail;
 /// Err — транспортный отказ → все failed + WARN env.verdict_read_failed
 /// (не подмешивается в «снос не доведён» — класс #1506).
-pub(super) async fn collect_verdicts(
-    sessions: &Gateway,
-    bootstrap: &str,
-    board_name: &str,
-    targets: &[&Task],
-    out: &mut EnvGcOutcome,
-) {
+pub(super) struct VerdictCtx<'a> {
+    pub sessions: &'a Gateway,
+    pub bootstrap: &'a str,
+    pub board_name: &'a str,
+    pub targets: &'a [&'a Task],
+    pub gone: &'a EnvGcGone,
+    pub out: &'a mut EnvGcOutcome,
+}
+
+pub(super) async fn collect_verdicts(ctx: &mut VerdictCtx<'_>) {
+    let sessions = ctx.sessions;
+    let bootstrap = ctx.bootstrap;
+    let board_name = ctx.board_name;
+    let targets = ctx.targets;
+    let gone = ctx.gone;
+    let out = &mut *ctx.out;
     let command = batch_command(targets);
     let started = Instant::now();
     let output = match sessions
@@ -248,6 +257,7 @@ pub(super) async fn collect_verdicts(
         let row = t.number().to_string();
         match parse_verdict(&text, &row) {
             Some(Verdict::Swept) => {
+                gone.mark_gone(board_name, t.number(), t.closed_at());
                 out.swept += 1;
                 tracing::info!(
                     event = "env.swept",
@@ -284,6 +294,7 @@ pub(super) async fn collect_verdicts(
                 );
             }
             Some(Verdict::Absent) => {
+                gone.mark_gone(board_name, t.number(), t.closed_at());
                 out.absent += 1;
                 tracing::info!(
                     event = "env.absent",

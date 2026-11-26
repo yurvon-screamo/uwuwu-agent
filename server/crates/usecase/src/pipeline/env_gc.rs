@@ -15,7 +15,10 @@ use crate::router::Gateway;
 use crate::spawn_models::SpawnModels;
 use uwuwu_domain::{AgentSlot, SessionSighting, Task};
 
+mod gone;
 mod row;
+
+pub use gone::EnvGcGone;
 use row::{collect_verdicts, preflight_row, revalidate_row};
 
 /// Батч-кап прохода (путь клина): rm мульти-ГБ каталогов медленный,
@@ -73,6 +76,8 @@ pub struct EnvGcOutcome {
     pub failed: usize,
     /// Строк, возрождённых после снапшота (ревалидация + перепроба).
     pub revoked: usize,
+    /// Уже исчезнувших env, отсеянных до батча.
+    pub gone: usize,
 }
 
 /// Контекст прохода: всё, что нужно одной доске, — не дублируется
@@ -88,6 +93,8 @@ pub struct EnvGcCtx<'a> {
     pub models: &'a SpawnModels,
     /// Носитель доски — свежие пробы статуса строк (ревалидация ревайва).
     pub board: &'a dyn TaskBoardRepo,
+    /// Строки с уже исчезнувшим env — не занимают батч.
+    pub gone: &'a EnvGcGone,
 }
 
 /// Надёжное гашение bootstrap-сессии прохода: до 3 попыток, итог громко
@@ -186,11 +193,18 @@ async fn ensure_bootstrap(ctx: &EnvGcCtx<'_>, batch_is_empty: bool) -> Option<St
 /// вердиктов из stdout shell-сообщения → надёжное гашение bootstrap.
 pub async fn sweep_envs(ctx: &EnvGcCtx<'_>, policy: EnvGcPolicy) -> UsecaseResult<EnvGcOutcome> {
     let mut out = EnvGcOutcome::default();
-    let mut candidates: Vec<&Task> = ctx
+    let mut candidates: Vec<&Task> = Vec::new();
+    for t in ctx
         .tasks
         .iter()
         .filter(|t| t.is_env_gc_candidate(policy.now_ms, policy.age_days))
-        .collect();
+    {
+        if ctx.gone.is_gone(ctx.board_name, t.number(), t.closed_at()) {
+            out.gone += 1;
+        } else {
+            candidates.push(t);
+        }
+    }
     out.candidates = candidates.len();
     if candidates.is_empty() {
         return Ok(out);
@@ -273,7 +287,15 @@ pub async fn sweep_envs(ctx: &EnvGcCtx<'_>, policy: EnvGcPolicy) -> UsecaseResul
     // Без user-сообщений и LLM-поворота (живая проба opencode 2.3.2:
     // POST shell → 204, в ленте только type shell, токены 0).
     if let Some(bootstrap) = &bootstrap {
-        collect_verdicts(ctx.sessions, bootstrap, ctx.board_name, &batch, &mut out).await;
+        let mut verdict = row::VerdictCtx {
+            sessions: ctx.sessions,
+            bootstrap,
+            board_name: ctx.board_name,
+            targets: &batch,
+            gone: ctx.gone,
+            out: &mut out,
+        };
+        collect_verdicts(&mut verdict).await;
     }
     // Любой исход: bootstrap гасится с ретраем (тихий `let _` давал
     // утечку при занятой сессии — класс протухших «env-gc …» в листинге).
@@ -287,6 +309,7 @@ pub async fn sweep_envs(ctx: &EnvGcCtx<'_>, policy: EnvGcPolicy) -> UsecaseResul
         candidates = out.candidates,
         held = out.held_live,
         revoked = out.revoked,
+        gone = out.gone,
         batch = batch.len(),
         bootstrap_created = bootstrap.is_some(),
         dispatched = out.dispatched,
