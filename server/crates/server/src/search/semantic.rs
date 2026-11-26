@@ -298,7 +298,8 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_vector_count_and_dim_are_rejected() {
-        let body = embed_body(1, EMBED_MODEL_DIMS);
+        // query шлёт один текст — два вектора в ответе должны отвергаться.
+        let body = embed_body(2, EMBED_MODEL_DIMS);
         let len = body.len();
         let c = client(one_shot("HTTP/1.1 200 OK", body, len));
         let err = c.embed_query("q").await.unwrap_err().to_string();
