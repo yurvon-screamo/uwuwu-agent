@@ -1582,6 +1582,163 @@ async fn task_body_strips_the_real_render_header_and_refuses_header_only() {
     assert_eq!(intact, body, "оба отказа не трогают носитель");
 }
 
+/// #1637: CRLF-копия реальной карточки task_get срезается на границе
+/// task_body; байты тела остаются CRLF — сервер не нормализует контент.
+#[tokio::test]
+async fn task_body_strips_crlf_real_render_header() {
+    let (tools, memory) = hub();
+    let body = "## Постановка\n\nчистое тело носителя.\n";
+    let (number, _) = create_task(&tools, "t: CRLF-зеркало", body).await;
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    let body_at = card.find(body).expect("тело в выводе карточки");
+    let copied = &card[..body_at + body.len()];
+    let crlf = copied.replace('\n', "\r\n");
+
+    let receipt = call(
+        &tools,
+        "task_body",
+        json!({ "number": number, "body": &crlf }),
+    )
+    .await
+    .expect("task_body ок");
+    assert!(receipt.contains("replaced"), "квитанция: {receipt}");
+
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert_eq!(
+        stored,
+        body.replace('\n', "\r\n"),
+        "тело без шапки: {stored}"
+    );
+}
+
+/// #1637: CRLF-шапка без тела упирается в отказ #1572 и не трогает носитель.
+#[tokio::test]
+async fn task_body_refuses_crlf_header_only() {
+    let (tools, memory) = hub();
+    let body = "## Постановка\n\nчистое тело.\n";
+    let (number, _) = create_task(&tools, "t: CRLF-шапка без тела", body).await;
+
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    let body_at = card.find(body).expect("тело в выводе карточки");
+    let crlf_header = card[..body_at].replace('\n', "\r\n");
+    let before = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+
+    let err = call(
+        &tools,
+        "task_body",
+        json!({ "number": number, "body": &crlf_header }),
+    )
+    .await
+    .expect_err("CRLF-шапка без тела — отказ");
+    assert!(
+        err.contains("effective content"),
+        "отказ называет пустой эффективный контент: {err}"
+    );
+    let intact = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert_eq!(intact, before, "носитель цел: {intact}");
+}
+
+/// #1637: task_create получает CRLF-копию карточки — новая строка несёт
+/// чистое тело без тайтл-строки рендера и fm-блока.
+#[tokio::test]
+async fn task_create_strips_crlf_card_header() {
+    let (tools, memory) = hub();
+    let body = "## Постановка\n\nчистое тело носителя.\n";
+    let (number, _) = create_task(&tools, "t: источник CRLF", body).await;
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    let body_at = card.find(body).expect("тело в выводе карточки");
+    let crlf_card = format!(
+        "{}{}",
+        card[..body_at].replace('\n', "\r\n"),
+        body.replace('\n', "\r\n")
+    );
+
+    let text = call(
+        &tools,
+        "task_create",
+        json!({ "title": "t: CRLF create", "body": &crlf_card }),
+    )
+    .await
+    .expect("create ок");
+    let created = memory
+        .read_issue("Задачи uwuwu", receipt_number(&text))
+        .await
+        .expect("read")
+        .body;
+    assert!(!created.contains("--- fm ---"), "fm вырезан: {created}");
+    assert!(
+        !created.contains("t: источник CRLF"),
+        "тайтл-строка вырезана: {created}"
+    );
+    assert!(
+        created.contains("чистое тело носителя."),
+        "тело доставлено: {created}"
+    );
+}
+
+/// Тестер #1637 (Low код-ревью): точный оракул на связке MCP — create из
+/// CRLF-копии карточки даёт те же байты, что create из чистого CRLF-тела.
+/// Прежний пин проверял только `contains` и пропустил бы обрезку тела.
+#[tokio::test]
+async fn task_create_strips_crlf_card_header_byte_exact() {
+    let (tools, memory) = hub();
+    let body = "## Постановка\r\n\r\nчистое тело.\r\n";
+    let (number, _) = create_task(&tools, "t: CRLF-источник точного оракула", body).await;
+    let card = call(&tools, "task_get", json!({ "number": number }))
+        .await
+        .expect("get");
+    let body_at = card.find(body).expect("тело в выводе карточки");
+    let crlf_card = format!("{}{}", card[..body_at].replace('\n', "\r\n"), body);
+
+    let (control, _) = create_task(&tools, "t: контроль CRLF create", body).await;
+    let control_stored = memory
+        .read_issue("Задачи uwuwu", control)
+        .await
+        .expect("read control")
+        .body;
+
+    let text = call(
+        &tools,
+        "task_create",
+        json!({ "title": "t: CRLF create точный оракул", "body": &crlf_card }),
+    )
+    .await
+    .expect("task_create");
+    let created = memory
+        .read_issue("Задачи uwuwu", receipt_number(&text))
+        .await
+        .expect("read created")
+        .body;
+    assert_eq!(
+        created, control_stored,
+        "create из CRLF-копии = create из чистого тела, байт-в-байт: {created}"
+    );
+    assert!(
+        !created.contains("t: CRLF-источник точного оракула"),
+        "тайтл-строка рендера не легла: {created}"
+    );
+    assert!(!created.contains("--- fm ---"), "fm-блок не лёг: {created}");
+}
+
 /// #1604 (ревью раунда 5, Low-2): строгость зеркала держится и на
 /// актуальной 8-ключевой форме (fact_track + body_bytes после слива
 /// #1631) — чужая строка между type и body_hash ломает срез, и вся
