@@ -107,19 +107,7 @@ impl BlobUseCase {
             )));
         }
         let sha8 = sha8_hex(bytes);
-        // Реюз санитайза #1171: сепараторы/control → '_', вырожденное
-        // имя → фолбэк file-<sha8>.bin (sha8 уникализует).
-        let name = normalize_asset_name(Some(&target.filename), MediaKind::Document, &sha8);
-        let task_segment = target
-            .task
-            .map_or_else(|| "misc".to_string(), |n| n.to_string());
-        let raw_key = format!(
-            "blobs/{}/{task_segment}/{sha8}-{name}",
-            target.project.trim()
-        );
-        let key = BlobKey::parse(&raw_key).ok_or_else(|| {
-            UsecaseError::BlobBadKey(format!("the dedup key failed the guard: {raw_key}"))
-        })?;
+        let (key, name) = build_key(target, &sha8)?;
         let content_type = content_type_for(&name);
         store.put(&key, &content_type, bytes).await?;
         let url = store.presign_get_url(&key);
@@ -136,17 +124,7 @@ impl BlobUseCase {
     pub fn reserve(&self, target: &BlobPlace) -> UsecaseResult<BlobReserveReceipt> {
         let store = self.store()?;
         let upload_id = Uuid::new_v4().to_string();
-        let name = normalize_asset_name(Some(&target.filename), MediaKind::Document, &upload_id);
-        let task_segment = target
-            .task
-            .map_or_else(|| "misc".to_string(), |n| n.to_string());
-        let raw_key = format!(
-            "blobs/{}/{task_segment}/{upload_id}-{name}",
-            target.project.trim()
-        );
-        let key = BlobKey::parse(&raw_key).ok_or_else(|| {
-            UsecaseError::BlobBadKey(format!("the reserve key failed the guard: {raw_key}"))
-        })?;
+        let (key, name) = build_key(target, &upload_id)?;
         let content_type = content_type_for(&name);
         Ok(BlobReserveReceipt {
             put_url: store.presign_put_url(&key, &content_type),
@@ -162,6 +140,21 @@ impl BlobUseCase {
     pub fn fresh_url(&self, key: &BlobKey) -> UsecaseResult<String> {
         Ok(self.store()?.presign_get_url(key))
     }
+}
+
+/// Единый канон ключа для обоих режимов: `<project>/<task|misc>/<id>-<name>`.
+/// Реюз санитайза #1171: сепараторы/control → '_', вырожденное имя →
+/// фолбэк `file-<id>.bin`. `<id>` — sha8 байтов или UUID загрузки.
+fn build_key(target: &BlobPlace, id: &str) -> UsecaseResult<(BlobKey, String)> {
+    let name = normalize_asset_name(Some(&target.filename), MediaKind::Document, id);
+    let task_segment = target
+        .task
+        .map_or_else(|| "misc".to_string(), |n| n.to_string());
+    let raw_key = format!("blobs/{}/{task_segment}/{id}-{name}", target.project.trim());
+    let key = BlobKey::parse(&raw_key).ok_or_else(|| {
+        UsecaseError::BlobBadKey(format!("the blob key failed the guard: {raw_key}"))
+    })?;
+    Ok((key, name))
 }
 
 /// Первые 8 hex SHA-256: дедуп-сегмент ключа (одинаковые байты → один ключ).

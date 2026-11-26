@@ -1941,6 +1941,28 @@ async fn blob_put_empty_data_base64_is_loud_instead_of_silent_reserve() {
 }
 
 #[tokio::test]
+async fn blob_put_null_data_base64_reserves_and_wrong_type_is_loud() {
+    let (tools, _memory) = hub();
+    let reserved = call(
+        &tools,
+        "blob_put",
+        json!({ "filename": "a.png", "data_base64": null }),
+    )
+    .await
+    .expect("null — отсутствие значения, как в optional_number");
+    assert!(reserved.contains("PUT URL"), "{reserved}");
+
+    let err = call(
+        &tools,
+        "blob_put",
+        json!({ "filename": "a.png", "data_base64": 42 }),
+    )
+    .await
+    .expect_err("громкий отказ на не-строку");
+    assert!(err.contains("data_base64 must be a base64 string"), "{err}");
+}
+
+#[tokio::test]
 async fn blob_put_without_number_goes_to_misc_segment() {
     let (tools, _memory) = hub();
     let put = call(

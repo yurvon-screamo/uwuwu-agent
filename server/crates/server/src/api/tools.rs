@@ -996,42 +996,36 @@ impl ToolHub {
             task: number,
             filename: arg_str(args, "filename"),
         };
-        match args.get("data_base64") {
-            None => self.blob_put_reserve(&target),
-            Some(value) => {
-                let data_base64 = value
-                    .as_str()
-                    .filter(|raw| !raw.trim().is_empty())
-                    .ok_or("data_base64 is empty; omit it for the presigned PUT mode")?;
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(data_base64.trim())
-                    .map_err(|e| format!("data_base64 does not decode: {e}"))?;
-                let receipt = self
-                    .blobs
-                    .place(&target, &bytes)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                ok_text(format!(
-                    "key: {}\nURL (TTL 7 days): {}\n{}; {} bytes",
-                    receipt.key, receipt.url, receipt.content_type, receipt.size
-                ))
+        let data_base64 = match args.get("data_base64") {
+            None | Some(Value::Null) => return self.blob_put_reserve(&target),
+            Some(Value::String(raw)) if !raw.trim().is_empty() => raw.trim(),
+            Some(Value::String(_)) => {
+                return Err("data_base64 is empty; omit it for the presigned PUT mode".into())
             }
-        }
+            Some(_) => return Err("data_base64 must be a base64 string".into()),
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data_base64)
+            .map_err(|e| format!("data_base64 does not decode: {e}"))?;
+        let receipt = self
+            .blobs
+            .place(&target, &bytes)
+            .await
+            .map_err(|e| e.to_string())?;
+        ok_text(format!(
+            "key: {}\nURL (TTL 7 days): {}\n{}; {} bytes",
+            receipt.key, receipt.url, receipt.content_type, receipt.size
+        ))
     }
 
     fn blob_put_reserve(&self, target: &BlobPlace) -> Result<Value, String> {
         let receipt = self.blobs.reserve(target).map_err(|e| e.to_string())?;
         ok_text(format!(
             "key: {}\nPUT URL (TTL {} s; send Content-Type: {}): {}\n\
-             URL (TTL 7 days): {}\n{}\n\
+             URL (TTL 7 days): {}\n\
              upload the bytes with curl from the shell; verify the GET URL before \
              writing the link, and reuse the key from this receipt",
-            receipt.key,
-            receipt.put_ttl_secs,
-            receipt.content_type,
-            receipt.put_url,
-            receipt.url,
-            receipt.content_type
+            receipt.key, receipt.put_ttl_secs, receipt.content_type, receipt.put_url, receipt.url
         ))
     }
 
@@ -1091,7 +1085,8 @@ fn require_args(args: &Value, keys: &[&str]) -> Result<(), String> {
     if all_filled {
         return Ok(());
     }
-    Err(format!("{} are required", keys.join(" and ")))
+    let verb = if keys.len() == 1 { "is" } else { "are" };
+    Err(format!("{} {} required", keys.join(" and "), verb))
 }
 
 /// message из аргументов или дефолт (например, «append: слаг»).
