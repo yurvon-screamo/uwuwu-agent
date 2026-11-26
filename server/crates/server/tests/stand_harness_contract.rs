@@ -17,6 +17,7 @@ use common::stand::{e2e_enabled, log_tail, Stand};
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// Прецедент гард-уборки: `tests/search/churn_maintenance.rs` (`TempDirGuard`),
 /// `src/rename_journal_test_support.rs` (`TempDir`). Каталог убирается и при
@@ -118,20 +119,24 @@ fn process_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-/// Гард обязан убить и убрать ОБА процесса. Холостые `sleep` вместо сервера
-/// и мока: проверяется только `Drop`, а не спавн/health. Структура `Stand`
-/// собрана напрямую — её поля pub, доступ к хелперам спавна не нужен.
+/// Гард обязан убить и убрать ОБА процесса. Холостые `sleep 30` вместо
+/// сервера и мока: проверяется только `Drop`, а не спавн/health. Структура
+/// `Stand` собрана напрямую — её поля pub, доступ к хелперам спавна не нужен.
+///
+/// Два признака одного инварианта: PID мертвы после `drop` (убраны) И сам
+/// `drop` вернулся на порядок быстрее естественной смерти детей (убиты). Без второго
+/// ассерта гард без `kill()` ждёт 30 с и проходит как зелёный.
 #[test]
 fn stand_drop_kills_and_reaps_both_children() {
     let dir = TempDirGuard::new("drop");
     let mock = Command::new("sleep")
-        .arg("300")
+        .arg("30")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn dummy mock");
     let server = Command::new("sleep")
-        .arg("300")
+        .arg("30")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -149,7 +154,13 @@ fn stand_drop_kills_and_reaps_both_children() {
     };
     assert!(process_alive(mock_pid), "холостой mock жив до drop");
     assert!(process_alive(server_pid), "холостой server жив до drop");
+    let started = Instant::now();
     drop(stand);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "Drop должен убить детей, а не ждать их естественной смерти: прошло {elapsed:?} при жизни sleep 30 с"
+    );
     assert!(
         !process_alive(mock_pid),
         "Drop обязан убить и убрать mock pid {mock_pid}"
