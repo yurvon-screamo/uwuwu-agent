@@ -216,14 +216,10 @@ pub(crate) fn jst_day_key(ms: u64) -> String {
 
 fn dreamer_prompt(target: &str) -> String {
     format!(
-        "Post-processing of a finished session {target} (the dreamer agent, methodology agents/dreamer).\n\n\
-         1. Read the session: uwuwu_session_export {{session: \"{target}\"}}\n\
-         2. Dedup: uwuwu_docs_ls / docs_read over Experience — «nothing to take» is a normal outcome,\n\
-            then just record that in your summary.\n\
-         3. Valuable: a class attribution into an existing experience article (uwuwu_docs_append),\n\
-            new articles — moderately; ADRs — only if an architectural decision was made.\n\
-         4. Doc hygiene: stale content/holes — point edits (uwuwu_docs_write).\n\
-         Act autonomously; the outcome — one brief line.",
+        "Post-processing of a finished session {target}.\n\
+         Methodology: agents/dreamer.md (loaded by opencode as your agent definition).\n\
+         Read the session: uwuwu_session_export {{session: \"{target}\"}}\n\
+         Act per that methodology; the outcome — one brief line.",
     )
 }
 
@@ -233,7 +229,7 @@ fn dreamer_prompt(target: &str) -> String {
 fn repeat_prompt(target: &str) -> String {
     format!(
         "Repeat run: session {target} gained new messages after the previous dream.\n\
-         Re-read the export (uwuwu_session_export {{session: \"{target}\"}}) and process the delta:\n\
-         dedup against what is already recorded, class attributions, doc hygiene. Outcome — one brief line.",
+         Re-read the export (uwuwu_session_export {{session: \"{target}\"}}) and process only the delta.\n\
+         Methodology: agents/dreamer.md. Outcome — one brief line.",
     )
 }

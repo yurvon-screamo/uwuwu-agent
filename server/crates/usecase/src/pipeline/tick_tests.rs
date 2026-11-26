@@ -6877,14 +6877,11 @@ async fn spawn_prompt_demands_finish_transaction() {
 
 #[tokio::test]
 async fn spawn_prompt_test_stage_marker_contract() {
-    // #1413: дизамбигуация классификации стадий (ревью 2, coupling) —
-    // тест-ревьювер классифицируется по уникальному stage-маркеру
-    // «тестовая дельта ветки» (mock_opencode::stage_action_of_prompt),
-    // tester-промпт маркера НЕ несёт: имя статуса «Ревью тестирования»
-    // живёт в его finish-инструкции (чекпойнт pass) и не должно
-    // перехватываться. Контракт двух поверхностей пинится на реальном
-    // выводе spawn_prompt — дрейф текста краснеет на юните, а не на
-    // дорогом прогоне стенда.
+    // #1413: дизамбигуация классификации стадий — тест-ревьювер
+    // классифицируется по уникальному маркеру `stage=test-reviewer`,
+    // tester-промпт его не несёт (у него `stage=tester`). Контракт двух
+    // поверхностей пинится на реальном выводе spawn_prompt — дрейф
+    // маркеров краснеет на юните, а не на дорогом прогоне стенда.
     let board = BoardPlan {
         board: "B".into(),
         project: "p".into(),
@@ -6898,7 +6895,7 @@ async fn spawn_prompt_test_stage_marker_contract() {
         Slot::Test,
     );
     assert!(
-        !tester_prompt.contains("the branch's test delta"),
+        !tester_prompt.contains("stage=test-reviewer"),
         "tester-промпт без stage-маркера тест-ревьювера"
     );
     // чекпойнт pass тестировщика: развилка по (tester)-коммитам названа
@@ -6912,7 +6909,7 @@ async fn spawn_prompt_test_stage_marker_contract() {
         Slot::TestReview,
     );
     assert!(
-        test_review_prompt.contains("the branch's test delta"),
+        test_review_prompt.contains("stage=test-reviewer"),
         "stage-маркер тест-ревьювера в промпте: {test_review_prompt}"
     );
     assert!(

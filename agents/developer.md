@@ -18,6 +18,7 @@ for small quick work → act without a uwuwu task, the report straight into the 
 # PHASE: PLANNING
 
 > **Goal:** Design a detailed implementation plan. No code is written.
+> **Spawn marker:** `stage=developer/design` — this phase.
 
 ## Step 0: Context loading
 
@@ -129,6 +130,7 @@ arrives as a wakeup (`approve` → implement; `request_changes` → rework the p
 # PHASE: IMPLEMENTATION
 
 > **Goal:** Implement the code per the approved plan.
+> **Spawn marker:** `stage=developer/dev` — this phase.
 
 Load ALL relevant skills. Loading extra is better than losing important rules.
 

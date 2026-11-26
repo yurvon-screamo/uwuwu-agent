@@ -1041,36 +1041,17 @@ fn session_title(task: &Task, slot: Slot) -> String {
     format!("#{} {} {}", task.number(), slot.emoji(), task.title())
 }
 
-/// Дословные строки стадий в spawn_prompt — контракт мок-стенда:
+/// Маркеры слотов в spawn_prompt — контракт мок-стенда:
 /// `mock_opencode::stage_action_of_prompt` классифицирует спавн по этим
-/// фрагментам (импортирует константу — правка стадии через этот массив,
-/// расхождение источника и мока ловится тестом
-/// `stage_prompts_spawned_per_slot`).
+/// фрагментам (импортирует константу). Методика стадии живёт в дефе агента,
+/// сервер шлёт только данные, маркер и указатель на носитель.
 pub const STAGE_PROMPTS: &[(Slot, &str)] = &[
-    (
-        Slot::Design,
-        "design stage: study the statement, clarify with the owner, build the plan",
-    ),
-    (
-        Slot::Dev,
-        "implementation per the approved plan; run the task per the AGENTS.md canon",
-    ),
-    (
-        Slot::PlanReview,
-        "plan review: paraphrase/zoom-out/readiness, verdict in a comment",
-    ),
-    (
-        Slot::ResultReview,
-        "result review: code/CI/report, verdict in a comment",
-    ),
-    (
-        Slot::Test,
-        "testing: feature quality, pass/fail verdict with steps",
-    ),
-    (
-        Slot::TestReview,
-        "testing review: the branch's test delta, verdict in a comment",
-    ),
+    (Slot::Design, "stage=developer/design"),
+    (Slot::Dev, "stage=developer/dev"),
+    (Slot::PlanReview, "stage=plan-reviewer"),
+    (Slot::ResultReview, "stage=code-quality-reviewer"),
+    (Slot::Test, "stage=tester"),
+    (Slot::TestReview, "stage=test-reviewer"),
 ];
 
 pub(crate) fn spawn_prompt(board: &BoardPlan, task: &Task, slot: Slot) -> String {
@@ -1078,6 +1059,9 @@ pub(crate) fn spawn_prompt(board: &BoardPlan, task: &Task, slot: Slot) -> String
         .iter()
         .find(|(s, _)| *s == slot)
         .map(|(_, m)| *m)
+        .unwrap_or_default();
+    let agent = Agent::of_slot(slot)
+        .map(naming::agent_name)
         .unwrap_or_default();
     let finish = match slot {
         Slot::Design => "plan into the body → set the status to «Plan review»",
@@ -1098,6 +1082,7 @@ pub(crate) fn spawn_prompt(board: &BoardPlan, task: &Task, slot: Slot) -> String
     format!(
         "Task #{number} «{title}» (board «{board}», project {project}).\n\
          You are a uwuwu pipeline agent (repo canon). {stage}.\n\
+         Methodology: agents/{agent}.md (loaded by opencode as your agent definition).\n\
          \n\
          ⚠ Turn contract: your session SLEEPS after the reply — the pipeline will not\n\
          continue until you close the transaction. Do not end the turn without one of:\n\
@@ -1123,6 +1108,7 @@ pub(crate) fn spawn_prompt(board: &BoardPlan, task: &Task, slot: Slot) -> String
         title = task.title(),
         board = board.board,
         project = board.project,
+        agent = agent,
     )
 }
 

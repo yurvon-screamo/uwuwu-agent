@@ -357,19 +357,9 @@ pub(crate) fn analyst_review_prompt(project: &str, rows: &[&Task]) -> String {
     }
     format!(
         "{marker} — rows in Review Analys, the whole wave:\n\n{list}\n\
-         Act per the repo methodology agents/analyst-reviewer. For each row:\n\
-         1. uwuwu_task_get {{number}} — the reworked body; verify against the request sources\n\
-            (Design Spec/README/ADRs/owner quotes): every requirement has a source;\n\
-            invented = request_changes.\n\
-         2. Optics: sourcing; form/dedup (title specificity, body per the type's TASK-TEMPLATE\n\
-            skeleton); proportionality (a spike not crushed by feature frames); readiness (the\n\
-            statement can be taken into work).\n\
-         3. Verdicts: approve → uwuwu_task_edit {{number, status: \"Todo\"}};\n\
-            request_changes → uwuwu_task_edit {{number, status: \"Analys\"}} + remarks in comments\n\
-            (the round guard counts the rounds); a real problem → Needs attention.\n\
+         Methodology: agents/analyst-reviewer.md (loaded by opencode as your agent definition).\n\
+         Act per that methodology for every row.\n\
          After an owner reply in chat, fix it verbatim in the body/thread and pass\n\
-         owner_answer with the source status when clearing Needs attention.\n\
-         The report — one comment per row (verdict + brief reason); no\n\
-         separate wave summary posts beyond those comments."
+         owner_answer with the source status when clearing Needs attention."
     )
 }
