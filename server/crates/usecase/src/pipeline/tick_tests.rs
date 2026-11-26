@@ -2,7 +2,9 @@
 //! юзкейсы — с фейками, без сети/досок).
 
 use crate::error::{UsecaseError, UsecaseResult};
-use crate::pipeline::tick::{BoardPlan, Mode, TickPlan, TickUseCase, PROBE_DEGRADE_MIN_ROWS};
+use crate::pipeline::tick::{
+    BoardPlan, Mode, TickOutcome, TickPlan, TickUseCase, PROBE_DEGRADE_MIN_ROWS,
+};
 use crate::ports::{
     AgentSessionGateway, Clock, CommentRef, DecisionJudge, DreamerMark, JudgeCfg, Liveness,
     PrGateway, PrProbe, PrState, QuotaProbe, SessionSpec, TaskBoardRepo, TickStateStore,
@@ -2810,8 +2812,8 @@ async fn spawn_loop_escalation_flags_attention_and_notifies_owner() {
 }
 
 /// Композиция тика после разнесения `process_row` по хелперам: один проход
-/// по смешанной доске отрабатывает все три ветки `decide` и эскалацию
-/// петель, не теряя счётчиков и записей на носителе. Пин именно observable
+/// по смешанной доске отрабатывает все три ветки `decide`, эскалацию петель
+/// и кап, не теряя счётчиков и записей на носителе. Пин именно observable
 /// исхода — перестановка хелперов без смены поведения тест не ломает, а
 /// потеря ветки/счётчика/записи ломает.
 #[tokio::test]
@@ -2829,10 +2831,11 @@ async fn one_tick_keeps_all_branch_outcomes_and_carrier_writes() {
     carrier(&mut carrier_row, 11, true);
     let (u, board, sessions, prs) = usecase_with_state(
         vec![
-            task(10, Status::InProgress), // Spawn
+            task(10, Status::InProgress), // Spawn — занимает единственный слот
             carrier_row,                  // Automerge
             task(12, Status::Todo),       // Observe
             task(14, Status::InProgress), // эскалация спавн-петли
+            task(15, Status::InProgress), // второй кандидат — удержан капом
         ],
         PrState::Open {
             mergeable: true,
@@ -2843,17 +2846,24 @@ async fn one_tick_keeps_all_branch_outcomes_and_carrier_writes() {
     *prs.url.lock().unwrap() = Some("https://github.com/a/c/pull/11".into());
 
     // Act
-    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
 
     // Assert
-    assert_eq!(out.rows_total, 4, "все четыре строки вошли в обход");
-    assert_eq!(out.spawns_done, 1, "спавн — только прямая строка #10");
-    assert_eq!(out.spawns_allowed, 1, "эскалация не занимает слот капа");
-    assert_eq!(out.automerged, 1, "зелёный PR #11 замержен");
-    assert_eq!(out.observed, 1, "строка #12 ожидает владельца");
+    // `rows_total` считается при чтении доски, до построения очереди;
+    // весь outcome целиком ловит и потерю ветки, и шум в любом счётчике.
     assert_eq!(
-        out.attention_flagged, 1,
-        "пятый спавн #14 без прогресса — эскалация"
+        out,
+        TickOutcome {
+            rows_total: 5,
+            spawns_allowed: 1,
+            spawns_done: 1,
+            held_cup: 1,
+            observed: 1,
+            automerged: 1,
+            attention_flagged: 1,
+            ..Default::default()
+        },
+        "весь outcome тика: шум в любом счётчике ломает композицию"
     );
     let specs = sessions.specs.lock().unwrap().clone();
     assert_eq!(specs.len(), 2, "bootstrap + рабочая сессия: {specs:?}");
@@ -2872,11 +2882,13 @@ async fn one_tick_keeps_all_branch_outcomes_and_carrier_writes() {
         "мерж не трогает статус строки #11: {log:?}"
     );
     assert!(
-        log.iter().any(|l| l == "status#14=NeedsAttention")
-            && log
-                .iter()
-                .any(|l| l.starts_with("comment#14=") && l.contains("Spawn loop")),
-        "эскалация #14 записала статус и коммент владельцу: {log:?}"
+        log.iter().any(|l| l == "status#14=NeedsAttention"),
+        "эскалация #14 записала статус: {log:?}"
+    );
+    assert!(
+        log.iter()
+            .any(|l| l.starts_with("comment#14=") && l.contains("Spawn loop")),
+        "эскалация #14 оставила коммент владельцу: {log:?}"
     );
     assert!(
         !log.iter().any(|l| l.starts_with("session#14=")),
@@ -13532,16 +13544,16 @@ fn candidate_queue_keeps_continuation_tier_and_priority_order() {
     newcomer_high.set_priority(Priority::High);
     let mut continuation_high = task(202, Status::InProgress);
     continuation_high.set_priority(Priority::High);
-    let continuation_low_b1 = task(103, Status::InProgress);
-    let continuation_low_b2 = task(203, Status::InProgress);
+    let continuation_empty_b1 = task(103, Status::InProgress);
+    let continuation_empty_b2 = task(203, Status::InProgress);
     let mut boards = vec![
         (
             &b1,
-            vec![newcomer_low, continuation_medium, continuation_low_b1],
+            vec![newcomer_low, continuation_medium, continuation_empty_b1],
         ),
         (
             &b2,
-            vec![newcomer_high, continuation_high, continuation_low_b2],
+            vec![newcomer_high, continuation_high, continuation_empty_b2],
         ),
     ];
 
