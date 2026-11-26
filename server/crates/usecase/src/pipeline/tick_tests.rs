@@ -2809,6 +2809,81 @@ async fn spawn_loop_escalation_flags_attention_and_notifies_owner() {
     );
 }
 
+/// Композиция тика после разнесения `process_row` по хелперам: один проход
+/// по смешанной доске отрабатывает все три ветки `decide` и эскалацию
+/// петель, не теряя счётчиков и записей на носителе. Пин именно observable
+/// исхода — перестановка хелперов без смены поведения тест не ломает, а
+/// потеря ветки/счётчика/записи ломает.
+#[tokio::test]
+async fn one_tick_keeps_all_branch_outcomes_and_carrier_writes() {
+    // Arrange
+    let state = Arc::new(MemState(Mutex::default()));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .loops
+        .push((14, Slot::Dev, Status::InProgress, 4));
+    state.set_last_seen_status("B", 14, Status::InProgress);
+    let mut carrier_row = task(11, Status::UserReview);
+    carrier(&mut carrier_row, 11, true);
+    let (u, board, sessions, prs) = usecase_with_state(
+        vec![
+            task(10, Status::InProgress), // Spawn
+            carrier_row,                  // Automerge
+            task(12, Status::Todo),       // Observe
+            task(14, Status::InProgress), // эскалация спавн-петли
+        ],
+        PrState::Open {
+            mergeable: true,
+            ci_green: true,
+        },
+        state,
+    );
+    *prs.url.lock().unwrap() = Some("https://github.com/a/c/pull/11".into());
+
+    // Act
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+
+    // Assert
+    assert_eq!(out.rows_total, 4, "все четыре строки вошли в обход");
+    assert_eq!(out.spawns_done, 1, "спавн — только прямая строка #10");
+    assert_eq!(out.spawns_allowed, 1, "эскалация не занимает слот капа");
+    assert_eq!(out.automerged, 1, "зелёный PR #11 замержен");
+    assert_eq!(out.observed, 1, "строка #12 ожидает владельца");
+    assert_eq!(
+        out.attention_flagged, 1,
+        "пятый спавн #14 без прогресса — эскалация"
+    );
+    let specs = sessions.specs.lock().unwrap().clone();
+    assert_eq!(specs.len(), 2, "bootstrap + рабочая сессия: {specs:?}");
+    assert!(
+        specs.iter().all(|s| s.title.contains("#10")),
+        "сессии созданы только для строки #10: {specs:?}"
+    );
+    assert_eq!(prs.merges.lock().unwrap().len(), 1, "один мерж");
+    let log = board.log.lock().unwrap();
+    assert!(
+        log.iter().any(|l| l.starts_with("session#10=")),
+        "дев-ячейка #10 записана: {log:?}"
+    );
+    assert!(
+        !log.iter().any(|l| l.starts_with("status#11")),
+        "мерж не трогает статус строки #11: {log:?}"
+    );
+    assert!(
+        log.iter().any(|l| l == "status#14=NeedsAttention")
+            && log
+                .iter()
+                .any(|l| l.starts_with("comment#14=") && l.contains("Spawn loop")),
+        "эскалация #14 записала статус и коммент владельцу: {log:?}"
+    );
+    assert!(
+        !log.iter().any(|l| l.starts_with("session#14=")),
+        "эскалация не создаёт сессию: {log:?}"
+    );
+}
+
 #[tokio::test]
 async fn status_journey_resets_loop_counter() {
     // Счётчик (In Progress, 2) пережил путь IP→Design→Ревью плана→IP:
