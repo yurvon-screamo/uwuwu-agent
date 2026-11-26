@@ -2059,6 +2059,67 @@ async fn blob_put_returns_key_and_url_get_resigns_by_key() {
 }
 
 #[tokio::test]
+async fn blob_put_presign_mode_returns_both_urls_without_bytes() {
+    let (tools, _memory) = hub();
+    let put = call(
+        &tools,
+        "blob_put",
+        json!({ "filename": "скрин от МПНЧ.png", "number": 1537 }),
+    )
+    .await
+    .expect("reserve ok");
+    let key = put
+        .lines()
+        .find_map(|l| l.strip_prefix("key: "))
+        .expect("key in the receipt");
+    assert!(key.starts_with("blobs/uwuwu/1537/"), "{put}");
+    assert!(put.contains("PUT URL (TTL 300 s"), "{put}");
+    assert!(put.contains("memory-put://"), "{put}");
+    assert!(put.contains("URL (TTL 7 days): memory://"), "{put}");
+    assert!(put.contains("image/png"), "{put}");
+
+    let get = call(&tools, "blob_get", json!({ "key": key }))
+        .await
+        .expect("get ok");
+    assert!(get.contains(&format!("memory://{key}")), "{get}");
+}
+
+#[tokio::test]
+async fn blob_put_empty_data_base64_is_loud_instead_of_silent_reserve() {
+    let (tools, _memory) = hub();
+    let err = call(
+        &tools,
+        "blob_put",
+        json!({ "filename": "a.png", "data_base64": "   " }),
+    )
+    .await
+    .expect_err("громкий отказ");
+    assert!(err.contains("data_base64 is empty"), "{err}");
+}
+
+#[tokio::test]
+async fn blob_put_null_data_base64_reserves_and_wrong_type_is_loud() {
+    let (tools, _memory) = hub();
+    let reserved = call(
+        &tools,
+        "blob_put",
+        json!({ "filename": "a.png", "data_base64": null }),
+    )
+    .await
+    .expect("null — отсутствие значения, как в optional_number");
+    assert!(reserved.contains("PUT URL"), "{reserved}");
+
+    let err = call(
+        &tools,
+        "blob_put",
+        json!({ "filename": "a.png", "data_base64": 42 }),
+    )
+    .await
+    .expect_err("громкий отказ на не-строку");
+    assert!(err.contains("data_base64 must be a base64 string"), "{err}");
+}
+
+#[tokio::test]
 async fn blob_put_without_number_goes_to_misc_segment() {
     let (tools, _memory) = hub();
     let put = call(
@@ -2127,18 +2188,19 @@ async fn blob_tools_fail_loud_without_env() {
         blob_usecase_missing(&["UWUWU_S3_ENDPOINT", "UWUWU_S3_BUCKET"]),
         Arc::new(StubCronState::default()),
     );
-    let err = call(
-        &tools,
-        "blob_put",
+    for args in [
         json!({ "filename": "a.png", "data_base64": base64_of(b"x") }),
-    )
-    .await
-    .expect_err("громкий отказ");
-    assert!(err.contains("blob is not configured"), "{err}");
-    assert!(
-        err.contains("UWUWU_S3_ENDPOINT") && err.contains("UWUWU_S3_BUCKET"),
-        "{err}"
-    );
+        json!({ "filename": "a.png" }),
+    ] {
+        let err = call(&tools, "blob_put", args)
+            .await
+            .expect_err("громкий отказ");
+        assert!(err.contains("blob is not configured"), "{err}");
+        assert!(
+            err.contains("UWUWU_S3_ENDPOINT") && err.contains("UWUWU_S3_BUCKET"),
+            "{err}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2837,6 +2899,184 @@ async fn radical_shrink_with_confirm_writes_and_receipt_carries_lengths() {
         stored.contains("короткий хвост"),
         "контент записан: {stored}"
     );
+}
+
+/// Приёмка пресайн-режима на проводе (#1537): тот же вызов, что делает
+/// агент (JSON-RPC `tools/call` через MCP-роутер), затем заливка байтов
+/// `reqwest::put` по URL из квитанции и чтение по GET-пресайну из неё же.
+/// Носитель — локальный HTTP-фейк: тест воспроизводим изолированно, не
+/// опирается на прод-бакет и не закрепляет протухшие пресайны.
+#[tokio::test]
+async fn blob_put_presign_mode_e2e_over_mcp_wire_with_local_http_store() {
+    use super::test_support::{call_tool_wire, BlobHttpFake, BlobObjects};
+    use crate::api::McpState;
+    use axum::http::StatusCode;
+
+    /// Пейлоад загрузки: та же строка служит иглой для оракула «байты не
+    /// едут в контекст» и телом PUT — иначе ассерт не может упасть.
+    const AGENT_BYTES: &[u8] = b"E2E-1537-agent-bytes";
+
+    struct TestHttpStore {
+        fake: BlobHttpFake,
+    }
+
+    #[async_trait::async_trait]
+    impl uwuwu_usecase::BlobStore for TestHttpStore {
+        async fn put(
+            &self,
+            key: &uwuwu_domain::BlobKey,
+            content_type: &str,
+            bytes: &[u8],
+        ) -> uwuwu_usecase::UsecaseResult<()> {
+            self.fake.objects.lock().expect("lock").insert(
+                key.as_str().to_string(),
+                (bytes.to_vec(), content_type.to_string()),
+            );
+            Ok(())
+        }
+        fn presign_get_url(&self, key: &uwuwu_domain::BlobKey) -> String {
+            self.fake.agent_get_url(key.as_str())
+        }
+        fn presign_put_url(&self, key: &uwuwu_domain::BlobKey, _content_type: &str) -> String {
+            self.fake.agent_put_url(key.as_str())
+        }
+    }
+
+    /// Общий `tools/call` по проводу; эта приёмка ждёт успешный текст
+    /// квитанции, а не голый JSON-RPC.
+    async fn wire_call(app: &axum::Router, name: &str, args: Value) -> String {
+        let (status, msg) = call_tool_wire(app, name, args, "wire-bearer").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(msg["result"]["isError"], json!(false), "{msg}");
+        msg["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    let fake = BlobHttpFake::start().await;
+    let objects: BlobObjects = fake.objects.clone();
+    let store = Arc::new(TestHttpStore { fake });
+    let (tools, _memory) = tool_hub(
+        Arc::new(StubWiki),
+        Arc::new(uwuwu_usecase::BlobUseCase::ready(store)),
+        Arc::new(StubCronState::default()),
+    );
+    let mcp = crate::api::mcp_router(Arc::new(McpState {
+        bearer: Arc::new("wire-bearer".to_string()),
+        tools,
+    }));
+
+    // Шаг 1 агента: резервирование без байтов — квитанция несёт только
+    // ключ и две ссылки (никакого payload в dehydrated-ответе).
+    let receipt = wire_call(
+        &mcp,
+        "blob_put",
+        json!({ "filename": "скрин 1537.png", "number": 1537 }),
+    )
+    .await;
+    let put_line = receipt
+        .lines()
+        .find(|l| l.starts_with("PUT URL "))
+        .expect("PUT URL в квитанции");
+    let put_url = put_line.rsplit(": ").next().expect("put url").to_string();
+    let content_type = put_line
+        .split("send Content-Type: ")
+        .nth(1)
+        .expect("content-type в подписи")
+        .split("):")
+        .next()
+        .expect("content-type value")
+        .to_string();
+    let get_url = receipt
+        .lines()
+        .find(|l| l.starts_with("URL (TTL 7 days): "))
+        .expect("GET URL в квитанции")
+        .rsplit(": ")
+        .next()
+        .expect("get url")
+        .to_string();
+    let key = receipt
+        .lines()
+        .find_map(|l| l.strip_prefix("key: "))
+        .expect("key в квитанции")
+        .to_string();
+    assert!(key.starts_with("blobs/uwuwu/1537/"), "{receipt}");
+    assert!(
+        put_url.contains(&key),
+        "PUT подписан на тот же ключ: {receipt}"
+    );
+    assert!(
+        get_url.contains(&key),
+        "GET подписан на тот же ключ: {receipt}"
+    );
+    assert_eq!(content_type, "image/png");
+    // Оракул НФТ: в dehydrated-ответе — ключ и ссылки, не байты. Потолок
+    // размера ловит даже скрытый base64-пакет (мутация +450 КБ → красный),
+    // а игла — дословный пейлоад загрузки, а не похожая фраза.
+    assert!(
+        receipt.len() < 4096,
+        "квитанция несёт только ключ и URL, а не байты: {} байт",
+        receipt.len()
+    );
+    assert!(
+        !receipt.contains(std::str::from_utf8(AGENT_BYTES).expect("utf8 payload")),
+        "байты загрузки едут в квитанции"
+    );
+
+    // Шаг 2: байты идут из shell мимо контекста — здесь HTTP-клиент на URL
+    // из квитанции с Content-Type из неё же. Саму подпись Content-Type
+    // держат пин адаптера в s3.rs и живой прогон Tigris; этот тест проверяет,
+    // что тип из квитанции доходит до носителя.
+    let status = reqwest::Client::new()
+        .put(&put_url)
+        .header("content-type", &content_type)
+        .body(AGENT_BYTES.to_vec())
+        .send()
+        .await
+        .expect("PUT by presigned URL")
+        .status();
+    assert_eq!(status, StatusCode::OK, "заливка через пресайн");
+    assert!(
+        objects
+            .lock()
+            .expect("lock")
+            .get(&key)
+            .is_some_and(|(b, ct)| b.as_slice() == AGENT_BYTES && ct == &content_type),
+        "байты и тип из квитанции дошли до носителя"
+    );
+
+    // Шаг 3: GET-пресайн из той же квитанции открывается и возвращает
+    // залитые байты; blob_get по ключу переподписывает GET и отдаёт их же.
+    let from_receipt = reqwest::get(&get_url)
+        .await
+        .expect("GET by presigned URL")
+        .error_for_status()
+        .expect("пресайн GET из квитанции")
+        .bytes()
+        .await
+        .expect("body");
+    assert_eq!(
+        from_receipt.as_ref(),
+        AGENT_BYTES,
+        "пресайн GET из квитанции вернул залитые байты"
+    );
+    let resign = wire_call(&mcp, "blob_get", json!({ "key": key })).await;
+    let resign_url = resign
+        .lines()
+        .next()
+        .expect("url line")
+        .rsplit(": ")
+        .next()
+        .expect("resigned url")
+        .to_string();
+    let got = reqwest::get(&resign_url)
+        .await
+        .expect("GET by resigned URL")
+        .bytes()
+        .await
+        .expect("body");
+    assert_eq!(got.as_ref(), AGENT_BYTES, "blob_get вернул залитые байты");
 }
 
 /// Строка в Needs attention для проб #1619: вопрос ушёл из Design.
@@ -3564,4 +3804,52 @@ async fn tester_clean_body_copy_is_not_overstripped() {
         .expect("read")
         .body;
     assert_eq!(stored, body, "чистое тело не тронуто");
+}
+
+/// Дельтовый пин Low-фикса (#1537): `data_base64: null` на проводе —
+/// резервирование (как отсутствие аргумента), не-строка — громкий отказ.
+/// Дев запинает диспетчер; здесь тот же контракт проверяется через
+/// JSON-RPC-роутер — тем вызовом, который делает агент.
+#[tokio::test]
+async fn blob_put_null_data_base64_reserves_over_wire_and_wrong_type_refuses() {
+    use super::test_support::call_tool_wire;
+    use crate::api::McpState;
+
+    let (tools, _memory) = hub();
+    let mcp = crate::api::mcp_router(Arc::new(McpState {
+        bearer: Arc::new("wire-bearer".to_string()),
+        tools,
+    }));
+
+    let (status, msg) = call_tool_wire(
+        &mcp,
+        "blob_put",
+        json!({ "filename": "null.png", "number": 1537, "data_base64": null }),
+        "wire-bearer",
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(msg["result"]["isError"], json!(false), "{msg}");
+    let receipt = msg["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(receipt.starts_with("key: blobs/uwuwu/1537/"), "{receipt}");
+    assert!(receipt.contains("PUT URL (TTL 300 s"), "{receipt}");
+    assert!(receipt.contains("URL (TTL 7 days): memory://"), "{receipt}");
+
+    let (_, wrong) = call_tool_wire(
+        &mcp,
+        "blob_put",
+        json!({ "filename": "a.png", "number": 1537, "data_base64": 42 }),
+        "wire-bearer",
+    )
+    .await;
+    assert_eq!(wrong["result"]["isError"], json!(true), "{wrong}");
+    assert!(
+        wrong["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("data_base64 must be a base64 string"),
+        "{wrong}"
+    );
 }

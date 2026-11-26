@@ -8,6 +8,7 @@ use crate::bots::MediaKind;
 use crate::error::{UsecaseError, UsecaseResult};
 use async_trait::async_trait;
 use std::sync::Arc;
+use uuid::Uuid;
 use uwuwu_domain::BlobKey;
 
 /// Потолок файла: прецедент UC-06 (Bot API getFile ≤ 20 MiB).
@@ -16,6 +17,10 @@ pub const BLOB_MAX_BYTES: usize = 20 * 1024 * 1024;
 /// Потолок SigV4: presigned URL живёт максимум 7 суток (604 800 с) —
 /// больше SigV4 не подписывает.
 pub const BLOB_PRESIGN_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Срок presigned PUT для заливки агентом: байты идут из shell мимо
+/// контекста модели; подпись живёт несколько минут, не сутки.
+pub const BLOB_PRESIGN_PUT_TTL_SECS: u64 = 5 * 60;
 
 /// Цель вложения: проект обязателен (сегмент ключа), задача опциональна
 /// (без неё сегмент `misc` — вложения к докам вики и пр.).
@@ -32,6 +37,9 @@ pub trait BlobStore: Send + Sync {
     /// Presign — локальная подпись, сетевых вызовов нет: URL на
     /// несуществующий ключ вернётся успешно (упадёт 403 при открытии).
     fn presign_get_url(&self, key: &BlobKey) -> String;
+    /// Presigned PUT ровно на этот ключ: агент заливает байты напрямую,
+    /// сервер их не видит. Content-Type входит в подпись.
+    fn presign_put_url(&self, key: &BlobKey, content_type: &str) -> String;
 }
 
 /// Квитанция blob_put: ключ + ссылка + фактический content-type/размер.
@@ -41,6 +49,16 @@ pub struct BlobPutReceipt {
     pub url: String,
     pub content_type: String,
     pub size: usize,
+}
+
+/// Квитанция резервирования: ключ и обе подписи, байты ещё не залиты.
+#[derive(Debug)]
+pub struct BlobReserveReceipt {
+    pub key: String,
+    pub put_url: String,
+    pub url: String,
+    pub content_type: String,
+    pub put_ttl_secs: u64,
 }
 
 /// Живой носитель или перечень недостающих env — громкий отказ (ADR-010):
@@ -89,19 +107,7 @@ impl BlobUseCase {
             )));
         }
         let sha8 = sha8_hex(bytes);
-        // Реюз санитайза #1171: сепараторы/control → '_', вырожденное
-        // имя → фолбэк file-<sha8>.bin (sha8 уникализует).
-        let name = normalize_asset_name(Some(&target.filename), MediaKind::Document, &sha8);
-        let task_segment = target
-            .task
-            .map_or_else(|| "misc".to_string(), |n| n.to_string());
-        let raw_key = format!(
-            "blobs/{}/{task_segment}/{sha8}-{name}",
-            target.project.trim()
-        );
-        let key = BlobKey::parse(&raw_key).ok_or_else(|| {
-            UsecaseError::BlobBadKey(format!("the dedup key failed the guard: {raw_key}"))
-        })?;
+        let (key, name) = build_key(target, &sha8)?;
         let content_type = content_type_for(&name);
         store.put(&key, &content_type, bytes).await?;
         let url = store.presign_get_url(&key);
@@ -113,11 +119,42 @@ impl BlobUseCase {
         })
     }
 
+    /// Резервирование ключа под прямую заливку: байты не приходят в тул,
+    /// поэтому дедуп по sha8 невозможен — каждый вызов даёт свежий UUID.
+    pub fn reserve(&self, target: &BlobPlace) -> UsecaseResult<BlobReserveReceipt> {
+        let store = self.store()?;
+        let upload_id = Uuid::new_v4().to_string();
+        let (key, name) = build_key(target, &upload_id)?;
+        let content_type = content_type_for(&name);
+        Ok(BlobReserveReceipt {
+            put_url: store.presign_put_url(&key, &content_type),
+            url: store.presign_get_url(&key),
+            key: key.as_str().to_string(),
+            content_type,
+            put_ttl_secs: BLOB_PRESIGN_PUT_TTL_SECS,
+        })
+    }
+
     /// Переподпись истёкшей ссылки по ключу. Носитель не правит — замену
     /// URL в теле/комменте/доке делает агент текстовыми тулами.
     pub fn fresh_url(&self, key: &BlobKey) -> UsecaseResult<String> {
         Ok(self.store()?.presign_get_url(key))
     }
+}
+
+/// Единый канон ключа для обоих режимов: `<project>/<task|misc>/<id>-<name>`.
+/// Реюз санитайза #1171: сепараторы/control → '_', вырожденное имя →
+/// фолбэк `file-<id>.bin`. `<id>` — sha8 байтов или UUID загрузки.
+fn build_key(target: &BlobPlace, id: &str) -> UsecaseResult<(BlobKey, String)> {
+    let name = normalize_asset_name(Some(&target.filename), MediaKind::Document, id);
+    let task_segment = target
+        .task
+        .map_or_else(|| "misc".to_string(), |n| n.to_string());
+    let raw_key = format!("blobs/{}/{task_segment}/{id}-{name}", target.project.trim());
+    let key = BlobKey::parse(&raw_key).ok_or_else(|| {
+        UsecaseError::BlobBadKey(format!("the blob key failed the guard: {raw_key}"))
+    })?;
+    Ok((key, name))
 }
 
 /// Первые 8 hex SHA-256: дедуп-сегмент ключа (одинаковые байты → один ключ).
