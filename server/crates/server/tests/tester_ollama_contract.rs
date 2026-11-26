@@ -61,6 +61,22 @@ fn read_request(sock: &mut std::net::TcpStream) -> Option<String> {
     Some(String::from_utf8_lossy(&buf[header_end..header_end + len]).into_owned())
 }
 
+/// Принимает соединение, не дожидаясь его вечно: mock живёт в потоке теста.
+fn accept_with_deadline(listener: &TcpListener, deadline: Instant) -> Option<std::net::TcpStream> {
+    loop {
+        match listener.accept() {
+            Ok((sock, _)) => return Some(sock),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
 impl MockEmbed {
     fn spawn(expected: usize) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
@@ -71,17 +87,9 @@ impl MockEmbed {
         let handle = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(5);
             for _ in 0..expected {
-                let (mut sock, _) = loop {
-                    match listener.accept() {
-                        Ok(pair) => break pair,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            if Instant::now() >= deadline {
-                                return;
-                            }
-                            thread::sleep(Duration::from_millis(10));
-                        }
-                        Err(_) => return,
-                    }
+                let mut sock = match accept_with_deadline(&listener, deadline) {
+                    Some(sock) => sock,
+                    None => return,
                 };
                 let _ = sock.set_read_timeout(Some(Duration::from_secs(5)));
                 let body = match read_request(&mut sock) {
