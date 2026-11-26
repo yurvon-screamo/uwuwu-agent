@@ -30,18 +30,24 @@ url = "https://opencode.uwuwu.net"
 # Карта моделей спавнов — единственный механизм конфигурации моделей
 # (#1154, решение владельца 17.11): модель кладётся сервером в тело
 # спавна; деф-файлы агентов (agents/*.md) моделей не несут.
-# Формат: "provider/id[#variant]". Ключ "default" — Dev/Design/bootstrap.
-# Отсутствие секции — канон владельца (SpawnModels::canonical).
+# Алиасы (#1684): raw-модель — на алиасе, агент ссылается на алиас.
+# Формат raw: "provider/id[#variant]". Отсутствие секции — канон владельца.
+[executor.model_aliases]
+flash = "opencode-go/hy4-flash-free#high"
+common = "opencode-go/muse-spark-1.3-contributor#high"
+smart = "zai-coding-plan/glm-5.4#high"
+
+# Ключ "default" — bootstrap-сессии; рабочие Design/Dev пишут "developer".
 [executor.models]
-default = "opencode-go/hy4-flash-free#high"
-developer = "opencode-go/hy4-flash-free#high"
-plan-reviewer = "zai-coding-plan/glm-5.4#high"
-code-quality-reviewer = "zai-coding-plan/glm-5.4#high"
-tester = "opencode-go/hy4-flash-free#high"
-test-reviewer = "zai-coding-plan/glm-5.4#high"
-analyst = "opencode-go/hy4-flash-free#high"
-analyst-reviewer = "zai-coding-plan/glm-5.4#high"
-dreamer = "opencode-go/hy4-flash-free#high"
+default = "flash"
+developer = "flash"
+plan-reviewer = "smart"
+code-quality-reviewer = "smart"
+tester = "common"
+test-reviewer = "smart"
+analyst = "flash"
+analyst-reviewer = "smart"
+dreamer = "common"
 
 [policy]
 cup = 10

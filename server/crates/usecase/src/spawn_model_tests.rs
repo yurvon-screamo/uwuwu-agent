@@ -435,7 +435,7 @@ async fn dreamer_spawn_carries_model_from_server_map() {
     assert_model(
         sessions.spec_of(),
         "дример-спавн",
-        "opencode-go/hy4-flash-free#high",
+        "opencode-go/muse-spark-1.3-contributor#high",
     );
 }
 

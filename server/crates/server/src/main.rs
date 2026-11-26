@@ -290,20 +290,12 @@ async fn run(
         cfg.state_path(&config_path)
             .with_file_name("rename-pre-image.json"),
     ));
-    let spawn_models = Arc::new(match cfg.executor.models.as_ref() {
-        Some(raw) => {
-            let mut map = std::collections::HashMap::new();
-            for (key, model) in raw {
-                map.insert(
-                    key.clone(),
-                    uwuwu_domain::SpawnModel::parse(model)
-                        .map_err(|e| format!("[executor.models] {key}: {e}"))?,
-                );
-            }
-            uwuwu_usecase::SpawnModels::new(map)
-        }
-        None => uwuwu_usecase::SpawnModels::canonical(),
-    });
+    // Два слоя карты моделей (#1684): алиасы несут raw, агенты ссылаются
+    // на алиас. Ошибка любого слоя — отказ старта, не тихий фоллбэк.
+    let spawn_models = Arc::new(uwuwu_usecase::SpawnModels::from_config(
+        cfg.executor.model_aliases.as_ref(),
+        cfg.executor.models.as_ref(),
+    )?);
     // Судья (#1364): opt-in владельца ([judge].enabled) + живой ключ.
     // Нет ключа — громкий warn и контур off (тик живёт старой механикой).
     let (judge, judge_cfg): (

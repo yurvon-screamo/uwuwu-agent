@@ -41,10 +41,13 @@ fn default_hub_driver() -> String {
 pub struct ExecutorCfg {
     pub name: String,
     pub url: String,
-    /// Карта моделей спавнов `provider/id[#variant]` по имени агента
-    /// (+ "default" для Dev/Design/bootstrap) — #1154. Отсутствует —
-    /// канон владельца (SpawnModels::canonical).
+    /// Назначение алиасов агентам: имя агента (+ "default" для bootstrap)
+    /// → имя алиаса flash/common/smart — #1684. Отсутствует — канон
+    /// владельца (SpawnModels::canonical). Raw-строки живут в model_aliases.
     pub models: Option<HashMap<String, String>>,
+    /// Алиасы flash/common/smart → raw-модель (#1684). Отсутствует —
+    /// канон владельца (ModelAliases::canonical).
+    pub model_aliases: Option<HashMap<String, String>>,
 }
 
 /// Дополнительный именованный исполнитель ([[executors]]): подмножество

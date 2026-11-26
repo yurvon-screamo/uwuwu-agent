@@ -1,13 +1,16 @@
 //! Общий харнес e2e-стендов uwuwu-server: живой сервер + mock_opencode
 //! на свободных портах, ожидание health, MCP-вызовы и хвост лога.
-//! Вынесен из quota_limit_pause_stand_e2e.rs — делится с cron_stand_e2e.rs.
+//! Вынесен из quota_limit_pause_stand_e2e.rs — делится с e2e-стендами
+//! (cron, quota, model_alias).
 //! Каждый integration-таргет компилирует модуль целиком — не таргетные
 //! хелперы мертвы локально, не по факту (lint-уровень унаследован от common).
 
 use serde_json::{json, Value};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub const BEARER: &str = "e2e-stand-bearer";
 
@@ -20,6 +23,10 @@ pub struct StandOptions<'a> {
     pub server_env: &'a [(&'a str, &'a str)],
     /// Содержимое state.json, записанное до старта сервера.
     pub pre_state: Option<&'a str>,
+    /// Тестовый прокси перед моком: писать тела запросов в `<dir>/capture.jsonl`.
+    /// Нужен, чтобы увидеть модель, которую сервер кладёт в POST /api/session
+    /// (сам mock_opencode модель в лог не пишет).
+    pub capture_sessions: bool,
 }
 
 pub struct Stand {
@@ -61,13 +68,163 @@ fn bin_exe(name: &str) -> PathBuf {
         .into()
 }
 
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Один запрос, перехваченный тестовым прокси.
+struct CapturedRequest {
+    method: String,
+    path: String,
+    body: Vec<u8>,
+    auth: Option<String>,
+    ctype: Option<String>,
+}
+
+/// Стартовая строка и нужные заголовки: (Content-Length, описание запроса).
+fn request_meta(head: &str) -> Option<(usize, CapturedRequest)> {
+    let mut meta = CapturedRequest {
+        method: String::new(),
+        path: String::new(),
+        body: Vec::new(),
+        auth: None,
+        ctype: None,
+    };
+    let mut content_len = 0usize;
+    for (index, line) in head.lines().enumerate() {
+        if index == 0 {
+            let mut parts = line.split_whitespace();
+            meta.method = parts.next()?.to_string();
+            meta.path = parts.next()?.to_string();
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        if key.eq_ignore_ascii_case("content-length") {
+            content_len = value.parse().unwrap_or(0);
+        } else if key.eq_ignore_ascii_case("authorization") {
+            meta.auth = Some(value.to_string());
+        } else if key.eq_ignore_ascii_case("content-type") {
+            meta.ctype = Some(value.to_string());
+        }
+    }
+    Some((content_len, meta))
+}
+
+/// Прочитать HTTP-запрос целиком: шапка, тело по Content-Length.
+async fn read_captured(client: &mut tokio::net::TcpStream) -> Option<CapturedRequest> {
+    let mut data = Vec::new();
+    let mut buf = [0u8; 4096];
+    let head_end = loop {
+        if let Some(pos) = find_subslice(&data, b"\r\n\r\n") {
+            break pos + 4;
+        }
+        let n = client.read(&mut buf).await.ok()?;
+        if n == 0 || data.len() > 1024 * 1024 {
+            return None;
+        }
+        data.extend_from_slice(&buf[..n]);
+    };
+    let head = String::from_utf8_lossy(&data[..head_end]);
+    let (content_len, mut meta) = request_meta(&head)?;
+    while data.len() < head_end + content_len {
+        let n = client.read(&mut buf).await.ok()?;
+        if n == 0 {
+            break;
+        }
+        data.extend_from_slice(&buf[..n]);
+    }
+    meta.body = data[head_end..].to_vec();
+    Some(meta)
+}
+
+/// Записать запрос в JSONL и передать моку, ответ вернуть клиенту.
+async fn pass_through(
+    client: &mut tokio::net::TcpStream,
+    req: CapturedRequest,
+    mock_port: u16,
+    capture: &Path,
+    http: &reqwest::Client,
+) {
+    let rec = json!({
+        "method": req.method,
+        "path": req.path,
+        "body": serde_json::from_slice::<Value>(&req.body).unwrap_or(Value::Null),
+    });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(capture)
+    {
+        let _ = writeln!(file, "{rec}");
+    }
+    let Ok(method) = req.method.parse::<reqwest::Method>() else {
+        return;
+    };
+    let mut forward = http.request(method, format!("http://127.0.0.1:{mock_port}{}", req.path));
+    if let Some(value) = req.auth {
+        forward = forward.header("authorization", value);
+    }
+    if let Some(value) = req.ctype {
+        forward = forward.header("content-type", value);
+    }
+    if !req.body.is_empty() {
+        forward = forward.body(req.body);
+    }
+    let Ok(resp) = forward.send().await else {
+        return;
+    };
+    let status = resp.status();
+    let bytes = resp.bytes().await.unwrap_or_default();
+    let mut out = format!(
+        "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\n\
+         content-length: {}\r\nconnection: close\r\n\r\n",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or(""),
+        bytes.len()
+    )
+    .into_bytes();
+    out.extend_from_slice(&bytes);
+    let _ = client.write_all(&out).await;
+}
+
+/// Прозрачный HTTP-прокси перед моком (только тесты): ловит method/path/body
+/// и пишет их в JSONL, после чего передаёт запрос моку как есть. Позволяет
+/// увидеть модель из карты сервера в живом POST /api/session.
+async fn capture_proxy(mock_port: u16, capture: PathBuf) -> u16 {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("capture proxy bind");
+    let port = listener.local_addr().expect("local_addr").port();
+    let http = reqwest::Client::new();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut client, _)) = listener.accept().await else {
+                continue;
+            };
+            let Some(req) = read_captured(&mut client).await else {
+                continue;
+            };
+            pass_through(&mut client, req, mock_port, &capture, &http).await;
+        }
+    });
+    port
+}
+
 pub async fn spawn_stand(dir: &Path, opts: StandOptions<'_>) -> Stand {
     let server_port = free_port();
     let mock_port = free_port();
+    let executor_port = if opts.capture_sessions {
+        capture_proxy(mock_port, dir.join("capture.jsonl")).await
+    } else {
+        mock_port
+    };
     let config = format!(
         "mode = \"live\"\npoll_sec = 10\nport = {server_port}\n\n\
          [hub]\nrepo = \"e2e/hub\"\ndriver = \"memory\"\n\n\
-         [executor]\nname = \"mock\"\nurl = \"http://127.0.0.1:{mock_port}\"\n\n\
+         [executor]\nname = \"mock\"\nurl = \"http://127.0.0.1:{executor_port}\"\n\n\
          {config_extra}\
          [policy]\ncup = 2\n\n[policy.peak]\nenabled = false\nstart_min = 360\nend_min = 600\n\n\
          [[project]]\nname = \"stand\"\nboard = \"stand\"\nrepo = \"e2e/stand\"\n\

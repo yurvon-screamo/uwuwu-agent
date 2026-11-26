@@ -1165,24 +1165,12 @@ fn fixture_usecase(
 
 /// Карта, где все этапы на GLM — пик-гейт (#1680) должен держать их как раньше.
 fn glm_models() -> Arc<crate::spawn_models::SpawnModels> {
-    let mut map = std::collections::HashMap::new();
-    for key in [
-        "default",
-        "developer",
-        "plan-reviewer",
-        "code-quality-reviewer",
-        "tester",
-        "test-reviewer",
-        "analyst",
-        "analyst-reviewer",
-        "dreamer",
-    ] {
-        map.insert(
-            key.to_string(),
-            uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.4#high").expect("glm-модель"),
-        );
-    }
-    Arc::new(crate::spawn_models::SpawnModels::new(map))
+    let glm = uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.4#high").expect("glm-модель");
+    let aliases = crate::model_aliases::ModelAliases::new(glm.clone(), glm.clone(), glm);
+    Arc::new(crate::spawn_models::SpawnModels::new(
+        aliases,
+        crate::spawn_models::canonical_assignments(),
+    ))
 }
 
 /// Юзкейс в пик-окне с настраиваемыми комментами (будильник-сценарии).
@@ -2207,14 +2195,15 @@ async fn dev_spawn_pins_the_developer_agent() {
         status_fails: AtomicBool::new(false),
     });
     let sessions = Arc::new(FakeSessions::new());
-    let mut map = std::collections::HashMap::new();
-    map.insert(
-        "default".to_string(),
+    let aliases = crate::model_aliases::ModelAliases::new(
         uwuwu_domain::SpawnModel::parse("p/default").unwrap(),
-    );
-    map.insert(
-        "developer".to_string(),
         uwuwu_domain::SpawnModel::parse("p/dev").unwrap(),
+        uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.4#high").unwrap(),
+    );
+    let mut assignments = crate::spawn_models::canonical_assignments();
+    assignments.insert(
+        "developer".to_string(),
+        crate::model_aliases::ModelAlias::Common,
     );
     let u = TickUseCase {
         board: board.clone(),
@@ -2228,7 +2217,7 @@ async fn dev_spawn_pins_the_developer_agent() {
         }),
         clock: Arc::new(FixedClock),
         state: Arc::new(MemState(Mutex::default())),
-        models: Arc::new(crate::spawn_models::SpawnModels::new(map)),
+        models: Arc::new(crate::spawn_models::SpawnModels::new(aliases, assignments)),
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
@@ -11291,7 +11280,11 @@ async fn review_and_test_spawns_carry_map_models_per_agent() {
             "code-quality-reviewer",
             "zai-coding-plan/glm-5.4#high",
         ),
-        (Status::Testing, "tester", "opencode-go/hy4-flash-free#high"),
+        (
+            Status::Testing,
+            "tester",
+            "opencode-go/muse-spark-1.3-contributor#high",
+        ),
     ];
     for (status, agent_name, raw) in cases {
         let (u, _, sessions, _) = usecase(vec![task(5, status)], PrState::Missing);
