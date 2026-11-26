@@ -111,7 +111,9 @@ pub(crate) fn dreamer_target() -> SessionInfo {
 /// на потоке без диспетчера, — после этого событие ловящего потока молча
 /// теряется (tokio-rs/tracing#3611; гонка в тестах #1661: 83/500 красных).
 /// Роутер регистрирует все callsite'ы как always и сам решает, отдать ли
-/// событие активной ловушке этого потока.
+/// событие активной ловушке этого потока. На Linux роутер ставится до старта
+/// тестовых потоков — иначе остаётся узкое окно между heal-pass и публикацией
+/// глобального, где сосед всё же кэширует `never` (пин Ordering ниже).
 /// Поля одного события склеиваются в одну запись: имя отказа должно лежать
 /// в том же событии, что и `event=<role>.list_degraded`, и ровно такой
 /// список: иначе ассерт ловит чужой `executor=down` из роутера или superset.
@@ -183,9 +185,38 @@ impl Drop for TrapGuard {
 
 static ROUTER: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
+/// Роутер был установлен до старта тестовых потоков (`.init_array`).
+static EAGER_INSTALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Харнес встал лениво — первым тестом с ловушкой (окно установки открыто).
+pub(crate) static LAZY_INSTALL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Роутер ставится до старта тестовых потоков (Linux, `.init_array`). При
+/// ленивой установке первый заход соседа на callsite между heal-pass
+/// (`Dispatch::new`) и публикацией глобального кэширует `Interest::never()`
+/// на весь процесс.
+#[cfg(target_os = "linux")]
+#[used]
+#[link_section = ".init_array"]
+static INSTALL_ROUTER: extern "C" fn() = install_router;
+
+#[cfg(target_os = "linux")]
+extern "C" fn install_router() {
+    EAGER_INSTALL.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = tracing::subscriber::set_global_default(EventRouter);
+}
+
 pub(crate) fn trap_events() -> (TrapGuard, Arc<Mutex<Vec<String>>>) {
     ROUTER.get_or_init(|| {
+        LAZY_INSTALL.store(
+            !EAGER_INSTALL.load(std::sync::atomic::Ordering::SeqCst),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         let _ = tracing::subscriber::set_global_default(EventRouter);
+        // Вне Linux роутер встаёт здесь; публикации предшествует heal-pass —
+        // первый заход соседа между ними мог кэшировать `never`: долечиваем.
+        tracing::callsite::rebuild_interest_cache();
     });
     let records = Arc::new(Mutex::new(Vec::new()));
     let prev = TRAP.with(|t| {

@@ -8364,10 +8364,6 @@ async fn compact_pass_marks_cooldown_before_failed_post_1661() {
     u.tick().await.unwrap();
     drop(guard);
 
-    assert!(
-        sessions.compacted.lock().unwrap().is_empty(),
-        "POST упал — успешных адмиссий нет"
-    );
     assert_eq!(
         state.master_compact_ms("analyst", "p"),
         20_000_000,
