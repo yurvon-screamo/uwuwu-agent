@@ -8,9 +8,9 @@ use crate::ports::{
 };
 use crate::router::SessionRouter;
 use async_trait::async_trait;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tracing::dispatcher::DefaultGuard;
 
 /// Гейтвей с памятью зовов: отказ list_sessions у одного исполнителя,
 /// живой спавн/delivery у другого.
@@ -105,7 +105,13 @@ pub(crate) fn dreamer_target() -> SessionInfo {
     }
 }
 
-/// Ловушка tracing: thread-local dispatcher, каждый tokio::test — свой поток.
+/// Ловушка tracing: процесс-глобальный роутер с `Interest::always()` плюс
+/// поток-локальный приёмник. `dispatcher::set_default` в tracing-core 0.1.36
+/// кэширует `Interest::never()` на callsite, если первый заход на него случился
+/// на потоке без диспетчера, — после этого событие ловящего потока молча
+/// теряется (tokio-rs/tracing#3611; гонка в тестах #1661: 83/500 красных).
+/// Роутер регистрирует все callsite'ы как always и сам решает, отдать ли
+/// событие активной ловушке этого потока.
 /// Поля одного события склеиваются в одну запись: имя отказа должно лежать
 /// в том же событии, что и `event=<role>.list_degraded`, и ровно такой
 /// список: иначе ассерт ловит чужой `executor=down` из роутера или superset.
@@ -140,24 +146,74 @@ impl tracing::Subscriber for EventTrap {
     fn exit(&self, _span: &tracing::Id) {}
 }
 
-pub(crate) fn trap_events() -> (DefaultGuard, Arc<Mutex<Vec<String>>>) {
+thread_local! {
+    static TRAP: RefCell<Option<Arc<EventTrap>>> = const { RefCell::new(None) };
+}
+
+struct EventRouter;
+
+impl tracing::Subscriber for EventRouter {
+    fn enabled(&self, _meta: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn register_callsite(&self, _meta: &tracing::Metadata<'_>) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::always()
+    }
+    fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::Id {
+        tracing::Id::from_u64(1)
+    }
+    fn record(&self, _span: &tracing::Id, _values: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _span: &tracing::Id, _follows: &tracing::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        if let Some(trap) = TRAP.with(|t| t.borrow().clone()) {
+            trap.event(event);
+        }
+    }
+    fn enter(&self, _span: &tracing::Id) {}
+    fn exit(&self, _span: &tracing::Id) {}
+}
+
+pub(crate) struct TrapGuard(Option<Arc<EventTrap>>);
+
+impl Drop for TrapGuard {
+    fn drop(&mut self) {
+        TRAP.with(|t| *t.borrow_mut() = self.0.take());
+    }
+}
+
+static ROUTER: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+pub(crate) fn trap_events() -> (TrapGuard, Arc<Mutex<Vec<String>>>) {
+    ROUTER.get_or_init(|| {
+        let _ = tracing::subscriber::set_global_default(EventRouter);
+    });
     let records = Arc::new(Mutex::new(Vec::new()));
-    let guard =
-        tracing::dispatcher::set_default(&tracing::Dispatch::new(EventTrap(Arc::clone(&records))));
-    (guard, records)
+    let prev = TRAP.with(|t| {
+        t.borrow_mut()
+            .replace(Arc::new(EventTrap(Arc::clone(&records))))
+    });
+    (TrapGuard(prev), records)
 }
 
 /// Точное поле события: имя сравнивается целиком, а не по подстроке —
 /// иначе префиксный вариант (`...list_degraded_v2`) проходил бы ассерт и
 /// сдвиг имени события не ловился ни одним из ролевых пинов (проверено
 /// мутацией в раунде тестирования).
+fn exact_field(rec: &str, field: &str, value: &str) -> bool {
+    let plain = format!("{field}={value}");
+    let quoted = format!("{field}=\"{value}\"");
+    rec.split(" | ").any(|f| f == plain || f == quoted)
+}
+
+pub(crate) fn has_exact_field(records: &[String], field: &str, value: &str) -> bool {
+    records.iter().any(|r| exact_field(r, field, value))
+}
+
 pub(crate) fn is_exact_degraded(records: &[String], event: &str) -> bool {
     const FAILED: &str = "executors=[\"down\"]";
-    let plain = format!("event={event}");
-    let quoted = format!("event=\"{event}\"");
     records
         .iter()
-        .any(|r| r.contains(FAILED) && r.split(" | ").any(|f| f == plain || f == quoted))
+        .any(|r| r.contains(FAILED) && exact_field(r, "event", event))
 }
 
 pub(crate) fn assert_degraded(records: &[String], event: &str) {

@@ -273,6 +273,8 @@ struct FakeSessions {
     /// Гейт недоступен целиком (окно заглушки/рестарт) — liveness Unknown
     /// на все сессии (#1281 срез 4: эскалация по недостоверной пробе).
     liveness_unknown: bool,
+    /// Unknown точечно по сессиям (#1661): соседняя привязка остаётся живой.
+    unknown_sessions: Mutex<Vec<String>>,
     /// Журнал абортов сессий (преемпшен #1259).
     aborted: Mutex<Vec<String>>,
     /// Журнал пинов агента слота (#1300): `{session}|{agent}`.
@@ -283,6 +285,15 @@ struct FakeSessions {
     spawn_probe: AtomicBool,
     /// Занятость окна контекста по сессиям (#1634): session -> pct.
     usage: Mutex<std::collections::BTreeMap<String, f64>>,
+    /// Сессии с отказом пробы занятости (#1661): Err вместо pct.
+    usage_fails_sessions: Mutex<Vec<String>>,
+    /// Отказ нативной адмиссии compact_session (#1661): метка уже стоит,
+    /// POST упал — ретрай гасится коулдауном.
+    compact_fails: bool,
+    /// Замер «метка ДО POST» (#1661): в момент compact_session читаем
+    /// коулдаун из состояния — иначе перенос метки после POST не виден.
+    compact_mark_probe: Option<(Arc<dyn TickStateStore>, &'static str, &'static str)>,
+    compact_mark_at_post: Mutex<Vec<u64>>,
     /// Журнал нативных компактов (#1626 re-entry + #1634 compact_pass).
     compacted: Mutex<Vec<String>>,
 }
@@ -318,11 +329,16 @@ impl FakeSessions {
             deleted: Mutex::default(),
             activity_fails_sessions: Mutex::default(),
             liveness_unknown: false,
+            unknown_sessions: Mutex::default(),
             aborted: Mutex::default(),
             switched: Mutex::default(),
             abort_fails: AtomicBool::new(false),
             spawn_probe: AtomicBool::new(true),
             usage: Mutex::default(),
+            usage_fails_sessions: Mutex::default(),
+            compact_fails: false,
+            compact_mark_probe: None,
+            compact_mark_at_post: Mutex::default(),
 
             compacted: Mutex::default(),
         }
@@ -406,6 +422,17 @@ impl AgentSessionGateway for FakeSessions {
         Ok(())
     }
     async fn compact_session(&self, session: &str) -> UsecaseResult<()> {
+        if let Some((state, role, project)) = &self.compact_mark_probe {
+            self.compact_mark_at_post
+                .lock()
+                .unwrap()
+                .push(state.master_compact_ms(role, project));
+        }
+        if self.compact_fails {
+            return Err(crate::error::UsecaseError::Session(
+                "compact_session недоступен (мок #1661)".into(),
+            ));
+        }
         self.compacted.lock().unwrap().push(session.to_string());
         Ok(())
     }
@@ -413,7 +440,7 @@ impl AgentSessionGateway for FakeSessions {
         Ok(())
     }
     async fn liveness(&self, s: &str) -> Liveness {
-        if self.liveness_unknown {
+        if self.liveness_unknown || self.unknown_sessions.lock().unwrap().iter().any(|x| x == s) {
             return Liveness::Unknown;
         }
         if self.dead_sessions.lock().unwrap().iter().any(|d| d == s) {
@@ -474,6 +501,17 @@ impl AgentSessionGateway for FakeSessions {
         session: &str,
         _model: &uwuwu_domain::ModelRef,
     ) -> UsecaseResult<Option<f64>> {
+        if self
+            .usage_fails_sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s == session)
+        {
+            return Err(crate::error::UsecaseError::Session(
+                "usage probe недоступен (мок #1661)".into(),
+            ));
+        }
         Ok(self.usage.lock().unwrap().get(session).copied())
     }
     async fn list_sessions(&self) -> UsecaseResult<Vec<crate::ports::SessionInfo>> {
@@ -1496,6 +1534,11 @@ fn wake_usecase(
         live: Mutex::default(),
         activity_fails_sessions: Mutex::default(),
         liveness_unknown: false,
+        unknown_sessions: Mutex::default(),
+        usage_fails_sessions: Mutex::default(),
+        compact_fails: false,
+        compact_mark_probe: None,
+        compact_mark_at_post: Mutex::default(),
         aborted: Mutex::default(),
         abort_fails: AtomicBool::new(false),
         spawn_probe: AtomicBool::new(true),
@@ -4348,6 +4391,11 @@ async fn dead_stage_and_candidate_hold_blind_when_list_unavailable() {
         deleted: Mutex::default(),
         activity_fails_sessions: Mutex::default(),
         liveness_unknown: false,
+        unknown_sessions: Mutex::default(),
+        usage_fails_sessions: Mutex::default(),
+        compact_fails: false,
+        compact_mark_probe: None,
+        compact_mark_at_post: Mutex::default(),
         aborted: Mutex::default(),
         abort_fails: AtomicBool::new(false),
         spawn_probe: AtomicBool::new(true),
@@ -5067,6 +5115,11 @@ async fn undelivered_comment_is_not_marked_seen() {
             deleted: Mutex::default(),
             activity_fails_sessions: Mutex::default(),
             liveness_unknown: false,
+            unknown_sessions: Mutex::default(),
+            usage_fails_sessions: Mutex::default(),
+            compact_fails: false,
+            compact_mark_probe: None,
+            compact_mark_at_post: Mutex::default(),
             aborted: Mutex::default(),
             abort_fails: AtomicBool::new(false),
             spawn_probe: AtomicBool::new(true),
@@ -5146,6 +5199,11 @@ async fn undelivered_comment_is_not_marked_seen() {
         deleted: Mutex::default(),
         activity_fails_sessions: Mutex::default(),
         liveness_unknown: false,
+        unknown_sessions: Mutex::default(),
+        usage_fails_sessions: Mutex::default(),
+        compact_fails: false,
+        compact_mark_probe: None,
+        compact_mark_at_post: Mutex::default(),
         aborted: Mutex::default(),
         abort_fails: AtomicBool::new(false),
         spawn_probe: AtomicBool::new(true),
@@ -5235,6 +5293,11 @@ async fn multi_comment_tail_delivered_together() {
         deleted: Mutex::default(),
         activity_fails_sessions: Mutex::default(),
         liveness_unknown: false,
+        unknown_sessions: Mutex::default(),
+        usage_fails_sessions: Mutex::default(),
+        compact_fails: false,
+        compact_mark_probe: None,
+        compact_mark_at_post: Mutex::default(),
         aborted: Mutex::default(),
         abort_fails: AtomicBool::new(false),
         spawn_probe: AtomicBool::new(true),
@@ -7710,6 +7773,36 @@ fn analyst_compact_uc(
     }
 }
 
+/// Зеркало `analyst_compact_uc` (#1661): тот же явный clock/политика/cup,
+/// но у ревьювера нет пик-гейта — в структуре нет поля `peak`.
+fn review_compact_uc(
+    state: Arc<MemState>,
+    sessions: Arc<FakeSessions>,
+    clock: Arc<dyn Clock>,
+    policy: Option<crate::bots::CompactPolicy>,
+    cup: usize,
+) -> AnalystReviewUseCase {
+    AnalystReviewUseCase {
+        board: Arc::new(FakeBoard {
+            rows: std::sync::Mutex::new(vec![]),
+            log: Mutex::default(),
+            comments: vec![],
+            fields_fails: false,
+            set_session_fails: false,
+            set_pr_fails: AtomicBool::new(false),
+            clear_session_fails: AtomicBool::new(false),
+            status_fails: AtomicBool::new(false),
+        }),
+        boards: vec![analyst_board()],
+        sessions: Arc::new(SessionRouter::uniform(sessions)),
+        state,
+        clock,
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        cup,
+        compact: policy,
+    }
+}
+
 /// Политика прохода тестов: те же числа, что в живом конфиге — idle 4ч,
 /// доля 62%, коулдаун 1ч (санкция владельца 25.11 в #1607).
 fn compact_policy_1607() -> crate::bots::CompactPolicy {
@@ -8160,14 +8253,7 @@ async fn compact_pass_keeps_each_role_event_prefix_1661() {
     // Пин ловит случайный `analys.compacted` у ревьювера и наоборот:
     // в обычном cargo test префиксы иначе не проверяются — только
     // гейтованные UWUWU_E2E-стенды (замечание ревью #1661).
-    use super::degraded_list_support::trap_events;
-
-    let has_exact = |recs: &[String], ev: &str| {
-        let plain = format!("event={ev}");
-        let quoted = format!("event=\"{ev}\"");
-        recs.iter()
-            .any(|r| r.split(" | ").any(|f| f == plain || f == quoted))
-    };
+    use super::degraded_list_support::{has_exact_field, trap_events};
 
     let state = Arc::new(MemState(Mutex::default()));
     state.set_master_binding(
@@ -8203,25 +8289,13 @@ async fn compact_pass_keeps_each_role_event_prefix_1661() {
         Some(compact_policy_1607()),
         7,
     );
-    let reviewer = AnalystReviewUseCase {
-        board: Arc::new(FakeBoard {
-            rows: std::sync::Mutex::new(vec![]),
-            log: Mutex::default(),
-            comments: vec![],
-            fields_fails: false,
-            set_session_fails: false,
-            set_pr_fails: AtomicBool::new(false),
-            clear_session_fails: AtomicBool::new(false),
-            status_fails: AtomicBool::new(false),
-        }),
-        boards: vec![analyst_board()],
-        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
-        state: state.clone(),
-        clock: Arc::new(LostClock),
-        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
-        cup: 7,
-        compact: Some(compact_policy_1607()),
-    };
+    let reviewer = review_compact_uc(
+        state.clone(),
+        sessions.clone(),
+        Arc::new(LostClock),
+        Some(compact_policy_1607()),
+        7,
+    );
 
     let (guard_a, recs_a) = trap_events();
     analyst.tick().await.unwrap();
@@ -8232,20 +8306,21 @@ async fn compact_pass_keeps_each_role_event_prefix_1661() {
 
     let a = recs_a.lock().unwrap();
     let r = recs_r.lock().unwrap();
+    let has = |recs: &[String], ev: &str| has_exact_field(recs, "event", ev);
     assert!(
-        has_exact(&a, "analys.compacted"),
+        has(&a, "analys.compacted"),
         "аналитик: нет analys.compacted: {a:?}"
     );
     assert!(
-        !has_exact(&a, "analys_review.compacted"),
+        !has(&a, "analys_review.compacted"),
         "аналитик пишет событие ревьювера: {a:?}"
     );
     assert!(
-        has_exact(&r, "analys_review.compacted"),
+        has(&r, "analys_review.compacted"),
         "ревьювер: нет analys_review.compacted: {r:?}"
     );
     assert!(
-        !has_exact(&r, "analys.compacted"),
+        !has(&r, "analys.compacted"),
         "ревьювер пишет событие аналитика: {r:?}"
     );
     assert_eq!(
@@ -8253,6 +8328,185 @@ async fn compact_pass_keeps_each_role_event_prefix_1661() {
         ["ses_analyst", "ses_reviewer"],
         "обе роли адмитили свою привязку"
     );
+}
+
+#[tokio::test]
+async fn compact_pass_marks_cooldown_before_failed_post_1661() {
+    // ADR-082: метка ставится ДО POST. compact_session упал — коулдаун всё
+    // равно стоит, следующий тик не повторяет адмиссию (ветка compact_failed
+    // в юнитах недостижима без мока-отказа POST).
+    use super::degraded_list_support::{has_exact_field, trap_events};
+
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_master",
+        "opencode-go/hy4-flash-free#high",
+        "/tmp/checkout",
+    );
+    let mut fake = FakeSessions::new();
+    fake.activity_ms = Some(0);
+    fake.compact_fails = true;
+    fake.compact_mark_probe = Some((state.clone(), "analyst", "p"));
+    fake.usage.lock().unwrap().insert("ses_master".into(), 90.0);
+    let sessions = Arc::new(fake);
+    let u = analyst_compact_uc(
+        state.clone(),
+        sessions.clone(),
+        Arc::new(LostClock),
+        Some(compact_policy_1607()),
+        7,
+    );
+
+    let (guard, recs) = trap_events();
+    u.tick().await.unwrap();
+    u.tick().await.unwrap();
+    drop(guard);
+
+    assert!(
+        sessions.compacted.lock().unwrap().is_empty(),
+        "POST упал — успешных адмиссий нет"
+    );
+    assert_eq!(
+        state.master_compact_ms("analyst", "p"),
+        20_000_000,
+        "метка коулдауна стоит несмотря на отказ POST"
+    );
+    let r = recs.lock().unwrap();
+    let count = |ev: &str| {
+        r.iter()
+            .filter(|rec| has_exact_field(&[(**rec).clone()], "event", ev))
+            .count()
+    };
+    assert_eq!(
+        sessions.compact_mark_at_post.lock().unwrap().as_slice(),
+        [20_000_000],
+        "метка видна в момент POST — до адмиссии, не после"
+    );
+    assert_eq!(
+        count("analys.compact_failed"),
+        1,
+        "compact_failed ровно один — повторный тик погашен коулдауном: {r:?}"
+    );
+    assert_eq!(count("analys.compacted"), 0, "успешных адмиссий нет: {r:?}");
+}
+
+#[tokio::test]
+async fn compact_pass_aborts_on_usage_probe_failure_1661() {
+    // Отказ пробы занятости завершает проход целиком, а не пропускает одну
+    // привязку: после отказа по проекту "a" проект "b" не адмитится.
+    let state = Arc::new(MemState(Mutex::default()));
+    for (project, session) in [("a", "ses_a"), ("b", "ses_b")] {
+        state.set_master_binding(
+            "analyst",
+            project,
+            session,
+            "opencode-go/hy4-flash-free#high",
+            "/tmp/checkout",
+        );
+    }
+    let mut fake = FakeSessions::new();
+    fake.activity_ms = Some(0);
+    fake.usage.lock().unwrap().insert("ses_b".into(), 90.0);
+    fake.usage.lock().unwrap().insert("ses_a".into(), 90.0);
+    fake.usage_fails_sessions
+        .lock()
+        .unwrap()
+        .push("ses_a".into());
+    let sessions = Arc::new(fake);
+    let board = |p: &str| AnalystBoard {
+        project: p.into(),
+        board: "B".into(),
+        checkout: "/tmp/checkout".into(),
+    };
+    let base = analyst_compact_uc(
+        state.clone(),
+        sessions.clone(),
+        Arc::new(LostClock),
+        Some(compact_policy_1607()),
+        7,
+    );
+    let u = AnalystUseCase {
+        boards: vec![board("a"), board("b")],
+        ..base
+    };
+    u.tick().await.unwrap();
+    assert!(
+        sessions.compacted.lock().unwrap().is_empty(),
+        "проход завершён — соседний проект не адмитится"
+    );
+    assert_eq!(
+        state.master_compact_ms("analyst", "b"),
+        0,
+        "метки соседа нет"
+    );
+}
+
+#[tokio::test]
+async fn compact_pass_skips_bad_binding_and_admits_neighbor_1661() {
+    // Dead/Unknown-привязка пропускается, соседи продолжаются: при смене
+    // `continue` на `return` соседняя адмиссия исчезнет. Хелпер общий —
+    // одной роли достаточно.
+    for kind in ["dead", "unknown"] {
+        let state = Arc::new(MemState(Mutex::default()));
+        state.set_master_binding(
+            "analyst",
+            "a",
+            "ses_bad",
+            "opencode-go/hy4-flash-free#high",
+            "/tmp/checkout",
+        );
+        state.set_master_binding(
+            "analyst",
+            "b",
+            "ses_good",
+            "opencode-go/hy4-flash-free#high",
+            "/tmp/checkout",
+        );
+        let mut fake = FakeSessions::new();
+        fake.activity_ms = Some(0);
+        fake.usage.lock().unwrap().insert("ses_bad".into(), 90.0);
+        fake.usage.lock().unwrap().insert("ses_good".into(), 90.0);
+        if kind == "dead" {
+            fake.dead_sessions.lock().unwrap().push("ses_bad".into());
+        } else {
+            fake.unknown_sessions.lock().unwrap().push("ses_bad".into());
+        }
+        let sessions = Arc::new(fake);
+        let board = |p: &str| AnalystBoard {
+            project: p.into(),
+            board: "B".into(),
+            checkout: "/tmp/checkout".into(),
+        };
+        let base = analyst_compact_uc(
+            state.clone(),
+            sessions.clone(),
+            Arc::new(LostClock),
+            Some(compact_policy_1607()),
+            7,
+        );
+        let u = AnalystUseCase {
+            boards: vec![board("a"), board("b")],
+            ..base
+        };
+        u.tick().await.unwrap();
+        assert_eq!(
+            sessions.compacted.lock().unwrap().as_slice(),
+            ["ses_good"],
+            "{kind}: плохая привязка пропущена, сосед адмитится"
+        );
+        assert_eq!(
+            state.master_compact_ms("analyst", "a"),
+            0,
+            "{kind}: метки плохой привязки нет"
+        );
+        assert_eq!(
+            state.master_compact_ms("analyst", "b"),
+            20_000_000,
+            "{kind}: метка соседа стоит"
+        );
+    }
 }
 
 #[tokio::test]
