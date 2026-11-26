@@ -3,6 +3,7 @@
 pub mod actions;
 pub mod analyst;
 pub mod analyst_review;
+mod compact_pass;
 #[cfg(test)]
 mod cup_pins_tests;
 #[cfg(test)]

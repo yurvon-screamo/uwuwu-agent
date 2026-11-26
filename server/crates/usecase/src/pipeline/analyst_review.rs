@@ -3,8 +3,9 @@
 //! мертвая пересоздается, между волнами - нативный автокомпакт.
 //! Отмена эфимерности #1588 старшим словом владельца 25.11.2026.
 
-use crate::bots::{compact_verdict, CompactFacts, CompactPolicy};
+use crate::bots::CompactPolicy;
 use crate::error::UsecaseResult;
+use crate::pipeline::compact_pass::CompactPass;
 use crate::ports::{SessionInfo, SessionSpec, TaskBoardRepo, TickStateStore};
 use crate::spawn_models::SpawnModels;
 use std::sync::Arc;
@@ -292,134 +293,24 @@ impl AnalystReviewUseCase {
         Ok(delivered)
     }
 
-    /// Сессия потеряна исполнителем (404-класс): liveness Dead против
-    /// транспортного Unknown — пропуск только по Dead, Unknown завершает
-    /// проход пробой (эталон — бот-супервизор).
-    async fn session_gone(&self, project: &str, session: &str) -> bool {
-        matches!(
-            self.sessions.project(project).liveness(session).await,
-            crate::ports::Liveness::Dead
-        )
-    }
-
-    /// Компакт-проход мастер-сессий ревьювера (#1634 срез 3, матрица
-    /// bots/compact): idle + занятость окна модели рождения + коулдаун.
-    /// Семантика проб — по эталону бот-супервизора: потерянная сессия
-    /// (Dead) — warn + пропуск привязки, соседи продолжаются; прочий
-    /// отказ пробы (транспорт/гейт) — warn + завершение прохода, чтобы
-    /// не долбить упавший исполнитель. CUP-гейт: при полном капе проход
-    /// откладывается целиком (как у мастер-аналитика #1607).
+    /// Компакт-проход ревьювера (#1634 срез 3): общая механика — в
+    /// `pipeline::compact_pass`; роль задаёт префикс событий. Пик-гейта
+    /// нет (в отличие от аналитика) — осознанное различие, не дрейф.
     async fn compact_pass(&self, policy: &CompactPolicy, scan: &[SessionInfo]) {
-        if crate::router::busy_count(scan) >= self.cup {
-            tracing::info!(
-                event = "analys_review.compact_held_cup",
-                "Компакт-проход отложен: CUP cap"
-            );
-            return;
+        CompactPass {
+            role: reviewer_role(),
+            event_prefix: "analys_review",
+            projects: &self.boards,
+            sessions: &self.sessions,
+            state: self.state.as_ref(),
+            clock: self.clock.as_ref(),
+            scan,
+            policy,
+            cup: self.cup,
+            peak: None,
         }
-        let now = self.clock.now_ms();
-        let role = reviewer_role();
-        let mut projects: Vec<&String> = self.boards.iter().map(|b| &b.project).collect();
-        projects.sort();
-        projects.dedup();
-        for project in projects {
-            let Some((session, bound_model, _)) = self.state.master_binding(role, project) else {
-                continue;
-            };
-            let gateway = self.sessions.project(project);
-            match gateway.liveness(&session).await {
-                crate::ports::Liveness::Alive => {}
-                crate::ports::Liveness::Dead => {
-                    tracing::debug!(
-                        event = "analys_review.compact_dead_skip",
-                        project = %project,
-                        "Мертвая привязка компактом не трогается"
-                    );
-                    continue;
-                }
-                crate::ports::Liveness::Unknown => {
-                    tracing::debug!(
-                        event = "analys_review.compact_unknown_skip",
-                        project = %project,
-                        "Состояние привязки неизвестно - компакт пропущен"
-                    );
-                    continue;
-                }
-            }
-            let Ok(model) = SpawnModel::parse(&bound_model) else {
-                tracing::warn!(
-                    event = "analys_review.compact_model_unparseable",
-                    project = %project,
-                    "Привязка с непарсящейся моделью - компакт пропущен"
-                );
-                continue;
-            };
-            let busy = scan
-                .iter()
-                .find(|s| s.id == session)
-                .map(|s| s.busy)
-                .unwrap_or(false);
-            let idle_ms = match gateway.last_activity_ms(&session).await {
-                Ok(ms) => ms.map(|ms| now.saturating_sub(ms)),
-                Err(e) => {
-                    if self.session_gone(project, &session).await {
-                        tracing::warn!(event = "analys_review.compact_session_gone", project = %project,
-                            session = %session, "Сессия потеряна исполнителем - привязка пропущена");
-                        continue;
-                    }
-                    tracing::warn!(event = "analys_review.compact_probe_failed", project = %project,
-                        error = %e, "Проба активности не удалась - компакт-проход завершён");
-                    return;
-                }
-            };
-            let usage_pct = match gateway.context_usage_pct(&session, &model.model).await {
-                Ok(u) => u,
-                Err(e) => {
-                    if self.session_gone(project, &session).await {
-                        tracing::warn!(event = "analys_review.compact_session_gone", project = %project,
-                            session = %session, "Сессия потеряна исполнителем - привязка пропущена");
-                        continue;
-                    }
-                    tracing::warn!(event = "analys_review.compact_probe_failed", project = %project,
-                        error = %e, "Проба занятости не удалась - компакт-проход завершён");
-                    return;
-                }
-            };
-            let facts = CompactFacts {
-                busy,
-                idle_ms,
-                usage_pct,
-                last_compact_ms: self.state.master_compact_ms(role, project),
-                now_ms: now,
-            };
-            let verdict = compact_verdict(&facts, policy);
-            if !verdict.fire {
-                tracing::debug!(
-                    event = "analys_review.compact_skip",
-                    project = %project,
-                    reason = %verdict.reason,
-                    "Компакт: не стреляем"
-                );
-                continue;
-            }
-            self.state.set_master_compact_ms(role, project, now);
-            if let Err(e) = self.state.save() {
-                tracing::warn!(event = "analys_review.compact_save_failed",
-                    project = %project, error = %e, "Метка компакта не персистится");
-            }
-            match gateway.compact_session(&session).await {
-                Ok(()) => {
-                    tracing::info!(event = "analys_review.compacted",
-                        project = %project, session = %session,
-                        reason = %verdict.reason, "Нативный compact admitted");
-                }
-                Err(e) => {
-                    tracing::warn!(event = "analys_review.compact_failed",
-                        project = %project, session = %session,
-                        error = %e, "Адмиссия компакта не удалась - ретрай по коулдауну");
-                }
-            }
-        }
+        .run()
+        .await;
     }
 
     /// Петля ревью-спавнов: строка -> Needs attention + коммент владельцу.

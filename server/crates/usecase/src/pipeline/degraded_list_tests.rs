@@ -7,8 +7,11 @@
 //! здесь пинит только событие роли, не дублируя поведенческие ассерты.
 //! dreamer-тест дополнительно пинит отложенный prune при частичном зрении.
 
+#[cfg(target_os = "linux")]
+use super::degraded_list_support::LAZY_INSTALL;
 use super::degraded_list_support::{
-    assert_degraded, dreamer_target, is_exact_degraded, router, trap_events, RecordingGw,
+    assert_degraded, dreamer_target, has_exact_field, is_exact_degraded, router, trap_events,
+    RecordingGw,
 };
 use crate::pipeline::analyst::AnalystUseCase;
 use crate::pipeline::analyst_review::AnalystReviewUseCase;
@@ -153,4 +156,43 @@ fn degraded_assert_requires_exact_event_name() {
     assert!(!is_exact_degraded(&suffix, "dreamer.list_degraded"));
     assert!(!is_exact_degraded(&superset, "dreamer.list_degraded"));
     assert!(!is_exact_degraded(&decoy, "dreamer.list_degraded"));
+}
+
+/// Гонка ловушки (#1661): первый заход на callsite с чужого потока без
+/// диспетчера в tracing-core 0.1.36 кэширует `Interest::never()`, после чего
+/// то же событие на потоке ловушки молча теряется (tokio-rs/tracing#3611).
+/// Свой callsite нужен, чтобы полный прогон не зарегистрировал его заранее.
+/// В изоляции на старом `trap_events` (thread-local dispatcher) тест красный
+/// всегда; в полном прогоне он красный только без соседней живой ловушки
+/// (при двух диспетчерах интерес считается по реестру и гонки нет) — как
+/// страж в полном прогоне слабый. На процесс-глобальном роутере с
+/// `Interest::always()` зелёный везде; страж порядка — тест ниже.
+fn trap_race_probe_emit() {
+    tracing::info!(target: "trap_race", event = "trap.race_probe", "пин гонки ловушки");
+}
+
+#[test]
+fn trap_survives_first_hit_on_other_thread() {
+    let (guard, recs) = trap_events();
+    std::thread::spawn(trap_race_probe_emit).join().unwrap();
+    trap_race_probe_emit();
+    drop(guard);
+    let recs = recs.lock().unwrap();
+    assert!(
+        has_exact_field(&recs, "event", "trap.race_probe"),
+        "ловушка потеряла своё событие: {recs:?}"
+    );
+}
+
+/// Роутер должен стоять до старта тестовых потоков: ленивая установка открывает
+/// окно «heal-pass → публикация», где первый заход соседа кэширует `never`.
+/// Первый же тест с ловушкой ставит флаг — пин красный при любом порядке тестов.
+#[cfg(target_os = "linux")]
+#[test]
+fn router_is_installed_before_test_threads() {
+    let (_guard, _recs) = trap_events();
+    assert!(
+        !LAZY_INSTALL.load(std::sync::atomic::Ordering::SeqCst),
+        "роутер поставлен лениво — окно установки открыто"
+    );
 }
