@@ -8,13 +8,7 @@ fn endpoint() -> String {
     std::env::var("UWUWU_EMBED_URL")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| {
-            if std::env::var("UWUWU_E2E").as_deref() == Ok("1") {
-                "http://127.0.0.1:11434".to_string()
-            } else {
-                "http://relay.railway.internal:2334".to_string()
-            }
-        })
+        .expect("UWUWU_E2E=1: задайте адрес Ollama (на kisa — http://127.0.0.1:11434)")
 }
 
 #[tokio::test]

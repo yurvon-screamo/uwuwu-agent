@@ -25,9 +25,9 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 const RPM_WINDOW_MS: u64 = 60_000;
 
 /// Кап бэкоффа на 429 (RetryInfo может обещать и больше — не тише прод-тика).
-pub const RATE_LIMIT_CAP_SECS: u64 = 15 * 60;
+pub(crate) const RATE_LIMIT_CAP_SECS: u64 = 15 * 60;
 /// Дефолт бэкоффа 429 без RetryInfo в теле.
-pub const RATE_LIMIT_DEFAULT_SECS: u64 = 300;
+pub(crate) const RATE_LIMIT_DEFAULT_SECS: u64 = 300;
 
 /// RetryInfo из тела 429: `details[]` с `retryDelay` ("26s", "1m").
 /// Возвращает секунды; без RetryInfo — None (вызывающая сторона ставит дефолт).
@@ -259,7 +259,7 @@ impl DecisionJudge for GeminiJudge {
             .await
             .map_err(|e| UsecaseError::Session(format!("judge: тело ответа: {e}")))?;
         if status == 429 {
-            // RetryInfo из тела — единый парсер с семантикой #1363; спать
+            // RetryInfo из тела — парсер переехал сюда из семантики (#1687); спать
             // внутри тика нельзя — структурный Err (fallback тика сработает,
             // следующий вызов — после интервала судьи; обработчики Err
             // читают задержку из варианта, не из человеческой строки)
@@ -585,6 +585,19 @@ mod tests {
             }
             other => panic!("ожидался структурный RateLimited, получен: {other:?}"),
         }
+    }
+
+    #[test]
+    fn retry_delay_seconds_parsed() {
+        let body = serde_json::json!({
+            "error": {
+                "details": [
+                    {"@type": "type.googleapis.com/google.rpc.QuotaFailure", "violations": []},
+                    {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "26s"}
+                ]
+            }
+        });
+        assert_eq!(parse_retry_delay(&body), Some(26));
     }
 
     #[test]

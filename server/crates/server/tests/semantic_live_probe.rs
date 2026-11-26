@@ -43,6 +43,12 @@ const CONTROL: &[(&str, &[&str])] = &[
             "Projects/uwuwu/ADR/ADR-032: Fast-track-вход задач — untracked In Progress спавнит implement-агента; рестарты на нейтральном continuePrompt",
         ],
     ),
+    (
+        "квотная пауза сталл-детекта по подписке",
+        &[
+            "Projects/uwuwu/ADR/ADR-quota-probe-trait-gate: Лимитная пауза сталл-детекта — глобальная проба квоты подписки за трейтом",
+        ],
+    ),
 ];
 const FRESH_SLUG: &str = "Experience/platform/Проба 1687";
 const FRESH_PHRASE: &str = "уникальная фраза зонда 1687 квантовый кроссворд";
@@ -285,6 +291,12 @@ async fn live_full_index_and_control_queries() {
     );
     let reuse = std::env::var("UWUWU_PROBE_REUSE").as_deref() == Ok("1");
     if !reuse {
+        // Гард: том пробы обязан лежать в scratch задачи, не в произвольном пути.
+        assert!(
+            dir.to_string_lossy().contains("/scratch/"),
+            "UWUWU_PROBE_VOLUME должен быть в <env>/scratch, факт: {}",
+            dir.display()
+        );
         let _ = std::fs::remove_dir_all(&dir); // полный rebuild, не частичный индекс
     }
     let wiki = Arc::new(ProbeWiki {

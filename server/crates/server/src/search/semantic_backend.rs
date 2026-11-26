@@ -1,6 +1,6 @@
 //! SemanticBackend на LanceDB embedded (решение задачи #1133): таблица чанков
 //! (slug/idx/text/vector) + FTS (BM25) — гибрид с векторным поиском.
-//! Эмбеддинги — Gemini Embedding 2 через Embedder-трейт (#1363).
+//! Эмбеддинги — локальная Ollama embeddinggemma-2 через Embedder-трейт (#1687).
 //! Инкремент — doc_hash в мета-таблице.
 
 use crate::search::semantic::{chunk_text, Embedder, EMBED_MODEL_DIMS};
@@ -36,8 +36,7 @@ fn slug_pred(slug: &str) -> String {
     format!("slug = '{}'", slug.replace('\'', "''"))
 }
 
-/// Исход синка одного носителя (#1473): проиндексирован / не изменился /
-/// суточный бюджет исчерпан (стоп всего прогона, не ошибка синка).
+/// Исход синка одного дока: проиндексирован / не изменился (#1473, #1687).
 enum DocSyncOutcome {
     Reindexed,
     Unchanged,
@@ -50,7 +49,7 @@ pub struct LanceSemanticBackend {
     /// Задачи для индекса (юзер-стори «по вики/задачам/опыту»); None — стенд.
     issues: Option<Arc<dyn uwuwu_usecase::IssueIndexSource>>,
     db: Connection,
-    /// Источник векторов (Gemini-клиент); query-модуль зовёт embed_query.
+    /// Источник векторов (Ollama-клиент); query-модуль зовёт embed_query.
     pub(super) embeddings: Arc<dyn Embedder>,
 }
 
@@ -245,21 +244,17 @@ impl LanceSemanticBackend {
         self.shas_file.clone()
     }
 
-    /// Число строк таблицы — дешёвый read для события полноты индекса.
-    async fn table_rows(&self, name: &str) -> usize {
-        let Ok(table) = self.table_named(name).await else {
-            return 0;
-        };
-        let Ok(stream) = table.query().execute().await else {
-            return 0;
-        };
-        use futures::stream::StreamExt;
-        let mut stream = stream;
-        let mut rows = 0usize;
-        while let Some(Ok(batch)) = stream.next().await {
-            rows += batch.num_rows();
+    /// Число строк через метаданные Lance (не full-scan векторной колонки).
+    /// None ≠ 0: отказ чтения не должен маскироваться под пустой индекс.
+    async fn table_rows(&self, name: &str) -> Option<usize> {
+        let table = self.table_named(name).await.ok()?;
+        match table.count_rows(None).await {
+            Ok(rows) => Some(rows),
+            Err(e) => {
+                tracing::warn!(event = "semantic.index_state_count_failed", table = name, error = %e, "счёт строк недоступен");
+                None
+            }
         }
-        rows
     }
 
     async fn known_hashes(&self) -> UsecaseResult<HashMap<String, i64>> {
@@ -445,8 +440,8 @@ impl SemanticBackend for LanceSemanticBackend {
         super::query::fulltext(self, tokens, top).await
     }
 
-    /// Исход синка одного носителя: проиндексирован / не изменился /
-    /// суточный бюджет исчерпан (стоп всего прогона).
+    /// Один тик синка: проиндексировать изменённые доки до емкостного гарда,
+    /// затем сообщить полноту индекса событием `semantic.index_state`.
     async fn sync_index(&self, budget: usize) -> UsecaseResult<usize> {
         // sha-инкремент: git blob-sha из дерева (один вызов) отсекает
         // неизменённые ДО чтения содержимого — иначе сотни read_doc
@@ -546,7 +541,7 @@ mod tests {
 
     #[test]
     fn dim_guard_flags_only_mismatch() {
-        assert!(dims_stale(Some(1024))); // qwen3-эпоха против Gemini 1536
+        assert!(dims_stale(Some(1536))); // Gemini-эпоха против Ollama 768
         assert!(!dims_stale(Some(EMBED_MODEL_DIMS)));
         assert!(!dims_stale(None)); // пустой volume — миграции нет
     }

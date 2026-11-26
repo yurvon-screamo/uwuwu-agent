@@ -1,5 +1,5 @@
 //! Эмбеддинги: локальная Ollama embeddinggemma-2 через /api/embed (#1687,
-//! слово владельца 26.11 — возврат с локального Gemini free tier).
+//! слово владельца 26.11 — возврат с внешнего Gemini free tier).
 //! Контракт модели (ollama.com/library/embeddinggemma-2): 768-dim,
 //! task-steered префиксы doc/query совпадают с прежним клиентом, MRL-усечение
 //! через options не применяется API. Отказ маршрута — типизированная ошибка.
@@ -96,21 +96,27 @@ impl OllamaEmbeddings {
     }
 
     async fn embed_one(&self, texts: &[String], total: Duration) -> UsecaseResult<Vec<Vec<f32>>> {
-        let resp = tokio::time::timeout(
-            total,
-            self.http
+        // Таймаут покрывает ВСЁ сетевое взаимодействие: send + заголовки +
+        // тело ответа. stalling-body не должен держать поиск без верхней границы.
+        let (status, body) = tokio::time::timeout(total, async {
+            let resp = self
+                .http
                 .post(format!("{}/api/embed", self.base_url.trim_end_matches('/')))
                 .json(&serde_json::json!({ "model": self.model, "input": texts }))
-                .send(),
-        )
+                .send()
+                .await
+                .map_err(|e| UsecaseError::State(format!("{SERVICE} transport: {e}")))?;
+            let status = resp.status();
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| UsecaseError::State(format!("{SERVICE} body: {e}")))?;
+            Ok::<_, UsecaseError>((status, body))
+        })
         .await
-        .map_err(|_| UsecaseError::State(format!("{SERVICE}: request timeout after {total:?}")))?
-        .map_err(|e| UsecaseError::State(format!("{SERVICE} transport: {e}")))?;
-        let status = resp.status();
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| UsecaseError::State(format!("{SERVICE} body: {e}")))?;
+        .map_err(|_| {
+            UsecaseError::State(format!("{SERVICE}: request timeout after {total:?}"))
+        })??;
         if !status.is_success() {
             return Err(UsecaseError::State(format!(
                 "{SERVICE} HTTP {status}: {}",
@@ -214,5 +220,109 @@ mod tests {
         let chunks = chunk_text(&md);
         assert!(chunks.len() > 1);
         assert!(chunks.iter().all(|c| c.len() <= 1400));
+    }
+
+    /// One-shot mock /api/embed: statusLine с выбранным Content-Length и
+    /// тело (может быть короче объявленного — кейс «тело встало»).
+    fn one_shot(status_line: &'static str, body: String, declared: usize) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 16 * 1024];
+            let mut got = 0usize;
+            while got < buf.len() {
+                let n = match sock.read(&mut buf[got..]) {
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                if n == 0 {
+                    break;
+                }
+                got += n;
+                if buf[..got].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let resp = format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n{body}"
+            );
+            let _ = sock.write_all(resp.as_bytes());
+            std::thread::sleep(std::time::Duration::from_millis(700));
+        });
+        format!("http://{addr}")
+    }
+
+    fn client(url: String) -> OllamaEmbeddings {
+        OllamaEmbeddings::with_timeouts(
+            url,
+            EMBED_MODEL.to_string(),
+            ClientTimeouts {
+                connect: Duration::from_millis(200),
+                query_total: Duration::from_millis(200),
+                batch_total: Duration::from_millis(200),
+            },
+        )
+    }
+
+    fn embed_body(n: usize, dim: usize) -> String {
+        let vecs: Vec<_> = (0..n).map(|_| vec![0.0f32; dim]).collect();
+        serde_json::json!({ "model": EMBED_MODEL, "embeddings": vecs }).to_string()
+    }
+
+    #[tokio::test]
+    async fn success_batch_returns_768_dim_vectors() {
+        let body = embed_body(2, EMBED_MODEL_DIMS);
+        let len = body.len();
+        let c = client(one_shot("HTTP/1.1 200 OK", body, len));
+        let docs = vec![("T".into(), "x".into()), ("T2".into(), "y".into())];
+        let out = c.embed_docs(&docs).await.expect("respond ok");
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|v| v.len() == EMBED_MODEL_DIMS));
+    }
+
+    #[tokio::test]
+    async fn http_error_and_missing_embeddings_are_state_errors() {
+        let body = " boom ".to_string();
+        let len = body.len();
+        let c = client(one_shot("HTTP/1.1 500 Internal Server Error", body, len));
+        assert!(c.embed_query("q").await.is_err(), "5xx -> State");
+
+        let body = "{}".to_string();
+        let len = body.len();
+        let c = client(one_shot("HTTP/1.1 200 OK", body, len));
+        let err = c.embed_query("q").await.unwrap_err().to_string();
+        assert!(err.contains("no embeddings"), "fact: {err}");
+    }
+
+    #[tokio::test]
+    async fn wrong_vector_count_and_dim_are_rejected() {
+        let body = embed_body(1, EMBED_MODEL_DIMS);
+        let len = body.len();
+        let c = client(one_shot("HTTP/1.1 200 OK", body, len));
+        let err = c.embed_query("q").await.unwrap_err().to_string();
+        assert!(err.contains("expected 1 vectors, got"), "fact: {err}");
+
+        let body = embed_body(1, 512);
+        let len = body.len();
+        let c = client(one_shot("HTTP/1.1 200 OK", body, len));
+        let err = c.embed_query("q").await.unwrap_err().to_string();
+        assert!(err.contains("512-dim vector"), "fact: {err}");
+    }
+
+    #[tokio::test]
+    async fn stalled_body_fails_within_total_timeout() {
+        // Заголовки пришли, рабочее тело короче объявленного Content-Length —
+        // reqwest ждёт остаток; без таймаута на чтении вызов висел бы вечно.
+        let body = embed_body(1, EMBED_MODEL_DIMS);
+        let c = client(one_shot("HTTP/1.1 200 OK", body, 100_000));
+        let started = std::time::Instant::now();
+        let err = c.embed_query("q").await.unwrap_err().to_string();
+        assert!(err.contains("timeout"), "fact: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "таймаут сработал"
+        );
     }
 }

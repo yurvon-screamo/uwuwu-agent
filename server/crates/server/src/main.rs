@@ -796,10 +796,9 @@ async fn run(
     if let Some(backend) = semantic_backend.clone() {
         let clock2 = clock.clone();
 
-        // Backoff дифференцированный (#1363): 429 — ожидаемый сигнал лимитов
-        // Gemini free tier, бэкофф в минутах из RetryInfo (кап 15 мин);
-        // транспортный/5xx отказ — час, как прежде. Часовой бэкофф на 429
-        // запрещён — это тишина вместо работы.
+        // На локальной Ollama квотных 429 больше нет (#1687): любой отказ
+        // синка (транспорт, таймаут, неверный ответ) — час тишины, чтобы не
+        // долбить лежащий релей каждые 180 с.
         let backoff_until = Arc::new(std::sync::Mutex::new(0u64));
         sidecars.push(Sidecar {
             name: "semantic-sync".into(),
