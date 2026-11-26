@@ -153,9 +153,9 @@ mod tests {
         let mut buf = InputBuffer::default();
         buf.push(9, msg(90, "одно и то же", None), false);
         buf.push(9, msg(90, "одно и то же", None), false);
+        assert_eq!(buf.max_update_id(), 9, "дубль не должен двигать offset");
         let items = buf.take();
         assert_eq!(items.len(), 1, "повторный апдейт продублировал ввод");
-        assert_eq!(buf.max_update_id(), 0, "offset не сброшен после дубля");
     }
 
     #[test]

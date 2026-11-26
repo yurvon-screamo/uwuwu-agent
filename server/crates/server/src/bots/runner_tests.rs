@@ -3172,10 +3172,11 @@ async fn offset_persisted_only_after_flush() {
     assert_eq!(state.bot_offset(SLUG), Some(41));
 }
 
-/// Правка в открытом окне перезапускает таймер: два апдейта — один батч
-/// с финальным текстом, а не один батч плюс отдельная правка.
+/// Правка в открытом окне заменяет оригинал в одном батче, а не едет
+/// отдельным промптом. Тайминг дедлайна здесь не меряется — пин только
+/// на содержимое.
 #[tokio::test]
-async fn edit_inside_window_restarts_timer_and_replaces_original() {
+async fn edit_inside_window_replaces_original() {
     let tg = FakeTg::new(vec![private_update(70, "yurvon", "старый текст")]);
     let sessions = FakeSessions::new();
     let mut d = deps(
