@@ -26,14 +26,23 @@ use uwuwu_usecase::{
 
 const HUB: &str = "yurvon-screamo/uwuwu-hub";
 
-/// Контрольные запросы (#1363, перепинаны на живые слаги 26.11).
-const CONTROL: &[(&str, &str)] = &[
+/// Контрольные запросы (#1363, перепинаны на живые слаги 26.11). На полном
+/// корпусе «фабрика…» даёт набор релевантных доков, а не один README из
+/// 4-докового сида — ожидание — набор релевантных слагов, не один фиксированный.
+const CONTROL: &[(&str, &[&str])] = &[
     (
         "обзор моделей эмбеддингов",
-        "Experience/llm-local/Embedding Models Overview",
+        &["Experience/llm-local/Embedding Models Overview"],
     ),
-    ("тренажёр кандзи для японского", "Projects/origa/README"),
-    ("фабрика задач канбан конвейер", "Projects/uwuwu/README"),
+    ("тренажёр кандзи для японского", &["Projects/origa/README"]),
+    (
+        "фабрика задач канбан конвейер",
+        &[
+            "Projects/uwuwu/README",
+            "Projects/uwuwu/Фабрика: диаграмма конвейера",
+            "Projects/uwuwu/ADR/ADR-032: Fast-track-вход задач — untracked In Progress спавнит implement-агента; рестарты на нейтральном continuePrompt",
+        ],
+    ),
 ];
 const FRESH_SLUG: &str = "Experience/platform/Проба 1687";
 const FRESH_PHRASE: &str = "уникальная фраза зонда 1687 квантовый кроссворд";
@@ -274,7 +283,10 @@ async fn live_full_index_and_control_queries() {
         std::env::var("UWUWU_PROBE_VOLUME")
             .expect("UWUWU_PROBE_VOLUME=<env>/scratch/semantic-live-probe"),
     );
-    let _ = std::fs::remove_dir_all(&dir); // полный rebuild, не частичный индекс
+    let reuse = std::env::var("UWUWU_PROBE_REUSE").as_deref() == Ok("1");
+    if !reuse {
+        let _ = std::fs::remove_dir_all(&dir); // полный rebuild, не частичный индекс
+    }
     let wiki = Arc::new(ProbeWiki {
         live: LiveWiki::open(token.clone()).await.expect("живая вика"),
     });
@@ -298,6 +310,9 @@ async fn live_full_index_and_control_queries() {
     // крупнее шаг: один вызов упирается в бюджет тика и не доходит до задач.
     let mut total = 0usize;
     for tick in 1..=8 {
+        if reuse {
+            break;
+        }
         let changed = backend.sync_index(400).await.expect("живой полный sync");
         eprintln!("тик {tick}: проиндексировано доков {changed}");
         total += changed;
@@ -305,8 +320,10 @@ async fn live_full_index_and_control_queries() {
             break;
         }
     }
-    eprintln!("полный sync проиндексировал доков: {total}");
-    assert!(total > 1000, "полный корпус должен дать >1000 доков");
+    eprintln!("полный sync проиндексировал доков: {total} (reuse={reuse})");
+    if !reuse {
+        assert!(total > 1000, "полный корпус должен дать >1000 доков");
+    }
 
     // Контрольные запросы — тот же SearchUseCase, что рендерит MCP search.
     let uc = SearchUseCase {
@@ -321,8 +338,8 @@ async fn live_full_index_and_control_queries() {
             .collect();
         eprintln!("контроль «{query}»: {semantic:?}");
         assert!(
-            semantic.iter().take(3).any(|s| s == expected),
-            "ожидаемый слаг {expected} — в top-3, факт: {semantic:?}"
+            semantic.iter().take(3).any(|s| expected.contains(s)),
+            "релевантный слаг из {expected:?} — в top-3, факт: {semantic:?}"
         );
     }
     let fresh = uc.search(FRESH_PHRASE, 5).await.expect("fresh query");
