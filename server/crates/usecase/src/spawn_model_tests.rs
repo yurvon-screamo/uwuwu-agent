@@ -16,7 +16,7 @@ use crate::router::SessionRouter;
 use crate::spawn_models::SpawnModels;
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
-use uwuwu_domain::{PeakWindow, Slot, SpawnModel, Status, Task};
+use uwuwu_domain::{Agent, PeakWindow, Slot, SpawnModel, Status, Task};
 
 /// Канон-карта владельца (единственный механизм моделей — #1154).
 fn models() -> Arc<SpawnModels> {
@@ -475,4 +475,34 @@ async fn cron_run_carries_model_from_server_map() {
         "крон-спавн",
         "opencode-go/hy4-flash-free#high",
     );
+}
+
+#[test]
+fn peak_gate_applies_only_to_glm_provider_1680() {
+    let models = SpawnModels::canonical();
+    // ревьюверы — GLM: peak держит их этапы
+    for agent in [
+        Agent::PlanReviewer,
+        Agent::CodeQualityReviewer,
+        Agent::TestReviewer,
+        Agent::AnalystReviewer,
+    ] {
+        assert!(
+            crate::spawn_models::peak_applies(&models.for_agent(agent)),
+            "GLM-этап должен попадать под peak: {agent:?}"
+        );
+    }
+    // остальные этапы — opencode-go: в окне работают без отложек
+    for agent in [
+        Agent::Developer,
+        Agent::Tester,
+        Agent::Analyst,
+        Agent::Dreamer,
+    ] {
+        assert!(
+            !crate::spawn_models::peak_applies(&models.for_agent(agent)),
+            "не-GLM этап не должен попадать под peak: {agent:?}"
+        );
+    }
+    assert!(!crate::spawn_models::peak_applies(&models.for_default()));
 }

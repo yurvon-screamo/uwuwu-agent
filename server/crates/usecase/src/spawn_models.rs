@@ -13,6 +13,15 @@ use crate::naming;
 use std::collections::HashMap;
 use uwuwu_domain::{Agent, SpawnModel};
 
+/// Провайдер, для которого действует peak-окно (#1679/#1680).
+/// Остальные провайдеры работают в окне без отложек.
+pub const PEAK_PROVIDER: &str = "zai-coding-plan";
+
+/// Peak-гейт применяется только к этапам целевого провайдера.
+pub fn peak_applies(model: &SpawnModel) -> bool {
+    model.model.provider() == PEAK_PROVIDER
+}
+
 #[derive(Debug, Clone)]
 pub struct SpawnModels {
     map: HashMap<String, SpawnModel>,
