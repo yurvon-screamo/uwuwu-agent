@@ -602,7 +602,7 @@ impl CronStateStore for MemCronState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ports::AppendDocOutcome;
+    use crate::ports::WikiRepo;
 
     use std::sync::{Arc, Mutex};
 
@@ -754,22 +754,14 @@ mod tests {
             self.0.lock().unwrap().insert(slug.into(), content.into());
             Ok(())
         }
-        async fn append_doc(
-            &self,
-            slug: &str,
-            line: &str,
-            _m: &str,
-        ) -> UsecaseResult<AppendDocOutcome> {
+        async fn append_doc(&self, slug: &str, line: &str, _m: &str) -> UsecaseResult<usize> {
             self.0
                 .lock()
                 .unwrap()
                 .entry(slug.into())
                 .or_default()
                 .push_str(&format!("{line}\n"));
-            Ok(AppendDocOutcome {
-                created: false,
-                lines: 0,
-            })
+            Ok(0)
         }
     }
 

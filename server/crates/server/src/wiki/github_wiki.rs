@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use uwuwu_usecase::WikiRepo;
-use uwuwu_usecase::{AppendDocOutcome, UsecaseError, UsecaseResult};
+use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 pub struct GitHubWiki {
     repo: String,
@@ -177,7 +177,16 @@ impl WikiRepo for GitHubWiki {
             ))
             .await?;
         if status.as_u16() == 404 {
-            return Ok(None);
+            // #1653: Contents отстаёт от git-data-коммита; до вердикта
+            // «дока нет» спрашиваем свежее дерево и читаем blob по sha.
+            return crate::wiki::witness::TreeWitness {
+                http: &self.http,
+                token: &self.token,
+                repo: &self.repo,
+                branch: &self.branch,
+            }
+            .read(&path)
+            .await;
         }
         if !status.is_success() {
             return Err(UsecaseError::Board(format!("read «{slug}»: HTTP {status}")));
@@ -217,12 +226,7 @@ impl WikiRepo for GitHubWiki {
             .await
     }
 
-    async fn append_doc(
-        &self,
-        slug: &str,
-        line: &str,
-        message: &str,
-    ) -> UsecaseResult<AppendDocOutcome> {
+    async fn append_doc(&self, slug: &str, line: &str, message: &str) -> UsecaseResult<usize> {
         let Some(w) = &self.writer else {
             return Err(UsecaseError::Board("wiki write is not configured".into()));
         };

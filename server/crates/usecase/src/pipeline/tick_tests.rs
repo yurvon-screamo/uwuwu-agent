@@ -1377,6 +1377,10 @@ async fn soft_ping_prompt_routes_to_project_executor() {
         named_prompts.iter().any(|p| p.contains("Soft ping")),
         "soft-ping на гейтвее проекта: {named_prompts:?}"
     );
+    assert!(
+        named_prompts.iter().any(|p| p.contains("owner_answer")),
+        "#1619: мягкий пинг напоминает про ответ владельца: {named_prompts:?}"
+    );
     // пин агента слота и на мягком пинге (#1300)
     let switched = named_gw.switched.lock().unwrap();
     assert!(
@@ -3476,6 +3480,10 @@ async fn test_slot_reentry_keeps_master_session_and_delivers_delta_wake() {
     assert!(
         prompts[0].contains("Repeat testing round"),
         "промпт входа — дельта, не спавн-промпт стадии: {prompts:?}"
+    );
+    assert!(
+        prompts[0].contains("owner_answer"),
+        "#1619: re-entry тоже знает про ответ владельца: {prompts:?}"
     );
     assert!(
         sessions.compacted.lock().unwrap().is_empty(),
@@ -6605,6 +6613,10 @@ async fn spawn_prompt_demands_finish_transaction() {
     assert!(
         prompt.contains("Needs attention"),
         "вопрос владельцу — легальный финал"
+    );
+    assert!(
+        prompt.contains("owner_answer"),
+        "#1619: возврат по ответу владельца объяснён в промпте спавна"
     );
 }
 
@@ -13345,4 +13357,31 @@ async fn continuation_soft_ping_on_later_board_beats_new_design_on_first() {
             .any(|p| p.starts_with("ses_702|") && p.contains("Soft ping")),
         "пинг доставлен в сессию продолжения: {prompts:?}"
     );
+}
+
+/// #1619: обе волны аналитики знают про owner_answer — у них свои промпты,
+/// мимо spawn_prompt; без клаузы ответ через чат снова упрётся в гард.
+#[test]
+fn analyst_wave_prompts_teach_owner_answer() {
+    let task = Task::new(9, "t".into(), Status::Analys);
+    let prompts = [
+        (
+            "analyst",
+            crate::pipeline::analyst::analyst_prompt("p", &[&task]),
+        ),
+        (
+            "analyst-reviewer",
+            crate::pipeline::analyst_review::analyst_review_prompt("p", &[&task]),
+        ),
+    ];
+    for (name, prompt) in prompts {
+        assert!(
+            prompt.contains("owner_answer"),
+            "{name}: клауза #1619 потеряна: {prompt}"
+        );
+        assert!(
+            prompt.contains("verbatim"),
+            "{name}: ответ должен быть дословным: {prompt}"
+        );
+    }
 }

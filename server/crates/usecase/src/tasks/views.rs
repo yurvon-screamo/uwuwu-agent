@@ -148,7 +148,9 @@ impl PersonView {
 }
 
 /// Слаг-гигиена: без ведущего docs/, без ../, без .md-суффикса.
-fn sanitize_slug(slug: &str) -> String {
+/// Публична с #1613: write-пути нормализуют таргет тем же кодом, что
+/// read/ls (асимметрия адресаций — окно семьи «запись не туда»).
+pub fn sanitize_slug(slug: &str) -> String {
     let mut s = slug.trim().trim_start_matches("docs/").trim_matches('/');
     if let Some(stripped) = s.strip_suffix(".md") {
         s = stripped;

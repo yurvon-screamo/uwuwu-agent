@@ -564,7 +564,7 @@ impl AnalystUseCase {
     }
 }
 
-fn analyst_prompt(project: &str, rows: &[&Task]) -> String {
+pub(crate) fn analyst_prompt(project: &str, rows: &[&Task]) -> String {
     let marker = ANALYST_WAVE_MARKER.replace("{project}", project);
     let mut list = String::new();
     for t in rows {
@@ -582,6 +582,8 @@ fn analyst_prompt(project: &str, rows: &[&Task]) -> String {
             duplicate/garbage → uwuwu_task_close {{number, not_planned: true}} with rationale;\n\
             a real blocker → Needs attention; a fork outside FT/NFT → a 🚩 flag in the body\n\
             (fork А/Б + an explicit recommendation), no questions to the owner.\n\
+           After an owner reply in chat, fix it verbatim in the body/thread and pass\n\
+            owner_answer with the source status when clearing Needs attention.\n\
          You are an analyst: do not implement the task, do not write into the Design Spec, do not create tasks."
     )
 }

@@ -90,3 +90,10 @@ impl StatusPreImageStore for JsonStatusPreImages {
         self.path.display().to_string()
     }
 }
+
+#[cfg(test)]
+#[path = "rename_journal_test_support.rs"]
+mod test_support;
+#[cfg(test)]
+#[path = "rename_journal_tests.rs"]
+mod tests;

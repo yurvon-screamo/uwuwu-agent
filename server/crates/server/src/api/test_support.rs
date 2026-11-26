@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 use uwuwu_domain::{Slot, Status};
 use uwuwu_usecase::{
-    AgentSessionGateway, AppendDocOutcome, DreamerMark, Liveness, SessionInfo, SessionSpec,
-    TaskView, TaskWriteUseCase, TickStateStore, UsecaseResult, WikiRepo,
+    AgentSessionGateway, DreamerMark, Liveness, SessionInfo, SessionSpec, TaskView,
+    TaskWriteUseCase, TickStateStore, UsecaseResult, WikiRepo,
 };
 
 use crate::clock::SystemClock;
@@ -261,6 +261,45 @@ pub(crate) fn tool_hub_on_board(
     (tools, aux)
 }
 
+/// Вызов инструмента через настоящий MCP-провод (POST /mcp, JSON-RPC
+/// tools/call) — общий хелпер для пинов уровня провода (#1256, третья
+/// копия развязана в #1576). Роутер и bearer отдаёт тест: фикстура не
+/// навязывает контур.
+pub(crate) async fn mcp_call(
+    app: &axum::Router,
+    bearer: &str,
+    name: &str,
+    args: serde_json::Value,
+) -> serde_json::Value {
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": name, "arguments": args }
+    });
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("authorization", format!("Bearer {bearer}"))
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .expect("request ok"),
+        )
+        .await
+        .expect("service ok");
+    assert_eq!(res.status(), axum::http::StatusCode::OK);
+    let bytes = res.into_body().collect().await.expect("body ok").to_bytes();
+    serde_json::from_slice(&bytes).expect("json ok")
+}
+
 /// body_hash из fm-шапки вывода task_get (общий для tools_tests и
 /// wire-проб mcp.rs — identical-code #1256).
 pub(crate) fn fm_hash(task_get: &str) -> String {
@@ -297,11 +336,8 @@ impl WikiRepo for StubWiki {
     async fn write_doc(&self, _: &str, _: &str, _: &str) -> UsecaseResult<()> {
         Ok(())
     }
-    async fn append_doc(&self, _: &str, _: &str, _: &str) -> UsecaseResult<AppendDocOutcome> {
-        Ok(AppendDocOutcome {
-            created: false,
-            lines: 0,
-        })
+    async fn append_doc(&self, _: &str, _: &str, _: &str) -> UsecaseResult<usize> {
+        Ok(0)
     }
 }
 
@@ -312,7 +348,8 @@ pub(crate) struct StubJournals {
 }
 
 /// Pre-image журнал rename (#1447) в армах диспетчера: память на время
-/// пробы (персистентность покрывает пин rename_journal).
+/// пробы; персистентность `JsonStatusPreImages` пинится офлайн-юнитами
+/// в `rename_journal_tests.rs` (этот no-op контракт файла не проверяет).
 pub(crate) struct StubPreImages;
 
 impl uwuwu_usecase::StatusPreImageStore for StubPreImages {

@@ -62,6 +62,9 @@ pub struct BodyWriteReceipt {
 pub struct EditReceipt {
     /// Some — патч нёс статус, исход подтверждения носителем.
     pub status: Option<StatusDelivery>,
+    /// #1619: ответ был передан, но строка уже не была в Needs attention —
+    /// ключ проигнорирован, квитанция обязана сказать это явно.
+    pub owner_answer_ignored: bool,
 }
 
 /// Квитанция секционной правки (#1152): исход + тело после записи.
@@ -204,6 +207,9 @@ pub struct TaskPatch {
     /// Тип задачи (#1271): нативный issue Type, PATCH {"type": имя}.
     /// None — не трогать (снос значения патчем не предусмотрен).
     pub kind: Option<TaskType>,
+    /// Дословный ответ владельца (#1619): разрешает возврат из Needs
+    /// attention в стадию-источник. Сам по себе не мутация.
+    pub owner_answer: Option<String>,
 }
 
 impl TaskPatch {
@@ -219,6 +225,7 @@ impl TaskPatch {
                 title: None,
                 automerge: None,
                 kind: None,
+                owner_answer: None,
             }
         )
     }
@@ -435,8 +442,11 @@ impl TaskWriter for TaskWriteUseCase {
         let mut want_priority: Option<String> = None;
         let mut want_automerge: Option<bool> = None;
         let mut status_delivery: Option<StatusDelivery> = None;
+        let mut owner_answer_ignored = false;
         if let Some(status) = patch.status {
-            let current = self.guard_canon(&board, number, status).await?;
+            let answer = patch.owner_answer.as_deref();
+            let (current, answer_used) = self.guard_canon(&board, number, status, answer).await?;
+            owner_answer_ignored = answer.is_some() && !answer_used;
             // Гейт полноты полей на выходе из Analys (#1280): волна
             // аналитики обязана выпускать строки с явными Приоритетом
             // и Automerge — решение разбора, не пустота носителя.
@@ -547,6 +557,7 @@ impl TaskWriter for TaskWriteUseCase {
         .await?;
         Ok(EditReceipt {
             status: status_delivery,
+            owner_answer_ignored,
         })
     }
 
@@ -676,10 +687,10 @@ impl TaskWriter for TaskWriteUseCase {
         // инвариант на границе: тело без fm и без дисплей-шапки task_get
         // (агенты могут копировать старый канон — сервер держит «fm снесён»
         // сам, #1151; fm-стек инцидента #1331)
-        let clean = if explicit_clear {
-            ""
+        let clean: String = if explicit_clear {
+            String::new()
         } else {
-            crate::fm_lite::strip(strip_task_get_header(input))
+            strip_comments_tail(crate::fm_lite::strip(strip_task_get_header(input)))
         };
         // Гард пустой записи судит по ЭФФЕКТИВНОМУ контенту — тому, что
         // уйдёт в replace_body (ревью #1572 Common-1): fm-блок или шапка
@@ -692,14 +703,15 @@ impl TaskWriter for TaskWriteUseCase {
             let current = self.board.read_issue(&board, number).await?;
             return Err(UsecaseError::Board(format!(
                 "body of #{number}: write refused — the `body` parameter carries no effective \
-                 content (only fm/task_get-header wrapping, stripped on the boundary); \
+                 content (only fm/task_get-header wrapping or a comments tail from a copied \
+                 card, stripped on the boundary); \
                  task_body REPLACES the whole carrier body (write, not read; current body: \
                  {} bytes). Read the body via task_get; to clear deliberately pass \
                  body: \"\"",
                 current.body.len()
             )));
         }
-        self.board.replace_body(number, clean).await?;
+        self.board.replace_body(number, &clean).await?;
         // контрольное чтение носителя: квитанция = факт доставки (#1331)
         let repo = self.board.clone();
         let bd = board.clone();
@@ -742,7 +754,7 @@ impl TaskWriter for TaskWriteUseCase {
                     "Контрольное чтение носителя не удалось — квитанция от отправленного тела"
                 );
                 Ok(BodyWriteReceipt {
-                    body_hash: md_section::body_hash(clean),
+                    body_hash: md_section::body_hash(&clean),
                     body_size: clean.len(),
                     verified: false,
                 })
@@ -969,16 +981,135 @@ where
     }
 }
 
-/// Дисплей-шапка task_get («--- fm ---» + fm-ключи рендера) — рендер
-/// MCP-карточки, не носитель: агенты копируют вывод task_get назад в
-/// task_body, и шапка наслаивалась в теле (fm-стек инцидента #1331).
-/// Срезается на границе записи: инвариант ADR-105 «тело — чистый
-/// markdown» держит сервер, не дисциплина агента (прецедент #1151).
-/// Консервативно: строго набор/порядок ключей одного из рендеров,
-/// любой посторонний контент («--- fm ---» внутри текста) не трогается.
-/// Зеркало рендера (api/tools.rs task_get): рендер меняется — менять
-/// все формы здесь; пин в tools_tests собран из реального рендера и
-/// краснеет при расхождении (#1604: рендер добавил body_bytes;
+/// Хвост ленты комментов из полной копии карточки `task_get`.
+///
+/// Граница записи держит инвариант ADR-105: тело не несёт композит чтения.
+/// Срез ограничен записями рендера, поэтому секции, дописанные после дампа,
+/// остаются на месте. Возвращает владельца: префикс и сохранённый хвост
+/// не образуют одного заимствованного среза.
+fn strip_comments_tail(input: &str) -> String {
+    let mut current = input.to_string();
+    while let Some((from, to)) = comments_tail_cut(&current) {
+        current = format!("{}{}", &current[..from], &current[to..]);
+    }
+    current
+}
+
+/// Диапазон байт одной распознанной ленты: от пары переводов перед маркером
+/// до конца последней записи (или до пустой строки перед H2).
+fn comments_tail_cut(input: &str) -> Option<(usize, usize)> {
+    let mut lines = Vec::new();
+    let mut at = 0;
+    for piece in input.split_inclusive('\n') {
+        let body = piece.strip_suffix('\n').unwrap_or(piece);
+        let body = body.strip_suffix('\r').unwrap_or(body);
+        lines.push((at, body));
+        at += piece.len();
+    }
+
+    let mut fence = false;
+    for index in 0..lines.len() {
+        let (start, line) = lines[index];
+        if !fence && line.starts_with("--- comments (latest") && line.ends_with(") ---") {
+            if let Some(end) = comments_tail_end(input.len(), &lines, index + 1) {
+                let from = if input[..start].ends_with("\r\n\r\n") {
+                    start - 4
+                } else if input[..start].ends_with("\n\n") {
+                    start - 2
+                } else {
+                    start
+                };
+                return Some((from, end));
+            }
+        }
+        if md_section::toggles_fence(line) {
+            fence = !fence;
+        }
+    }
+    None
+}
+
+/// Конец ленты: последняя запись идёт до конца входа или до пустой строки
+/// перед H2. Состояние блока кода не наследуется от предыдущего коммента.
+fn comments_tail_end(len: usize, lines: &[(usize, &str)], from: usize) -> Option<usize> {
+    let mut index = from;
+    let mut found = false;
+    while entry_starts_at(lines, index) {
+        found = true;
+        if let Some(end) = scan_entry(lines, index + 2) {
+            return Some(end);
+        }
+        index += 2;
+        while index < lines.len() && !entry_starts_at(lines, index) {
+            index += 1;
+        }
+    }
+    if found {
+        Some(len)
+    } else {
+        None
+    }
+}
+
+/// Тело записи заканчивается на пустой строке перед H2 вне блока кода.
+fn scan_entry(lines: &[(usize, &str)], from: usize) -> Option<usize> {
+    let mut fence = false;
+    for index in from..lines.len() {
+        let line = lines[index].1;
+        if section_starts_at(lines, index, fence) {
+            return Some(lines[index].0);
+        }
+        if entry_starts_at(lines, index) {
+            return None;
+        }
+        if md_section::toggles_fence(line) {
+            fence = !fence;
+        }
+    }
+    None
+}
+
+fn entry_starts_at(lines: &[(usize, &str)], index: usize) -> bool {
+    index + 1 < lines.len() && lines[index].1 == "---" && is_comment_stamp(lines[index + 1].1)
+}
+
+fn section_starts_at(lines: &[(usize, &str)], index: usize, fence: bool) -> bool {
+    index + 1 < lines.len()
+        && !fence
+        && lines[index].1.is_empty()
+        && lines[index + 1].1.starts_with("## ")
+}
+
+/// Штамп коммента рендера: `YYYY-MM-DDTHH:MM:SSZ` (UTC).
+fn is_comment_stamp(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    if bytes.len() != 20 {
+        return false;
+    }
+    let separators = matches!(
+        (bytes[4], bytes[7], bytes[10], bytes[13], bytes[16], bytes[19]),
+        (b'-', b'-', b'T', b':', b':', b'Z')
+    );
+    if !separators {
+        return false;
+    }
+    [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18]
+        .iter()
+        .all(|&i| bytes[i].is_ascii_digit())
+}
+
+/// Дисплей-шапка task_get — рендер MCP-карточки, не носитель: агенты
+/// копируют вывод task_get назад в task_body, и шапка наслаивалась в
+/// теле (fm-стек инцидента #1331, инстансы #1526). Состав рендера
+/// (api/tools.rs task_get): тайтл-строка «#N title — status», пустая
+/// строка, fm-блок с ключами одного из рендеров ниже. Срезается на
+/// границе записи: инвариант ADR-105 «тело — чистый markdown» держит
+/// сервер, не дисциплина агента (прецедент #1151). Консервативно:
+/// строго набор/порядок ключей и форма карточки; срезаются все
+/// подряд идущие слои (стек, #1632); любой посторонний контент
+/// («--- fm ---» внутри текста) не трогается. Зеркало рендера: рендер
+/// меняется — менять формы здесь; пин в tools_tests собран из
+/// реального рендера и краснеет при расхождении (#1604 — body_bytes;
 /// #1631 — fact_track).
 fn strip_task_get_header(md: &str) -> &str {
     // Актуальный рендер (#1604+#1631): branch/pr/automerge/direct/
@@ -1016,20 +1147,44 @@ fn strip_task_get_header(md: &str) -> &str {
     // агентами из старых сессий и статей опыта — срезаются тоже)
     const LEGACY_KEYS_NO_TYPE: [&str; 5] =
         ["branch: ", "pr: ", "automerge: ", "direct: ", "body_hash: "];
-    let Some(rest) = md.strip_prefix("--- fm ---\n") else {
-        return md;
-    };
-    for keys in [
-        &KEYS[..],
-        &LEGACY_KEYS[..],
-        &LEGACY_KEYS_6[..],
-        &LEGACY_KEYS_NO_TYPE[..],
-    ] {
-        if let Some(stripped) = strip_header_keys(rest, keys) {
-            return stripped;
-        }
+    let mut pos = md;
+    while let Some(rest) = strip_header_layer(
+        pos,
+        &[
+            &KEYS[..],
+            &LEGACY_KEYS[..],
+            &LEGACY_KEYS_6[..],
+            &LEGACY_KEYS_NO_TYPE[..],
+        ],
+    ) {
+        pos = rest;
     }
-    md
+    pos
+}
+
+/// Один слой шапки в начале входа: fm-блок (форма A) либо полная
+/// карточка рендера — тайтл-строка + пустая строка + fm-блок (форма B,
+/// #1632). Ключи сверяются со всеми наборами рендеров (актуальный +
+/// легаси). None — не слой шапки, вход не трогается.
+fn strip_header_layer<'a>(md: &'a str, key_sets: &[&[&str]]) -> Option<&'a str> {
+    if let Some(rest) = strip_fm_block(md, key_sets) {
+        return Some(rest);
+    }
+    let (title_line, after_title) = md.split_once('\n')?;
+    if !is_render_title_line(title_line) {
+        return None;
+    }
+    let after_blank = after_title.strip_prefix('\n')?;
+    strip_fm_block(after_blank, key_sets)
+}
+
+/// fm-блок рендера: маркер + ключи одного из наборов строго по
+/// порядку; возврат — вход после шапки без ведущих пустых строк.
+fn strip_fm_block<'a>(md: &'a str, key_sets: &[&[&str]]) -> Option<&'a str> {
+    let rest = md.strip_prefix("--- fm ---\n")?;
+    key_sets
+        .iter()
+        .find_map(|keys| strip_header_keys(rest, keys))
 }
 
 /// Строгое совпадение набора/порядка ключей одного рендера; частичные
@@ -1053,6 +1208,17 @@ fn strip_header_keys<'a>(rest: &'a str, keys: &[&str]) -> Option<&'a str> {
         pos = pos[line_end..].strip_prefix('\n').unwrap_or("");
     }
     Some(pos.trim_start_matches('\n'))
+}
+
+/// Тайтл-строка рендера карточки: «#<номер> <тайтл> — <статус>» —
+/// решётка, цифры, пробел; разделитель « — » из рендера (статусы не
+/// захардкожены — дрейф доски гард не ломает).
+fn is_render_title_line(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix('#') else {
+        return false;
+    };
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    digits > 0 && rest[digits..].starts_with(' ') && line.contains(" — ")
 }
 
 /// Ожидания контрольного чтения edit: Some — значение менялось и должно
@@ -1170,23 +1336,55 @@ impl TaskWriteUseCase {
     /// Квотная дисциплина ADR-113/#1437: точечный GraphQL-рид только
     /// на редких ветках — отказная, идемпотентная, нечитаемый кеш-вид
     /// (один рид на вызов, без повторов).
-    async fn guard_canon(&self, board: &str, number: u64, status: Status) -> UsecaseResult<Status> {
+    async fn guard_canon(
+        &self,
+        board: &str,
+        number: u64,
+        status: Status,
+        owner_answer: Option<&str>,
+    ) -> UsecaseResult<(Status, bool)> {
+        // bool — ответ владельца реально понадобился для ребра; квитанция
+        // обязана отличать его от ключа, переданного по привычке (#1619).
         match self.guard_current(board, number, status).await? {
             // Свежий носитель уже оплачен (рид #1437/нечитаемый кеш-вид):
             // повторной fresh-сверки нет — канон-проверка по нему
             GuardView::Fresh(current) => {
                 let (direct, fact_track) = self.carrier_flags(number, current, status).await;
                 if uwuwu_domain::Status::can_transition_with(current, status, direct, fact_track) {
-                    return Ok(current);
+                    return Ok((current, false));
+                }
+                if uwuwu_domain::Status::can_transition_with_answer(
+                    current,
+                    status,
+                    direct,
+                    fact_track,
+                    owner_answer,
+                ) {
+                    return Ok((current, true));
                 }
                 // отказ: кеш-вида как источника здесь нет (рид был свежим
                 // или кеш нечитаем) — расхождению докладывать нечего
-                Err(Self::reject_canon(number, current, None, status))
+                Err(Self::reject_canon(
+                    number,
+                    current,
+                    None,
+                    status,
+                    owner_answer,
+                ))
             }
             GuardView::Cached(cached) => {
                 let (direct, fact_track) = self.carrier_flags(number, cached, status).await;
                 if uwuwu_domain::Status::can_transition_with(cached, status, direct, fact_track) {
-                    return Ok(cached);
+                    return Ok((cached, false));
+                }
+                if uwuwu_domain::Status::can_transition_with_answer(
+                    cached,
+                    status,
+                    direct,
+                    fact_track,
+                    owner_answer,
+                ) {
+                    return Ok((cached, true));
                 }
                 let fresh = verifiable_current(
                     board,
@@ -1194,8 +1392,29 @@ impl TaskWriteUseCase {
                     self.board.fresh_row_status(board, number).await?,
                 )?;
                 let (direct, fact_track) = self.carrier_flags(number, fresh, status).await;
-                if !uwuwu_domain::Status::can_transition_with(fresh, status, direct, fact_track) {
-                    return Err(Self::reject_canon(number, fresh, Some(cached), status));
+                let answer_used =
+                    !uwuwu_domain::Status::can_transition_with(fresh, status, direct, fact_track)
+                        && uwuwu_domain::Status::can_transition_with_answer(
+                            fresh,
+                            status,
+                            direct,
+                            fact_track,
+                            owner_answer,
+                        );
+                if !uwuwu_domain::Status::can_transition_with_answer(
+                    fresh,
+                    status,
+                    direct,
+                    fact_track,
+                    owner_answer,
+                ) {
+                    return Err(Self::reject_canon(
+                        number,
+                        fresh,
+                        Some(cached),
+                        status,
+                        owner_answer,
+                    ));
                 }
                 tracing::warn!(
                     event = "board.guard_stale_cache",
@@ -1204,7 +1423,7 @@ impl TaskWriteUseCase {
                     fresh = %naming::status_name(fresh),
                     "Кеш-вид гарда отстал от носителя — переход проведён по свежему чтению (#1615)"
                 );
-                Ok(fresh)
+                Ok((fresh, answer_used))
             }
         }
     }
@@ -1218,6 +1437,7 @@ impl TaskWriteUseCase {
         fresh: Status,
         cached: Option<Status>,
         to: Status,
+        owner_answer: Option<&str>,
     ) -> UsecaseError {
         match cached {
             Some(cached) => tracing::warn!(
@@ -1236,9 +1456,19 @@ impl TaskWriteUseCase {
                 "Гард канона: переход запрещён (свежий носитель подтвердил отказ)"
             ),
         }
+        let hint = if fresh == Status::NeedsAttention
+            && !uwuwu_domain::Status::can_transition(fresh, to)
+            && owner_answer.is_none_or(|answer| answer.trim().is_empty())
+        {
+            // #1619: самообучающий отказ доезжает до живого агента, даже
+            // если его сессия заспавнена до деплоя новой клаузы промпта.
+            "; Needs attention → source stage requires owner_answer (the verbatim owner reply, fixed in the body/thread first)"
+        } else {
+            ""
+        };
         UsecaseError::Board(format!(
-            "transition {:?} → {:?} outside the pipeline canon",
-            fresh, to
+            "transition {:?} → {:?} outside the pipeline canon{}",
+            fresh, to, hint
         ))
     }
 
@@ -1364,7 +1594,7 @@ fn render_create_body(spec: &NewTask) -> String {
     } else {
         // fm и дисплей-шапка task_get — на границе (инвариант сервера,
         // #1151; fm-стек инцидента #1331)
-        crate::fm_lite::strip(strip_task_get_header(&spec.body_md)).to_string()
+        strip_comments_tail(crate::fm_lite::strip(strip_task_get_header(&spec.body_md)))
     };
     // тело уже в канон-форме (агенты шлют «## Постановка…») — не дублируем
     // H2 (инцидент #1149: скелет prepend'ался к готовому телу)
@@ -2170,6 +2400,17 @@ mod tests {
     }
 
     #[test]
+    fn create_body_strips_full_card_header() {
+        // #1632: task_create идёт через тот же гард — копия карточки
+        // task_get (тайтл-строка + fm) в body_md срезается на границе
+        let card_copy = "#1526 t — In Progress\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\n\n## Постановка\n\nТекст.";
+        let out = render_create_body(&spec(card_copy));
+        assert!(!out.contains("--- fm ---"), "шапка вырезана: {out}");
+        assert!(!out.contains("#1526"), "тайтл-строка вырезана: {out}");
+        assert_eq!(out, "## Постановка\n\nТекст.\n");
+    }
+
+    #[test]
     fn create_body_strips_task_get_header_without_trailing_newline() {
         let header = "--- fm ---\nbranch: x\npr: y\nautomerge: true\ndirect: false\nfact_track: false\ntype: feature\nbody_hash: h\nbody_bytes: 66";
         let out = render_create_body(&spec(header));
@@ -2197,6 +2438,174 @@ mod tests {
         // легаси до #1271: 5 ключей, без type
         let md_legacy5 = "--- fm ---\nbranch: work/task-1331\npr: —\nautomerge: true\ndirect: false\nbody_hash: 9de430c691c92328\n\n## Постановка\nтекст";
         assert_eq!(strip_task_get_header(md_legacy5), "## Постановка\nтекст");
+    }
+
+    /// fm-стек из чистых fm-блоков, без тайтл-строк (#1331): форма A
+    /// тоже применяется циклически — срезаются все слои, не только
+    /// первый.
+    #[test]
+    fn task_get_stacked_fm_blocks_are_stripped() {
+        let fm = "--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\n\n";
+        let md = format!("{fm}{fm}## Постановка\nтело");
+        assert_eq!(strip_task_get_header(&md), "## Постановка\nтело");
+    }
+
+    /// Полная копия карточки (#1632): тайтл-строка рендера + пустая
+    /// строка + fm-блок — срезается целиком, на носителе тело.
+    #[test]
+    fn task_get_full_card_copy_is_stripped() {
+        let md = "#1526 Bug: гардин молчит — In Progress\n\n--- fm ---\nbranch: work/task-1526\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: 9de430c691c92328\n\n## Постановка\nтекст";
+        assert_eq!(strip_task_get_header(md), "## Постановка\nтекст");
+    }
+
+    /// Полная копия карточки без тела — срезается в пустоту (пустой
+    /// эффективный контент → отказ #1572 на границе записи).
+    #[test]
+    fn task_get_full_card_without_body_strips_to_empty() {
+        let md = "#1526 t — In Progress\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\n\n";
+        assert_eq!(strip_task_get_header(md), "");
+    }
+
+    /// fm-стек (#1331): подряд идущие шапки карточек срезаются все.
+    #[test]
+    fn task_get_stacked_card_headers_are_stripped() {
+        let layer = |title: &str| {
+            format!(
+                "{title}\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: \
+                 false\nfact_track: false\ntype: bug\nbody_hash: h\n\n"
+            )
+        };
+        let md = format!(
+            "{}{}{}## Постановка\nтело",
+            layer("#1 t — In Progress"),
+            layer("#2 t — Design"),
+            layer("#3 t — Todo"),
+        );
+        assert_eq!(strip_task_get_header(&md), "## Постановка\nтело");
+    }
+
+    /// Смешанный стек: внешний слой легаси-7 (fact_track без
+    /// body_bytes) + внутренний легаси-6 (без fact_track) — срезаются
+    /// ОБА: легаси-наборы приземлились с #506 (#1604 в мастере), страж
+    /// границы перевёрнут (решение 6 плана #1632). Актуальная
+    /// восьмиключевая форма — в пинах ниже.
+    #[test]
+    fn task_get_stacked_mixed_render_and_legacy_layers_are_stripped() {
+        let fresh = "#1 t — In Progress\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\n\n";
+        let legacy = "#2 t — Todo\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\ntype: bug\nbody_hash: h\n\n";
+        let md = format!("{fresh}{legacy}## Тело");
+        assert_eq!(strip_task_get_header(&md), "## Тело");
+    }
+
+    /// Карточка актуального рендера (#1604+#1631): восемь ключей,
+    /// `body_bytes` последним. Прежние фикстуры формы B — легаси-7;
+    /// без этого пина актуальная форма держится только tools-зеркалом.
+    fn card_copy_fresh_with_title(title: &str) -> String {
+        format!(
+            "{title}\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: \
+             false\nfact_track: false\ntype: bug\nbody_hash: h\nbody_bytes: 42\n\n## Постановка\nтекст"
+        )
+    }
+
+    #[test]
+    fn task_get_fresh_render_card_copy_is_stripped() {
+        let md = card_copy_fresh_with_title("#1632 t — In Progress");
+        assert_eq!(strip_task_get_header(&md), "## Постановка\nтекст");
+    }
+
+    /// Терминатор «конец входа» (#1604) в форме B: шапка актуального
+    /// рендера без хвостового переноса срезается в пустоту — на границе
+    /// записи это отказ #1572.
+    #[test]
+    fn task_get_fresh_render_card_without_newline_strips_to_empty() {
+        let md = "#1632 t — In Progress\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\nbody_bytes: 42";
+        assert_eq!(strip_task_get_header(md), "");
+    }
+
+    /// Стек: внешний слой актуального рендера (8 ключей) + внутренний
+    /// легаси-6 — срез циклом, на носителе тело.
+    #[test]
+    fn task_get_stacked_fresh_render_and_legacy_layers_are_stripped() {
+        let fresh = "#1 t — In Progress\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\nbody_bytes: 42\n\n";
+        let legacy = "#2 t — Todo\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\ntype: bug\nbody_hash: h\n\n";
+        let md = format!("{fresh}{legacy}## Тело");
+        assert_eq!(strip_task_get_header(&md), "## Тело");
+    }
+
+    /// Шапка без хвостового переноса срезается: терминатор последнего
+    /// ключа — конец входа (#1604), дельта приземлилась с #506.
+    #[test]
+    fn task_get_header_without_trailing_newline_is_stripped() {
+        let md = "--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h";
+        assert_eq!(strip_task_get_header(md), "");
+    }
+
+    /// Карточка рендера с заданной тайтл-строкой и валидным fm-блоком:
+    /// всё, кроме самой тайтл-строки, удовлетворяет форме B — падение
+    /// теста однозначно называет сломанный барьер тайтла.
+    fn card_copy_with_title(title: &str) -> String {
+        format!(
+            "{title}\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: \
+             false\nfact_track: false\ntype: bug\nbody_hash: h\n\n## Постановка\nтекст"
+        )
+    }
+
+    /// fm-блока за тайтлом нет — не карточка, вход цел.
+    #[test]
+    fn task_get_title_without_fm_block_is_kept() {
+        let md = "#1526 t — In Progress\n\n## Постановка\nтекст";
+        assert_eq!(strip_task_get_header(md), md);
+    }
+
+    /// Пустой строки перед fm нет — не карточка, вход цел.
+    #[test]
+    fn task_get_title_without_blank_line_before_fm_is_kept() {
+        let md = "#1526 t — In Progress\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\n\nтекст";
+        assert_eq!(strip_task_get_header(md), md);
+    }
+
+    /// CRLF-карточка — скоп #1637, здесь барьер не срабатывает (строгий
+    /// LF-паттерн); тест изолирован, чтобы держатель #1637 перевернул
+    /// ровно его, не задевая LF-барьеры.
+    #[test]
+    fn task_get_crlf_card_header_is_kept() {
+        let md = "#1526 t — In Progress\r\n\r\n--- fm ---\r\nbranch: b\r\npr: —\r\nautomerge: true\r\ndirect: false\r\nfact_track: false\r\ntype: bug\r\nbody_hash: h\r\n\r\nтекст";
+        assert_eq!(strip_task_get_header(md), md);
+    }
+
+    /// «Тайтл» не рендер-формы (## Постановка) — вход цел.
+    #[test]
+    fn task_get_non_render_title_is_kept() {
+        let md = "## Постановка\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\n\nтекст";
+        assert_eq!(strip_task_get_header(md), md);
+    }
+
+    /// Барьер решётки: тайтл без `#` — не рендер; вход цел.
+    #[test]
+    fn task_get_title_without_hash_is_kept() {
+        let md = card_copy_with_title("1526 t — In Progress");
+        assert_eq!(strip_task_get_header(md.as_str()), md.as_str());
+    }
+
+    /// Барьер « — »: тайтл без разделителя статуса — не рендер.
+    #[test]
+    fn task_get_title_without_dash_separator_is_kept() {
+        let md = card_copy_with_title("#1526 t In Progress");
+        assert_eq!(strip_task_get_header(md.as_str()), md.as_str());
+    }
+
+    /// Барьер цифр: тайтл без номера — не рендер.
+    #[test]
+    fn task_get_title_without_digits_is_kept() {
+        let md = card_copy_with_title("# — In Progress");
+        assert_eq!(strip_task_get_header(md.as_str()), md.as_str());
+    }
+
+    /// Барьер пробела после номера: `#1526t` — не рендер.
+    #[test]
+    fn task_get_title_without_space_after_digits_is_kept() {
+        let md = card_copy_with_title("#1526t — In Progress");
+        assert_eq!(strip_task_get_header(md.as_str()), md.as_str());
     }
 
     #[test]
@@ -2668,5 +3077,215 @@ mod tests {
         assert_eq!(report.section_now, 4);
         assert!(!report.confirmed, "без confirm");
         assert!(report.verified, "честная квитанция");
+    }
+
+    fn comments_tail(marker: &str, entries: &[(&str, &str)]) -> String {
+        let mut out = format!("\n\n{marker}\n");
+        for (stamp, text) in entries {
+            out.push_str(&format!("---\n{stamp}\n{text}\n"));
+        }
+        out
+    }
+
+    #[test]
+    fn comments_tail_strip_keeps_body_bytes_with_and_without_trailing_newline() {
+        for body in ["## П\n\nтело\n", "## П\n\nтело"] {
+            let input = format!(
+                "{body}{}",
+                comments_tail(
+                    "--- comments (latest 2 of 2) ---",
+                    &[
+                        ("2026-11-24T04:59:18Z", "первый"),
+                        ("2026-11-24T05:00:00Z", "второй")
+                    ]
+                )
+            );
+            assert_eq!(strip_comments_tail(&input), body, "body: {body:?}");
+        }
+    }
+
+    #[test]
+    fn comments_tail_strip_recognises_legacy_marker() {
+        let body = "## П\n\nтело\n";
+        let input = format!(
+            "{body}{}",
+            comments_tail(
+                "--- comments (latest) ---",
+                &[("2026-11-24T04:59:18Z", "коммент")]
+            )
+        );
+        assert_eq!(strip_comments_tail(&input), body);
+    }
+
+    #[test]
+    fn comments_tail_strip_keeps_sections_appended_after_dump() {
+        for base in ["## П\n\nтело\n", "## П\n\nтело"] {
+            let dump = comments_tail(
+                "--- comments (latest 1 of 1) ---",
+                &[("2026-11-24T04:59:18Z", "коммент")],
+            );
+            let assembled = format!("{base}{dump}\n## План\n\nновая секция\n");
+            let expected = format!("{base}\n## План\n\nновая секция\n");
+            assert_eq!(strip_comments_tail(&assembled), expected, "base: {base:?}");
+        }
+    }
+
+    #[test]
+    fn comments_tail_strip_keeps_section_when_heading_inside_comment() {
+        let input = "## П\n\nтело\n\n\n--- comments (latest 1 of 1) ---\n---\n2026-11-24T04:59:18Z\nтекст\n\n## Внутри коммента\n\nещё текст\n\n## План\n\nсекция\n";
+        let out = strip_comments_tail(input);
+        assert!(out.contains("## План\n\nсекция"), "секция цела: {out}");
+        assert!(!out.contains("--- comments (latest"), "маркер ушёл: {out}");
+    }
+
+    #[test]
+    fn comments_tail_strip_keeps_marker_inside_fence() {
+        let body =
+            "## П\n\n```\n--- comments (latest 1 of 1) ---\n---\n2026-11-24T04:59:18Z\nкод\n```\n";
+        assert_eq!(strip_comments_tail(body), body);
+    }
+
+    #[test]
+    fn comments_tail_strip_continues_after_false_marker() {
+        let input = "## П\n\n--- comments (latest) ---\n\nтело\n\n\n--- comments (latest 1 of 1) ---\n---\n2026-11-24T04:59:18Z\nкоммент\n";
+        assert_eq!(
+            strip_comments_tail(input),
+            "## П\n\n--- comments (latest) ---\n\nтело\n"
+        );
+    }
+
+    #[test]
+    fn comments_tail_strip_resets_fence_at_entry_start() {
+        let input = "## П\n\nтело\n\n\n--- comments (latest 2 of 2) ---\n---\n2026-11-24T04:59:18Z\n```\nнезакрытый fence\n---\n2026-11-24T05:00:00Z\nвторой\n\n## План\n\nсекция\n";
+        let out = strip_comments_tail(input);
+        assert!(out.contains("## План\n\nсекция"), "секция цела: {out}");
+        assert!(!out.contains("--- comments (latest"), "маркер ушёл: {out}");
+    }
+
+    #[test]
+    fn comments_tail_strip_cycles_through_stacked_dumps() {
+        let old = comments_tail(
+            "--- comments (latest) ---",
+            &[("2026-11-24T04:59:18Z", "старый")],
+        );
+        let current = comments_tail(
+            "--- comments (latest 1 of 1) ---",
+            &[("2026-11-25T04:59:18Z", "текущий")],
+        );
+        let input = format!("## П\n\nтело\n{old}\n## План\n\nсекция\n{current}");
+        assert_eq!(
+            strip_comments_tail(&input),
+            "## П\n\nтело\n\n## План\n\nсекция\n"
+        );
+    }
+
+    #[test]
+    fn comments_tail_strip_accepts_crlf_entries() {
+        let body = "## П\r\n\r\nтело\r\n";
+        let input = format!(
+            "{body}\r\n\r\n--- comments (latest 1 of 1) ---\r\n---\r\n2026-11-24T04:59:18Z\r\nкоммент\r\n"
+        );
+        assert_eq!(strip_comments_tail(&input), body);
+    }
+
+    #[test]
+    fn comments_tail_marker_without_entries_is_kept() {
+        let body = "## П\n\n--- comments (latest 1 of 1) ---\n\nцитата в теле\n";
+        assert_eq!(strip_comments_tail(body), body);
+    }
+
+    #[test]
+    fn comments_tail_strip_keeps_section_when_heading_in_first_of_two_entries() {
+        let input = "## П\n\nтело\n\n\n--- comments (latest 2 of 2) ---\n---\n2026-11-24T04:59:18Z\nпервый\n\n## Внутри коммента\n\nещё\n---\n2026-11-24T05:00:00Z\nвторой\n\n## План\n\nсекция\n";
+        let out = strip_comments_tail(input);
+        assert!(out.contains("## План\n\nсекция"), "секция цела: {out}");
+        assert!(!out.contains("--- comments (latest"), "маркер ушёл: {out}");
+        assert!(
+            !out.contains("2026-11-24T04:59:18Z"),
+            "первая запись ушла: {out}"
+        );
+        assert!(!out.contains("первый"), "тело первой записи ушло: {out}");
+    }
+
+    #[test]
+    fn comments_tail_strip_accepts_crlf_seam_before_section() {
+        let body = "## П\r\n\r\nтело\r\n";
+        let input = format!(
+            "{body}\r\n\r\n--- comments (latest 1 of 1) ---\r\n---\r\n2026-11-24T04:59:18Z\r\nкоммент\r\n\r\n## План\r\n\r\nсекция\r\n"
+        );
+        let out = strip_comments_tail(&input);
+        assert!(
+            out.contains("## План\r\n\r\nсекция"),
+            "CRLF-стык цел: {out}"
+        );
+        assert!(!out.contains("--- comments"), "маркер снят: {out}");
+    }
+
+    // ---- tester #1648: независимые пины главного сценария и стыка ----
+
+    // На юнит-уровне проверяем сам хелпер: композицию трёх приватных срезов
+    // из места вызова (set_body) закрывают интеграционные пины на MCP-поверхности.
+
+    #[test]
+    fn tester_copied_card_tail_strips_to_exact_body() {
+        let body = "## Постановка\n\nтело для копии.\n";
+        let tail = "\n\n--- comments (latest 2 of 2) ---\n---\n2026-11-24T04:59:18Z\nпервый\n\
+                    ---\n2026-11-24T05:00:00Z\nвторой\n";
+        let copied = format!("{body}{tail}");
+        assert_eq!(
+            strip_comments_tail(&copied),
+            body,
+            "копия карточки → тело байт-в-байт"
+        );
+    }
+
+    #[test]
+    fn tester_legacy_marker_is_stripped() {
+        let body = "## Постановка\n\nтело.\n";
+        let tail = "\n\n--- comments (latest) ---\n---\n2026-11-23T10:00:00Z\nлегаси\n";
+        assert_eq!(strip_comments_tail(&format!("{body}{tail}")), body);
+    }
+
+    #[test]
+    fn tester_seam_exact_bytes_lf_and_crlf() {
+        let comment = "\n\n--- comments (latest 1 of 1) ---\n---\n2026-11-24T04:59:18Z\nкоммент\n";
+        let comment_crlf = "\r\n\r\n--- comments (latest 1 of 1) ---\r\n---\r\n2026-11-24T04:59:18Z\r\nкоммент\r\n";
+        for (base, tail, section, expected) in [
+            (
+                "## П\n\nтело\n",
+                comment,
+                "\n## План\n\nсекция\n",
+                "## П\n\nтело\n\n## План\n\nсекция\n",
+            ),
+            (
+                "## П\n\nтело",
+                comment,
+                "\n## План\n\nсекция\n",
+                "## П\n\nтело\n## План\n\nсекция\n",
+            ),
+            (
+                "## П\r\n\r\nтело\r\n",
+                comment_crlf,
+                "\r\n## План\r\n\r\nсекция\r\n",
+                "## П\r\n\r\nтело\r\n\r\n## План\r\n\r\nсекция\r\n",
+            ),
+        ] {
+            let assembled = format!("{base}{tail}{section}");
+            assert_eq!(strip_comments_tail(&assembled), expected, "base: {base:?}");
+        }
+    }
+
+    #[test]
+    fn tester_clean_body_roundtrip_is_untouched() {
+        for body in [
+            "## Постановка\n\nчистое тело без ленты.\n",
+            "--- comments (latest 1 of 1) ---\n\nцитата в прозе без записей\n",
+        ] {
+            assert_eq!(
+                strip_comments_tail(body),
+                body,
+                "не трогаем без сигнатуры ленты"
+            );
+        }
     }
 }

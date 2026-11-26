@@ -5,6 +5,7 @@
 
 pub mod blobs;
 pub mod bots;
+pub mod cron_journal;
 mod crons;
 mod error;
 pub mod fm_guard;
@@ -19,6 +20,9 @@ mod router_tests;
 mod search;
 #[cfg(test)]
 mod search_tests;
+pub mod slug_guard;
+#[cfg(test)]
+mod slug_guard_tests;
 #[cfg(test)]
 mod spawn_model_tests;
 pub mod spawn_models;
@@ -54,11 +58,11 @@ pub use pipeline::{
     ANALYST_WAVE_MARKER, STAGE_PROMPTS,
 };
 pub use ports::{
-    AgentSessionGateway, AppendDocOutcome, AssistantReply, Clock, CommentRef, CronRow,
-    CronRunTrack, CronStateStore, DecisionJudge, DreamerMark, FmMutator, IssueDigest,
-    IssueFieldStore, IssueIndexSource, IssueView, JudgeCfg, JudgeContext, JudgeSessionTail,
-    Liveness, PrGateway, PrProbe, PrState, QuotaProbe, QuotaSnapshot, SessionInfo, SessionSpec,
-    StatusDelivery, TaskBoardRepo, TickStateStore, WikiRepo,
+    AgentSessionGateway, AssistantReply, Clock, CommentRef, CronRow, CronRunTrack, CronStateStore,
+    DecisionJudge, DreamerMark, FmMutator, IssueDigest, IssueFieldStore, IssueIndexSource,
+    IssueView, JudgeCfg, JudgeContext, JudgeSessionTail, Liveness, PrGateway, PrProbe, PrState,
+    QuotaProbe, QuotaSnapshot, SessionInfo, SessionSpec, StatusDelivery, TaskBoardRepo,
+    TickStateStore, WikiRepo,
 };
 pub use router::SessionRouter;
 pub use search::{sync_allowed, SearchHit, SearchUseCase, SemanticBackend};
@@ -73,7 +77,7 @@ pub use tasks::clean::{
     CleanVerdict, IssueProbe, RowBinding, TaskCleanUseCase, UndoOutcome, UndoReport,
     CLEAN_BATCH_CAP,
 };
-pub use tasks::views::{DocsView, PersonView, TaskView};
+pub use tasks::views::{sanitize_slug, DocsView, PersonView, TaskView};
 pub use tasks::write::{
     BodyWriteReceipt, NewTask, SectionAction, SectionEditReport, SectionWrite, TaskPatch,
     TaskWriteUseCase, TaskWriter,
