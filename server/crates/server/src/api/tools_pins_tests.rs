@@ -1833,3 +1833,102 @@ async fn docs_delete_refuses_unknown_mutation_argument() {
     .expect_err("unknown arg");
     assert!(error.contains("unknown argument(s) content"), "{error}");
 }
+
+/// Пин тестировщика (#1658, uwuwu#1658 UC-1): слаг прогоняется тем же
+/// sanitize_slug, что и у чтения/записи — «docs/…md» сносит тот же док.
+#[tokio::test]
+async fn docs_delete_normalizes_docs_prefix_and_md_suffix() {
+    let tools = hub();
+    let slug = "Projects/uwuwu/Нормализация-1658";
+    call(
+        &tools,
+        "docs_write",
+        json!({ "slug": slug, "content": "# док\n" }),
+    )
+    .await
+    .expect("seed");
+
+    let answer = call(
+        &tools,
+        "docs_delete",
+        json!({ "slug": format!("docs/{slug}.md") }),
+    )
+    .await
+    .expect("delete");
+
+    assert!(
+        answer.starts_with("deleted: «Projects/uwuwu/Нормализация-1658»"),
+        "{answer}"
+    );
+    let error = call(&tools, "docs_read", json!({ "slug": slug }))
+        .await
+        .expect_err("док должен быть снесён");
+    assert!(error.contains("not found"), "{error}");
+}
+
+/// Ветка absent обязана называть живого длинного тёзку и не трогать его
+/// (#1658, uwuwu#1658 NFT-1): кандидаты — не отказ, но и не тихий успех.
+#[tokio::test]
+async fn docs_delete_absent_names_suffix_candidates_and_keeps_twin() {
+    let tools = hub();
+    let twin = "Experience/uwuwu/Projects/Отсутствующий-1658";
+    call(
+        &tools,
+        "docs_write",
+        json!({ "slug": twin, "content": "# тёзка\n" }),
+    )
+    .await
+    .expect("seed twin");
+
+    let error = call(
+        &tools,
+        "docs_delete",
+        json!({ "slug": "Projects/Отсутствующий-1658" }),
+    )
+    .await
+    .expect_err("absent");
+
+    assert!(error.starts_with("absent:"), "{error}");
+    assert!(
+        error.contains("suffix candidates: Experience/uwuwu/Projects/Отсутствующий-1658"),
+        "{error}"
+    );
+    let ls = call(&tools, "docs_ls", json!({ "path": "Experience/uwuwu" }))
+        .await
+        .expect("ls");
+    assert!(
+        ls.contains("Projects/Отсутствующий-1658"),
+        "тёзка пострадала при absent: {ls}"
+    );
+}
+
+/// Успех delete на проводе MCP: isError=false и текст ветки deleted —
+/// зеркало отказа, который уже закреплён в docs_delete_refusal_is_error_over_mcp_wire.
+#[tokio::test]
+async fn docs_delete_success_is_not_error_over_mcp_wire() {
+    let tools = hub();
+    let slug = "Projects/uwuwu/Проводимый";
+    call(
+        &tools,
+        "docs_write",
+        json!({ "slug": slug, "content": "# док\n" }),
+    )
+    .await
+    .expect("seed");
+    let state = Arc::new(super::McpState {
+        bearer: Arc::new("t-bearer".into()),
+        tools,
+    });
+    let app = super::mcp_router(state);
+
+    let answer = mcp_call(&app, "t-bearer", "docs_delete", json!({ "slug": slug })).await;
+
+    assert_eq!(answer["result"]["isError"], Value::Bool(false), "{answer}");
+    let text = answer["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.starts_with("deleted: «Projects/uwuwu/Проводимый»"),
+        "{text}"
+    );
+}
