@@ -17,6 +17,9 @@
   },
   "overrides": {
     "@babel/core": "^7.29.6",
-    "zod": "^4.6.6"
+    "zod": "^4.6.6",
+    "@opentelemetry/core": "^2.8.0",
+    "glob": "^14.0.2",
+    "minimatch": "^11.0.1"
   }
 }
