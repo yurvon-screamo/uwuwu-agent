@@ -5,7 +5,7 @@
 
 use reqwest::{Client, Method};
 use serde_json::Value;
-use uwuwu_usecase::{UsecaseError, UsecaseResult};
+use uwuwu_usecase::{DocSnapshot, UsecaseError, UsecaseResult};
 
 use crate::wiki::encode_path;
 use crate::wiki::gitwiki::base64_std;
@@ -23,6 +23,16 @@ impl TreeWitness<'_> {
     /// (тогда «нет» не доказано и мутация обязана отказать честно,
     /// а не портить шапку/текст).
     pub(crate) async fn read(&self, path: &str) -> UsecaseResult<Option<String>> {
+        Ok(self.fetch(path).await?.map(|doc| doc.content))
+    }
+
+    /// Чтение с blob SHA из того же свидетельства (#1658): квитанция
+    /// удаления не берёт SHA из кэша дерева.
+    pub(crate) async fn read_with_sha(&self, path: &str) -> UsecaseResult<Option<DocSnapshot>> {
+        self.fetch(path).await
+    }
+
+    async fn fetch(&self, path: &str) -> UsecaseResult<Option<DocSnapshot>> {
         let tree_path = format!(
             "/repos/{}/git/trees/{}?recursive=1",
             self.repo,
@@ -45,7 +55,10 @@ impl TreeWitness<'_> {
                 "wiki blob {path}: HTTP {status}"
             )));
         }
-        Ok(Some(blob_text(&blob)?))
+        Ok(Some(DocSnapshot {
+            content: blob_text(&blob)?,
+            blob_sha: sha.to_string(),
+        }))
     }
 
     async fn call(

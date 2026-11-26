@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use uwuwu_usecase::WikiRepo;
+use uwuwu_usecase::{DocDeleteCommit, DocSnapshot, WikiRepo};
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 pub struct GitHubWiki {
@@ -118,6 +118,51 @@ impl GitHubWiki {
         Ok(list)
     }
 
+    /// Состав и sha дерева меняются вместе с любой мутацией вики.
+    fn invalidate_caches(&self) {
+        *self.tree_cache.lock().expect("tree lock") = None;
+        *self.shas_cache.lock().expect("shas lock") = None;
+    }
+
+    /// Одно чтение Contents с witness на miss-пути (#1653): текст и SHA
+    /// приходят из одного ответа, чтобы квитанция удаления не врала.
+    async fn fetch_doc(&self, slug: &str) -> UsecaseResult<Option<DocSnapshot>> {
+        if slug.is_empty() {
+            return Ok(None);
+        }
+        let path = format!("docs/{slug}.md");
+        let (status, body) = self
+            .get(&format!(
+                "/repos/{}/contents/{}",
+                self.repo,
+                encode_path(&path)
+            ))
+            .await?;
+        if status.as_u16() == 404 {
+            return crate::wiki::witness::TreeWitness {
+                http: &self.http,
+                token: &self.token,
+                repo: &self.repo,
+                branch: &self.branch,
+            }
+            .read_with_sha(&path)
+            .await;
+        }
+        if !status.is_success() {
+            return Err(UsecaseError::Board(format!("read «{slug}»: HTTP {status}")));
+        }
+        let b64 = body["content"]
+            .as_str()
+            .unwrap_or_default()
+            .replace('\n', "");
+        let bytes = crate::wiki::gitwiki::base64_std(&b64)
+            .ok_or_else(|| UsecaseError::Board(format!("read «{slug}»: base64")))?;
+        Ok(Some(DocSnapshot {
+            content: String::from_utf8_lossy(&bytes).into_owned(),
+            blob_sha: body["sha"].as_str().unwrap_or_default().to_string(),
+        }))
+    }
+
     async fn docs_tree(&self) -> UsecaseResult<Vec<String>> {
         {
             let guard = self.tree_cache.lock().expect("tree lock");
@@ -165,39 +210,37 @@ impl GitHubWiki {
 #[async_trait]
 impl WikiRepo for GitHubWiki {
     async fn read_doc(&self, slug: &str) -> UsecaseResult<Option<String>> {
-        if slug.is_empty() {
+        Ok(self.fetch_doc(slug).await?.map(|doc| doc.content))
+    }
+
+    async fn read_doc_with_sha(&self, slug: &str) -> UsecaseResult<Option<DocSnapshot>> {
+        let Some(doc) = self.fetch_doc(slug).await? else {
             return Ok(None);
+        };
+        if doc.blob_sha.is_empty() {
+            return Err(UsecaseError::Board(format!(
+                "read «{slug}»: no live blob sha in the response"
+            )));
         }
-        let path = format!("docs/{slug}.md");
-        let (status, body) = self
-            .get(&format!(
-                "/repos/{}/contents/{}",
-                self.repo,
-                encode_path(&path)
-            ))
+        Ok(Some(doc))
+    }
+
+    async fn delete_doc(
+        &self,
+        slug: &str,
+        old_blob_sha: &str,
+        message: &str,
+    ) -> UsecaseResult<DocDeleteCommit> {
+        let Some(w) = &self.writer else {
+            return Err(UsecaseError::Board("wiki delete is not configured".into()));
+        };
+        let commit = w
+            .delete_file(&format!("docs/{slug}.md"), old_blob_sha, message)
             .await?;
-        if status.as_u16() == 404 {
-            // #1653: Contents отстаёт от git-data-коммита; до вердикта
-            // «дока нет» спрашиваем свежее дерево и читаем blob по sha.
-            return crate::wiki::witness::TreeWitness {
-                http: &self.http,
-                token: &self.token,
-                repo: &self.repo,
-                branch: &self.branch,
-            }
-            .read(&path)
-            .await;
-        }
-        if !status.is_success() {
-            return Err(UsecaseError::Board(format!("read «{slug}»: HTTP {status}")));
-        }
-        let b64 = body["content"]
-            .as_str()
-            .unwrap_or_default()
-            .replace('\n', "");
-        let bytes = crate::wiki::gitwiki::base64_std(&b64)
-            .ok_or_else(|| UsecaseError::Board(format!("read «{slug}»: base64")))?;
-        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+        // И состав, и sha должны обновиться сразу: семантик-синк сверяет
+        // doc_shas, а list_docs держит отдельный кэш того же дерева.
+        self.invalidate_caches();
+        Ok(commit)
     }
 
     async fn list_docs(&self, prefix: &str) -> UsecaseResult<Vec<String>> {
@@ -220,8 +263,7 @@ impl WikiRepo for GitHubWiki {
         let Some(w) = &self.writer else {
             return Err(UsecaseError::Board("wiki write is not configured".into()));
         };
-        // инвентаризация кэша сбрасывается: состав изменился
-        *self.tree_cache.lock().expect("tree lock") = None;
+        self.invalidate_caches();
         w.commit_file(&format!("docs/{slug}.md"), content, message)
             .await
     }
@@ -254,6 +296,19 @@ pub(crate) fn encode_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mutation_invalidates_both_tree_and_sha_caches() {
+        let wiki = GitHubWiki::with_writer("o/r".into(), "main".into(), "token".into(), None);
+        *wiki.tree_cache.lock().expect("tree") = Some((Instant::now(), vec!["a".into()]));
+        *wiki.shas_cache.lock().expect("shas") =
+            Some((Instant::now(), vec![("a".into(), "sha".into())]));
+
+        wiki.invalidate_caches();
+
+        assert!(wiki.tree_cache.lock().expect("tree").is_none());
+        assert!(wiki.shas_cache.lock().expect("shas").is_none());
+    }
 
     #[test]
     fn encodes_spaces_and_unicode() {

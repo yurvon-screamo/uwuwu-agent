@@ -186,11 +186,42 @@ pub struct IssueView {
     pub comments: Vec<CommentRef>,
 }
 
+/// Живой док: содержимое и blob SHA из одного и того же ответа.
+/// SHA из кэша `doc_shas` не годится для квитанции удаления (#1658).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocSnapshot {
+    pub content: String,
+    pub blob_sha: String,
+}
+
+/// Результат пост-проверки удаления по дереву commit ref.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostCheck {
+    ConfirmedAbsent,
+    Disagreement(String),
+    Unverified(String),
+}
+
+/// Коммит удаления path из вики; бэкап собирается выше по слою.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocDeleteCommit {
+    pub commit_sha: String,
+    pub post_check: PostCheck,
+}
+
 /// Вики-репозиторий: чтение/запись доков (MCP docs_*, кроны, дример).
 #[async_trait]
 pub trait WikiRepo: Send + Sync {
     /// markdown дока по слагу (docs/** без .md); None — не найден.
     async fn read_doc(&self, slug: &str) -> UsecaseResult<Option<String>>;
+
+    /// Чтение с blob SHA живого файла. Defaults are loud: an adapter that
+    /// does not implement the delete path must never claim a backup SHA.
+    async fn read_doc_with_sha(&self, slug: &str) -> UsecaseResult<Option<DocSnapshot>> {
+        Err(UsecaseError::Board(format!(
+            "wiki {slug}: read_doc_with_sha is not implemented"
+        )))
+    }
     /// Пути .md под префиксом (напр. «Projects/uwuwu»), без docs/.
     async fn list_docs(&self, prefix: &str) -> UsecaseResult<Vec<String>>;
     /// Слаги + git blob-sha всех доков (одно дерево): инкрементальный
@@ -205,6 +236,19 @@ pub trait WikiRepo: Send + Sync {
     /// создание — только docs_write); возвращает строк после записи
     /// (#1353: ответ тула отражает факт, не эхо ввода).
     async fn append_doc(&self, slug: &str, line: &str, message: &str) -> UsecaseResult<usize>;
+
+    /// Удаление файла дока ff-only коммитом; old_blob_sha — снимок живой
+    /// версии из квитанции. Несовпадение ref — явный RaceRef, без ретрая.
+    async fn delete_doc(
+        &self,
+        slug: &str,
+        old_blob_sha: &str,
+        message: &str,
+    ) -> UsecaseResult<DocDeleteCommit> {
+        Err(UsecaseError::Board(format!(
+            "wiki {slug}: delete_doc is not implemented ({old_blob_sha}, {message})"
+        )))
+    }
 }
 
 /// Коммент задачи в терминах wakeup: идентичность + время создания.

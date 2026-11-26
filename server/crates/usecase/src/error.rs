@@ -36,6 +36,14 @@ pub enum UsecaseError {
     /// append дописывает живой носитель, создание — только docs_write.
     /// Финальный, не временный: ретрай той же строкой бессмысленен.
     AppendMissing(String),
+    /// Удаление дока: файла нет в живом чтении — бэкап и мутация не делаются.
+    DocAbsent(String),
+    /// Удаление дока: источник чтения не доказал содержимое и blob SHA.
+    DocReadFailed(String),
+    /// Удаление дока: бэкап не состоялся — мутация запрещена.
+    BackupFailed(String),
+    /// Удаление дока: ref изменился между чтением и коммитом (#1653).
+    RaceRef(String),
     /// Эмбеддинг-маршрут упёрся в лимиты провайдера (HTTP 429, #1363):
     /// временная — ретрай осмыслен в том же часу; бэкофф из RetryInfo.
     RateLimited {
@@ -59,6 +67,10 @@ impl fmt::Display for UsecaseError {
             Self::BlobNotConfigured(m) => write!(f, "blob is not configured: {m}"),
             Self::BlobBadKey(m) => write!(f, "blob bad key: {m}"),
             Self::AppendMissing(m) => write!(f, "append target missing: {m}"),
+            Self::DocAbsent(m) => write!(f, "doc absent: {m}"),
+            Self::DocReadFailed(m) => write!(f, "doc read failed: {m}"),
+            Self::BackupFailed(m) => write!(f, "backup failed: {m}"),
+            Self::RaceRef(m) => write!(f, "competing ref: {m}"),
             Self::RateLimited {
                 service,
                 retry_after_secs,

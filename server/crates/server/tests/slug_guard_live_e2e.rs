@@ -981,6 +981,161 @@ async fn run_scenario(dir: PathBuf, rig: RigGithub, stamp: String) {
     rig.wait_final_blobs(expected).await;
 }
 
+/// #1658: живой прогон docs_delete на том же риге — сид через MCP,
+/// снос тулом, проверка absence, восстановление из бэкапа по ключу из
+/// квитанции и повторный снос. Мок не засчитывается (персона 09.11).
+async fn run_doc_delete_scenario(dir: std::path::PathBuf, rig: RigGithub) {
+    if let Some(error) = &rig.creation_error {
+        panic!("{error}");
+    }
+    let stand = spawn_server(&dir, &rig.repo).await;
+    let http = reqwest::Client::new();
+    let slug = "Projects/uwuwu/Удаляемый-1658";
+    let body = "---\ntitle: Удаляемый 1658\ndate: 2026-11-26\n---\n\nживой прогон\n";
+
+    let (err, text) = mcp_write(
+        &http,
+        &stand,
+        "docs_write",
+        json!({ "slug": slug, "content": body }),
+    )
+    .await;
+    assert!(!err, "сид docs_write: {text}");
+    rig.wait_file(&format!("docs/{slug}.md"), "живой прогон")
+        .await;
+
+    let (err, receipt) = mcp_call(&http, &stand, "docs_delete", json!({ "slug": slug })).await;
+    assert!(!err, "docs_delete: {receipt}");
+    assert!(
+        receipt.starts_with(&format!("deleted: «{slug}»")),
+        "{receipt}"
+    );
+    assert!(receipt.contains("\nbackup: blobs/"), "{receipt}");
+    assert!(
+        receipt.contains("\npost-check: absent in tree at "),
+        "{receipt}"
+    );
+
+    let (err, listing) = mcp_call(
+        &http,
+        &stand,
+        "docs_ls",
+        json!({ "path": "Projects/uwuwu" }),
+    )
+    .await;
+    assert!(!err, "docs_ls: {listing}");
+    assert!(
+        !listing.contains("Удаляемый-1658"),
+        "док остался: {listing}"
+    );
+    let (err, read) = mcp_call(&http, &stand, "docs_read", json!({ "slug": slug })).await;
+    assert!(err && read.contains("not found"), "docs_read: {read}");
+
+    let key = receipt
+        .lines()
+        .find_map(|line| line.strip_prefix("backup: "))
+        .and_then(|line| line.split_whitespace().next())
+        .expect("ключ бэкапа в квитанции");
+    let (err, blob_answer) = mcp_call(&http, &stand, "blob_get", json!({ "key": key })).await;
+    assert!(!err, "blob_get: {blob_answer}");
+    let url = blob_answer
+        .lines()
+        .find_map(|line| line.strip_prefix("URL (TTL 7 days): "))
+        .expect("presigned GET в ответе blob_get");
+    let restored = http
+        .get(url)
+        .send()
+        .await
+        .expect("GET бэкапа")
+        .text()
+        .await
+        .expect("тело бэкапа");
+    assert_eq!(restored, body, "бэкап не совпал с удалённым доком");
+
+    let (err, written) = mcp_write(
+        &http,
+        &stand,
+        "docs_write",
+        json!({ "slug": slug, "content": restored.clone() }),
+    )
+    .await;
+    assert!(!err, "восстановление: {written}");
+    rig.wait_file(&format!("docs/{slug}.md"), "живой прогон")
+        .await;
+    let (err, after) = mcp_call(&http, &stand, "docs_read", json!({ "slug": slug })).await;
+    assert!(
+        !err && after.trim_end() == restored.trim_end(),
+        "read-back: {after}"
+    );
+
+    let (err, second) = mcp_call(&http, &stand, "docs_delete", json!({ "slug": slug })).await;
+    assert!(
+        !err && second.starts_with("deleted:"),
+        "финальный снос: {second}"
+    );
+    println!("docs_delete live: бэкап {key}, восстановление и повторный снос прошли");
+}
+
+#[tokio::test]
+async fn docs_delete_live_e2e_backup_and_restore() {
+    let Some(token) = e2e_ready() else {
+        println!("e2e выключен: UWUWU_E2E=1 для живой пробы docs_delete");
+        return;
+    };
+    for name in [
+        "UWUWU_S3_ENDPOINT",
+        "UWUWU_S3_REGION",
+        "UWUWU_S3_BUCKET",
+        "UWUWU_S3_ACCESS_KEY",
+        "UWUWU_S3_SECRET",
+    ] {
+        if std::env::var(name).unwrap_or_default().trim().is_empty() {
+            println!("e2e docs_delete пропущен: нет {name} — бэкап в Tigris недоступен");
+            return;
+        }
+    }
+    let stamp = format!(
+        "{}{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis(),
+        std::process::id()
+    );
+    let dir = std::env::temp_dir().join(format!("uwuwu-rig-e2e-dd-{stamp}"));
+    std::fs::create_dir_all(&dir).expect("rig dir");
+    let http = reqwest::Client::new();
+    let rig = RigGithub::create(&http, &token, &stamp).await;
+    let mut lease = RigLease {
+        repo: rig.repo.clone(),
+        deleted: false,
+    };
+    let outcome = tokio::spawn(run_doc_delete_scenario(dir.clone(), rig.clone())).await;
+    let scenario_error = outcome.err().map(|join| {
+        join.into_panic()
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_else(|| "паника без сообщения".to_string())
+    });
+    let log_tail = log_tail(&dir.join("server.log"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let delete_result = rig.delete().await;
+    lease.deleted = delete_result.is_ok();
+    let mut problems = Vec::new();
+    if let Some(msg) = scenario_error {
+        problems.push(format!(
+            "docs_delete e2e упал\n{log_tail}\n--- паника ---\n{msg}"
+        ));
+    }
+    if let Err(error) = delete_result {
+        problems.push(format!(
+            "риг {} не снесён: {error} — снеси руками: gh api -X DELETE /repos/{}",
+            rig.repo, rig.repo
+        ));
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n\n"));
+}
+
 #[tokio::test]
 async fn slug_guard_live_e2e_main_scenario() {
     let Some(token) = e2e_ready() else {

@@ -7,6 +7,7 @@ pub mod blobs;
 pub mod bots;
 pub mod cron_journal;
 mod crons;
+pub mod docs_delete;
 mod error;
 pub mod fm_guard;
 mod fm_lite;
@@ -40,6 +41,9 @@ pub use crons::{
     cron_name, jst_stamp, parse_schedule_text, CronUseCase, FireOutcome, CRON_DIR,
     FIRE_SIGNAL_COOLDOWN_MS, RUN_SILENCE_MS,
 };
+pub use docs_delete::{
+    DeleteGuard, DeleteReceipt, DeleteRefusal, DeleteRequest, DocsDeleteUseCase,
+};
 pub use error::{UsecaseError, UsecaseResult, ViewError};
 pub use goals::{gist_of, Goal, GoalsRepo, GoalsView};
 pub use naming::{
@@ -59,10 +63,10 @@ pub use pipeline::{
 };
 pub use ports::{
     AgentSessionGateway, AssistantReply, Clock, CommentRef, CronRow, CronRunTrack, CronStateStore,
-    DecisionJudge, DreamerMark, FmMutator, IssueDigest, IssueFieldStore, IssueIndexSource,
-    IssueView, JudgeCfg, JudgeContext, JudgeSessionTail, Liveness, PrGateway, PrProbe, PrState,
-    QuotaProbe, QuotaSnapshot, SessionInfo, SessionSpec, StatusDelivery, TaskBoardRepo,
-    TickStateStore, WikiRepo,
+    DecisionJudge, DocDeleteCommit, DocSnapshot, DreamerMark, FmMutator, IssueDigest,
+    IssueFieldStore, IssueIndexSource, IssueView, JudgeCfg, JudgeContext, JudgeSessionTail,
+    Liveness, PostCheck, PrGateway, PrProbe, PrState, QuotaProbe, QuotaSnapshot, SessionInfo,
+    SessionSpec, StatusDelivery, TaskBoardRepo, TickStateStore, WikiRepo,
 };
 pub use router::SessionRouter;
 pub use search::{sync_allowed, SearchHit, SearchUseCase, SemanticBackend};

@@ -3,7 +3,7 @@
 //! Единый писатель — сервер (конвейер), конфликт ff громко отвергается.
 
 use serde_json::{json, Value};
-use uwuwu_usecase::{UsecaseError, UsecaseResult};
+use uwuwu_usecase::{DocDeleteCommit, PostCheck, UsecaseError, UsecaseResult};
 
 use crate::wiki::encode_path;
 
@@ -109,7 +109,40 @@ impl GitWikiWriter {
         content: &[u8],
         message: &str,
     ) -> UsecaseResult<()> {
-        // ref → commit → base tree
+        let (_, blob) = self
+            .call(
+                reqwest::Method::POST,
+                &format!("/repos/{}/git/blobs", self.repo),
+                Some(json!({
+                    "content": base64_encode(content),
+                    "encoding": "base64"
+                })),
+            )
+            .await?;
+        let blob_sha = blob["sha"].as_str().unwrap_or_default().to_string();
+        let entry = json!({ "path": path, "mode": "100644", "type": "blob", "sha": blob_sha });
+        self.commit_tree(json!([entry]), message).await?;
+        Ok(())
+    }
+
+    /// Удаление файла: tree-entry с sha=null (Git Data API) + ff-only ref.
+    /// Пост-проверка идёт по дереву нового коммита, а не по кэшу Contents.
+    pub async fn delete_file(
+        &self,
+        path: &str,
+        _old_blob_sha: &str,
+        message: &str,
+    ) -> UsecaseResult<DocDeleteCommit> {
+        let commit_sha = self.commit_tree(tree_delete_entry(path), message).await?;
+        let post_check = self.path_absent_at(&commit_sha, path).await;
+        Ok(DocDeleteCommit {
+            commit_sha,
+            post_check,
+        })
+    }
+
+    /// ref → commit → base tree → новый tree → commit → ff-only update_ref.
+    async fn commit_tree(&self, tree: Value, message: &str) -> UsecaseResult<String> {
         let (_, head) = self
             .call(
                 reqwest::Method::GET,
@@ -135,29 +168,14 @@ impl GitWikiWriter {
             .as_str()
             .unwrap_or_default()
             .to_string();
-        // blob → tree → commit → ref (ff)
-        let (_, blob) = self
-            .call(
-                reqwest::Method::POST,
-                &format!("/repos/{}/git/blobs", self.repo),
-                Some(json!({
-                    "content": base64_encode(content),
-                    "encoding": "base64"
-                })),
-            )
-            .await?;
-        let blob_sha = blob["sha"].as_str().unwrap_or_default().to_string();
-        let (_, tree) = self
+        let (_, tree_resp) = self
             .call(
                 reqwest::Method::POST,
                 &format!("/repos/{}/git/trees", self.repo),
-                Some(json!({
-                    "base_tree": base_tree,
-                    "tree": [{ "path": path, "mode": "100644", "type": "blob", "sha": blob_sha }]
-                })),
+                Some(json!({ "base_tree": base_tree, "tree": tree })),
             )
             .await?;
-        let tree_sha = tree["sha"].as_str().unwrap_or_default().to_string();
+        let tree_sha = tree_resp["sha"].as_str().unwrap_or_default().to_string();
         let (_, new_commit) = self
             .call(
                 reqwest::Method::POST,
@@ -176,14 +194,48 @@ impl GitWikiWriter {
         let fast_forward =
             status.is_success() && resp["object"]["sha"].as_str() == Some(new_sha.as_str());
         if !fast_forward {
-            // #1653: сразу после своего коммита GitHub изредка отвечает
-            // 422 без конкурента. Повтор мутации рискует гонкой, поэтому
-            // отказ честный (ADR-093, #1353) — окно описано в задаче.
-            return Err(Self::err(format!(
-                "update_ref {path}: not fast-forward (HTTP {status}) — a competing commit"
+            // #1653: 422 сразу после своего коммита бывает и без конкурента.
+            // Повтор опасен гонкой — отказ честный, без re-shot.
+            return Err(UsecaseError::RaceRef(format!(
+                "gitwiki: update_ref not fast-forward (HTTP {status}) — a competing commit"
             )));
         }
-        Ok(())
+        Ok(new_sha)
+    }
+
+    /// дерево коммита — независимый от Contents-кэша свидетель удаления.
+    async fn path_absent_at(&self, commit_sha: &str, path: &str) -> PostCheck {
+        let result = self
+            .call(
+                reqwest::Method::GET,
+                &format!(
+                    "/repos/{}/git/trees/{}?recursive=1",
+                    self.repo,
+                    encode_path(commit_sha)
+                ),
+                None,
+            )
+            .await;
+        let (status, tree) = match result {
+            Ok(pair) => pair,
+            Err(e) => return PostCheck::Unverified(e.to_string()),
+        };
+        if !status.is_success() || tree["truncated"].as_bool().unwrap_or(false) {
+            return PostCheck::Unverified(format!(
+                "post-check tree {commit_sha}: HTTP {status} (truncated: {:?})",
+                tree["truncated"].as_bool()
+            ));
+        }
+        let still_there = tree["tree"].as_array().is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|e| e["path"].as_str() == Some(path) && e["type"].as_str() == Some("blob"))
+        });
+        if still_there {
+            PostCheck::Disagreement(format!("{path} still in tree at {commit_sha}"))
+        } else {
+            PostCheck::ConfirmedAbsent
+        }
     }
 
     /// Append строки в конец существующего файла (ff-only); возвращает
@@ -201,6 +253,12 @@ impl GitWikiWriter {
         self.commit_file(path, &next, message).await?;
         Ok(next.lines().count())
     }
+}
+
+/// Удаление файла в Git Data tree: `sha: null` (официальный контракт
+/// https://docs.github.com/en/rest/git/trees#create-a-tree).
+fn tree_delete_entry(path: &str) -> Value {
+    json!([{ "path": path, "mode": "100644", "type": "blob", "sha": null }])
 }
 
 /// Строка Contents-GET: путь percent-кодируется, чтобы `#`/`?` в имени
@@ -277,6 +335,13 @@ mod tests {
 
     /// Красный тест инцидента #1353: `#`/`?` в пути файла — данные, не
     /// fragment/query URL; сырой путь рвёт GET (404 → append-перезапись).
+    #[test]
+    fn delete_tree_entry_uses_null_sha() {
+        let entry = tree_delete_entry("docs/Projects/foo.md");
+        assert_eq!(entry[0]["path"], "docs/Projects/foo.md");
+        assert!(entry[0]["sha"].is_null(), "sha=null обязателен для сноса");
+    }
+
     #[test]
     fn contents_url_encodes_fragment_and_query_delimiters() {
         let url = contents_url("o/r", "docs/Experience/Опыт (srv, #1248).md");
