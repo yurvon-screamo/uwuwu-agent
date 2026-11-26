@@ -2670,6 +2670,46 @@ mod tests {
         assert_eq!(strip_task_get_header(in_middle), in_middle);
     }
 
+    /// Тестер #1637 (Low код-ревью): CRLF-близнецы барьеров «тайтл без
+    /// fm-блока» и не-рендер-тайтла (нет `#` / нет разделителя статуса)
+    /// не срезаются — путь, где тайтл и пустая строка проходят, а срез
+    /// останавливается на маркере, оставался без пина.
+    #[test]
+    fn task_get_crlf_title_barriers_are_kept() {
+        let no_fm = "#1526 t — In Progress\r\n\r\n## Постановка\r\nтекст";
+        assert_eq!(strip_task_get_header(no_fm), no_fm);
+        for title in ["1526 t — In Progress", "#1526 t In Progress"] {
+            let md = card_copy_with_title(title).replace('\n', "\r\n");
+            assert_eq!(
+                strip_task_get_header(md.as_str()),
+                md.as_str(),
+                "тайтл: {title}"
+            );
+        }
+    }
+
+    /// Тестер #1637 (Low код-ревью): форма A без хвостового переноса
+    /// срезается и в CRLF — паритет с LF-пином для всех четырёх наборов.
+    #[test]
+    fn task_get_crlf_form_a_without_trailing_newline_strips_to_empty() {
+        let h8 = "--- fm ---\r\nbranch: x\r\npr: y\r\nautomerge: true\r\ndirect: false\r\nfact_track: false\r\ntype: feature\r\nbody_hash: h\r\nbody_bytes: 66";
+        let h7 = "--- fm ---\r\nbranch: x\r\npr: y\r\nautomerge: true\r\ndirect: false\r\nfact_track: false\r\ntype: bug\r\nbody_hash: h";
+        let h6 = "--- fm ---\r\nbranch: x\r\npr: y\r\nautomerge: true\r\ndirect: false\r\ntype: bug\r\nbody_hash: h";
+        let h5 =
+            "--- fm ---\r\nbranch: x\r\npr: y\r\nautomerge: true\r\ndirect: false\r\nbody_hash: h";
+        for md in [h8, h7, h6, h5] {
+            assert_eq!(strip_task_get_header(md), "", "форма: {md}");
+        }
+    }
+
+    /// Тестер #1637 (Low код-ревью): переносы строк в шапке независимы —
+    /// смешанный LF/CRLF-слой срезается, байты тела не меняются.
+    #[test]
+    fn task_get_mixed_line_endings_header_is_stripped() {
+        let md = "#1526 t — In Progress\r\n\n--- fm ---\r\nbranch: b\npr: —\r\nautomerge: true\ndirect: false\r\nfact_track: false\ntype: bug\r\nbody_hash: h\n\n## Постановка\r\nтекст\n";
+        assert_eq!(strip_task_get_header(md), "## Постановка\r\nтекст\n");
+    }
+
     /// «Тайтл» не рендер-формы (## Постановка) — вход цел.
     #[test]
     fn task_get_non_render_title_is_kept() {
