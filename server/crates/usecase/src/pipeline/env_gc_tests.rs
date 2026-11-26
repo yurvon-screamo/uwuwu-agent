@@ -1150,3 +1150,102 @@ async fn bootstrap_delete_failure_is_loud_and_bounded() {
         "ровно три попытки гашения — дальше рипер следующего прохода"
     );
 }
+
+// ---------- пины тестера #1693 (остаток Low-1 ревью круга 2) ----------
+
+/// Проход по заданной доске через общий контейнер меток: изоляция ключа
+/// по доске иначе не проверяется — run_pass шьёт одну доску.
+async fn run_pass_on_board<'a>(
+    board_name: &'a str,
+    tasks: &'a [Task],
+    gw: &'a Arc<FakeGcSessions>,
+    board: &'a Arc<FakeBoard>,
+    gone: &'a EnvGcGone,
+) -> EnvGcOutcome {
+    let router = SessionRouter::uniform(gw.clone());
+    let sessions = router.project("p");
+    let ctx = EnvGcCtx {
+        board_name,
+        checkout: "/checkout",
+        env_root: ENV_ROOT,
+        tasks,
+        sessions,
+        models: &SpawnModels::canonical(),
+        board: board.as_ref(),
+        gone,
+    };
+    sweep_envs(&ctx, policy(NOW, false))
+        .await
+        .expect("проход не падает")
+}
+
+#[tokio::test]
+async fn norepo_and_foreign_verdicts_do_not_mark_gone_and_are_retried() {
+    // Остаток Low-1 круга 2: мутанты «метка в ветке NOREPO/FOREIGN»
+    // оставляли все тесты зелёными — скрипт такие env и так не сносит,
+    // метка спрятала бы живую строку из батча навсегда (до рестарта).
+    for verdict in ["NOREPO", "FOREIGN"] {
+        let gw = fake(Vec::new());
+        verdict_default(&gw, verdict);
+        let tasks = [done_closed(55, THREE_DAYS, NOW)];
+        let gone = EnvGcGone::default();
+        let board = FakeBoard::all_done();
+        let pass = Pass {
+            tasks: &tasks,
+            gw: &gw,
+            board: &board,
+            now: NOW,
+            observe: false,
+            gone: &gone,
+        };
+
+        let first = run_pass(&pass).await;
+        assert_eq!(first.gone, 0, "{verdict} не должен ставить метку");
+        assert_eq!(
+            gw.commands.lock().unwrap().len(),
+            1,
+            "{verdict}: первый проход диспатчит"
+        );
+
+        verdict_default(&gw, "SWEPT");
+        let second = run_pass(&pass).await;
+        assert_eq!(second.gone, 0, "{verdict} не должен ставить метку");
+        assert_eq!(
+            second.swept, 1,
+            "{verdict}: живой env перепробуется и сносится"
+        );
+        assert_eq!(
+            gw.commands.lock().unwrap().len(),
+            2,
+            "{verdict}: второй проход снова диспатчит строку"
+        );
+    }
+}
+
+#[tokio::test]
+async fn gone_mark_is_scoped_to_board() {
+    // Ключ метки включает доску: одноимённая строка другой доски —
+    // другой env, метка чужой доски её прятать не должна.
+    let gw = fake(Vec::new());
+    verdict_default(&gw, "SWEPT");
+    let gone = EnvGcGone::default();
+    let board = FakeBoard::all_done();
+
+    let tasks_a = [done_closed(77, THREE_DAYS, NOW)];
+    let first = run_pass_on_board("Задачи uwuwu", &tasks_a, &gw, &board, &gone).await;
+    assert_eq!(first.swept, 1);
+    assert_eq!(first.gone, 0);
+
+    let tasks_b = [done_closed(77, THREE_DAYS, NOW)];
+    let second = run_pass_on_board("Задачи origa", &tasks_b, &gw, &board, &gone).await;
+    assert_eq!(
+        second.gone, 0,
+        "метка доски uwuwu не прячет одноимённую строку origa"
+    );
+    assert_eq!(second.swept, 1, "одноимённая строка другой доски сносится");
+    assert_eq!(
+        gw.commands.lock().unwrap().len(),
+        2,
+        "второй проход диспатчит, а не молчит на метке чужой доски"
+    );
+}
