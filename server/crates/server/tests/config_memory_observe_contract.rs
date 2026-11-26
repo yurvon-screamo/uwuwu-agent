@@ -63,6 +63,14 @@ fn launch_block(head: &str) -> String {
 fn memory_stand_header_forces_observe_without_mock() {
     let cfg = fs::read_to_string(config_path()).expect("config.memory.toml читается");
     let head = header(&cfg);
+    // Шапка обещает «Ручного live по этой шапке нет» — значит в ней ровно
+    // одна команда запуска сервера. Второй блок без переменной не должен
+    // прятаться за проверенным первым.
+    assert_eq!(
+        head.matches("cargo run --bin uwuwu-server").count(),
+        1,
+        "в шапке должна быть ровно одна команда запуска сервера:\n{head}"
+    );
     let cmd = launch_block(&head);
 
     // Главное правило: ровно одно присваивание UWUWU_SERVER_MODE в команде,
@@ -128,19 +136,19 @@ fn memory_stand_header_forces_observe_without_mock() {
 }
 
 /// Уборка tempdir и дочерних процессов даже при упавшем ассерте.
+/// Оба поля опциональны: гард строится сразу после первого спавна, до любых
+/// ожиданий и ассертов, — иначе паника в этом окне оставляет процесс живым.
 struct StandGuard {
     dir: PathBuf,
-    server: Child,
+    server: Option<Child>,
     mock: Option<Child>,
 }
 
 impl Drop for StandGuard {
     fn drop(&mut self) {
-        let _ = self.server.kill();
-        let _ = self.server.wait();
-        if let Some(mock) = &mut self.mock {
-            let _ = mock.kill();
-            let _ = mock.wait();
+        for child in [&mut self.server, &mut self.mock].into_iter().flatten() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
         let _ = fs::remove_dir_all(&self.dir);
     }
@@ -152,12 +160,6 @@ fn free_port() -> u16 {
         .local_addr()
         .expect("local_addr")
         .port()
-}
-
-fn read_mock_ready(log: &Path) -> bool {
-    fs::read_to_string(log)
-        .map(|raw| raw.contains("mock.started"))
-        .unwrap_or(false)
 }
 
 /// Режим без мока: что реально доказано — observe, тишина сайдкаров,
@@ -204,7 +206,7 @@ async fn observe_stand_from_real_config_is_read_only_and_quiet() {
         .expect("сервер спавнен");
     let mut stand = StandGuard {
         dir: dir.clone(),
-        server: child,
+        server: Some(child),
         mock: None,
     };
 
@@ -213,7 +215,13 @@ async fn observe_stand_from_real_config_is_read_only_and_quiet() {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline && !read_log().contains(&bind) {
         assert!(
-            stand.server.try_wait().expect("статус ребёнка").is_none(),
+            stand
+                .server
+                .as_mut()
+                .expect("сервер спавнен")
+                .try_wait()
+                .expect("статус ребёнка")
+                .is_none(),
             "сервер умер до http.listening\nлог:\n{}",
             read_log()
         );
@@ -271,8 +279,10 @@ async fn observe_stand_from_real_config_is_read_only_and_quiet() {
         ticks >= 3 && zeros >= ticks,
         "тики есть, но не все с spawns: 0 (ticks={ticks}, zeros={zeros})\nлог:\n{out}"
     );
+    // Успешный спавн сервер пишет как spawn.done и счётчиком spawns:N;
+    // create_session в его логе — только тексты отказов, как сигнал мёртв.
     for forbidden in [
-        "create_session",
+        "spawn.done",
         "sidecar.tick_failed",
         "spawn.budget_exhausted",
         "env.gc",
@@ -341,6 +351,7 @@ async fn observe_gate_holds_with_reachable_mock() {
 
     let mock_out = fs::File::create(&mock_log).expect("лог мока открыт");
     let mock = Command::new(env!("CARGO_BIN_EXE_mock_opencode"))
+        .env("RUST_LOG", "info")
         .env("MOCK_MODE", "agent")
         .env("MOCK_MCP_TOKEN", bearer)
         .env("MOCK_PORT", mock_port.to_string())
@@ -348,15 +359,22 @@ async fn observe_gate_holds_with_reachable_mock() {
         .stderr(Stdio::from(mock_out))
         .spawn()
         .expect("мок спавнен");
-    // Мок должен быть готов до старта сервера: иначе первый тик увидит
-    // недоступного исполнителя и оставит WARN, который здесь не ожидается.
+    // Гард строится сразу после спавна, до любых ожиданий и ассертов:
+    // паника в окне готовности не оставит живой процесс и tempdir.
+    let mut stand = StandGuard {
+        dir: dir.clone(),
+        server: None,
+        mock: Some(mock),
+    };
+    // Готовность по TCP, а не по логу: уровень логирования задан тестом,
+    // но сам сигнал от внешнего RUST_LOG не зависит.
     let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline && !read_mock_ready(&mock_log) {
+    while Instant::now() < deadline && TcpStream::connect(("127.0.0.1", mock_port)).is_err() {
         std::thread::sleep(Duration::from_millis(100));
     }
     assert!(
-        read_mock_ready(&mock_log),
-        "мок не поднялся за 20 c\nлог:\n{}",
+        TcpStream::connect(("127.0.0.1", mock_port)).is_ok(),
+        "мок не слушает {mock_port} за 20 c\nлог:\n{}",
         fs::read_to_string(&mock_log).unwrap_or_default()
     );
 
@@ -382,11 +400,7 @@ async fn observe_gate_holds_with_reachable_mock() {
         .stderr(Stdio::from(log))
         .spawn()
         .expect("сервер спавнен");
-    let mut stand = StandGuard {
-        dir: dir.clone(),
-        server: child,
-        mock: Some(mock),
-    };
+    stand.server = Some(child);
 
     let read_server = || fs::read_to_string(&server_log).unwrap_or_default();
     let read_mock = || fs::read_to_string(&mock_log).unwrap_or_default();
@@ -394,7 +408,13 @@ async fn observe_gate_holds_with_reachable_mock() {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline && !read_server().contains(&bind) {
         assert!(
-            stand.server.try_wait().expect("статус ребёнка").is_none(),
+            stand
+                .server
+                .as_mut()
+                .expect("сервер спавнен")
+                .try_wait()
+                .expect("статус ребёнка")
+                .is_none(),
             "сервер умер до http.listening\nлог мока:\n{}\nлог сервера:\n{}",
             read_mock(),
             read_server()
@@ -429,13 +449,22 @@ async fn observe_gate_holds_with_reachable_mock() {
         out.contains("\"mode\":\"Observe\"") && out.contains("\"event\":\"sidecars.observe_mode\""),
         "стенд не в observe\nлог:\n{out}"
     );
+    let spawn_values: Vec<u64> = out
+        .match_indices("\"spawns\":")
+        .filter_map(|(i, _)| {
+            out[i + "\"spawns\":".len()..]
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|digits| digits.parse().ok())
+        })
+        .collect();
     assert!(
-        out.contains("\"spawns\":0") && !out.contains("\"spawns\":1"),
-        "observe при доступном моке разрешил спавн\nлог:\n{out}"
+        !spawn_values.is_empty() && spawn_values.iter().all(|value| *value == 0),
+        "observe при доступном моке разрешил спавн: {spawn_values:?}\nлог:\n{out}"
     );
     assert!(
-        !out.contains("create_session") && !mock_out.contains("session_created"),
-        "observe вызвал создание сессии\nлог мока:\n{mock_out}\nлог сервера:\n{out}"
+        !out.contains("spawn.done") && !mock_out.contains("session_created"),
+        "observe вызвал создание сессии (spawn.done у сервера или session_created у мока)\nлог мока:\n{mock_out}\nлог сервера:\n{out}"
     );
     assert!(
         !out.contains("sessions.list_reachable_failed"),
