@@ -1,7 +1,9 @@
 //! Юнит-матрица blob-канала (#1292): лимит, дедуп-ключ, content-type,
 //! идемпотентность, громкость отказа без конфига.
 
-use super::{content_type_for, sha8_hex, BlobPlace, BlobUseCase, BLOB_MAX_BYTES};
+use super::{
+    content_type_for, sha8_hex, BlobPlace, BlobUseCase, BLOB_MAX_BYTES, BLOB_PRESIGN_PUT_TTL_SECS,
+};
 use crate::error::UsecaseError;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -21,6 +23,9 @@ impl super::BlobStore for RecordingStore {
     }
     fn presign_get_url(&self, key: &BlobKey) -> String {
         format!("presigned://{}", key.as_str())
+    }
+    fn presign_put_url(&self, key: &BlobKey, _content_type: &str) -> String {
+        format!("presigned-put://{}", key.as_str())
     }
 }
 
@@ -55,6 +60,52 @@ async fn place_builds_dedup_key_and_returns_presigned_url() {
     assert!(tail.starts_with(&sha8_hex(bytes)), "дедуп-сегмент: {key}");
     assert!(tail.ends_with("скрин от МПНЧ.png"), "имя сохранено: {key}");
     assert_eq!(receipt.url, format!("presigned://{key}"));
+}
+
+#[test]
+fn reserve_builds_fresh_key_with_both_presigned_urls() {
+    let case = ready_case();
+    let first = case.reserve(&place("скрин от МПНЧ.png")).expect("first");
+    let second = case.reserve(&place("скрин от МПНЧ.png")).expect("second");
+
+    assert_eq!(first.content_type, "image/png");
+    assert_eq!(first.put_ttl_secs, BLOB_PRESIGN_PUT_TTL_SECS);
+    let tail = first
+        .key
+        .strip_prefix("blobs/uwuwu/1292/")
+        .unwrap_or_default();
+    assert!(tail.ends_with("-скрин от МПНЧ.png"), "{tail}");
+    assert!(
+        tail.split('-').next().is_some_and(|id| id.len() == 8),
+        "UUID-сегмент: {tail}"
+    );
+    assert_eq!(first.put_url, format!("presigned-put://{}", first.key));
+    assert_eq!(first.url, format!("presigned://{}", first.key));
+    assert_ne!(first.key, second.key, "каждая загрузка — новый ключ");
+}
+
+#[test]
+fn reserve_sanitizes_filename_and_rejects_missing_config() {
+    let case = ready_case();
+    let reserved = case.reserve(&place("../../etc/passwd")).expect("санитайз");
+    let segments: Vec<&str> = reserved.key.split('/').collect();
+    assert_eq!(segments.len(), 4, "{}", reserved.key);
+    assert!(
+        segments
+            .iter()
+            .all(|s| !s.is_empty() && *s != "." && *s != ".."),
+        "сегменты безопасны: {}",
+        reserved.key
+    );
+
+    let missing = BlobUseCase::missing(vec!["UWUWU_S3_SECRET".to_string()]);
+    let err = missing
+        .reserve(&place("a.png"))
+        .expect_err("громкий отказ без конфига");
+    assert!(matches!(
+        err,
+        crate::error::UsecaseError::BlobNotConfigured(_)
+    ));
 }
 
 #[tokio::test]

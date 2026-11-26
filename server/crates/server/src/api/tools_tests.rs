@@ -1884,6 +1884,45 @@ async fn blob_put_returns_key_and_url_get_resigns_by_key() {
 }
 
 #[tokio::test]
+async fn blob_put_presign_mode_returns_both_urls_without_bytes() {
+    let (tools, _memory) = hub();
+    let put = call(
+        &tools,
+        "blob_put",
+        json!({ "filename": "скрин от МПНЧ.png", "number": 1537 }),
+    )
+    .await
+    .expect("reserve ok");
+    let key = put
+        .lines()
+        .find_map(|l| l.strip_prefix("key: "))
+        .expect("key in the receipt");
+    assert!(key.starts_with("blobs/uwuwu/1537/"), "{put}");
+    assert!(put.contains("PUT URL (TTL 300 s"), "{put}");
+    assert!(put.contains("memory-put://"), "{put}");
+    assert!(put.contains("URL (TTL 7 days): memory://"), "{put}");
+    assert!(put.contains("image/png"), "{put}");
+
+    let get = call(&tools, "blob_get", json!({ "key": key }))
+        .await
+        .expect("get ok");
+    assert!(get.contains(&format!("memory://{key}")), "{get}");
+}
+
+#[tokio::test]
+async fn blob_put_empty_data_base64_is_loud_instead_of_silent_reserve() {
+    let (tools, _memory) = hub();
+    let err = call(
+        &tools,
+        "blob_put",
+        json!({ "filename": "a.png", "data_base64": "   " }),
+    )
+    .await
+    .expect_err("громкий отказ");
+    assert!(err.contains("data_base64 is empty"), "{err}");
+}
+
+#[tokio::test]
 async fn blob_put_without_number_goes_to_misc_segment() {
     let (tools, _memory) = hub();
     let put = call(
@@ -1952,18 +1991,19 @@ async fn blob_tools_fail_loud_without_env() {
         blob_usecase_missing(&["UWUWU_S3_ENDPOINT", "UWUWU_S3_BUCKET"]),
         Arc::new(StubCronState::default()),
     );
-    let err = call(
-        &tools,
-        "blob_put",
+    for args in [
         json!({ "filename": "a.png", "data_base64": base64_of(b"x") }),
-    )
-    .await
-    .expect_err("громкий отказ");
-    assert!(err.contains("blob is not configured"), "{err}");
-    assert!(
-        err.contains("UWUWU_S3_ENDPOINT") && err.contains("UWUWU_S3_BUCKET"),
-        "{err}"
-    );
+        json!({ "filename": "a.png" }),
+    ] {
+        let err = call(&tools, "blob_put", args)
+            .await
+            .expect_err("громкий отказ");
+        assert!(err.contains("blob is not configured"), "{err}");
+        assert!(
+            err.contains("UWUWU_S3_ENDPOINT") && err.contains("UWUWU_S3_BUCKET"),
+            "{err}"
+        );
+    }
 }
 
 #[tokio::test]

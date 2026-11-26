@@ -381,13 +381,16 @@ pub fn tool_descriptors() -> Value {
         ),
         tool(
             "blob_put",
-            "Put a file into the private blob bucket (Tigris) — an attachment to a \
-             task/doc: key + presigned URL (TTL 7 days; an expired one is \
-             re-signed via blob_get by key)",
+            "Attach a file to a task/doc in the private bucket (Tigris). Give \
+             data_base64 for a small file. Omit data_base64 for a presigned PUT \
+             URL: upload the bytes with curl from the shell, then use the key \
+             and the GET URL from the same receipt",
             object(json!({
                 "filename": string("file name with extension — content-type \
                                    is derived from it"),
-                "data_base64": string("file content base64; limit 20 MiB"),
+                "data_base64": string("file content base64 (limit 20 MiB); omit \
+                                      to reserve a key and get a presigned PUT \
+                                      URL with a 5-minute TTL"),
                 "number": integer("task number: key blobs/<project>/<number>/…; \
                                   without it — misc segment"),
                 "project": string("project; default uwuwu")
@@ -918,26 +921,49 @@ impl ToolHub {
     }
 
     async fn blob_put(&self, project: &str, args: &Value) -> Result<Value, String> {
-        require_args(args, &["filename", "data_base64"])?;
-        let filename = arg_str(args, "filename");
-        let data_base64 = arg_str(args, "data_base64");
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(data_base64.trim())
-            .map_err(|e| format!("data_base64 does not decode: {e}"))?;
+        require_args(args, &["filename"])?;
         let number = optional_number(args)?;
         let target = BlobPlace {
             project: project.to_string(),
             task: number,
-            filename,
+            filename: arg_str(args, "filename"),
         };
-        let receipt = self
-            .blobs
-            .place(&target, &bytes)
-            .await
-            .map_err(|e| e.to_string())?;
+        match args.get("data_base64") {
+            None => self.blob_put_reserve(&target),
+            Some(value) => {
+                let data_base64 = value
+                    .as_str()
+                    .filter(|raw| !raw.trim().is_empty())
+                    .ok_or("data_base64 is empty; omit it for the presigned PUT mode")?;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data_base64.trim())
+                    .map_err(|e| format!("data_base64 does not decode: {e}"))?;
+                let receipt = self
+                    .blobs
+                    .place(&target, &bytes)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                ok_text(format!(
+                    "key: {}\nURL (TTL 7 days): {}\n{}; {} bytes",
+                    receipt.key, receipt.url, receipt.content_type, receipt.size
+                ))
+            }
+        }
+    }
+
+    fn blob_put_reserve(&self, target: &BlobPlace) -> Result<Value, String> {
+        let receipt = self.blobs.reserve(target).map_err(|e| e.to_string())?;
         ok_text(format!(
-            "key: {}\nURL (TTL 7 days): {}\n{}; {} bytes",
-            receipt.key, receipt.url, receipt.content_type, receipt.size
+            "key: {}\nPUT URL (TTL {} s; send Content-Type: {}): {}\n\
+             URL (TTL 7 days): {}\n{}\n\
+             upload the bytes with curl from the shell; verify the GET URL before \
+             writing the link, and reuse the key from this receipt",
+            receipt.key,
+            receipt.put_ttl_secs,
+            receipt.content_type,
+            receipt.put_url,
+            receipt.url,
+            receipt.content_type
         ))
     }
 
@@ -947,7 +973,7 @@ impl ToolHub {
             return Err("key is required".into());
         }
         let key = uwuwu_domain::BlobKey::parse_read(raw.trim()).ok_or(
-            "key must look like blobs/<project>/<task|misc>/<sha8>-<name> \
+            "key must look like blobs/<project>/<task|misc>/<id>-<name> \
              or assets/<path of a migrated attachment>",
         )?;
         let url = self.blobs.fresh_url(&key).map_err(|e| e.to_string())?;

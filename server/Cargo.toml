@@ -22,6 +22,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # blob-канал #1292: Tigris S3 (SigV4 sans-IO; rustcrypto — без xml/md-5/full,
 # тулам нужны только GetObject/PutObject + presign) + дедуп-хэш + base64-вход
 rusty-s3 = { version = "0.12", default-features = false, features = ["rustcrypto"] }
+uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 base64 = "0.23"
 # dev

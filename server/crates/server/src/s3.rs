@@ -7,7 +7,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
 use uwuwu_domain::BlobKey;
-use uwuwu_usecase::{BlobStore, UsecaseError, UsecaseResult, BLOB_PRESIGN_TTL_SECS};
+use uwuwu_usecase::{
+    BlobStore, UsecaseError, UsecaseResult, BLOB_PRESIGN_PUT_TTL_SECS, BLOB_PRESIGN_TTL_SECS,
+};
 
 #[cfg(test)]
 use std::sync::Mutex;
@@ -97,6 +99,16 @@ impl BlobStore for TigrisBlobStore {
             .sign(Duration::from_secs(BLOB_PRESIGN_TTL_SECS))
             .to_string()
     }
+
+    fn presign_put_url(&self, key: &BlobKey, content_type: &str) -> String {
+        let mut action = self
+            .bucket
+            .put_object(Some(&self.credentials), key.as_str());
+        action.headers_mut().insert("content-type", content_type);
+        action
+            .sign(Duration::from_secs(BLOB_PRESIGN_PUT_TTL_SECS))
+            .to_string()
+    }
 }
 
 /// Стенд (e2e/пробы): фиксирует key ↔ байты в памяти — полный туловой
@@ -130,6 +142,10 @@ impl BlobStore for MemoryBlobStore {
 
     fn presign_get_url(&self, key: &BlobKey) -> String {
         format!("memory://{}", key.as_str())
+    }
+
+    fn presign_put_url(&self, key: &BlobKey, _content_type: &str) -> String {
+        format!("memory-put://{}", key.as_str())
     }
 }
 
@@ -176,6 +192,21 @@ mod tests {
         assert!(url.contains("X-Amz-Signature="), "{url}");
         // Кириллица/пробелы — percent-encoded, путь не рвётся
         assert!(!url.contains(' '), "{url}");
+    }
+
+    #[test]
+    fn presign_put_url_carries_short_ttl_and_signed_content_type() {
+        let store = fake_store();
+        let key = BlobKey::parse("blobs/uwuwu/1292/a1b2c3d4-скрин.png").expect("ключ валиден");
+        let url = store.presign_put_url(&key, "image/png");
+        assert!(url.contains("X-Amz-Expires=300"), "{url}");
+        assert!(
+            url.contains("X-Amz-SignedHeaders=content-type%3Bhost")
+                || url.contains("X-Amz-SignedHeaders=content-type;host"),
+            "тип в подписи: {url}"
+        );
+        assert!(url.contains("X-Amz-Signature="), "{url}");
+        assert!(!url.contains(' '), "кириллица percent-encoded: {url}");
     }
 
     #[tokio::test]
@@ -355,6 +386,25 @@ mod tests {
             resp.status(),
             reqwest::StatusCode::NOT_FOUND,
             "L-1: presign локален — URL на несуществующий ключ успешен, 404 на открытии"
+        );
+
+        let direct_key =
+            BlobKey::parse("blobs/uwuwu/misc/f0f0f0f0-direct.png").expect("ключ валиден");
+        let direct_url = store.presign_put_url(&direct_key, "image/png");
+        reqwest::Client::new()
+            .put(direct_url)
+            .header("content-type", "image/png")
+            .body("agent-bytes")
+            .send()
+            .await
+            .expect("agent PUT by presigned URL")
+            .error_for_status()
+            .expect("PUT через presign успешен");
+        assert!(
+            stored.lock().expect("lock").iter().any(|(k, b, c)| {
+                k == direct_key.as_str() && b.as_slice() == b"agent-bytes" && c == "image/png"
+            }),
+            "байты агента через presign дошли до носителя"
         );
     }
 }
