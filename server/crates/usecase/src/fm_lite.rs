@@ -44,9 +44,10 @@ pub fn strip(md: &str) -> &str {
         .unwrap_or(body)
 }
 
-/// Ведущие пустые строки после fm — LF и CRLF одинаково, без потери
-/// переносов самого тела.
-fn trim_blank_lines(md: &str) -> &str {
+/// Ведущие пустые строки после шапки — LF и CRLF одинаково, без потери
+/// переносов самого тела. Общая политика обоих стрипперов (#1637/#1664):
+/// `strip_task_get_header` в `write.rs` вызывает этот же срез.
+pub(crate) fn trim_blank_lines(md: &str) -> &str {
     let mut rest = md;
     loop {
         let Some(next) = rest
@@ -117,9 +118,11 @@ mod tests {
         assert_eq!(strip(md), md);
     }
 
-    /// #1664: доки ботов и кронов в CRLF — fm снимается, тело байт-в-байт.
+    /// #1664: CRLF-док — fm снимается, тело байт-в-байт. Здесь проверяется
+    /// только `strip`: чистый CRLF-док до `parse` потребителей не доходит
+    /// (пины реальных путей — в `bots/spec.rs` и `crons.rs`).
     #[test]
-    fn strip_crlf_consumer_docs() {
+    fn strip_crlf_doc_bodies() {
         let bot = "---\r\nmodel: p/id\r\ntoken_env: TOK\r\nworkspace: /w\r\n---\r\n\r\n## Методичка\r\nтекст";
         assert_eq!(strip(bot), "## Методичка\r\nтекст");
         let cron = "---\r\ntitle: Тест\r\nschedule: 5m\r\nproject: uwuwu\r\n---\r\n\r\nТело\r\n";

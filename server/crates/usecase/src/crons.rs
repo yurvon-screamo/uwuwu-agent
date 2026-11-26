@@ -682,6 +682,22 @@ mod tests {
         assert_eq!(m.agent, AgentSlot::Role(uwuwu_domain::Agent::Dreamer));
     }
 
+    /// #1664: LF-шапка и CRLF-тело: мастер парсится, ведущие пустые
+    /// строки сняты, переносы тела не изменились.
+    #[test]
+    fn master_mixed_line_endings_body_has_no_leading_blanks() {
+        let md = "---\ntitle: Тест\nschedule: 5m\nproject: uwuwu\n---\r\n\r\nТело\r\n";
+        let m = parse_master("cron/x/README", md).unwrap();
+        assert_eq!(m.body, "Тело\r\n");
+    }
+
+    /// #1664: чистый CRLF-док крона не парсится — парсер LF-строгий.
+    #[test]
+    fn master_crlf_doc_is_rejected() {
+        let md = "---\r\ntitle: Тест\r\nschedule: 5m\r\nproject: uwuwu\r\n---\r\nТело";
+        assert!(parse_master("cron/x/README", md).is_none());
+    }
+
     #[test]
     fn run_prompt_carries_last_fire_and_no_journal() {
         let md = "---\ntitle: Тест\nschedule: 5m\nproject: uwuwu\n---\nТело";
