@@ -2,11 +2,12 @@
 //! (hub driver=memory, executor = mock_opencode) получает алиасы из конфига
 //! и кладёт разрешённую модель в тело каждого спавна.
 //!
-//! Сценарий, который тестировщик гонял руками на стенде (`scratch/alias_probe`):
+//! Сценарий, воспроизведённый тестировщиком на изолированном стенде:
 //!   1. разная raw у трёх алиасов → flash-агенты и bootstrap несут flash,
-//!      tester — common, ревьювер — smart;
-//!   2. правка raw только у алиаса flash → вся flash-группа едет на новой
-//!      модели без правок по агентам; tester и ревьювер не задеты.
+//!      tester — common, plan-reviewer — smart; code-quality-reviewer
+//!      намеренно переназначен на flash — это проверка слоя назначений;
+//!   2. правка raw только у алиаса flash → flash-группа и переназначенный
+//!      ревьювер едут на новой модели; tester и plan-reviewer не задеты.
 //!
 //! Тела POST /api/session ловит тестовый прокси из общего харнеса
 //! (`capture.jsonl`): сам mock_opencode модель в лог не пишет.
@@ -22,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Каталог стенда убирается и при красном прогоне (мутации/паника) —
-/// четыре прогона не оставляют хвост в системном temp.
+/// хвост в системном temp не остаётся.
 struct AliasTempDirGuard(PathBuf);
 
 impl AliasTempDirGuard {
@@ -140,7 +141,7 @@ async fn alias_layers_reach_live_spawns_and_one_edit_moves_whole_group() {
     let dir_v2 = AliasTempDirGuard::new("v2");
     let dir_v3 = AliasTempDirGuard::new("v3");
 
-    // 1. Раскладка опроса доезжает до живых спавнов.
+    // 1. Раскладка алиасов и неканоническое назначение доезжают до спавнов.
     let stand_v2 = spawn_stand(
         &dir_v2.0,
         StandOptions {
@@ -167,7 +168,7 @@ async fn alias_layers_reach_live_spawns_and_one_edit_moves_whole_group() {
     assert_eq!(
         v2.get("plan-reviewer").map(String::as_str),
         Some(SMART_V2),
-        "ревьювер — smart"
+        "plan-reviewer — smart: алиас не тронут"
     );
     // Назначение неканоническое: код-ревьювер переназначен на flash.
     // Именно этот слой доезжает до живого спавна и проверяется здесь;
