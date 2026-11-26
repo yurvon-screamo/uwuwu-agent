@@ -7,7 +7,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
 use uwuwu_domain::BlobKey;
-use uwuwu_usecase::{BlobStore, UsecaseError, UsecaseResult, BLOB_PRESIGN_TTL_SECS};
+use uwuwu_usecase::{
+    BlobStore, UsecaseError, UsecaseResult, BLOB_PRESIGN_PUT_TTL_SECS, BLOB_PRESIGN_TTL_SECS,
+};
 
 #[cfg(test)]
 use std::sync::Mutex;
@@ -97,6 +99,16 @@ impl BlobStore for TigrisBlobStore {
             .sign(Duration::from_secs(BLOB_PRESIGN_TTL_SECS))
             .to_string()
     }
+
+    fn presign_put_url(&self, key: &BlobKey, content_type: &str) -> String {
+        let mut action = self
+            .bucket
+            .put_object(Some(&self.credentials), key.as_str());
+        action.headers_mut().insert("content-type", content_type);
+        action
+            .sign(Duration::from_secs(BLOB_PRESIGN_PUT_TTL_SECS))
+            .to_string()
+    }
 }
 
 /// Стенд (e2e/пробы): фиксирует key ↔ байты в памяти — полный туловой
@@ -130,6 +142,10 @@ impl BlobStore for MemoryBlobStore {
 
     fn presign_get_url(&self, key: &BlobKey) -> String {
         format!("memory://{}", key.as_str())
+    }
+
+    fn presign_put_url(&self, key: &BlobKey, _content_type: &str) -> String {
+        format!("memory-put://{}", key.as_str())
     }
 }
 
@@ -178,6 +194,83 @@ mod tests {
         assert!(!url.contains(' '), "{url}");
     }
 
+    #[test]
+    fn presign_put_url_carries_short_ttl_and_signed_content_type() {
+        let store = fake_store();
+        let key = BlobKey::parse("blobs/uwuwu/1292/a1b2c3d4-скрин.png").expect("ключ валиден");
+        let url = store.presign_put_url(&key, "image/png");
+        assert!(url.contains("X-Amz-Expires=300"), "{url}");
+        assert!(
+            url.contains("X-Amz-SignedHeaders=content-type%3Bhost")
+                || url.contains("X-Amz-SignedHeaders=content-type;host"),
+            "тип в подписи: {url}"
+        );
+        assert!(url.contains("X-Amz-Signature="), "{url}");
+        assert!(!url.contains(' '), "кириллица percent-encoded: {url}");
+    }
+
+    /// PUT-пресайн подписан ровно на один ключ и один Content-Type:
+    /// смена любого из них меняет подпись, Path — тот же ключ, что в
+    /// квитанции (правило «пресайн ↔ ключ» из Experience/mcp 24.11).
+    #[test]
+    fn presign_put_url_binds_signature_to_one_key_and_content_type() {
+        let store = fake_store();
+        let a = BlobKey::parse("blobs/uwuwu/1537/f0f0f0f0-one.png").expect("ключ a");
+        let b = BlobKey::parse("blobs/uwuwu/1537/f0f0f0f1-two.png").expect("ключ b");
+
+        let param = |u: &str, name: &str| {
+            u.split('&')
+                .find(|p| p.starts_with(&format!("{name}=")))
+                .unwrap_or_default()
+                .to_string()
+        };
+        let date = |u: &str| param(u, "X-Amz-Date");
+        let sig = |u: &str| param(u, "X-Amz-Signature");
+        let path = |u: &str| u.split('?').next().unwrap_or_default().to_string();
+
+        // Подписи сравниваются только внутри одной секунды: иначе дата
+        // сама по себе разведёт подписи и ассерт станет мёртвым (ревью
+        // тестов #1537, Low-2). На границе секунды — переподпись.
+        let mut urls = None;
+        for _ in 0..20 {
+            let ua = store.presign_put_url(&a, "image/png");
+            let ub = store.presign_put_url(&b, "image/png");
+            let uo = store.presign_put_url(&a, "application/octet-stream");
+            if date(&ua) == date(&ub) && date(&ua) == date(&uo) {
+                urls = Some((ua, ub, uo));
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let (url_a, url_b, url_a_other_ct) = urls.expect("подписи в одну секунду");
+
+        assert_eq!(
+            path(&url_a),
+            "https://uwuwu-blobs.t3.storageapi.dev/blobs/uwuwu/1537/f0f0f0f0-one.png"
+        );
+        assert_eq!(
+            path(&url_b),
+            "https://uwuwu-blobs.t3.storageapi.dev/blobs/uwuwu/1537/f0f0f0f1-two.png"
+        );
+        assert_eq!(date(&url_a), date(&url_b), "сравнение в одной секунде");
+        assert_eq!(
+            date(&url_a),
+            date(&url_a_other_ct),
+            "сравнение в одной секунде"
+        );
+        assert_eq!(
+            url_a.matches("X-Amz-Signature=").count(),
+            1,
+            "одна подпись в URL"
+        );
+        assert_ne!(sig(&url_a), sig(&url_b), "подпись привязана к ключу");
+        assert_ne!(
+            sig(&url_a),
+            sig(&url_a_other_ct),
+            "подпись привязана к Content-Type"
+        );
+    }
+
     #[tokio::test]
     async fn memory_store_roundtrips_key_bytes_and_content_type() {
         let store = MemoryBlobStore::default();
@@ -203,109 +296,17 @@ mod tests {
     /// `*.localhost` в loopback; резолвера нет — стенд пропускается.
     #[tokio::test]
     async fn tigris_store_roundtrip_over_real_http_transport() {
-        use axum::extract::{Path, State};
-        use axum::response::Response;
         use std::net::ToSocketAddrs;
-        use std::sync::Arc;
         if "uwuwu-blobs-it.localhost:1".to_socket_addrs().is_err() {
             eprintln!("*.localhost не резолвится — интеграционный стенд пропущен");
             return;
         }
 
-        type Storage = Arc<Mutex<Vec<(String, Vec<u8>, String)>>>;
-        let stored: Storage = Arc::default();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        let app = {
-            let stored = stored.clone();
-            axum::Router::new()
-                .route(
-                    "/{*key}",
-                    axum::routing::any(
-                        move |method: axum::http::Method,
-                              uri: axum::http::Uri,
-                              headers: axum::http::HeaderMap,
-                              State(stored): State<Storage>,
-                              Path(key): Path<String>,
-                              body: axum::body::Bytes| {
-                            async move {
-                                let respond =
-                                    |status: axum::http::StatusCode,
-                                     ctype: Option<&str>,
-                                     body: Vec<u8>| {
-                                        let mut builder = Response::builder().status(status);
-                                        if let Some(ctype) = ctype {
-                                            builder = builder.header("content-type", ctype);
-                                        }
-                                        builder
-                                            .body(axum::body::Body::from(body))
-                                            .expect("static response")
-                                    };
-                                match method {
-                                    axum::http::Method::PUT => {
-                                        let ctype = headers
-                                            .get("content-type")
-                                            .and_then(|v| v.to_str().ok())
-                                            .unwrap_or_default()
-                                            .to_string();
-                                        stored.lock().expect("lock").push((
-                                            key,
-                                            body.to_vec(),
-                                            ctype,
-                                        ));
-                                        respond(axum::http::StatusCode::OK, None, Vec::new())
-                                    }
-                                    m if m == axum::http::Method::GET
-                                        || m == axum::http::Method::HEAD =>
-                                    {
-                                        let signed = uri
-                                            .query()
-                                            .map(|q| q.contains("X-Amz-Signature="))
-                                            .unwrap_or(false);
-                                        let hit = signed.then(|| {
-                                            stored
-                                                .lock()
-                                                .expect("lock")
-                                                .iter()
-                                                .find(|(k, _, _)| *k == key)
-                                                .map(|(_, b, c)| (b.clone(), c.clone()))
-                                        });
-                                        match hit.flatten() {
-                                            Some((bytes, ctype)) => respond(
-                                                axum::http::StatusCode::OK,
-                                                Some(ctype.as_str()),
-                                                bytes,
-                                            ),
-                                            None if signed => respond(
-                                                axum::http::StatusCode::NOT_FOUND,
-                                                None,
-                                                Vec::new(),
-                                            ),
-                                            None => respond(
-                                                axum::http::StatusCode::FORBIDDEN,
-                                                Some("application/xml"),
-                                                b"<Error><Code>AccessDenied</Code></Error>"
-                                                    .to_vec(),
-                                            ),
-                                        }
-                                    }
-                                    _ => respond(
-                                        axum::http::StatusCode::METHOD_NOT_ALLOWED,
-                                        None,
-                                        Vec::new(),
-                                    ),
-                                }
-                            }
-                        },
-                    ),
-                )
-                .with_state(stored.clone())
-        };
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve");
-        });
+        // Общий фейк (revью тестов #1537, Low-3): S3-маршрут `/<key>` с
+        // проверкой подписи и агентские `/put/`,`/get/` — одна фикстура
+        // на этот тест и на MCP-приёмку в tools_tests.rs.
+        let fake = crate::api::test_support::BlobHttpFake::start().await;
+        let port = fake.port;
 
         let store = TigrisBlobStore::new(TigrisConfig {
             endpoint: format!("http://localhost:{port}"),
@@ -322,8 +323,13 @@ mod tests {
             .await
             .expect("put через реальный HTTP-транспорт");
         {
-            let guard = stored.lock().expect("lock");
-            let (_, bytes, ctype) = guard.first().expect("фейк принял объект");
+            let (bytes, ctype) = fake
+                .objects
+                .lock()
+                .expect("lock")
+                .get(key.as_str())
+                .cloned()
+                .expect("фейк принял объект");
             assert_eq!(bytes.as_slice(), b"\x89PNG-it", "байты дошли до носителя");
             assert_eq!(ctype, "image/png", "content-type дошёл до носителя");
         }
@@ -355,6 +361,31 @@ mod tests {
             resp.status(),
             reqwest::StatusCode::NOT_FOUND,
             "L-1: presign локален — URL на несуществующий ключ успешен, 404 на открытии"
+        );
+
+        let direct_key =
+            BlobKey::parse("blobs/uwuwu/misc/f0f0f0f0-direct.png").expect("ключ валиден");
+        let direct_url = store.presign_put_url(&direct_key, "image/png");
+        reqwest::Client::new()
+            .put(direct_url)
+            .header("content-type", "image/png")
+            .body("agent-bytes")
+            .send()
+            .await
+            .expect("agent PUT by presigned URL")
+            .error_for_status()
+            .expect("PUT через presign успешен");
+        let (bytes, ctype) = fake
+            .objects
+            .lock()
+            .expect("lock")
+            .get(direct_key.as_str())
+            .cloned()
+            .expect("объект от агента в фейке");
+        assert_eq!(bytes.as_slice(), b"agent-bytes");
+        assert_eq!(
+            ctype, "image/png",
+            "байты агента через presign дошли до носителя"
         );
     }
 }

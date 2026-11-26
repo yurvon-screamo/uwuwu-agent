@@ -4,7 +4,13 @@
 //! обоих тест-файлах (identical-code smell, раунд #1256).
 
 use async_trait::async_trait;
-use std::sync::Arc;
+use axum::extract::Path;
+use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
+use axum::response::Response;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use tower::ServiceExt;
 use uwuwu_domain::{Slot, Status};
 use uwuwu_usecase::{
     AgentSessionGateway, DreamerMark, Liveness, SessionInfo, SessionSpec, TaskView,
@@ -25,6 +31,146 @@ pub(crate) fn blob_usecase() -> Arc<uwuwu_usecase::BlobUseCase> {
     Arc::new(uwuwu_usecase::BlobUseCase::ready(Arc::new(
         crate::s3::MemoryBlobStore::default(),
     )))
+}
+
+/// Общий JSON-RPC `tools/call` через MCP-роутер (#1256, ревью тестов #1537):
+/// один провод на все wire-пробы вместо копий в mcp.rs и tools_tests.rs.
+pub(crate) async fn call_tool_wire(
+    app: &axum::Router,
+    name: &str,
+    args: Value,
+    bearer: &str,
+) -> (StatusCode, Value) {
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": name, "arguments": args }
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/mcp")
+                .header("authorization", format!("Bearer {bearer}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(payload.to_string()))
+                .expect("request ok"),
+        )
+        .await
+        .expect("service ok");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), super::mcp::BODY_LIMIT_BYTES)
+        .await
+        .expect("body ok");
+    let msg: Value = serde_json::from_slice(&bytes).expect("json ok");
+    (status, msg)
+}
+
+/// Хранилище общего HTTP-фейка blob-канала: ключ → (байты, content-type).
+pub(crate) type BlobObjects = Arc<Mutex<HashMap<String, (Vec<u8>, String)>>>;
+
+/// Один локальный HTTP-фейк на две границы (#1256-дубли, ревью тестов
+/// #1537): `/put/<key>` + `/get/<key>` для агентской заливки и S3-маршрут
+/// `/<key>` для адаптера Tigris (GET без `X-Amz-Signature` → 403,
+/// как приватный бакет). Прод-бакет и живые пресайны не участвуют.
+pub(crate) struct BlobHttpFake {
+    pub port: u16,
+    pub objects: BlobObjects,
+}
+
+impl BlobHttpFake {
+    pub(crate) async fn start() -> Self {
+        let objects: BlobObjects = Arc::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let app = axum::Router::new().route(
+            "/{*tail}",
+            axum::routing::any({
+                let objects = objects.clone();
+                move |method: Method,
+                      uri: Uri,
+                      headers: HeaderMap,
+                      Path(tail): Path<String>,
+                      body: axum::body::Bytes| {
+                    let objects = objects.clone();
+                    async move {
+                        // Агентские маршруты — подпрефиксы, настоящие ключи
+                        // начинаются с `blobs/`, коллизий нет.
+                        let (verb, key) = if let Some(k) = tail.strip_prefix("put/") {
+                            ("put", k)
+                        } else if let Some(k) = tail.strip_prefix("get/") {
+                            ("get", k)
+                        } else {
+                            ("s3", tail.as_str())
+                        };
+                        match (verb, method) {
+                            ("put", Method::PUT) | ("s3", Method::PUT) => {
+                                let ctype = headers
+                                    .get("content-type")
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or_default()
+                                    .to_string();
+                                objects
+                                    .lock()
+                                    .expect("lock")
+                                    .insert(key.to_string(), (body.to_vec(), ctype));
+                                blob_response(StatusCode::OK, None, Vec::new())
+                            }
+                            ("get", Method::GET) => fetch(&objects, key),
+                            ("s3", Method::GET) | ("s3", Method::HEAD) => {
+                                let signed =
+                                    uri.query().is_some_and(|q| q.contains("X-Amz-Signature="));
+                                if !signed {
+                                    return blob_response(
+                                        StatusCode::FORBIDDEN,
+                                        Some("application/xml".to_string()),
+                                        b"<Error><Code>AccessDenied</Code></Error>".to_vec(),
+                                    );
+                                }
+                                fetch(&objects, key)
+                            }
+                            _ => blob_response(StatusCode::METHOD_NOT_ALLOWED, None, Vec::new()),
+                        }
+                    }
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        Self { port, objects }
+    }
+
+    /// presign-подобный PUT-URL для агентской заливки (без реальной подписи
+    /// — подпись проверяют юнит-пины адаптера и живой прогон).
+    pub(crate) fn agent_put_url(&self, key: &str) -> String {
+        format!("http://127.0.0.1:{}/put/{}", self.port, key)
+    }
+
+    pub(crate) fn agent_get_url(&self, key: &str) -> String {
+        format!("http://127.0.0.1:{}/get/{}", self.port, key)
+    }
+}
+
+fn fetch(objects: &BlobObjects, key: &str) -> Response {
+    match objects.lock().expect("lock").get(key).cloned() {
+        Some((bytes, ctype)) => blob_response(StatusCode::OK, Some(ctype), bytes),
+        None => blob_response(StatusCode::NOT_FOUND, None, Vec::new()),
+    }
+}
+
+fn blob_response(status: StatusCode, ctype: Option<String>, body: Vec<u8>) -> Response {
+    let mut builder = Response::builder().status(status);
+    if let Some(ct) = ctype {
+        builder = builder.header(header::CONTENT_TYPE, ct);
+    }
+    builder
+        .body(axum::body::Body::from(body))
+        .expect("static response")
 }
 
 /// Blob-канал «не сконфигурирован»: громкий отказ с перечнем (ADR-010).

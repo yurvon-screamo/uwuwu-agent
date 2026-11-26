@@ -71,7 +71,8 @@ struct MockSession {
     /// «работа» ещё идёт (agent-режим).
     busy: bool,
     /// time.busy/time.idle API (Started/idle): busy ⟺ busy_ms > idle_ms
-    /// (нулевое значение = нет события) — семантика CUP-учёта (#1231).
+    /// (нулевое значение = нет события); слот держится, пока свеж updated_ms
+    /// (#1231, зомби-гард #409, живость #1547).
     busy_ms: u64,
     idle_ms: u64,
     dead: bool,
@@ -671,6 +672,14 @@ async fn create_session(
         body["model"]["providerID"].as_str().unwrap_or_default(),
         body["model"]["id"].as_str().unwrap_or_default()
     );
+    let created_ms = now_ms();
+    let zombie_ms = body["busy_ms_ago"]
+        .as_u64()
+        .map(|ago| created_ms.saturating_sub(ago));
+    let updated_ms = body["updated_ms_ago"]
+        .as_u64()
+        .map(|ago| created_ms.saturating_sub(ago))
+        .unwrap_or(zombie_ms.unwrap_or(created_ms));
     let session = MockSession {
         id: id.clone(),
         agent: body["agent"].as_str().unwrap_or_default().to_string(),
@@ -680,17 +689,14 @@ async fn create_session(
             .unwrap_or_default()
             .to_string(),
         model,
-        updated_ms: now_ms(),
+        updated_ms,
         outcome: String::new(),
         tokens_in: 0,
         tokens_out: 0,
         busy: false,
-        // дев-ручка стенда (#1313 V4): busy_ms в прошлом — зомби-флаг
-        // (busy > idle старше 30 мин не держит CUP-кап)
-        busy_ms: body["busy_ms_ago"]
-            .as_u64()
-            .map(|ago| now_ms().saturating_sub(ago))
-            .unwrap_or(0),
+        // Дев-ручка стенда: зомби старит оба поля; V7 даёт старый busy
+        // при свежем updated — длинный живой ход (#1547).
+        busy_ms: zombie_ms.unwrap_or(0),
         idle_ms: 0,
         dead: mode == "dead",
         reply: None,
@@ -935,7 +941,7 @@ async fn prompt(
     }
     tracing::info!(event = "mock.prompt", %id, len = text.len(),
         head = text.lines().find(|l| !l.trim().is_empty()).unwrap_or_default(),
-        "POST /prompt");
+        body = %text, "POST /prompt");
     let mut sessions = store.sessions.lock().expect("store");
     if let Some(s) = sessions.get_mut(&id) {
         s.updated_ms = now_ms();

@@ -207,36 +207,14 @@ mod tests {
     async fn contentless_mutations_refuse_loudly_over_the_wire_and_carrier_survives() {
         let (app, memory) = app_with_hub();
 
+        /// Один провод `tools/call` живёт в test_support (#1256, ревью
+        /// тестов #1537) — здесь только локальный bearer стенда.
         async fn call_tool(
             app: &Router,
             name: &str,
             args: serde_json::Value,
         ) -> (StatusCode, serde_json::Value) {
-            let payload = json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": { "name": name, "arguments": args }
-            });
-            let response = app
-                .clone()
-                .oneshot(
-                    axum::http::Request::builder()
-                        .method(axum::http::Method::POST)
-                        .uri("/mcp")
-                        .header("authorization", "Bearer test-bearer")
-                        .header("content-type", "application/json")
-                        .body(axum::body::Body::from(payload.to_string()))
-                        .expect("request ok"),
-                )
-                .await
-                .expect("service ok");
-            let status = response.status();
-            let bytes = axum::body::to_bytes(response.into_body(), BODY_LIMIT_BYTES)
-                .await
-                .expect("body ok");
-            let msg: serde_json::Value = serde_json::from_slice(&bytes).expect("json ok");
-            (status, msg)
+            crate::api::test_support::call_tool_wire(app, name, args, "test-bearer").await
         }
 
         let body = "## Постановка\n\nДержатель массы тела — носитель не должен стереться.\n\n## Проверка\n\nНаполнитель пробы.\n";

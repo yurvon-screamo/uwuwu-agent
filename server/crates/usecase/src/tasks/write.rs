@@ -1106,7 +1106,8 @@ fn is_comment_stamp(line: &str) -> bool {
 /// границе записи: инвариант ADR-105 «тело — чистый markdown» держит
 /// сервер, не дисциплина агента (прецедент #1151). Консервативно:
 /// строго набор/порядок ключей и форма карточки; срезаются все
-/// подряд идущие слои (стек, #1632); любой посторонний контент
+/// подряд идущие слои (стек, #1632); переносы шапки — LF или CRLF
+/// (#1637), тело не нормализуется. Любой посторонний контент
 /// («--- fm ---» внутри текста) не трогается. Зеркало рендера: рендер
 /// меняется — менять формы здесь; пин в tools_tests собран из
 /// реального рендера и краснеет при расхождении (#1604 — body_bytes;
@@ -1165,23 +1166,30 @@ fn strip_task_get_header(md: &str) -> &str {
 /// Один слой шапки в начале входа: fm-блок (форма A) либо полная
 /// карточка рендера — тайтл-строка + пустая строка + fm-блок (форма B,
 /// #1632). Ключи сверяются со всеми наборами рендеров (актуальный +
-/// легаси). None — не слой шапки, вход не трогается.
+/// легаси). Переносы тайтла и пустой строки — LF или CRLF (#1637).
+/// None — не слой шапки, вход не трогается.
 fn strip_header_layer<'a>(md: &'a str, key_sets: &[&[&str]]) -> Option<&'a str> {
     if let Some(rest) = strip_fm_block(md, key_sets) {
         return Some(rest);
     }
-    let (title_line, after_title) = md.split_once('\n')?;
+    let (title_line, break_len) = header_line(md)?;
     if !is_render_title_line(title_line) {
         return None;
     }
-    let after_blank = after_title.strip_prefix('\n')?;
+    let after_title = &md[break_len..];
+    let after_blank = after_title
+        .strip_prefix("\r\n")
+        .or_else(|| after_title.strip_prefix('\n'))?;
     strip_fm_block(after_blank, key_sets)
 }
 
 /// fm-блок рендера: маркер + ключи одного из наборов строго по
 /// порядку; возврат — вход после шапки без ведущих пустых строк.
+/// Маркер принимает оба переноса (#1637).
 fn strip_fm_block<'a>(md: &'a str, key_sets: &[&[&str]]) -> Option<&'a str> {
-    let rest = md.strip_prefix("--- fm ---\n")?;
+    let rest = md
+        .strip_prefix("--- fm ---\r\n")
+        .or_else(|| md.strip_prefix("--- fm ---\n"))?;
     key_sets
         .iter()
         .find_map(|keys| strip_header_keys(rest, keys))
@@ -1193,21 +1201,48 @@ fn strip_fm_block<'a>(md: &'a str, key_sets: &[&[&str]]) -> Option<&'a str> {
 /// потребителя — без этого KEYS (актуальная форма) не матчится, а
 /// короткая легаси-форма матчится на префиксе, и остаток последней
 /// строки («body_bytes: N») уезжает эффективным контентом (#1604,
-/// ревью раунд 2).
+/// ревью раунд 2). Перенос строки — LF или CRLF, для всех ключей
+/// независимо (#1637).
 fn strip_header_keys<'a>(rest: &'a str, keys: &[&str]) -> Option<&'a str> {
     let mut pos = rest;
     for (index, key) in keys.iter().enumerate() {
-        let line_end = match pos.find('\n') {
-            Some(at) => at,
-            None if index + 1 == keys.len() => pos.len(),
+        let (line, break_len) = match header_line(pos) {
+            Some(parts) => parts,
+            None if index + 1 == keys.len() => {
+                return pos.starts_with(key).then_some("");
+            }
             None => return None,
         };
-        if !pos[..line_end].starts_with(key) {
+        if !line.starts_with(key) {
             return None;
         }
-        pos = pos[line_end..].strip_prefix('\n').unwrap_or("");
+        pos = &pos[break_len..];
     }
-    Some(pos.trim_start_matches('\n'))
+    Some(trim_blank_lines(pos))
+}
+
+/// Строка с переносом: содержимое до CR/LF и длина переноса.
+fn header_line(line: &str) -> Option<(&str, usize)> {
+    let lf = line.find('\n')?;
+    let end = if lf > 0 && line.as_bytes()[lf - 1] == b'\r' {
+        lf - 1
+    } else {
+        lf
+    };
+    Some((&line[..end], lf + 1))
+}
+
+/// Ведущие пустые строки после шапки — LF и CRLF одинаково (#1637):
+/// паритет с прежним trim_start_matches, но без потери CRLF-тела.
+fn trim_blank_lines(md: &str) -> &str {
+    let mut pos = md;
+    loop {
+        if let Some(rest) = pos.strip_prefix("\r\n").or_else(|| pos.strip_prefix('\n')) {
+            pos = rest;
+        } else {
+            return pos;
+        }
+    }
 }
 
 /// Тайтл-строка рендера карточки: «#<номер> <тайтл> — <статус>» —
@@ -2420,6 +2455,15 @@ mod tests {
         );
     }
 
+    /// task_create: CRLF-копия карточки в body даёт чистое тело новой
+    /// задачи — тот же гард на втором входе записи.
+    #[test]
+    fn create_body_strips_crlf_card_header() {
+        let card = "#1526 t — In Progress\r\n\r\n--- fm ---\r\nbranch: b\r\npr: —\r\nautomerge: true\r\ndirect: false\r\nfact_track: false\r\ntype: bug\r\nbody_hash: h\r\n\r\n## Постановка\r\nТекст.";
+        let out = render_create_body(&spec(card));
+        assert_eq!(out, "## Постановка\r\nТекст.\n", "тело без шапки: {out}");
+    }
+
     /// Дисплей-шапка task_get срезается на границе записи (fm-стек
     /// инцидента #1331: агент копирует вывод task_get назад в task_body).
     /// Все четыре формы рендера — актуальная (#1604+#1631, fact_track и
@@ -2564,13 +2608,106 @@ mod tests {
         assert_eq!(strip_task_get_header(md), md);
     }
 
-    /// CRLF-карточка — скоп #1637, здесь барьер не срабатывает (строгий
-    /// LF-паттерн); тест изолирован, чтобы держатель #1637 перевернул
-    /// ровно его, не задевая LF-барьеры.
+    /// CRLF-карточка (#1637): тот же слой шапки срезается с обоими
+    /// переносами; байты тела (здесь CRLF) не меняются.
     #[test]
-    fn task_get_crlf_card_header_is_kept() {
-        let md = "#1526 t — In Progress\r\n\r\n--- fm ---\r\nbranch: b\r\npr: —\r\nautomerge: true\r\ndirect: false\r\nfact_track: false\r\ntype: bug\r\nbody_hash: h\r\n\r\nтекст";
-        assert_eq!(strip_task_get_header(md), md);
+    fn task_get_crlf_card_header_is_stripped() {
+        let md = "#1526 t — In Progress\r\n\r\n--- fm ---\r\nbranch: b\r\npr: —\r\nautomerge: true\r\ndirect: false\r\nfact_track: false\r\ntype: bug\r\nbody_hash: h\r\n\r\n## Постановка\r\nтекст";
+        assert_eq!(strip_task_get_header(md), "## Постановка\r\nтекст");
+    }
+
+    /// Все четыре набора ключей рендера срезаются и в CRLF-форме.
+    #[test]
+    fn task_get_crlf_display_header_variants_are_stripped() {
+        let as_crlf = |md: &str| md.replace('\n', "\r\n");
+        let fresh = "--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\nbody_bytes: 42\n\n## Тело";
+        let legacy7 = "--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\n\n## Тело";
+        let legacy6 = "--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\ntype: bug\nbody_hash: h\n\n## Тело";
+        let legacy5 =
+            "--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nbody_hash: h\n\n## Тело";
+        for md in [fresh, legacy7, legacy6, legacy5] {
+            let crlf = as_crlf(md);
+            assert_eq!(strip_task_get_header(&crlf), "## Тело", "форма: {crlf}");
+        }
+    }
+
+    /// Терминатор конца входа работает и в CRLF: последний ключ без
+    /// переноса срезает шапку целиком.
+    #[test]
+    fn task_get_crlf_header_without_trailing_newline_strips_to_empty() {
+        let md = "#1637 t — In Progress\r\n\r\n--- fm ---\r\nbranch: b\r\npr: —\r\nautomerge: true\r\ndirect: false\r\nfact_track: false\r\ntype: bug\r\nbody_hash: h\r\nbody_bytes: 42";
+        assert_eq!(strip_task_get_header(md), "");
+    }
+
+    /// Одна политика хвоста для LF и CRLF: все ведущие пустые строки
+    /// после последнего ключа снимаются, паритет с живым кодом.
+    #[test]
+    fn task_get_blank_tail_lines_are_stripped_in_both_line_endings() {
+        let lf = "--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\n\n\n\n## Тело";
+        let crlf = lf.replace('\n', "\r\n");
+        assert_eq!(strip_task_get_header(lf), "## Тело");
+        assert_eq!(strip_task_get_header(&crlf), "## Тело");
+    }
+
+    /// CRLF-стек: актуальный слой и легаси-слой срезаются оба.
+    #[test]
+    fn task_get_crlf_mixed_stack_is_stripped() {
+        let fresh = "#1 t — In Progress\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\nbody_bytes: 42\n\n";
+        let legacy = "#2 t — Todo\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\ntype: bug\nbody_hash: h\n\n";
+        let md = format!("{fresh}{legacy}## Тело").replace('\n', "\r\n");
+        assert_eq!(strip_task_get_header(&md), "## Тело");
+    }
+
+    /// CRLF-близнецы LF-барьеров: без пустой строки, не-рендер-тайтл и
+    /// fm в середине текста не трогаются.
+    #[test]
+    fn task_get_crlf_barriers_are_kept() {
+        let no_blank = "#1526 t — In Progress\r\n--- fm ---\r\nbranch: b\r\npr: —\r\nautomerge: true\r\ndirect: false\r\nfact_track: false\r\ntype: bug\r\nbody_hash: h\r\n\r\nтекст";
+        assert_eq!(strip_task_get_header(no_blank), no_blank);
+        let not_title = "## Постановка\r\n\r\n--- fm ---\r\nbranch: b\r\npr: —\r\nautomerge: true\r\ndirect: false\r\nfact_track: false\r\ntype: bug\r\nbody_hash: h\r\n\r\nтекст";
+        assert_eq!(strip_task_get_header(not_title), not_title);
+        let in_middle = "## Секция\r\n\r\n--- fm ---\r\nbranch: x\r\npr: y\r\nautomerge: true\r\ndirect: false\r\nfact_track: false\r\ntype: —\r\nbody_hash: h\r\n\r\nтекст";
+        assert_eq!(strip_task_get_header(in_middle), in_middle);
+    }
+
+    /// Тестер #1637 (Low код-ревью): CRLF-близнецы барьеров «тайтл без
+    /// fm-блока» и не-рендер-тайтла (нет `#` / нет разделителя статуса)
+    /// не срезаются — путь, где тайтл и пустая строка проходят, а срез
+    /// останавливается на маркере, оставался без пина.
+    #[test]
+    fn task_get_crlf_title_barriers_are_kept() {
+        let no_fm = "#1526 t — In Progress\r\n\r\n## Постановка\r\nтекст";
+        assert_eq!(strip_task_get_header(no_fm), no_fm);
+        for title in ["1526 t — In Progress", "#1526 t In Progress"] {
+            let md = card_copy_with_title(title).replace('\n', "\r\n");
+            assert_eq!(
+                strip_task_get_header(md.as_str()),
+                md.as_str(),
+                "тайтл: {title}"
+            );
+        }
+    }
+
+    /// Тестер #1637 (Low код-ревью): форма A без хвостового переноса
+    /// срезается и в CRLF — паритет с LF-пином для всех четырёх наборов.
+    #[test]
+    fn task_get_crlf_form_a_without_trailing_newline_strips_to_empty() {
+        let h8 = "--- fm ---\r\nbranch: x\r\npr: y\r\nautomerge: true\r\ndirect: false\r\nfact_track: false\r\ntype: feature\r\nbody_hash: h\r\nbody_bytes: 66";
+        let h7 = "--- fm ---\r\nbranch: x\r\npr: y\r\nautomerge: true\r\ndirect: false\r\nfact_track: false\r\ntype: bug\r\nbody_hash: h";
+        let h6 = "--- fm ---\r\nbranch: x\r\npr: y\r\nautomerge: true\r\ndirect: false\r\ntype: bug\r\nbody_hash: h";
+        let h5 =
+            "--- fm ---\r\nbranch: x\r\npr: y\r\nautomerge: true\r\ndirect: false\r\nbody_hash: h";
+        for md in [h8, h7, h6, h5] {
+            assert_eq!(strip_task_get_header(md), "", "форма: {md}");
+        }
+    }
+
+    /// Тестер #1637 (Low код-ревью): переносы строк в шапке независимы —
+    /// смешанный LF/CRLF-слой срезается, байты тела не меняются.
+    #[test]
+    fn task_get_mixed_line_endings_header_is_stripped() {
+        let md = "#1526 t — In Progress\r\n\n--- fm ---\r\nbranch: b\npr: —\r\nautomerge: true\ndirect: false\r\nfact_track: false\ntype: bug\r\nbody_hash: h\n\n## Постановка\r\nтекст\n";
+        assert_eq!(strip_task_get_header(md), "## Постановка\r\nтекст\n");
     }
 
     /// «Тайтл» не рендер-формы (## Постановка) — вход цел.

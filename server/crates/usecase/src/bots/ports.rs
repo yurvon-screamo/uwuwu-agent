@@ -4,12 +4,15 @@
 use crate::error::UsecaseResult;
 use async_trait::async_trait;
 
-/// Апдейт ТГ (потребляются только `message`-апдейты).
+/// Апдейт ТГ: обычное сообщение и правка старого — оба доезжают в буфер
+/// (#1596). Прочие типы апдейтов поглощаются.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TgUpdate {
     pub update_id: u64,
-    /// None — не message-апдейт (edited_message и т.п.): поглощается.
     pub message: Option<TgMessage>,
+    /// Правка сообщения: та же форма, что message, но с message_id
+    /// оригинала — заменяет его в буфере, если он ещё не сброшен.
+    pub edited_message: Option<TgMessage>,
 }
 
 /// Тип медиа-вложения ТГ (#1171): Photo/Document — качаются сервером,
@@ -48,6 +51,8 @@ pub enum Incoming {
 /// Сообщение ТГ: только факты маршрутизации, текст — не для логов.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TgMessage {
+    /// Id сообщения в чате: правка по нему находит оригинал в буфере (#1596).
+    pub message_id: i64,
     /// «private» | «group» | «supergroup» | «channel».
     pub chat_type: String,
     pub chat_id: i64,

@@ -139,6 +139,7 @@ mod tests {
 
     fn msg(chat_type: &str, username: Option<&str>, text: Option<&str>) -> TgMessage {
         TgMessage {
+            message_id: 1,
             chat_type: chat_type.into(),
             chat_id: 42,
             from_username: username.map(String::from),
@@ -151,6 +152,7 @@ mod tests {
 
     fn photo(caption: Option<&str>) -> TgMessage {
         TgMessage {
+            message_id: 2,
             chat_type: "private".into(),
             chat_id: 42,
             from_username: Some("yurvon".into()),

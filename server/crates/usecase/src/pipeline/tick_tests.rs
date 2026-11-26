@@ -2,7 +2,9 @@
 //! юзкейсы — с фейками, без сети/досок).
 
 use crate::error::{UsecaseError, UsecaseResult};
-use crate::pipeline::tick::{BoardPlan, Mode, TickPlan, TickUseCase, PROBE_DEGRADE_MIN_ROWS};
+use crate::pipeline::tick::{
+    BoardPlan, Mode, TickOutcome, TickPlan, TickUseCase, PROBE_DEGRADE_MIN_ROWS,
+};
 use crate::ports::{
     AgentSessionGateway, Clock, CommentRef, DecisionJudge, DreamerMark, JudgeCfg, Liveness,
     PrGateway, PrProbe, PrState, QuotaProbe, SessionSpec, TaskBoardRepo, TickStateStore,
@@ -1103,12 +1105,13 @@ fn peak_plan(mode: Mode, cup: usize) -> TickPlan {
 
 /// Общий билдер тик-фикстуры: fake-компоненты + юзкейс (дедуп семейства
 /// билдеров — ревью #1310 Low; в поле TickUseCase меняется одно место).
-fn fixture_usecase(
+fn fixture_usecase_with_models(
     rows: Vec<Task>,
     comments: Vec<CommentRef>,
     state: Arc<MemState>,
     clock: Arc<dyn Clock>,
     sessions: FakeSessions,
+    models: Arc<crate::spawn_models::SpawnModels>,
 ) -> (TickUseCase, Arc<FakeBoard>, Arc<FakeSessions>, Arc<FakePrs>) {
     let board = Arc::new(FakeBoard {
         rows: rows.into(),
@@ -1134,7 +1137,7 @@ fn fixture_usecase(
         prs: prs.clone(),
         clock,
         state,
-        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        models,
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
@@ -1143,18 +1146,58 @@ fn fixture_usecase(
     (u, board, sessions, prs)
 }
 
+fn fixture_usecase(
+    rows: Vec<Task>,
+    comments: Vec<CommentRef>,
+    state: Arc<MemState>,
+    clock: Arc<dyn Clock>,
+    sessions: FakeSessions,
+) -> (TickUseCase, Arc<FakeBoard>, Arc<FakeSessions>, Arc<FakePrs>) {
+    fixture_usecase_with_models(
+        rows,
+        comments,
+        state,
+        clock,
+        sessions,
+        Arc::new(crate::spawn_models::SpawnModels::canonical()),
+    )
+}
+
+/// Карта, где все этапы на GLM — пик-гейт (#1680) должен держать их как раньше.
+fn glm_models() -> Arc<crate::spawn_models::SpawnModels> {
+    let mut map = std::collections::HashMap::new();
+    for key in [
+        "default",
+        "developer",
+        "plan-reviewer",
+        "code-quality-reviewer",
+        "tester",
+        "test-reviewer",
+        "analyst",
+        "analyst-reviewer",
+        "dreamer",
+    ] {
+        map.insert(
+            key.to_string(),
+            uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.4#high").expect("glm-модель"),
+        );
+    }
+    Arc::new(crate::spawn_models::SpawnModels::new(map))
+}
+
 /// Юзкейс в пик-окне с настраиваемыми комментами (будильник-сценарии).
 fn peak_usecase(
     rows: Vec<Task>,
     comments: Vec<CommentRef>,
     state: Arc<MemState>,
 ) -> (TickUseCase, Arc<FakeBoard>, Arc<FakeSessions>, Arc<FakePrs>) {
-    fixture_usecase(
+    fixture_usecase_with_models(
         rows,
         comments,
         state,
         Arc::new(PeakClock),
         FakeSessions::new(),
+        glm_models(),
     )
 }
 
@@ -2802,6 +2845,138 @@ async fn observe_does_not_charge_spawn_loops() {
     assert!(
         state.0.lock().unwrap().loops.is_empty(),
         "observe не пишет счётчики петель"
+    );
+}
+
+/// Пять спавнов слота без смены статуса (#1046, порог >4 из домена):
+/// эскалация в Needs attention, коммент владельцу и ни одного нового
+/// спавна. Пин перенесённой ветки `spawn_precheck`: без него инверсия
+/// условия или потеря статуса/коммента не будет замечена.
+#[tokio::test]
+async fn spawn_loop_escalation_flags_attention_and_notifies_owner() {
+    // Arrange
+    let state = Arc::new(MemState(Mutex::default()));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .loops
+        .push((66, Slot::Dev, Status::InProgress, 4));
+    state.set_last_seen_status("B", 66, Status::InProgress);
+    let (u, board, sessions, _) = usecase_with_state(
+        vec![task(66, Status::InProgress)],
+        PrState::Missing,
+        state.clone(),
+    );
+
+    // Act
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+
+    // Assert
+    assert_eq!(
+        out.attention_flagged, 1,
+        "пятый спавн без прогресса — эскалация"
+    );
+    assert_eq!(out.spawns_allowed, 0, "эскалация до гейта — спавна нет");
+    assert_eq!(out.spawns_done, 0, "сессия не создана");
+    let log = board.log.lock().unwrap();
+    assert!(
+        log.iter().any(|l| l == "status#66=NeedsAttention"),
+        "строка снята с тика в Needs attention: {log:?}"
+    );
+    assert!(
+        log.iter()
+            .any(|l| l.starts_with("comment#66=") && l.contains("Spawn loop")),
+        "владелец получил дайджест петли: {log:?}"
+    );
+    assert!(
+        sessions.specs.lock().unwrap().is_empty(),
+        "эскалация не запускает сессию"
+    );
+}
+
+/// Композиция тика после разнесения `process_row` по хелперам: один проход
+/// по смешанной доске отрабатывает все три ветки `decide`, эскалацию петель
+/// и кап, не теряя счётчиков и записей на носителе. Пин именно observable
+/// исхода — перестановка хелперов без смены поведения тест не ломает, а
+/// потеря ветки/счётчика/записи ломает.
+#[tokio::test]
+async fn one_tick_keeps_all_branch_outcomes_and_carrier_writes() {
+    // Arrange
+    let state = Arc::new(MemState(Mutex::default()));
+    state
+        .0
+        .lock()
+        .unwrap()
+        .loops
+        .push((14, Slot::Dev, Status::InProgress, 4));
+    state.set_last_seen_status("B", 14, Status::InProgress);
+    let mut carrier_row = task(11, Status::UserReview);
+    carrier(&mut carrier_row, 11, true);
+    let (u, board, sessions, prs) = usecase_with_state(
+        vec![
+            task(10, Status::InProgress), // Spawn — занимает единственный слот
+            carrier_row,                  // Automerge
+            task(12, Status::Todo),       // Observe
+            task(14, Status::InProgress), // эскалация спавн-петли
+            task(15, Status::InProgress), // второй кандидат — удержан капом
+        ],
+        PrState::Open {
+            mergeable: true,
+            ci_green: true,
+        },
+        state,
+    );
+    *prs.url.lock().unwrap() = Some("https://github.com/a/c/pull/11".into());
+
+    // Act
+    let out = u.run(&plan(Mode::Live, 1)).await.unwrap();
+
+    // Assert
+    // `rows_total` считается при чтении доски, до построения очереди;
+    // весь outcome целиком ловит и потерю ветки, и шум в любом счётчике.
+    assert_eq!(
+        out,
+        TickOutcome {
+            rows_total: 5,
+            spawns_allowed: 1,
+            spawns_done: 1,
+            held_cup: 1,
+            observed: 1,
+            automerged: 1,
+            attention_flagged: 1,
+            ..Default::default()
+        },
+        "весь outcome тика: шум в любом счётчике ломает композицию"
+    );
+    let specs = sessions.specs.lock().unwrap().clone();
+    assert_eq!(specs.len(), 2, "bootstrap + рабочая сессия: {specs:?}");
+    assert!(
+        specs.iter().all(|s| s.title.contains("#10")),
+        "сессии созданы только для строки #10: {specs:?}"
+    );
+    assert_eq!(prs.merges.lock().unwrap().len(), 1, "один мерж");
+    let log = board.log.lock().unwrap();
+    assert!(
+        log.iter().any(|l| l.starts_with("session#10=")),
+        "дев-ячейка #10 записана: {log:?}"
+    );
+    assert!(
+        !log.iter().any(|l| l.starts_with("status#11")),
+        "мерж не трогает статус строки #11: {log:?}"
+    );
+    assert!(
+        log.iter().any(|l| l == "status#14=NeedsAttention"),
+        "эскалация #14 записала статус: {log:?}"
+    );
+    assert!(
+        log.iter()
+            .any(|l| l.starts_with("comment#14=") && l.contains("Spawn loop")),
+        "эскалация #14 оставила коммент владельцу: {log:?}"
+    );
+    assert!(
+        !log.iter().any(|l| l.starts_with("session#14=")),
+        "эскалация не создаёт сессию: {log:?}"
     );
 }
 
@@ -4826,6 +5001,23 @@ async fn wakeup_delivery_occupies_cup_slot() {
         "слот занят доставленным ходом — кандидат ждёт следующего тика"
     );
     assert_eq!(out.spawns_done, 0);
+}
+
+#[tokio::test]
+async fn opencode_go_medium_spawn_passes_peak_1680() {
+    // #1680: peak-окно гейтит только этапы zai-coding-plan; dev на
+    // opencode-go должен спавниться в окне без отложки.
+    let state = Arc::new(MemState(Mutex::default()));
+    let (u, _, _, _) = fixture_usecase(
+        vec![medium_design(900)],
+        Vec::new(),
+        state,
+        Arc::new(PeakClock),
+        FakeSessions::new(),
+    );
+    let out = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.deferred_peak, 0, "не-GLM этап не откладывается окном");
+    assert_eq!(out.spawns_done, 1, "не-GLM этап спавнится в окне");
 }
 
 #[tokio::test]
@@ -8131,14 +8323,14 @@ impl Clock for PeakCompactClock {
 
 #[tokio::test]
 async fn analyst_compact_defers_in_peak_window_1661() {
-    // Пик откладывает проход аналитика целиком (UC-05): ни адмиссии,
-    // ни метки коулдауна — ретрай возможен сразу после окна.
+    // Пик откладывает привязку целевого провайдера (#1680, UC-05): ни
+    // адмиссии, ни метки коулдауна — ретрай возможен сразу после окна.
     let state = Arc::new(MemState(Mutex::default()));
     state.set_master_binding(
         "analyst",
         "p",
         "ses_master",
-        "opencode-go/hy4-flash-free#high",
+        "zai-coding-plan/glm-5.4#high",
         "/tmp/checkout",
     );
     let mut fake = FakeSessions::new();
@@ -12332,7 +12524,7 @@ fn matrix_usecase(
     Arc<MatrixClock>,
 ) {
     let clock = Arc::new(MatrixClock::new());
-    let (u, board, sessions, prs) = fixture_usecase(
+    let (u, board, sessions, prs) = fixture_usecase_with_models(
         rows,
         comments,
         state,
@@ -12341,6 +12533,7 @@ fn matrix_usecase(
             idle_reply,
             ..FakeSessions::new()
         },
+        glm_models(),
     );
     (u, board, sessions, prs, clock)
 }
@@ -13868,4 +14061,74 @@ fn analyst_wave_prompts_teach_owner_answer() {
             "{name}: ответ должен быть дословным: {prompt}"
         );
     }
+}
+
+/// После выноса очереди в хелпер порядок кандидатов (#1586) остаётся
+/// прежним: тир «продолжение» выше приоритета, внутри тира — приоритет,
+/// затем порядок досок.
+#[test]
+fn candidate_queue_keeps_continuation_tier_and_priority_order() {
+    fn plan(project: &str, board: &str) -> BoardPlan {
+        BoardPlan {
+            project: project.into(),
+            board: board.into(),
+            repo: "repo".into(),
+            checkout: "checkout".into(),
+            env_root: "env".into(),
+        }
+    }
+    let b1 = plan("p1", "B1");
+    let b2 = plan("p2", "B2");
+    let mut newcomer_low = task(101, Status::Design);
+    newcomer_low.set_priority(Priority::Low);
+    let mut continuation_medium = task(102, Status::InProgress);
+    continuation_medium.set_priority(Priority::Medium);
+    let mut newcomer_high = task(201, Status::Design);
+    newcomer_high.set_priority(Priority::High);
+    let mut continuation_high = task(202, Status::InProgress);
+    continuation_high.set_priority(Priority::High);
+    let continuation_empty_b1 = task(103, Status::InProgress);
+    let continuation_empty_b2 = task(203, Status::InProgress);
+    let mut boards = vec![
+        (
+            &b1,
+            vec![newcomer_low, continuation_medium, continuation_empty_b1],
+        ),
+        (
+            &b2,
+            vec![newcomer_high, continuation_high, continuation_empty_b2],
+        ),
+    ];
+
+    let rows = crate::pipeline::tick::collect_candidates(&mut boards, None);
+
+    assert_eq!(
+        rows.iter()
+            .map(|(_, _, _, t)| t.number())
+            .collect::<Vec<_>>(),
+        vec![202, 102, 103, 203, 201, 101],
+        "продолжения раньше новичков; внутри тира — приоритет, затем доска"
+    );
+}
+
+/// Дебаг-гейт одной строки (UWUWU_ONLY_TASK) после выноса очереди
+/// по-прежнему оставляет в обходе только выбранную строку.
+#[test]
+fn candidate_queue_only_filter_keeps_single_row() {
+    let board = BoardPlan {
+        project: "p".into(),
+        board: "B".into(),
+        repo: "repo".into(),
+        checkout: "checkout".into(),
+        env_root: "env".into(),
+    };
+    let mut boards = vec![(
+        &board,
+        vec![task(7, Status::Design), task(8, Status::Design)],
+    )];
+
+    let rows = crate::pipeline::tick::collect_candidates(&mut boards, Some(8));
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].3.number(), 8);
 }

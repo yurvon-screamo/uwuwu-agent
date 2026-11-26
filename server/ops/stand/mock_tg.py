@@ -77,6 +77,17 @@ def _media_message(body):
     return {kind: media}
 
 
+def _inject_edit(msg, edit):
+    """Правка в окне (#1596): тот же формат апдейта Bot API."""
+    msg.pop("message", None)
+    msg["edited_message"] = {
+        "message_id": int(edit.get("message_id", 0)),
+        "chat": {"id": edit.get("chat_id", 42), "type": "private"},
+        "from": {"username": edit.get("username", "yurvon")},
+        "text": edit.get("text", ""),
+    }
+
+
 class Api(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # тишина: логи сервера читает e2e
         pass
@@ -111,6 +122,10 @@ class Api(BaseHTTPRequestHandler):
                     "chat": {"id": body.get("chat_id", 42), "type": body.get("chat_type", "private")},
                     "from": {"username": body.get("username", "yurvon")},
                     "text": body.get("text", ""),
+                    # Bot API всегда несёт message_id; без него правка в окне
+                    # не находит оригинал и стенд проверяет не замену, а
+                    # отдельный «неизвестный» апдейт (ревью #1596).
+                    "message_id": int(body.get("message_id", body["update_id"])),
                 },
             }
             if body.get("media"):
@@ -121,6 +136,8 @@ class Api(BaseHTTPRequestHandler):
                     msg["message"]["caption"] = body["media"]["caption"]
             if body.get("forward_origin"):
                 msg["message"]["forward_origin"] = body["forward_origin"]
+            if body.get("edited_message"):
+                _inject_edit(msg, body["edited_message"])
             with LOCK:
                 UPDATES.append(msg)
                 LOCK.notify_all()

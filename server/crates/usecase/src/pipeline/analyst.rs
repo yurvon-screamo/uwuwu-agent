@@ -375,7 +375,8 @@ impl AnalystUseCase {
 
     /// Компакт-проход аналитика (#1607, срез 4): общая механика — в
     /// `pipeline::compact_pass`; роль задаёт префикс событий и пик-гейт
-    /// (у ревьювера пика нет — осознанное различие, не дрейф).
+    /// целевого провайдера (#1680; у ревьювера пика нет — осознанное
+    /// различие, не дрейф).
     async fn compact_pass(&self, policy: &CompactPolicy, scan: &[SessionInfo]) {
         CompactPass {
             role: analyst_role(),

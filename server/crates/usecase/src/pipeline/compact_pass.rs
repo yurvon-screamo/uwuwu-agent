@@ -1,8 +1,9 @@
 //! Общий компакт-проход мастер-привязок аналитика и ревьювера (#1661):
-//! CUP-гейт → пик-гейт → сортировка/дедуп проектов → привязка → liveness →
-//! разбор модели → пробы → вердикт → адмиссия. Различия ролей заданы
-//! данными (префикс событий и наличие пик-гейта), чтобы гейты не могли
-//! разойтись молча при правке одной из ролей.
+//! CUP-гейт → сортировка/дедуп проектов → привязка → liveness → разбор
+//! модели → пик-гейт целевого провайдера (#1680) → пробы → вердикт →
+//! адмиссия. Различия ролей заданы данными (префикс событий и наличие
+//! пик-гейта), чтобы гейты не могли разойтись молча при правке одной
+//! из ролей.
 
 use crate::bots::{compact_verdict, CompactFacts, CompactPolicy};
 use crate::pipeline::analyst::AnalystBoard;
@@ -10,8 +11,9 @@ use crate::ports::{Clock, Liveness, SessionInfo, TickStateStore};
 use crate::router::SessionRouter;
 use uwuwu_domain::{PeakWindow, SpawnModel};
 
-/// Вход прохода. `peak: Some` — пик откладывает проход целиком (аналитик),
-/// `None` — гейта нет (ревьювер, #1634: осознанное различие, не дрейф).
+/// Вход прохода. `peak: Some` — пик откладывает привязки целевого
+/// провайдера (аналитик, #1680), `None` — гейта нет (ревьювер, #1634:
+/// осознанное различие, не дрейф).
 pub(crate) struct CompactPass<'a> {
     pub(crate) role: &'a str,
     pub(crate) event_prefix: &'a str,
@@ -37,15 +39,6 @@ impl CompactPass<'_> {
                 "Компакт-проход отложен: CUP cap"
             );
             return;
-        }
-        if let Some(peak) = self.peak {
-            if peak.holds(self.clock.utc_minute()) {
-                tracing::info!(
-                    event = %event("compact_deferred_peak"),
-                    "Компакт-проход мастер-сессий отложен: пик-окно"
-                );
-                return;
-            }
         }
         let now = self.clock.now_ms();
         let mut projects: Vec<&String> = self.projects.iter().map(|b| &b.project).collect();
@@ -84,6 +77,17 @@ impl CompactPass<'_> {
                 );
                 continue;
             };
+            if let Some(peak) = self.peak {
+                if crate::spawn_models::peak_applies(&model) && peak.holds(self.clock.utc_minute())
+                {
+                    tracing::info!(
+                        event = %event("compact_deferred_peak"),
+                        project = %project,
+                        "Компакт мастер-сессии отложен: пик-окно провайдера"
+                    );
+                    continue;
+                }
+            }
             let busy = self
                 .scan
                 .iter()
