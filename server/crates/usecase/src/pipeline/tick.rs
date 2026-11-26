@@ -771,26 +771,24 @@ impl TickUseCase {
         if self.apply_spawn_hold(view, effects, task, slot) {
             return;
         }
-        let mut gated = gate(
-            task,
-            action,
-            view.plan.policy,
-            *effects.active_now,
-            view.now,
-        );
+        // Peak-окно держит только этапы целевого провайдера (#1680):
+        // модель слота уже известна из карты, остальные провайдеры
+        // работают в окне. CUP и исключение High остаются в доменном gate.
+        let mut policy = view.plan.policy;
+        let slot_model = Agent::of_slot(slot)
+            .map(|agent| self.models.for_agent(agent))
+            .unwrap_or_else(|| self.models.for_default());
+        if !crate::spawn_models::peak_applies(&slot_model) {
+            policy.peak.enabled = false;
+        }
+        let mut gated = gate(task, action, policy, *effects.active_now, view.now);
         if matches!(gated, Gate::HeldCup { .. })
             && view.plan.mode == Mode::Live
             && self
                 .try_preempt(view.board, task, view.ctx, effects.active_now, effects.out)
                 .await
         {
-            gated = gate(
-                task,
-                action,
-                view.plan.policy,
-                *effects.active_now,
-                view.now,
-            );
+            gated = gate(task, action, policy, *effects.active_now, view.now);
         }
         match gated {
             Gate::Allowed => {

@@ -298,8 +298,15 @@ impl TickUseCase {
             .await
         {
             Liveness::Alive => {
-                // будильник: пик держит не-high (живой агент в окне не будим)
-                if policy.peak.holds(now) && task.priority() != Priority::High {
+                // будильник: пик держит не-high только у целевого провайдера
+                // (#1680); живой агент другого провайдера будится в окне.
+                let slot_model = Agent::of_slot(slot)
+                    .map(|agent| self.models.for_agent(agent))
+                    .unwrap_or_else(|| self.models.for_default());
+                if crate::spawn_models::peak_applies(&slot_model)
+                    && policy.peak.holds(now)
+                    && task.priority() != Priority::High
+                {
                     tracing::info!(
                         event = "wakeup.deferred_peak",
                         number = task.number(),

@@ -43,7 +43,8 @@ dreamer = "opencode-go/hy4-flash-free#high"
 
 [policy]
 cup = 10
-# пик-окно GLM: будни 06:00–10:00 UTC (минуты от полуночи UTC), off = false
+# пик-окно провайдера zai-coding-plan (GLM): будни 06:00–10:00 UTC
+# (минуты от полуночи UTC), off = false; этапы других провайдеров не откладываются (#1680)
 peak = { enabled = true, start_min = 360, end_min = 600 }
 
 # Автокомпакт (#1221 + #1607 срез 4): проход ботов + проход мастер-сессий

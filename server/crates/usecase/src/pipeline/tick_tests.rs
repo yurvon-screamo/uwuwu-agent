@@ -1067,12 +1067,13 @@ fn peak_plan(mode: Mode, cup: usize) -> TickPlan {
 
 /// Общий билдер тик-фикстуры: fake-компоненты + юзкейс (дедуп семейства
 /// билдеров — ревью #1310 Low; в поле TickUseCase меняется одно место).
-fn fixture_usecase(
+fn fixture_usecase_with_models(
     rows: Vec<Task>,
     comments: Vec<CommentRef>,
     state: Arc<MemState>,
     clock: Arc<dyn Clock>,
     sessions: FakeSessions,
+    models: Arc<crate::spawn_models::SpawnModels>,
 ) -> (TickUseCase, Arc<FakeBoard>, Arc<FakeSessions>, Arc<FakePrs>) {
     let board = Arc::new(FakeBoard {
         rows: rows.into(),
@@ -1098,7 +1099,7 @@ fn fixture_usecase(
         prs: prs.clone(),
         clock,
         state,
-        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        models,
         boot_ms: 0,
         judge: None,
         judge_cfg: Default::default(),
@@ -1107,18 +1108,58 @@ fn fixture_usecase(
     (u, board, sessions, prs)
 }
 
+fn fixture_usecase(
+    rows: Vec<Task>,
+    comments: Vec<CommentRef>,
+    state: Arc<MemState>,
+    clock: Arc<dyn Clock>,
+    sessions: FakeSessions,
+) -> (TickUseCase, Arc<FakeBoard>, Arc<FakeSessions>, Arc<FakePrs>) {
+    fixture_usecase_with_models(
+        rows,
+        comments,
+        state,
+        clock,
+        sessions,
+        Arc::new(crate::spawn_models::SpawnModels::canonical()),
+    )
+}
+
+/// Карта, где все этапы на GLM — пик-гейт (#1680) должен держать их как раньше.
+fn glm_models() -> Arc<crate::spawn_models::SpawnModels> {
+    let mut map = std::collections::HashMap::new();
+    for key in [
+        "default",
+        "developer",
+        "plan-reviewer",
+        "code-quality-reviewer",
+        "tester",
+        "test-reviewer",
+        "analyst",
+        "analyst-reviewer",
+        "dreamer",
+    ] {
+        map.insert(
+            key.to_string(),
+            uwuwu_domain::SpawnModel::parse("zai-coding-plan/glm-5.4#high").expect("glm-модель"),
+        );
+    }
+    Arc::new(crate::spawn_models::SpawnModels::new(map))
+}
+
 /// Юзкейс в пик-окне с настраиваемыми комментами (будильник-сценарии).
 fn peak_usecase(
     rows: Vec<Task>,
     comments: Vec<CommentRef>,
     state: Arc<MemState>,
 ) -> (TickUseCase, Arc<FakeBoard>, Arc<FakeSessions>, Arc<FakePrs>) {
-    fixture_usecase(
+    fixture_usecase_with_models(
         rows,
         comments,
         state,
         Arc::new(PeakClock),
         FakeSessions::new(),
+        glm_models(),
     )
 }
 
@@ -4912,6 +4953,23 @@ async fn wakeup_delivery_occupies_cup_slot() {
         "слот занят доставленным ходом — кандидат ждёт следующего тика"
     );
     assert_eq!(out.spawns_done, 0);
+}
+
+#[tokio::test]
+async fn opencode_go_medium_spawn_passes_peak_1680() {
+    // #1680: peak-окно гейтит только этапы zai-coding-plan; dev на
+    // opencode-go должен спавниться в окне без отложки.
+    let state = Arc::new(MemState(Mutex::default()));
+    let (u, _, _, _) = fixture_usecase(
+        vec![medium_design(900)],
+        Vec::new(),
+        state,
+        Arc::new(PeakClock),
+        FakeSessions::new(),
+    );
+    let out = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+    assert_eq!(out.deferred_peak, 0, "не-GLM этап не откладывается окном");
+    assert_eq!(out.spawns_done, 1, "не-GLM этап спавнится в окне");
 }
 
 #[tokio::test]
@@ -11982,7 +12040,7 @@ fn matrix_usecase(
     Arc<MatrixClock>,
 ) {
     let clock = Arc::new(MatrixClock::new());
-    let (u, board, sessions, prs) = fixture_usecase(
+    let (u, board, sessions, prs) = fixture_usecase_with_models(
         rows,
         comments,
         state,
@@ -11991,6 +12049,7 @@ fn matrix_usecase(
             idle_reply,
             ..FakeSessions::new()
         },
+        glm_models(),
     );
     (u, board, sessions, prs, clock)
 }

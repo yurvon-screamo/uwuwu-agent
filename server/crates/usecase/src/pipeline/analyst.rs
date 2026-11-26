@@ -397,17 +397,10 @@ impl AnalystUseCase {
             );
             return;
         }
-        // Пик-окно — как будильник: запуск хода откладывается целиком
-        // (план #1607; у ревьювера #1634 пик-гейта нет — осознанное
-        // различие, не дрейф: волна аналитика пик-гейта тоже не несёт,
-        // компакт здесь строже).
-        if self.peak.holds(self.clock.utc_minute()) {
-            tracing::info!(
-                event = "analys.compact_deferred_peak",
-                "Компакт-проход мастер-сессий отложен: пик-окно"
-            );
-            return;
-        }
+        // Пик-окно — как будильник, но только для этапов целевого
+        // провайдера (#1680); проверка ниже, после парсинга модели
+        // привязки. У ревьювера #1634 пик-гейта нет — осознанное
+        // различие, не дрейф.
         let now = self.clock.now_ms();
         let role = analyst_role();
         let mut projects: Vec<&String> = self.boards.iter().map(|b| &b.project).collect();
@@ -445,6 +438,15 @@ impl AnalystUseCase {
                 );
                 continue;
             };
+            if crate::spawn_models::peak_applies(&model) && self.peak.holds(self.clock.utc_minute())
+            {
+                tracing::info!(
+                    event = "analys.compact_deferred_peak",
+                    project = %project,
+                    "Компакт мастер-сессии отложен: пик-окно провайдера"
+                );
+                continue;
+            }
             let busy_flag = scan
                 .iter()
                 .find(|s| s.id == session)
