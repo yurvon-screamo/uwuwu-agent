@@ -45,6 +45,9 @@ pub struct ExecutorCfg {
     /// (+ "default" для Dev/Design/bootstrap) — #1154. Отсутствует —
     /// канон владельца (SpawnModels::canonical).
     pub models: Option<HashMap<String, String>>,
+    /// Алиасы flash/common/smart → raw-модель (#1684). Отсутствует —
+    /// канон владельца (ModelAliases::canonical).
+    pub model_aliases: Option<HashMap<String, String>>,
 }
 
 /// Дополнительный именованный исполнитель ([[executors]]): подмножество

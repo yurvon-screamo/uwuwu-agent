@@ -1,20 +1,14 @@
-//! Карта моделей спавнов (#1154, решение владельца 17.11): единый
-//! механизм конфигурации — модель кладётся сервером в тело спавна
-//! (`SessionSpec.model`), деф-файлы агентов моделей не несут. Канон
-//! владельца (25.11, #1628): flash-контуры (default/developer/tester/
-//! analyst/dreamer) — opencode-go/hy4-flash-free#high, ревьюверы — полный
-//! zai-coding-plan/glm-5.4#high (канон 18.11, #417). canonical() следует
-//! config.example дословно (кросс-гвард spawn_models_config_sync_test).
-//! Ключи карты — имена агентов (naming::agent_name) + "default"
-//! (bootstrap-сессии подготовки env; до #1300 — также дев-семья, после
-//! пина агента Design/Dev берут ключ "developer").
+//! Карта моделей спавнов (#1154, #1684): raw-модель живёт на алиасе
+//! flash/common/smart, агенты и `default` ссылаются на алиас. Сервер кладёт
+//! модель в тело спавна (`SessionSpec.model`), деф-файлы агентов моделей
+//! не несут. Уровень алиса доступен в рантайме для сдвига из #1689.
 
+use crate::model_aliases::{ModelAlias, ModelAliases};
 use crate::naming;
 use std::collections::HashMap;
 use uwuwu_domain::{Agent, SpawnModel};
 
 /// Провайдер, для которого действует peak-окно (#1679/#1680).
-/// Остальные провайдеры работают в окне без отложек.
 pub const PEAK_PROVIDER: &str = "zai-coding-plan";
 
 /// Peak-гейт применяется только к этапам целевого провайдера.
@@ -22,71 +16,108 @@ pub fn peak_applies(model: &SpawnModel) -> bool {
     model.model.provider() == PEAK_PROVIDER
 }
 
+/// Раскладка опроса владельца 26.11 (#1684): flash — default/developer/
+/// analyst, common — tester/dreamer, smart — все ревьюверы.
+pub fn canonical_assignments() -> HashMap<String, ModelAlias> {
+    HashMap::from([
+        ("default", ModelAlias::Flash),
+        ("developer", ModelAlias::Flash),
+        ("plan-reviewer", ModelAlias::Smart),
+        ("code-quality-reviewer", ModelAlias::Smart),
+        ("tester", ModelAlias::Common),
+        ("test-reviewer", ModelAlias::Smart),
+        ("analyst", ModelAlias::Flash),
+        ("analyst-reviewer", ModelAlias::Smart),
+        ("dreamer", ModelAlias::Common),
+    ])
+    .into_iter()
+    .map(|(key, alias)| (key.to_string(), alias))
+    .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct SpawnModels {
-    map: HashMap<String, SpawnModel>,
+    aliases: ModelAliases,
+    assignments: HashMap<String, ModelAlias>,
 }
 
 impl SpawnModels {
-    pub fn new(map: HashMap<String, SpawnModel>) -> Self {
-        Self { map }
+    pub fn new(aliases: ModelAliases, assignments: HashMap<String, ModelAlias>) -> Self {
+        Self {
+            aliases,
+            assignments,
+        }
     }
 
-    /// Канон владельца — дефолт карты при отсутствии секции в конфиге.
-    /// Синхрон с config.example (кросс-гвард): flash-контуры на
-    /// opencode-go/hy4-flash-free#high (25.11, #1628 — supersedes санкцию
-    /// 24.11 в #1607 по ключу analyst), ревьюверы стадий + ревью
-    /// аналитики — zai-coding-plan/glm-5.4#high (поручение 18.11, f1b9091c).
-    pub fn canonical() -> Self {
-        let mut map = HashMap::new();
-        let mut put = |key: &str, raw: &str| {
-            map.insert(
-                key.to_string(),
-                SpawnModel::parse(raw).expect("канон-карта"),
-            );
+    /// Два необязательных раздела конфига. Каждый отсутствующий слой берётся
+    /// из канона; неизвестный алиас в назначении — громкий отказ старта.
+    pub fn from_config(
+        alias_raw: Option<&HashMap<String, String>>,
+        assignment_raw: Option<&HashMap<String, String>>,
+    ) -> Result<Self, String> {
+        let aliases = match alias_raw {
+            Some(raw) => ModelAliases::from_map(raw)?,
+            None => ModelAliases::canonical(),
         };
-        put("default", "opencode-go/hy4-flash-free#high");
-        put("developer", "opencode-go/hy4-flash-free#high");
-        put("plan-reviewer", "zai-coding-plan/glm-5.4#high");
-        put("code-quality-reviewer", "zai-coding-plan/glm-5.4#high");
-        put("tester", "opencode-go/hy4-flash-free#high");
-        put("test-reviewer", "zai-coding-plan/glm-5.4#high");
-        put("analyst", "opencode-go/hy4-flash-free#high");
-        put("analyst-reviewer", "zai-coding-plan/glm-5.4#high");
-        put("dreamer", "opencode-go/hy4-flash-free#high");
-        Self { map }
+        let assignments = match assignment_raw {
+            Some(raw) => raw
+                .iter()
+                .map(|(key, value)| {
+                    ModelAlias::parse(value)
+                        .map(|alias| (key.clone(), alias))
+                        .map_err(|error| format!("[executor.models].{key}: {error}"))
+                })
+                .collect::<Result<HashMap<String, ModelAlias>, String>>()?,
+            None => canonical_assignments(),
+        };
+        Ok(Self::new(aliases, assignments))
     }
 
-    /// Множество ключей карты (агенты + default) — кросс-гвард с конфигом.
+    pub fn canonical() -> Self {
+        Self::new(ModelAliases::canonical(), canonical_assignments())
+    }
+
+    /// Ключи карты (агенты + default) — кросс-гвард с конфигом.
     pub fn keys(&self) -> Vec<&str> {
-        let mut keys: Vec<&str> = self.map.keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = self.assignments.keys().map(String::as_str).collect();
         keys.sort_unstable();
         keys
     }
 
+    /// Модель по ключу: алиас назначения → raw-модель алиаса.
+    pub fn get(&self, key: &str) -> Option<&SpawnModel> {
+        self.assignments
+            .get(key)
+            .map(|alias| self.aliases.get(*alias))
+    }
+
+    /// Алиас ключа — доступен в рантайме для сдвига уровня (#1689).
+    pub fn alias_for_key(&self, key: &str) -> Option<ModelAlias> {
+        self.assignments.get(key).copied()
+    }
+
+    pub fn alias_for_agent(&self, agent: Agent) -> ModelAlias {
+        self.alias_for_key(naming::agent_name(agent))
+            .unwrap_or_else(|| canonical_assignments()[naming::agent_name(agent)])
+    }
+
+    pub fn model_for_alias(&self, alias: ModelAlias) -> &SpawnModel {
+        self.aliases.get(alias)
+    }
+
     /// Модель агента конвейера (по имени из naming::agent_name).
     pub fn for_agent(&self, agent: Agent) -> SpawnModel {
-        self.by_key(naming::agent_name(agent))
+        self.get(naming::agent_name(agent))
             .cloned()
             .unwrap_or_else(|| self.fallback(agent))
     }
 
-    /// Значение карты по ключу (кросс-гварды конфига и тесты).
-    pub fn get(&self, key: &str) -> Option<&SpawnModel> {
-        self.map.get(key)
-    }
-
     /// Модель bootstrap-сессий подготовки env (ключ "default"). Рабочие
-    /// дев-сессии с #1300 берут ключ "developer" (for_agent) — переход
-    /// осознанный, ключи карты канонически одинаковы.
+    /// дев-сессии берут ключ "developer" (for_agent).
     pub fn for_default(&self) -> SpawnModel {
-        self.by_key("default")
+        self.get("default")
             .cloned()
-            .unwrap_or_else(|| self.fallback(Agent::Developer))
-    }
-
-    fn by_key(&self, key: &str) -> Option<&SpawnModel> {
-        self.map.get(key)
+            .unwrap_or_else(|| Self::canonical().get("default").cloned().expect("канон"))
     }
 
     /// Отсутствие ключа — не тихий дефолт: громкий warn + канон. Падать
@@ -99,75 +130,9 @@ impl SpawnModels {
             "Карта моделей: нет ключа — секция [executor.models] неполна, \
              применён канон-дефолт"
         );
-        // канон несёт все ключи агентов — expect достижим только при
-        // недействительном agent_name (невозможно: ключи из naming)
-        SpawnModels::canonical()
-            .map
+        Self::canonical()
             .get(key)
             .cloned()
             .expect("канон несёт ключ агента")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn canonical_carries_owner_model_map() {
-        // канон владельца 25.11 (#1628): flash-контуры на
-        // opencode-go/hy4-flash-free#high (supersedes санкцию 24.11 в #1607
-        // по ключу analyst), ревьюверы — glm-5.4#high;
-        // карта = config.example verbatim (кросс-гвард)
-        let m = SpawnModels::canonical();
-        assert_eq!(
-            m.for_agent(Agent::PlanReviewer),
-            SpawnModel::parse("zai-coding-plan/glm-5.4#high").unwrap(),
-            "ревьюверы — полный glm-5.4#high (канон #417)"
-        );
-        assert_eq!(
-            m.for_agent(Agent::Analyst),
-            SpawnModel::parse("opencode-go/hy4-flash-free#high").unwrap(),
-            "аналитик — flash-free (санкция 25.11 в #1628, без исключений)"
-        );
-        assert_eq!(
-            m.for_agent(Agent::AnalystReviewer),
-            SpawnModel::parse("zai-coding-plan/glm-5.4#high").unwrap(),
-            "ревью аналитики — glm-5.4#high (санкция 24.11, #1607)"
-        );
-        assert_eq!(
-            m.for_agent(Agent::Dreamer),
-            SpawnModel::parse("opencode-go/hy4-flash-free#high").unwrap()
-        );
-        assert_eq!(
-            m.for_agent(Agent::Tester),
-            SpawnModel::parse("opencode-go/hy4-flash-free#high").unwrap()
-        );
-        assert_eq!(m.for_default(), m.for_agent(Agent::Developer));
-    }
-
-    #[test]
-    fn model_string_parses_with_variant() {
-        let sm = SpawnModel::parse("opencode-go/hy4-flash-free#max").unwrap();
-        assert_eq!(sm.model.provider(), "opencode-go");
-        assert_eq!(sm.model.id(), "hy4-flash-free");
-        assert_eq!(sm.variant.as_deref(), Some("max"));
-
-        let plain = SpawnModel::parse("p/id").unwrap();
-        assert_eq!(plain.variant, None);
-        assert!(SpawnModel::parse("без-слэша").is_err());
-        assert!(SpawnModel::parse("/id").is_err());
-    }
-
-    #[test]
-    fn missing_key_falls_back_to_canon_with_warn() {
-        let mut map = HashMap::new();
-        map.insert("default".to_string(), SpawnModel::parse("p/id").unwrap());
-        let m = SpawnModels::new(map);
-        // громкий фоллбэк (warn в лог), не тихий: значение = канон
-        assert_eq!(
-            m.for_agent(Agent::Tester),
-            SpawnModels::canonical().for_agent(Agent::Tester)
-        );
     }
 }

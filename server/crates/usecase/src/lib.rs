@@ -12,6 +12,7 @@ mod error;
 pub mod fm_guard;
 mod fm_lite;
 pub mod goals;
+mod model_aliases;
 mod naming;
 mod pipeline;
 mod ports;
@@ -27,6 +28,8 @@ mod slug_guard_tests;
 #[cfg(test)]
 mod spawn_model_tests;
 pub mod spawn_models;
+#[cfg(test)]
+mod spawn_models_tests;
 mod tasks;
 
 pub use blobs::{
@@ -46,6 +49,7 @@ pub use docs_delete::{
 };
 pub use error::{UsecaseError, UsecaseResult, ViewError};
 pub use goals::{gist_of, Goal, GoalsRepo, GoalsView};
+pub use model_aliases::{ModelAlias, ModelAliases};
 pub use naming::{
     agent_name, parse_agent, parse_priority, parse_status, parse_task_type, priority_name,
     schedule_label, slot_key, status_name, status_names, task_type_name, task_type_native_name,
@@ -70,7 +74,7 @@ pub use ports::{
 };
 pub use router::SessionRouter;
 pub use search::{sync_allowed, SearchHit, SearchUseCase, SemanticBackend};
-pub use spawn_models::SpawnModels;
+pub use spawn_models::{canonical_assignments, SpawnModels};
 pub use tasks::board_status::{
     BoardStatusRenameUseCase, BoardStatusRepo, RenameReport, StatusFieldImage, StatusOption,
     StatusPreImage, StatusPreImageStore, VERIFY_ATTEMPTS,
