@@ -3199,6 +3199,12 @@ mod tests {
         let input = "## П\n\nтело\n\n\n--- comments (latest 2 of 2) ---\n---\n2026-11-24T04:59:18Z\nпервый\n\n## Внутри коммента\n\nещё\n---\n2026-11-24T05:00:00Z\nвторой\n\n## План\n\nсекция\n";
         let out = strip_comments_tail(input);
         assert!(out.contains("## План\n\nсекция"), "секция цела: {out}");
+        assert!(!out.contains("--- comments (latest"), "маркер ушёл: {out}");
+        assert!(
+            !out.contains("2026-11-24T04:59:18Z"),
+            "первая запись ушла: {out}"
+        );
+        assert!(!out.contains("первый"), "тело первой записи ушло: {out}");
     }
 
     #[test]
@@ -3217,35 +3223,27 @@ mod tests {
 
     // ---- tester #1648: независимые пины главного сценария и стыка ----
 
-    /// Полная копия карточки `task_get` от маркера fm до конца — то, что
-    /// агент вставляет в `task_body`. Оракул — байты исходного тела.
-    fn tester_copied_card(body: &str, tail: &str) -> String {
-        format!(
-            "#42 manual: источник — Testing\n\n--- fm ---\nbranch: —\npr: —\nautomerge: true\n\
-             direct: false\nfact_track: false\ntype: bug\nbody_hash: deadbeef\nbody_bytes: {}\n\n\
-             {body}{tail}",
-            body.len()
-        )
-    }
-
-    fn tester_chain(input: &str) -> String {
-        strip_comments_tail(crate::fm_lite::strip(strip_task_get_header(input)))
-    }
+    // На юнит-уровне проверяем сам хелпер: композицию трёх приватных срезов
+    // из места вызова (set_body) закрывают интеграционные пины на MCP-поверхности.
 
     #[test]
-    fn tester_copied_card_written_back_is_exact_body() {
+    fn tester_copied_card_tail_strips_to_exact_body() {
         let body = "## Постановка\n\nтело для копии.\n";
         let tail = "\n\n--- comments (latest 2 of 2) ---\n---\n2026-11-24T04:59:18Z\nпервый\n\
                     ---\n2026-11-24T05:00:00Z\nвторой\n";
-        let cleaned = tester_chain(&tester_copied_card(body, tail));
-        assert_eq!(cleaned, body, "копия карточки пишется телом байт-в-байт");
+        let copied = format!("{body}{tail}");
+        assert_eq!(
+            strip_comments_tail(&copied),
+            body,
+            "копия карточки → тело байт-в-байт"
+        );
     }
 
     #[test]
-    fn tester_legacy_marker_full_chain() {
+    fn tester_legacy_marker_is_stripped() {
         let body = "## Постановка\n\nтело.\n";
         let tail = "\n\n--- comments (latest) ---\n---\n2026-11-23T10:00:00Z\nлегаси\n";
-        assert_eq!(tester_chain(&tester_copied_card(body, tail)), body);
+        assert_eq!(strip_comments_tail(&format!("{body}{tail}")), body);
     }
 
     #[test]
@@ -3283,7 +3281,11 @@ mod tests {
             "## Постановка\n\nчистое тело без ленты.\n",
             "--- comments (latest 1 of 1) ---\n\nцитата в прозе без записей\n",
         ] {
-            assert_eq!(tester_chain(body), body, "не трогаем без сигнатуры ленты");
+            assert_eq!(
+                strip_comments_tail(body),
+                body,
+                "не трогаем без сигнатуры ленты"
+            );
         }
     }
 }
