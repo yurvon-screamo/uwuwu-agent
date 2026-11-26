@@ -665,15 +665,83 @@ async fn absent_rows_do_not_starve_next_batch() {
     assert_eq!(second_rows, ["21"], "второй батч не должен нести старые 20");
 }
 
+/// Исходы, при которых env всё ещё может быть жив: метка недопустима.
+#[derive(Debug, Clone, Copy)]
+enum BadOutcome {
+    Dirty,
+    Fail,
+    MissingVerdict,
+    TransportFailure,
+    Deadline,
+}
+
+impl BadOutcome {
+    fn configure(self, gw: &Arc<FakeGcSessions>) {
+        match self {
+            Self::Dirty => verdict_default(gw, "DIRTY"),
+            Self::Fail => verdict_default(gw, "FAIL"),
+            Self::MissingVerdict => {
+                *gw.feed_override.lock().unwrap() = Some("ENV-GC 999 ABSENT".into());
+            }
+            Self::TransportFailure => *gw.command_fails.lock().unwrap() = true,
+            Self::Deadline => *gw.wait_none.lock().unwrap() = true,
+        }
+    }
+}
+
 #[tokio::test]
-async fn non_terminal_verdicts_are_retried_on_next_pass() {
-    // DIRTY не помечает строку: она остаётся в очереди и перепробуется.
+async fn non_terminal_outcomes_are_retried_on_next_pass() {
+    for outcome in [
+        BadOutcome::Dirty,
+        BadOutcome::Fail,
+        BadOutcome::MissingVerdict,
+        BadOutcome::TransportFailure,
+        BadOutcome::Deadline,
+    ] {
+        let gw = fake(Vec::new());
+        outcome.configure(&gw);
+        let tasks = [done_closed(55, THREE_DAYS, NOW)];
+        let gone = EnvGcGone::default();
+        let board = FakeBoard::all_done();
+        let pass = Pass {
+            tasks: &tasks,
+            gw: &gw,
+            board: &board,
+            now: NOW,
+            observe: false,
+            gone: &gone,
+        };
+
+        let first = run_pass(&pass).await;
+        assert_eq!(first.gone, 0, "{outcome:?} не должен ставить метку");
+        assert_eq!(
+            first.dirty + first.failed,
+            1,
+            "{outcome:?} должен провалиться"
+        );
+
+        *gw.feed_override.lock().unwrap() = None;
+        *gw.command_fails.lock().unwrap() = false;
+        *gw.wait_none.lock().unwrap() = false;
+        verdict_default(&gw, "SWEPT");
+        let second = run_pass(&pass).await;
+
+        assert_eq!(second.gone, 0, "{outcome:?} не должен ставить метку");
+        assert_eq!(
+            second.swept, 1,
+            "{outcome:?}: живой env не должен прятаться"
+        );
+        assert_eq!(gw.commands.lock().unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn swept_rows_are_excluded_from_next_batch() {
     let gw = fake(Vec::new());
-    verdict_default(&gw, "DIRTY");
-    let tasks = [done_closed(55, THREE_DAYS, NOW)];
+    verdict_default(&gw, "SWEPT");
+    let tasks = [done_closed(88, THREE_DAYS, NOW)];
     let gone = EnvGcGone::default();
     let board = FakeBoard::all_done();
-
     let pass = Pass {
         tasks: &tasks,
         gw: &gw,
@@ -682,13 +750,15 @@ async fn non_terminal_verdicts_are_retried_on_next_pass() {
         observe: false,
         gone: &gone,
     };
+
     let first = run_pass(&pass).await;
     let second = run_pass(&pass).await;
 
-    assert_eq!(first.dirty, 1);
-    assert_eq!(second.dirty, 1);
-    assert_eq!(second.gone, 0);
-    assert_eq!(gw.commands.lock().unwrap().len(), 2);
+    assert_eq!(first.swept, 1);
+    assert_eq!(first.gone, 0);
+    assert_eq!(second.candidates, 0);
+    assert_eq!(second.gone, 1);
+    assert_eq!(gw.commands.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
