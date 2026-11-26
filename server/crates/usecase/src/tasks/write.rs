@@ -1218,7 +1218,7 @@ fn strip_header_keys<'a>(rest: &'a str, keys: &[&str]) -> Option<&'a str> {
         }
         pos = &pos[break_len..];
     }
-    Some(trim_blank_lines(pos))
+    Some(crate::fm_lite::trim_blank_lines(pos))
 }
 
 /// Строка с переносом: содержимое до CR/LF и длина переноса.
@@ -1230,19 +1230,6 @@ fn header_line(line: &str) -> Option<(&str, usize)> {
         lf
     };
     Some((&line[..end], lf + 1))
-}
-
-/// Ведущие пустые строки после шапки — LF и CRLF одинаково (#1637):
-/// паритет с прежним trim_start_matches, но без потери CRLF-тела.
-fn trim_blank_lines(md: &str) -> &str {
-    let mut pos = md;
-    loop {
-        if let Some(rest) = pos.strip_prefix("\r\n").or_else(|| pos.strip_prefix('\n')) {
-            pos = rest;
-        } else {
-            return pos;
-        }
-    }
 }
 
 /// Тайтл-строка рендера карточки: «#<номер> <тайтл> — <статус>» —

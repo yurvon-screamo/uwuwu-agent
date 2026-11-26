@@ -713,6 +713,31 @@ mod tests {
         assert_eq!(classify(&probe("t", false, "текст")), CleanVerdict::Dead);
     }
 
+    /// #1664: CRLF-fm не прячет скелет от гарда чистки; дописанное
+    /// содержимое остаётся Live — направление ошибки безопасное.
+    #[test]
+    fn classify_crlf_fm_body_forms() {
+        let probe = |body: &str| IssueProbe {
+            title: "t".into(),
+            open: true,
+            body: body.into(),
+        };
+        assert_eq!(
+            classify(&probe("---\r\nstatus: Draft\r\n---\r\n")),
+            CleanVerdict::DraftSkeleton
+        );
+        assert_eq!(
+            classify(&probe("---\r\nstatus: Draft\r\n---\r\n## Постановка\n\nt")),
+            CleanVerdict::DraftSkeleton
+        );
+        assert_eq!(
+            classify(&probe(
+                "---\r\nstatus: Draft\r\n---\r\n## Постановка\n\nтекст задачи"
+            )),
+            CleanVerdict::Live
+        );
+    }
+
     // --- dry-run ---
 
     #[tokio::test]

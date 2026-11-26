@@ -124,4 +124,23 @@ greeting: Привет!\nenabled: false\n---\n\n## Методичка\nсозд�
             "нет workspace"
         );
     }
+
+    /// #1664: LF-шапка и CRLF-тело доходят до парсера; ведущие пустые
+    /// строки снимаются, переносы методички остаются.
+    #[test]
+    fn mixed_doc_manual_has_no_leading_blank_lines() {
+        let md =
+            "---\nmodel: p/id\ntoken_env: TOK\nworkspace: /w\n---\r\n\r\n## Методичка\r\nтекст";
+        let spec = parse_bot_doc("bot/смешанный", md).unwrap();
+        assert_eq!(spec.manual, "## Методичка\r\nтекст");
+    }
+
+    /// #1664: чистый CRLF-док доходит до `parse`, но LF-строгий парсер
+    /// возвращает пустую карту — потребитель отказывает; до `strip` док
+    /// не доходит.
+    #[test]
+    fn crlf_doc_is_rejected_by_lf_strict_parse() {
+        let md = "---\r\nmodel: p/id\r\ntoken_env: TOK\r\nworkspace: /w\r\n---\r\n## Методичка";
+        assert!(parse_bot_doc("bot/crlf", md).is_err());
+    }
 }

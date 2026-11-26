@@ -20,19 +20,44 @@ pub fn parse(md: &str) -> BTreeMap<String, String> {
     out
 }
 
+/// Срезает fm-блок в начале входа. Переносы маркера, терминатора и
+/// пустых строк — LF или CRLF (#1664); тело возвращается срезом без
+/// переписывания байтов.
 pub fn strip(md: &str) -> &str {
-    let Some(rest) = md.strip_prefix("---\n") else {
+    let Some(rest) = md
+        .strip_prefix("---\r\n")
+        .or_else(|| md.strip_prefix("---\n"))
+    else {
         return md;
     };
+    // find("\n---") матчит и LF, и CRLF-терминатор: CR остаётся перед
+    // найденным индексом, срез начинается сразу после «---».
     let Some(end) = rest.find("\n---") else {
         return md;
     };
-    let body = rest[end + 4..].trim_start_matches('\n');
+    let body = trim_blank_lines(&rest[end + 4..]);
     // хвостовой сепаратор fm-эпохи: «fm\n---\n---\nконтент» — после вырезки
     // блока остаётся одинокий «---» (закрытие + разделитель старого формата)
-    body.strip_prefix("---\n")
-        .map(|b| b.trim_start_matches('\n'))
+    body.strip_prefix("---\r\n")
+        .or_else(|| body.strip_prefix("---\n"))
+        .map(trim_blank_lines)
         .unwrap_or(body)
+}
+
+/// Ведущие пустые строки после шапки — LF и CRLF одинаково, без потери
+/// переносов самого тела. Общая политика обоих стрипперов (#1637/#1664):
+/// `strip_task_get_header` в `write.rs` вызывает этот же срез.
+pub(crate) fn trim_blank_lines(md: &str) -> &str {
+    let mut rest = md;
+    loop {
+        let Some(next) = rest
+            .strip_prefix("\r\n")
+            .or_else(|| rest.strip_prefix('\n'))
+        else {
+            return rest;
+        };
+        rest = next;
+    }
 }
 
 #[cfg(test)]
@@ -58,5 +83,63 @@ mod tests {
         assert_eq!(strip("---\na: 1\n---\nтекст"), "текст");
         // без fm — как есть
         assert_eq!(strip("просто текст"), "просто текст");
+    }
+
+    /// #1664: CRLF-легаси-fm срезается; переносы тела не переписываются.
+    #[test]
+    fn strip_crlf_legacy_fm_keeps_body_bytes() {
+        let md = "---\r\ntitle: Ночной QA\r\nschedule: 1d\r\n---\r\n\r\n## Инструкция\r\nтекст";
+        assert_eq!(strip(md), "## Инструкция\r\nтекст");
+    }
+
+    /// #1664: префикс и терминатор допускают разные переносы.
+    #[test]
+    fn strip_mixed_line_endings() {
+        let cases = [
+            ("---\r\na: 1\n---\n\n## Тело\n", "## Тело\n"),
+            ("---\na: 1\r\n---\r\n\r\n## Тело\r\n", "## Тело\r\n"),
+        ];
+        for (md, expected) in cases {
+            assert_eq!(strip(md), expected, "форма: {md:?}");
+        }
+    }
+
+    /// #1664: одинокий сепаратор fm-эпохи срезается и в CRLF-форме.
+    #[test]
+    fn strip_crlf_double_separator() {
+        let md = "---\r\nstatus: Draft\r\n---\r\n---\r\n\r\n## Постановка\r\n";
+        assert_eq!(strip(md), "## Постановка\r\n");
+    }
+
+    /// #1664: без fm вход цел, включая «---» как строку тела.
+    #[test]
+    fn strip_keeps_crlf_text_without_fm() {
+        let md = "## Постановка\r\nтекст\r\n---\r\nещё текст";
+        assert_eq!(strip(md), md);
+    }
+
+    /// #1664 (tester): незакрытый CRLF-fm не срезается — симметрия с LF.
+    /// Маркер без терминатора — это текст, а не шапка; срез не должен
+    /// пожирать тело только потому, что переносы стали CRLF.
+    #[test]
+    fn strip_unterminated_crlf_fm_is_kept() {
+        let md = "---\r\ntitle: x\r\nstatus: Draft\r\n";
+        assert_eq!(strip(md), md);
+        // смешанная форма: префикс CRLF, терминатора нет вообще
+        let mixed = "---\r\ntitle: x\nstatus: Draft\n";
+        assert_eq!(strip(mixed), mixed);
+    }
+
+    /// #1664: CRLF-док — fm снимается, тело байт-в-байт. Здесь проверяется
+    /// только `strip`: чистый CRLF-док до `parse` потребителей доходит, но
+    /// тот LF-строгий и возвращает пустую карту, поэтому потребитель
+    /// отказывает; до `strip` док не доходит (пины реальных путей —
+    /// в `bots/spec.rs` и `crons.rs`).
+    #[test]
+    fn strip_crlf_doc_bodies() {
+        let bot = "---\r\nmodel: p/id\r\ntoken_env: TOK\r\nworkspace: /w\r\n---\r\n\r\n## Методичка\r\nтекст";
+        assert_eq!(strip(bot), "## Методичка\r\nтекст");
+        let cron = "---\r\ntitle: Тест\r\nschedule: 5m\r\nproject: uwuwu\r\n---\r\n\r\nТело\r\n";
+        assert_eq!(strip(cron), "Тело\r\n");
     }
 }
