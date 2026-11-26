@@ -831,6 +831,36 @@ impl uwuwu_usecase::WikiRepo for MemoryHub {
         self.with_state(|state| Ok(state.docs.get(slug).cloned()))
     }
 
+    async fn read_doc_with_sha(
+        &self,
+        slug: &str,
+    ) -> UsecaseResult<Option<uwuwu_usecase::DocSnapshot>> {
+        self.with_state(|state| {
+            Ok(state
+                .docs
+                .get(slug)
+                .map(|content| uwuwu_usecase::DocSnapshot {
+                    content: content.clone(),
+                    blob_sha: format!("{:x}", content.len()),
+                }))
+        })
+    }
+
+    async fn delete_doc(
+        &self,
+        slug: &str,
+        _old_blob_sha: &str,
+        _message: &str,
+    ) -> UsecaseResult<uwuwu_usecase::DocDeleteCommit> {
+        self.with_state(|state| {
+            state.docs.remove(slug);
+            Ok(uwuwu_usecase::DocDeleteCommit {
+                commit_sha: format!("mem-{}", slug.len()),
+                post_check: uwuwu_usecase::PostCheck::ConfirmedAbsent,
+            })
+        })
+    }
+
     async fn list_docs(&self, prefix: &str) -> UsecaseResult<Vec<String>> {
         self.with_state(|state| {
             let norm = prefix.trim_matches('/');

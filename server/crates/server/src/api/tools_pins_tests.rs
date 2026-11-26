@@ -5,7 +5,7 @@
 //! тексты отказов и ответов, чтобы дрейф вернуть нечем. Пробы через живой
 //! диспетчер на MemoryHub — без GitHub, как в tools_tests.rs.
 
-use super::test_support::{blob_usecase, mcp_call, tool_hub, StubCronState};
+use super::test_support::{blob_usecase, blob_usecase_missing, mcp_call, tool_hub, StubCronState};
 use super::tools::ToolHub;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -1671,4 +1671,165 @@ async fn task_edit_status_unverified_receipt_does_not_claim_success() {
         get.starts_with("#1 unverified-прогон — Wait"),
         "запись применена несмотря на Unverified: {get}"
     );
+}
+
+// --- docs_delete (#1658): квитанция, гард, бэкап ---
+
+#[tokio::test]
+async fn docs_delete_reports_backup_and_removes_live_doc() {
+    let tools = hub();
+    call(
+        &tools,
+        "docs_write",
+        json!({ "slug": "Projects/uwuwu/Удаляемый", "content": "# док\n" }),
+    )
+    .await
+    .expect("seed");
+
+    let answer = call(
+        &tools,
+        "docs_delete",
+        json!({ "slug": "Projects/uwuwu/Удаляемый" }),
+    )
+    .await
+    .expect("delete");
+
+    assert!(
+        answer.starts_with("deleted: «Projects/uwuwu/Удаляемый»"),
+        "{answer}"
+    );
+    assert!(answer.contains("blob sha "), "{answer}");
+    assert!(answer.contains("commit "), "{answer}");
+    assert!(answer.contains("\nbackup: blobs/uwuwu/misc/"), "{answer}");
+    assert!(answer.contains("TTL 7 days"), "{answer}");
+    assert!(
+        answer.contains("\npost-check: absent in tree at "),
+        "{answer}"
+    );
+    let ls = call(&tools, "docs_ls", json!({ "path": "Projects/uwuwu" }))
+        .await
+        .expect("ls");
+    assert!(!ls.contains("Удаляемый"), "док остался в листинге: {ls}");
+}
+
+#[tokio::test]
+async fn docs_delete_absent_doc_is_not_silent_success() {
+    let tools = hub();
+
+    let error = call(
+        &tools,
+        "docs_delete",
+        json!({ "slug": "Projects/uwuwu/Нет" }),
+    )
+    .await
+    .expect_err("absent");
+
+    assert_eq!(
+        error,
+        "absent: doc «Projects/uwuwu/Нет» does not exist (no backup, no mutation)"
+    );
+}
+
+#[tokio::test]
+async fn docs_delete_refuses_outside_wiki_roots() {
+    let tools = hub();
+
+    let error = call(&tools, "docs_delete", json!({ "slug": "cli/x" }))
+        .await
+        .expect_err("root-prefix");
+
+    assert!(error.contains("refused: root-prefix"), "{error}");
+}
+
+#[tokio::test]
+async fn docs_delete_keeps_suffix_twin_as_information() {
+    let tools = hub();
+    for slug in ["Projects/foo", "Experience/uwuwu/Projects/foo"] {
+        call(
+            &tools,
+            "docs_write",
+            json!({ "slug": slug, "content": "# x\n" }),
+        )
+        .await
+        .expect("seed");
+    }
+
+    let answer = call(&tools, "docs_delete", json!({ "slug": "Projects/foo" }))
+        .await
+        .expect("delete");
+
+    assert!(answer.starts_with("deleted: «Projects/foo»"), "{answer}");
+    assert!(
+        answer.contains("suffix twins: Experience/uwuwu/Projects/foo"),
+        "{answer}"
+    );
+    let ls = call(&tools, "docs_ls", json!({ "path": "Experience/uwuwu" }))
+        .await
+        .expect("ls");
+    assert!(ls.contains("Projects/foo"), "тёзка пострадала: {ls}");
+}
+
+#[tokio::test]
+async fn docs_delete_without_backup_refuses_before_mutation() {
+    let (tools, _) = tool_hub(
+        Arc::new(crate::mockhub::MemoryHub::from_env()),
+        blob_usecase_missing(&["UWUWU_S3_BUCKET"]),
+        Arc::new(StubCronState::default()),
+    );
+    call(
+        &tools,
+        "docs_write",
+        json!({ "slug": "Projects/uwuwu/БезБэкапа", "content": "# док\n" }),
+    )
+    .await
+    .expect("seed");
+
+    let error = call(
+        &tools,
+        "docs_delete",
+        json!({ "slug": "Projects/uwuwu/БезБэкапа" }),
+    )
+    .await
+    .expect_err("backup-failed");
+
+    assert!(error.contains("refused: backup-failed"), "{error}");
+    let doc = call(
+        &tools,
+        "docs_read",
+        json!({ "slug": "Projects/uwuwu/БезБэкапа" }),
+    )
+    .await
+    .expect("док цел");
+    assert!(doc.contains("# док"), "док тронут при отказе бэкапа: {doc}");
+}
+
+#[tokio::test]
+async fn docs_delete_refusal_is_error_over_mcp_wire() {
+    let tools = hub();
+    let state = Arc::new(super::McpState {
+        bearer: Arc::new("t-bearer".into()),
+        tools,
+    });
+    let app = super::mcp_router(state);
+
+    let answer = mcp_call(&app, "t-bearer", "docs_delete", json!({ "slug": "cli/x" })).await;
+
+    assert_eq!(answer["result"]["isError"], Value::Bool(true), "{answer}");
+    let text = answer["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(text.contains("refused: root-prefix"), "{text}");
+}
+
+#[tokio::test]
+async fn docs_delete_refuses_unknown_mutation_argument() {
+    let tools = hub();
+    let error = call(
+        &tools,
+        "docs_delete",
+        json!({ "slug": "Projects/foo", "content": "x" }),
+    )
+    .await
+    .expect_err("unknown arg");
+    assert!(error.contains("unknown argument(s) content"), "{error}");
 }

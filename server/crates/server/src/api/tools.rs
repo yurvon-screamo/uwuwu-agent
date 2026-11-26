@@ -4,9 +4,13 @@
 use base64::Engine as _;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use uwuwu_usecase::docs_delete::{
+    guard as delete_guard, DeleteReceipt, DeleteRequest, DocsDeleteUseCase,
+};
 use uwuwu_usecase::{
     cron_journal, fm_guard, jst_stamp, sanitize_slug, slug_guard, BlobPlace, BlobUseCase, Clock,
-    DocsView, PersonView, SectionWrite, TaskView, TaskWriteUseCase, TaskWriter, UsecaseError,
+    DocsView, PersonView, PostCheck, SectionWrite, TaskView, TaskWriteUseCase, TaskWriter,
+    UsecaseError,
 };
 
 pub struct ToolHub {
@@ -50,6 +54,7 @@ const MUTATION_TOOLS: &[&str] = &[
     "blob_put",
     "docs_write",
     "docs_append",
+    "docs_delete",
 ];
 
 /// Ключи диспетчера: легальны на любом мутационном туле. Семантика
@@ -325,6 +330,14 @@ pub fn tool_descriptors() -> Value {
             }))
         ),
         tool(
+            "docs_delete",
+            "Delete a wiki doc by full slug. A verbatim backup is stored in the private blob bucket BEFORE the ff-only delete; the receipt names the branch (deleted, absent, refused), the backup key and the post-check. Refuses slugs outside the wiki roots; a longer suffix twin is reported as information, not a refusal",
+            object(json!({
+                "slug": string("doc slug (without docs/ and .md); sanitized like docs_read"),
+                "message": string("commit message; default delete")
+            }))
+        ),
+        tool(
             "cron_list",
             "Cron inventory (masters /cron/<name>/README.md: schedule + machine accounting — last fire, fail counter)",
             object(json!({
@@ -438,6 +451,7 @@ impl ToolHub {
             "goal_list" => self.goal_list(&project).await,
             "docs_append" => self.docs_append(args).await,
             "docs_write" => self.docs_write(args).await,
+            "docs_delete" => self.docs_delete(&project, args).await,
             "cron_list" => self.cron_list(args).await,
             "search" => self.search(args).await,
             "session_export" => self.session_export(args).await,
@@ -667,6 +681,42 @@ impl ToolHub {
             fact.push_str(" — slug-guard degraded: collision checks skipped (tree unavailable)");
         }
         ok_text(fact)
+    }
+
+    /// #1658: удаление дока — слаг-гард → живое чтение → бэкап → снос.
+    async fn docs_delete(&self, project: &str, args: &Value) -> Result<Value, String> {
+        require_args(args, &["slug"])?;
+        let slug = sanitize_slug(&arg_str(args, "slug"));
+        if slug.is_empty() {
+            return Err(empty_slug_error());
+        }
+        let (live, degraded) = match self.wiki.list_docs("").await {
+            Ok(live) => (live, false),
+            Err(_) => (Vec::new(), true),
+        };
+        let verdict = delete_guard(&slug, &live);
+        if let Some(refusal) = verdict.refusal {
+            return Err(match refusal {
+                uwuwu_usecase::docs_delete::DeleteRefusal::RootPrefix(candidates) => {
+                    root_prefix_error(&slug, &candidates)
+                }
+                uwuwu_usecase::docs_delete::DeleteRefusal::ParentCollision(parent) => {
+                    parent_collision_error(&parent)
+                }
+            });
+        }
+        let usecase = DocsDeleteUseCase::new(self.wiki.clone(), self.blobs.clone());
+        let request = DeleteRequest {
+            slug: slug.clone(),
+            project: project.to_string(),
+            message: message_or(args, format!("delete: {slug}")),
+            twins: verdict.twins.clone(),
+        };
+        match usecase.delete(request).await {
+            Ok(receipt) => ok_text(delete_receipt_text(&receipt, degraded)),
+            Err(UsecaseError::DocAbsent(_)) => Err(delete_absent_error(&slug, &verdict.twins)),
+            Err(e) => Err(delete_refusal_error(&e)),
+        }
     }
 
     async fn cron_list(&self, args: &Value) -> Result<Value, String> {
@@ -1163,6 +1213,60 @@ fn suffix_collision_error(slug: &str, candidates: &[String]) -> String {
     )
 }
 
+/// Квитанция удаления (#1658): ветка, бэкап, пост-проверка, тёзки.
+fn delete_receipt_text(receipt: &DeleteReceipt, degraded: bool) -> String {
+    let mut out = format!(
+        "deleted: «{}» (path {}, blob sha {}, commit {})",
+        receipt.slug, receipt.path, receipt.old_blob_sha, receipt.commit_sha
+    );
+    out.push_str(&format!(
+        "\nbackup: {} (presigned GET: {}, TTL 7 days)",
+        receipt.backup_key, receipt.backup_url
+    ));
+    let check = match &receipt.post_check {
+        PostCheck::ConfirmedAbsent => format!("absent in tree at {}", receipt.commit_sha),
+        PostCheck::Disagreement(reason) => {
+            format!("⚠ disagreement — {reason}; verify before retry")
+        }
+        PostCheck::Unverified(reason) => format!("⚠ unverified — {reason}; verify before retry"),
+    };
+    out.push_str(&format!("\npost-check: {check}"));
+    if !receipt.suffix_twins.is_empty() {
+        out.push_str(&format!(
+            "\nsuffix twins: {}",
+            receipt.suffix_twins.join(", ")
+        ));
+    }
+    if degraded {
+        out.push_str("\nslug-guard degraded: collision checks skipped (tree unavailable)");
+    }
+    out
+}
+
+/// Отсутствующий док: честная ветка `absent`, без мутации и бэкапа.
+fn delete_absent_error(slug: &str, candidates: &[String]) -> String {
+    let mut out = format!("absent: doc «{slug}» does not exist (no backup, no mutation)");
+    if !candidates.is_empty() {
+        out.push_str(&format!("; suffix candidates: {}", candidates.join(", ")));
+    }
+    out
+}
+
+/// Отказы удаления: имя ветки и причина, без повторной мутации.
+fn delete_refusal_error(error: &UsecaseError) -> String {
+    match error {
+        UsecaseError::DocReadFailed(reason) => format!("refused: read-failed — {reason}"),
+        UsecaseError::BackupFailed(reason) => format!("refused: backup-failed — {reason}"),
+        UsecaseError::RaceRef(reason) => format!(
+            "refused: race-ref — {reason}; the delete was NOT retried, verify before repeating"
+        ),
+        UsecaseError::DocAbsent(reason) => {
+            format!("absent: doc «{reason}» does not exist (no backup, no mutation)")
+        }
+        other => other.to_string(),
+    }
+}
+
 fn str_arg(args: &Value, key: &str) -> Option<String> {
     args.get(key)
         .and_then(|v| v.as_str())
@@ -1519,6 +1623,7 @@ mod tests {
             "docs_read",
             "docs_write",
             "docs_append",
+            "docs_delete",
             "person_show",
             "goal_list",
             "projects",
@@ -1528,7 +1633,7 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "нет инструмента {expected}");
         }
-        assert_eq!(names.len(), 24, "контракт поверхности: {names:?}");
+        assert_eq!(names.len(), 25, "контракт поверхности: {names:?}");
     }
 
     /// Пин консистентности Common-2 (ревью #1572): allow-list гарда
@@ -1625,7 +1730,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names.len(), 24, "контракт поверхности: {names:?}");
+        assert_eq!(names.len(), 25, "контракт поверхности: {names:?}");
         for name in &names {
             let is_mutation = MUTATION_TOOLS.contains(name);
             let is_read = READ_TOOLS.contains(name);
