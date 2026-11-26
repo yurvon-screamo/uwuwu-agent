@@ -76,6 +76,7 @@ UWUWU_SERVER_MODE=live \
 UWUWU_SERVER_BEARER="$BEARER" \
 UWUWU_OPENCODE_PASSWORD=mockpass \
 UWUWU_TG_API="http://127.0.0.1:$PORT_TG" \
+UWUWU_BOT_DEBOUNCE_MS=100 \
 UWUWU_BOT_TOKEN_E2E="$TOKEN" \
 UWUWU_MOCK_DOCS="$BOT_DOC" \
 RUST_LOG=info \
@@ -149,6 +150,7 @@ UWUWU_SERVER_MODE=live \
 UWUWU_SERVER_BEARER="$BEARER" \
 UWUWU_OPENCODE_PASSWORD=mockpass \
 UWUWU_TG_API="http://127.0.0.1:$PORT_TG" \
+UWUWU_BOT_DEBOUNCE_MS=100 \
 UWUWU_BOT_TOKEN_E2E="$TOKEN" \
 UWUWU_MOCK_DOCS="$BOT_DOC" \
 RUST_LOG=info \
@@ -315,4 +317,49 @@ done
 [ -n "$FWD_REPLY" ] || fail "реплай на форвард не дошёл до ТГ"
 say "форвард: реплай владельцу отправлен"
 
-say "ИТОГ: E2E ботов зелёный (spawn → reply → greeting → state → рестарт → private-only → media → forward)"
+# ---------- буфер ввода (#1596): опоздавший пост + правка = один батч ----------
+say "батч ввода: три сообщения + пост с большим update_id + правка"
+PROMPTS_BEFORE=$(grep -c '"event":"mock.prompt"' "$LOG_MOCK" || true)
+for _id in 50 51 52; do
+  curl -s -X POST "http://127.0.0.1:$PORT_TG/inject" -H 'Content-Type: application/json' \
+    -d "{\"update_id\":$_id,\"chat_id\":42,\"username\":\"yurvon\",\"text\":\"сообщение $_id\"}" >/dev/null
+done
+curl -s -X POST "http://127.0.0.1:$PORT_TG/inject" -H 'Content-Type: application/json' \
+  -d '{"update_id":53,"chat_id":42,"username":"yurvon","text":"пост Hy-MT3","forward_origin":{"type":"channel","chat":{"id":-100999,"type":"channel","title":"AI ML","username":"ai_machinelearning_big_data"}}}' >/dev/null
+curl -s -X POST "http://127.0.0.1:$PORT_TG/inject" -H 'Content-Type: application/json' \
+  -d '{"update_id":54,"edited_message":{"message_id":50,"text":"сообщение 50 исправлено"}}' >/dev/null
+BATCH_OK=""
+for _ in $(seq 1 20); do
+  sleep 1
+  PROMPTS_AFTER=$(grep -c '"event":"mock.prompt"' "$LOG_MOCK" || true)
+  if [ "$((PROMPTS_AFTER - PROMPTS_BEFORE))" -eq 1 ] && grep -q "Пересланный пост — канал @ai_machinelearning_big_data" "$LOG_MOCK"; then
+    BATCH_OK=1 && break
+  fi
+done
+[ -n "$BATCH_OK" ] || fail "батч ввода не доставлен одним промптом (лог: $LOG_MOCK)"
+# Содержимое батча сверяется по полному тексту промпта из лога мока:
+# маркер материала раньше команд, правка заменяет оригинал на его месте.
+python3 - "$LOG_MOCK" <<'PY'
+import json, sys
+prompts = []
+for line in open(sys.argv[1]):
+    try:
+        rec = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    fields = rec.get("fields", {})
+    if fields.get("event") == "mock.prompt":
+        prompts.append(fields.get("body", ""))
+batch = [p for p in prompts if "пост Hy-MT3" in p]
+assert len(batch) == 1, f"ожидался один батч с постом, получено {len(batch)}"
+lines = [ln.strip() for ln in batch[0].splitlines()]
+marker = "[Пересланный пост — канал @ai_machinelearning_big_data]"
+order = [marker, "пост Hy-MT3", "сообщение 50 исправлено", "сообщение 51", "сообщение 52"]
+pos = [lines.index(needle) for needle in order]
+assert pos == sorted(pos), f"порядок батча нарушен: {pos} ({lines})"
+assert "сообщение 50" not in lines, f"оригинал продублирован после правки: {lines}"
+print("[e2e-bots] батч: материал первым, правка заменила оригинал, порядок сохранён")
+PY
+say "батч доставлен одним промптом: материал первым, правка в окне обработана" 
+
+say "ИТОГ: E2E ботов зелёный (spawn → reply → greeting → state → рестарт → private-only → media → forward → batch)"
