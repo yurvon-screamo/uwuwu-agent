@@ -687,10 +687,10 @@ impl TaskWriter for TaskWriteUseCase {
         // инвариант на границе: тело без fm и без дисплей-шапки task_get
         // (агенты могут копировать старый канон — сервер держит «fm снесён»
         // сам, #1151; fm-стек инцидента #1331)
-        let clean = if explicit_clear {
-            ""
+        let clean: String = if explicit_clear {
+            String::new()
         } else {
-            crate::fm_lite::strip(strip_task_get_header(input))
+            strip_comments_tail(crate::fm_lite::strip(strip_task_get_header(input)))
         };
         // Гард пустой записи судит по ЭФФЕКТИВНОМУ контенту — тому, что
         // уйдёт в replace_body (ревью #1572 Common-1): fm-блок или шапка
@@ -703,14 +703,15 @@ impl TaskWriter for TaskWriteUseCase {
             let current = self.board.read_issue(&board, number).await?;
             return Err(UsecaseError::Board(format!(
                 "body of #{number}: write refused — the `body` parameter carries no effective \
-                 content (only fm/task_get-header wrapping, stripped on the boundary); \
+                 content (only fm/task_get-header wrapping or a comments tail from a copied \
+                 card, stripped on the boundary); \
                  task_body REPLACES the whole carrier body (write, not read; current body: \
                  {} bytes). Read the body via task_get; to clear deliberately pass \
                  body: \"\"",
                 current.body.len()
             )));
         }
-        self.board.replace_body(number, clean).await?;
+        self.board.replace_body(number, &clean).await?;
         // контрольное чтение носителя: квитанция = факт доставки (#1331)
         let repo = self.board.clone();
         let bd = board.clone();
@@ -753,7 +754,7 @@ impl TaskWriter for TaskWriteUseCase {
                     "Контрольное чтение носителя не удалось — квитанция от отправленного тела"
                 );
                 Ok(BodyWriteReceipt {
-                    body_hash: md_section::body_hash(clean),
+                    body_hash: md_section::body_hash(&clean),
                     body_size: clean.len(),
                     verified: false,
                 })
@@ -978,6 +979,123 @@ where
     } else {
         Delivery::Blind
     }
+}
+
+/// Хвост ленты комментов из полной копии карточки `task_get`.
+///
+/// Граница записи держит инвариант ADR-105: тело не несёт композит чтения.
+/// Срез ограничен записями рендера, поэтому секции, дописанные после дампа,
+/// остаются на месте. Возвращает владельца: префикс и сохранённый хвост
+/// не образуют одного заимствованного среза.
+fn strip_comments_tail(input: &str) -> String {
+    let mut current = input.to_string();
+    while let Some((from, to)) = comments_tail_cut(&current) {
+        current = format!("{}{}", &current[..from], &current[to..]);
+    }
+    current
+}
+
+/// Диапазон байт одной распознанной ленты: от пары переводов перед маркером
+/// до конца последней записи (или до пустой строки перед H2).
+fn comments_tail_cut(input: &str) -> Option<(usize, usize)> {
+    let mut lines = Vec::new();
+    let mut at = 0;
+    for piece in input.split_inclusive('\n') {
+        let body = piece.strip_suffix('\n').unwrap_or(piece);
+        let body = body.strip_suffix('\r').unwrap_or(body);
+        lines.push((at, body));
+        at += piece.len();
+    }
+
+    let mut fence = false;
+    for index in 0..lines.len() {
+        let (start, line) = lines[index];
+        if !fence && line.starts_with("--- comments (latest") && line.ends_with(") ---") {
+            if let Some(end) = comments_tail_end(input.len(), &lines, index + 1) {
+                let from = if input[..start].ends_with("\r\n\r\n") {
+                    start - 4
+                } else if input[..start].ends_with("\n\n") {
+                    start - 2
+                } else {
+                    start
+                };
+                return Some((from, end));
+            }
+        }
+        if md_section::toggles_fence(line) {
+            fence = !fence;
+        }
+    }
+    None
+}
+
+/// Конец ленты: последняя запись идёт до конца входа или до пустой строки
+/// перед H2. Состояние блока кода не наследуется от предыдущего коммента.
+fn comments_tail_end(len: usize, lines: &[(usize, &str)], from: usize) -> Option<usize> {
+    let mut index = from;
+    let mut found = false;
+    while entry_starts_at(lines, index) {
+        found = true;
+        if let Some(end) = scan_entry(lines, index + 2) {
+            return Some(end);
+        }
+        index += 2;
+        while index < lines.len() && !entry_starts_at(lines, index) {
+            index += 1;
+        }
+    }
+    if found {
+        Some(len)
+    } else {
+        None
+    }
+}
+
+/// Тело записи заканчивается на пустой строке перед H2 вне блока кода.
+fn scan_entry(lines: &[(usize, &str)], from: usize) -> Option<usize> {
+    let mut fence = false;
+    for index in from..lines.len() {
+        let line = lines[index].1;
+        if section_starts_at(lines, index, fence) {
+            return Some(lines[index].0);
+        }
+        if entry_starts_at(lines, index) {
+            return None;
+        }
+        if md_section::toggles_fence(line) {
+            fence = !fence;
+        }
+    }
+    None
+}
+
+fn entry_starts_at(lines: &[(usize, &str)], index: usize) -> bool {
+    index + 1 < lines.len() && lines[index].1 == "---" && is_comment_stamp(lines[index + 1].1)
+}
+
+fn section_starts_at(lines: &[(usize, &str)], index: usize, fence: bool) -> bool {
+    index + 1 < lines.len()
+        && !fence
+        && lines[index].1.is_empty()
+        && lines[index + 1].1.starts_with("## ")
+}
+
+/// Штамп коммента рендера: `YYYY-MM-DDTHH:MM:SSZ` (UTC).
+fn is_comment_stamp(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    if bytes.len() != 20 {
+        return false;
+    }
+    let separators = matches!(
+        (bytes[4], bytes[7], bytes[10], bytes[13], bytes[16], bytes[19]),
+        (b'-', b'-', b'T', b':', b':', b'Z')
+    );
+    if !separators {
+        return false;
+    }
+    [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18]
+        .iter()
+        .all(|&i| bytes[i].is_ascii_digit())
 }
 
 /// Дисплей-шапка task_get — рендер MCP-карточки, не носитель: агенты
@@ -1511,7 +1629,7 @@ fn render_create_body(spec: &NewTask) -> String {
     } else {
         // fm и дисплей-шапка task_get — на границе (инвариант сервера,
         // #1151; fm-стек инцидента #1331)
-        crate::fm_lite::strip(strip_task_get_header(&spec.body_md)).to_string()
+        strip_comments_tail(crate::fm_lite::strip(strip_task_get_header(&spec.body_md)))
     };
     // тело уже в канон-форме (агенты шлют «## Постановка…») — не дублируем
     // H2 (инцидент #1149: скелет prepend'ался к готовому телу)
@@ -3056,5 +3174,215 @@ mod tests {
         assert_eq!(report.section_now, 4);
         assert!(!report.confirmed, "без confirm");
         assert!(report.verified, "честная квитанция");
+    }
+
+    fn comments_tail(marker: &str, entries: &[(&str, &str)]) -> String {
+        let mut out = format!("\n\n{marker}\n");
+        for (stamp, text) in entries {
+            out.push_str(&format!("---\n{stamp}\n{text}\n"));
+        }
+        out
+    }
+
+    #[test]
+    fn comments_tail_strip_keeps_body_bytes_with_and_without_trailing_newline() {
+        for body in ["## П\n\nтело\n", "## П\n\nтело"] {
+            let input = format!(
+                "{body}{}",
+                comments_tail(
+                    "--- comments (latest 2 of 2) ---",
+                    &[
+                        ("2026-11-24T04:59:18Z", "первый"),
+                        ("2026-11-24T05:00:00Z", "второй")
+                    ]
+                )
+            );
+            assert_eq!(strip_comments_tail(&input), body, "body: {body:?}");
+        }
+    }
+
+    #[test]
+    fn comments_tail_strip_recognises_legacy_marker() {
+        let body = "## П\n\nтело\n";
+        let input = format!(
+            "{body}{}",
+            comments_tail(
+                "--- comments (latest) ---",
+                &[("2026-11-24T04:59:18Z", "коммент")]
+            )
+        );
+        assert_eq!(strip_comments_tail(&input), body);
+    }
+
+    #[test]
+    fn comments_tail_strip_keeps_sections_appended_after_dump() {
+        for base in ["## П\n\nтело\n", "## П\n\nтело"] {
+            let dump = comments_tail(
+                "--- comments (latest 1 of 1) ---",
+                &[("2026-11-24T04:59:18Z", "коммент")],
+            );
+            let assembled = format!("{base}{dump}\n## План\n\nновая секция\n");
+            let expected = format!("{base}\n## План\n\nновая секция\n");
+            assert_eq!(strip_comments_tail(&assembled), expected, "base: {base:?}");
+        }
+    }
+
+    #[test]
+    fn comments_tail_strip_keeps_section_when_heading_inside_comment() {
+        let input = "## П\n\nтело\n\n\n--- comments (latest 1 of 1) ---\n---\n2026-11-24T04:59:18Z\nтекст\n\n## Внутри коммента\n\nещё текст\n\n## План\n\nсекция\n";
+        let out = strip_comments_tail(input);
+        assert!(out.contains("## План\n\nсекция"), "секция цела: {out}");
+        assert!(!out.contains("--- comments (latest"), "маркер ушёл: {out}");
+    }
+
+    #[test]
+    fn comments_tail_strip_keeps_marker_inside_fence() {
+        let body =
+            "## П\n\n```\n--- comments (latest 1 of 1) ---\n---\n2026-11-24T04:59:18Z\nкод\n```\n";
+        assert_eq!(strip_comments_tail(body), body);
+    }
+
+    #[test]
+    fn comments_tail_strip_continues_after_false_marker() {
+        let input = "## П\n\n--- comments (latest) ---\n\nтело\n\n\n--- comments (latest 1 of 1) ---\n---\n2026-11-24T04:59:18Z\nкоммент\n";
+        assert_eq!(
+            strip_comments_tail(input),
+            "## П\n\n--- comments (latest) ---\n\nтело\n"
+        );
+    }
+
+    #[test]
+    fn comments_tail_strip_resets_fence_at_entry_start() {
+        let input = "## П\n\nтело\n\n\n--- comments (latest 2 of 2) ---\n---\n2026-11-24T04:59:18Z\n```\nнезакрытый fence\n---\n2026-11-24T05:00:00Z\nвторой\n\n## План\n\nсекция\n";
+        let out = strip_comments_tail(input);
+        assert!(out.contains("## План\n\nсекция"), "секция цела: {out}");
+        assert!(!out.contains("--- comments (latest"), "маркер ушёл: {out}");
+    }
+
+    #[test]
+    fn comments_tail_strip_cycles_through_stacked_dumps() {
+        let old = comments_tail(
+            "--- comments (latest) ---",
+            &[("2026-11-24T04:59:18Z", "старый")],
+        );
+        let current = comments_tail(
+            "--- comments (latest 1 of 1) ---",
+            &[("2026-11-25T04:59:18Z", "текущий")],
+        );
+        let input = format!("## П\n\nтело\n{old}\n## План\n\nсекция\n{current}");
+        assert_eq!(
+            strip_comments_tail(&input),
+            "## П\n\nтело\n\n## План\n\nсекция\n"
+        );
+    }
+
+    #[test]
+    fn comments_tail_strip_accepts_crlf_entries() {
+        let body = "## П\r\n\r\nтело\r\n";
+        let input = format!(
+            "{body}\r\n\r\n--- comments (latest 1 of 1) ---\r\n---\r\n2026-11-24T04:59:18Z\r\nкоммент\r\n"
+        );
+        assert_eq!(strip_comments_tail(&input), body);
+    }
+
+    #[test]
+    fn comments_tail_marker_without_entries_is_kept() {
+        let body = "## П\n\n--- comments (latest 1 of 1) ---\n\nцитата в теле\n";
+        assert_eq!(strip_comments_tail(body), body);
+    }
+
+    #[test]
+    fn comments_tail_strip_keeps_section_when_heading_in_first_of_two_entries() {
+        let input = "## П\n\nтело\n\n\n--- comments (latest 2 of 2) ---\n---\n2026-11-24T04:59:18Z\nпервый\n\n## Внутри коммента\n\nещё\n---\n2026-11-24T05:00:00Z\nвторой\n\n## План\n\nсекция\n";
+        let out = strip_comments_tail(input);
+        assert!(out.contains("## План\n\nсекция"), "секция цела: {out}");
+        assert!(!out.contains("--- comments (latest"), "маркер ушёл: {out}");
+        assert!(
+            !out.contains("2026-11-24T04:59:18Z"),
+            "первая запись ушла: {out}"
+        );
+        assert!(!out.contains("первый"), "тело первой записи ушло: {out}");
+    }
+
+    #[test]
+    fn comments_tail_strip_accepts_crlf_seam_before_section() {
+        let body = "## П\r\n\r\nтело\r\n";
+        let input = format!(
+            "{body}\r\n\r\n--- comments (latest 1 of 1) ---\r\n---\r\n2026-11-24T04:59:18Z\r\nкоммент\r\n\r\n## План\r\n\r\nсекция\r\n"
+        );
+        let out = strip_comments_tail(&input);
+        assert!(
+            out.contains("## План\r\n\r\nсекция"),
+            "CRLF-стык цел: {out}"
+        );
+        assert!(!out.contains("--- comments"), "маркер снят: {out}");
+    }
+
+    // ---- tester #1648: независимые пины главного сценария и стыка ----
+
+    // На юнит-уровне проверяем сам хелпер: композицию трёх приватных срезов
+    // из места вызова (set_body) закрывают интеграционные пины на MCP-поверхности.
+
+    #[test]
+    fn tester_copied_card_tail_strips_to_exact_body() {
+        let body = "## Постановка\n\nтело для копии.\n";
+        let tail = "\n\n--- comments (latest 2 of 2) ---\n---\n2026-11-24T04:59:18Z\nпервый\n\
+                    ---\n2026-11-24T05:00:00Z\nвторой\n";
+        let copied = format!("{body}{tail}");
+        assert_eq!(
+            strip_comments_tail(&copied),
+            body,
+            "копия карточки → тело байт-в-байт"
+        );
+    }
+
+    #[test]
+    fn tester_legacy_marker_is_stripped() {
+        let body = "## Постановка\n\nтело.\n";
+        let tail = "\n\n--- comments (latest) ---\n---\n2026-11-23T10:00:00Z\nлегаси\n";
+        assert_eq!(strip_comments_tail(&format!("{body}{tail}")), body);
+    }
+
+    #[test]
+    fn tester_seam_exact_bytes_lf_and_crlf() {
+        let comment = "\n\n--- comments (latest 1 of 1) ---\n---\n2026-11-24T04:59:18Z\nкоммент\n";
+        let comment_crlf = "\r\n\r\n--- comments (latest 1 of 1) ---\r\n---\r\n2026-11-24T04:59:18Z\r\nкоммент\r\n";
+        for (base, tail, section, expected) in [
+            (
+                "## П\n\nтело\n",
+                comment,
+                "\n## План\n\nсекция\n",
+                "## П\n\nтело\n\n## План\n\nсекция\n",
+            ),
+            (
+                "## П\n\nтело",
+                comment,
+                "\n## План\n\nсекция\n",
+                "## П\n\nтело\n## План\n\nсекция\n",
+            ),
+            (
+                "## П\r\n\r\nтело\r\n",
+                comment_crlf,
+                "\r\n## План\r\n\r\nсекция\r\n",
+                "## П\r\n\r\nтело\r\n\r\n## План\r\n\r\nсекция\r\n",
+            ),
+        ] {
+            let assembled = format!("{base}{tail}{section}");
+            assert_eq!(strip_comments_tail(&assembled), expected, "base: {base:?}");
+        }
+    }
+
+    #[test]
+    fn tester_clean_body_roundtrip_is_untouched() {
+        for body in [
+            "## Постановка\n\nчистое тело без ленты.\n",
+            "--- comments (latest 1 of 1) ---\n\nцитата в прозе без записей\n",
+        ] {
+            assert_eq!(
+                strip_comments_tail(body),
+                body,
+                "не трогаем без сигнатуры ленты"
+            );
+        }
     }
 }

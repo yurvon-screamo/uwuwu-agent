@@ -5,6 +5,10 @@ pub mod analyst;
 pub mod analyst_review;
 #[cfg(test)]
 mod cup_pins_tests;
+#[cfg(test)]
+mod degraded_list_support;
+#[cfg(test)]
+mod degraded_list_tests;
 pub mod dreamer;
 pub mod env_gc;
 #[cfg(test)]
