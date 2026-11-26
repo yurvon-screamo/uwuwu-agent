@@ -1739,6 +1739,100 @@ async fn task_create_strips_crlf_card_header_byte_exact() {
     assert!(!created.contains("--- fm ---"), "fm-блок не лёг: {created}");
 }
 
+/// #1664: голый CRLF-легаси-fm (без карточки task_get) проходит второй
+/// стриппер границы; носитель несёт чистое тело, квитанция честная.
+#[tokio::test]
+async fn task_body_strips_crlf_legacy_fm() {
+    let (tools, memory) = hub();
+    let body = "## Постановка\n\nчистое тело.\n";
+    let (number, _) = create_task(&tools, "t: CRLF-fm", body).await;
+    let crlf_body = body.replace('\n', "\r\n");
+    let with_fm = format!("---\r\ntitle: legacy\r\nstatus: Draft\r\n---\r\n\r\n{crlf_body}");
+
+    let receipt = call(
+        &tools,
+        "task_body",
+        json!({ "number": number, "body": &with_fm }),
+    )
+    .await
+    .expect("task_body ок");
+    assert!(receipt.contains("replaced"), "квитанция: {receipt}");
+
+    let stored = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert_eq!(stored, crlf_body, "тело без fm: {stored}");
+    assert!(
+        receipt.contains(&uwuwu_usecase::body_hash(&stored)),
+        "хэш квитанции = хэш записанного тела: {receipt}"
+    );
+}
+
+/// #1664: один CRLF-fm без эффективного контента упирается в отказ #1572.
+#[tokio::test]
+async fn task_body_refuses_crlf_fm_only() {
+    let (tools, memory) = hub();
+    let (number, _) = create_task(&tools, "t: CRLF-fm-only", &big_body()).await;
+    let before = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+
+    let err = call(
+        &tools,
+        "task_body",
+        json!({
+            "number": number,
+            "body": "---\r\ntitle: x\r\nstatus: Draft\r\n---\r\n\r\n"
+        }),
+    )
+    .await
+    .expect_err("CRLF-fm без тела — отказ");
+    assert!(
+        err.contains("effective content"),
+        "отказ называет пустой эффективный контент: {err}"
+    );
+    let intact = memory
+        .read_issue("Задачи uwuwu", number)
+        .await
+        .expect("read")
+        .body;
+    assert_eq!(intact, before, "носитель цел");
+}
+
+/// #1664: task_create с CRLF-легаси-fm даёт те же байты, что create из
+/// чистого CRLF-тела.
+#[tokio::test]
+async fn task_create_strips_crlf_legacy_fm_byte_exact() {
+    let (tools, memory) = hub();
+    let body = "## Постановка\r\n\r\nчистое тело.\r\n";
+    let (control, _) = create_task(&tools, "t: контроль CRLF-create", body).await;
+    let control_stored = memory
+        .read_issue("Задачи uwuwu", control)
+        .await
+        .expect("read control")
+        .body;
+    let with_fm = format!("---\r\ntitle: legacy\r\nstatus: Draft\r\n---\r\n\r\n{body}");
+
+    let text = call(
+        &tools,
+        "task_create",
+        json!({ "title": "t: CRLF-fm create", "body": &with_fm }),
+    )
+    .await
+    .expect("task_create ок");
+    let created = memory
+        .read_issue("Задачи uwuwu", receipt_number(&text))
+        .await
+        .expect("read created")
+        .body;
+    assert_eq!(created, control_stored, "байт-в-байт: {created}");
+    assert!(!created.contains("status: Draft"), "fm не лёг: {created}");
+}
+
 /// #1604 (ревью раунда 5, Low-2): строгость зеркала держится и на
 /// актуальной 8-ключевой форме (fact_track + body_bytes после слива
 /// #1631) — чужая строка между type и body_hash ломает срез, и вся

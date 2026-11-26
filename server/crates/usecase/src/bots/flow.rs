@@ -280,6 +280,13 @@ mod tests {
         assert_eq!(normalize_lessons(""), "");
     }
 
+    /// #1664: CRLF-fm носителя уроков срезается, CRLF урока остаётся.
+    #[test]
+    fn normalize_lessons_strips_crlf_fm_without_rewriting_body() {
+        let raw = "---\r\ntitle: Уроки\r\n---\r\n\r\nурок один\r\nурок два";
+        assert_eq!(normalize_lessons(raw), "урок один\r\nурок два");
+    }
+
     #[test]
     fn chunks_at_limit_preferring_newline() {
         assert_eq!(chunk_reply("короткий"), vec!["короткий"]);
