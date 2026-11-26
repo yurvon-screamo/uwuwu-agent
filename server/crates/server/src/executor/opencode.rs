@@ -38,17 +38,17 @@ fn message_activity_ms(msg: &Value) -> Option<u64> {
         .or_else(|| t["created"].as_u64())
 }
 
-/// Session busy verdict (#1231 semantics, #409 zombie guard, #1547 liveness):
-/// busy iff busy > idle and the session keeps updating. The age of `time.busy`
-/// alone does not prove an aborted turn: a long live turn still writes messages,
-/// while a crashed turn keeps busy > idle forever but stops updating.
+/// busy-вердикт сессии (#1231 семантика, #409 зомби-гард, #1547 живость):
+/// busy ⟺ busy > idle И сессия обновлялась за последние 30 минут.
+/// Возраст `time.busy` не доказывает оборванный ход: живой длинный ход
+/// продолжает писать сообщения, оборванный — молчит.
 fn session_busy(s: &serde_json::Value, now_ms: u64) -> bool {
-    const ZOMBIE_BUSY_MS: u64 = 30 * 60_000;
+    const STALE_UPDATE_MS: u64 = 30 * 60_000;
     let busy_ms = s["time"]["busy"].as_u64();
     let idle_ms = s["time"]["idle"].as_u64();
     let updated_ms = s["time"]["updated"].as_u64();
     busy_ms.is_some_and(|b| idle_ms.is_none_or(|i| b > i))
-        && updated_ms.is_some_and(|u| now_ms.saturating_sub(u) < ZOMBIE_BUSY_MS)
+        && updated_ms.is_some_and(|u| now_ms.saturating_sub(u) < STALE_UPDATE_MS)
 }
 
 /// Тело ответа message-эндпоинта opencode: голый массив ИЛИ обёртка
@@ -968,6 +968,44 @@ mod tests {
     }
 
     #[test]
+    fn fresh_busy_flag_without_updates_does_not_hold_slot() {
+        // #1547: расхождение со старым правилом — флаг свежий, но лента
+        // молчит дольше 30 минут. Такой ход слот не держит.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let silent = serde_json::json!({
+            "id": "s1", "agent": "developer",
+            "time": {
+                "busy": now - 60_000, "idle": now - 120_000,
+                "updated": now - 31 * 60_000
+            }
+        });
+        assert!(
+            !session_busy(&silent, now),
+            "свежий флаг без обновлений — не busy"
+        );
+    }
+
+    #[test]
+    fn session_without_updated_field_does_not_hold_slot() {
+        // #1547: поле обязательно — до правки сессия считалась busy по флагу.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let no_updated = serde_json::json!({
+            "id": "s1", "agent": "developer",
+            "time": { "busy": now - 60_000, "idle": now - 120_000 }
+        });
+        assert!(
+            !session_busy(&no_updated, now),
+            "без time.updated слот не держится"
+        );
+    }
+
+    #[test]
     fn message_activity_reads_live_203_shape() {
         // живой прод-ответ 17.11 (сессия #1202, хвост order=desc):
         // idle-событие несёт только time.created, assistant —
@@ -1084,6 +1122,7 @@ mod tests {
         let mut item = page_item("s", "/x");
         item["time"]["busy"] = busy;
         item["time"]["idle"] = idle;
+        // #1547: живость теперь читается по updated, фикстура свежая к now.
         item["time"]["updated"] = serde_json::json!(std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1099,8 +1138,8 @@ mod tests {
         // #1231: busy ⟺ time.busy > time.idle — ход в полёте (Started
         // пишет time.busy, idle-финал пишет time.idle). outcome — атрибут
         // последнего завершённого хода, живость не выражает.
-        // PR #409: плюс зомби-гард — флаг busy свежее 30 мин (фикстуры
-        // динамические от now: статичные ms протухают по определению).
+        // #409/#1547: зомби-гард по свежести time.updated, не по возрасту
+        // флага busy (фикстуры динамические от now: статичные ms протухают).
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

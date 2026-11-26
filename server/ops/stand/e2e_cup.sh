@@ -10,12 +10,14 @@
 #     reachable-busy живого A (#1450), строки A не морозятся;
 #   V3 восстановление: B возвращается — его очередь выезжает
 #     (слепой hold #1263 снимается);
-#   V4 зомби-флаг: busy>idle старше 30 мин (PR #409) не держит слот;
+#   V4 зомби-ход: busy>idle без обновлений старше 30 мин (#409/#1547) не держит слот;
 #   V5 мягкий сталл-пинг: при полном капе держится (#1313),
 #     на свободном слоте доставляется;
 #   V6 глобальный порядок кандидатов: продолжение начатой на поздней
 #     доске получает свободный слот раньше нового high-кандидата первой
 #     доски (#1586) — live-пин главного сценария (тик-скип доставки).
+#   V7 длинный живой ход: старый busy-флаг при свежем time.updated держит
+#     слот, кандидат held_cup; освобождение выпускает его (#1547).
 #
 # Запуск: server/ops/stand/e2e_cup.sh   (из каталога server; cargo build сам)
 # Порты: оверрайды PORT_MOCK_A/PORT_MOCK_B/PORT_SRV заданы — как есть
@@ -131,12 +133,14 @@ start_mock() { # $1 порт, $2 лог, $3 mode — ждём поднятия �
   [ -n "$ok" ] || fail "мок на порту $1 не поднялся за 15 с (лог: $2)"
 }
 stop_pid() { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
-mk_busy() { # $1 порт, $2 ms_ago — свежий/протухший busy; ретрай ×2
+mk_busy() { # $1 порт, $2 ms_ago флага, $3 ms_ago обновления (по умолчанию = флаг); ретрай ×2
   local id=""
+  local updated_field=""
+  [ -n "${3:-}" ] && updated_field=",\"updated_ms_ago\":$3"
   for _ in 1 2; do
     id=$(curl -s --max-time 5 -X POST "http://127.0.0.1:$1/api/session" \
       -H 'Content-Type: application/json' \
-      -d "{\"title\":\"busy-filler\",\"location\":{\"directory\":\"/tmp\"},\"busy_ms_ago\":$2}" \
+      -d "{\"title\":\"busy-filler\",\"location\":{\"directory\":\"/tmp\"},\"busy_ms_ago\":$2$updated_field}" \
       | grep -oE 'ses_mock[0-9a-f]+' | head -1 || true)
     [ -n "$id" ] && break
     sleep 2
@@ -208,7 +212,7 @@ P2_SPAWN=$(grep -oE '"event":"spawn.done","number":3400' "$LOG_SRV" | wc -l || t
 say "V3 ок: восстановление исполнителя выпускает его очередь"
 
 # ===== V4: зомби-флаг не держит слот =====
-say "V4: busy-флаг старше 30 мин (PR #409) — слот свободен, кандидат едет"
+say "V4: зомби без обновлений старше 30 мин (#409/#1547) — слот свободен, кандидат едет"
 stop_pid "$SRV_PID"; SRV_PID=""
 rm -f "$STATE"
 Z=$(mk_busy "$PORT_A" 2100000)   # 35 мин назад — протухший busy
@@ -320,4 +324,30 @@ if [ "$DONE6" -lt "$DEL6" ]; then
 fi
 say "V6 ок: слот у продолжения с поздней доски (del=$DEL6, tick=$TICK6, spawn=$DONE6); новичок ждёт следующего слота"
 
-say "ИТОГ: V1–V6 зелёные — CUP-матрица живьём"
+# ===== V7: длинный живой ход держит слот (#1547) =====
+say "V7: старый busy-флаг при свежем updated — живой ход держит кап"
+stop_pid "$SRV_PID"; SRV_PID=""
+rm -f "$STATE"
+L7=$(mk_busy "$PORT_A" 2100000 30000)   # флаг 35 мин назад, обновление 30 с назад
+[ -n "$L7" ] || fail "V7: филлер длинного хода не создан"
+HELD_BEFORE=$(grep -c '"event":"spawn.held_cup"' "$LOG_SRV" || true)
+SPAWN_BEFORE=$(grep -c '"event":"spawn.done","number":3300' "$LOG_SRV" || true)
+UWUWU_SERVER_CONFIG=$CONFIG UWUWU_SERVER_STATE=$STATE PORT=$PORT_SRV \
+  UWUWU_SERVER_MODE=live UWUWU_SERVER_BEARER="$BEARER" UWUWU_OPENCODE_PASSWORD=x \
+  UWUWU_MOCK_SEED="Задачи uwuwu:3300:Design:Medium" \
+  RUST_LOG=info "$BIN_SRV" >>"$LOG_SRV" 2>&1 &
+SRV_PID=$!
+wait_phase 25
+HELD_AFTER=$(grep -c '"event":"spawn.held_cup"' "$LOG_SRV" || true)
+[ "$HELD_AFTER" -gt "$HELD_BEFORE" ] || fail "V7: длинный живой ход не держит слот — held_cup нет"
+SPAWN_AFTER=$(grep -c '"event":"spawn.done","number":3300' "$LOG_SRV" || true)
+[ "$SPAWN_AFTER" -eq "$SPAWN_BEFORE" ] || fail "V7: кандидат заспавнен поверх идущего хода"
+say "V7: кап полон по живому длинному ходу — held_cup жив"
+# освобождение слота — кандидат выезжает
+curl -s --max-time 5 -X DELETE "http://127.0.0.1:$PORT_A/api/session/$L7" >/dev/null
+wait_phase 25
+SPAWN_DRAIN=$(grep -c '"event":"spawn.done","number":3300' "$LOG_SRV" || true)
+[ "$SPAWN_DRAIN" -gt "$SPAWN_BEFORE" ] || fail "V7: после освобождения кандидат не выехал"
+say "V7 ок: старый флаг + свежая лента держит слот, освобождение выпускает кандидата"
+
+say "ИТОГ: V1–V7 зелёные — CUP-матрица живьём"

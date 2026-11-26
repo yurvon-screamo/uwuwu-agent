@@ -71,7 +71,8 @@ struct MockSession {
     /// «работа» ещё идёт (agent-режим).
     busy: bool,
     /// time.busy/time.idle API (Started/idle): busy ⟺ busy_ms > idle_ms
-    /// (нулевое значение = нет события) — семантика CUP-учёта (#1231).
+    /// (нулевое значение = нет события); слот держится, пока свеж updated_ms
+    /// (#1231, зомби-гард #409, живость #1547).
     busy_ms: u64,
     idle_ms: u64,
     dead: bool,
@@ -675,6 +676,10 @@ async fn create_session(
     let zombie_ms = body["busy_ms_ago"]
         .as_u64()
         .map(|ago| created_ms.saturating_sub(ago));
+    let updated_ms = body["updated_ms_ago"]
+        .as_u64()
+        .map(|ago| created_ms.saturating_sub(ago))
+        .unwrap_or(zombie_ms.unwrap_or(created_ms));
     let session = MockSession {
         id: id.clone(),
         agent: body["agent"].as_str().unwrap_or_default().to_string(),
@@ -684,12 +689,13 @@ async fn create_session(
             .unwrap_or_default()
             .to_string(),
         model,
-        updated_ms: zombie_ms.unwrap_or(created_ms),
+        updated_ms,
         outcome: String::new(),
         tokens_in: 0,
         tokens_out: 0,
         busy: false,
-        // dev endpoint (#1313 V4): a zombie has both busy and updates in the past.
+        // Дев-ручка стенда: зомби старит оба поля; V7 даёт старый busy
+        // при свежем updated — длинный живой ход (#1547).
         busy_ms: zombie_ms.unwrap_or(0),
         idle_ms: 0,
         dead: mode == "dead",
