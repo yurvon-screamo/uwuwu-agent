@@ -8374,6 +8374,66 @@ async fn analyst_compact_defers_in_peak_window_1661() {
 }
 
 #[tokio::test]
+async fn compact_pass_peak_defers_only_target_provider_1661() {
+    // Мерж master (#1680) перенёс пик-гейт в общее ядро: после разбора
+    // модели окно держит только zai-coding-plan, чужие провайдеры идут
+    // без отложки. Пин ловит снятие `peak_applies` в CompactPass::run().
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst",
+        "a",
+        "ses_glm",
+        "zai-coding-plan/glm-5.4#high",
+        "/tmp/checkout",
+    );
+    state.set_master_binding(
+        "analyst",
+        "b",
+        "ses_flash",
+        "opencode-go/hy4-flash-free#high",
+        "/tmp/checkout",
+    );
+    let mut fake = FakeSessions::new();
+    fake.activity_ms = Some(0);
+    fake.usage.lock().unwrap().insert("ses_glm".into(), 90.0);
+    fake.usage.lock().unwrap().insert("ses_flash".into(), 90.0);
+    let sessions = Arc::new(fake);
+    let board = |p: &str| AnalystBoard {
+        project: p.into(),
+        board: "B".into(),
+        checkout: "/tmp/checkout".into(),
+    };
+    let base = analyst_compact_uc(
+        state.clone(),
+        sessions.clone(),
+        Arc::new(PeakCompactClock),
+        Some(compact_policy_1607()),
+        7,
+    );
+    let u = AnalystUseCase {
+        boards: vec![board("a"), board("b")],
+        peak: PeakWindow {
+            enabled: true,
+            start_min: 360,
+            end_min: 600,
+        },
+        ..base
+    };
+    u.tick().await.unwrap();
+    assert_eq!(
+        sessions.compacted.lock().unwrap().as_slice(),
+        ["ses_flash"],
+        "в пике отложена только GLM-привязка, flash адмитится"
+    );
+    assert_eq!(state.master_compact_ms("analyst", "a"), 0, "метки GLM нет");
+    assert_eq!(
+        state.master_compact_ms("analyst", "b"),
+        20_000_000,
+        "метка flash стоит"
+    );
+}
+
+#[tokio::test]
 async fn analyst_compact_skips_dead_binding_1661() {
     // Dead-привязка аналитика компактом не трогается (парность с #1634).
     let state = Arc::new(MemState(Mutex::default()));
