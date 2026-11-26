@@ -759,7 +759,9 @@ fn doc_md(model: &str, token_env: &str, manual: &str) -> String {
 fn private_update(id: u64, username: &str, text: &str) -> TgUpdate {
     TgUpdate {
         update_id: id,
+        edited_message: None,
         message: Some(TgMessage {
+            message_id: id as i64,
             chat_type: "private".into(),
             chat_id: 42,
             from_username: Some(username.into()),
@@ -782,7 +784,9 @@ fn media_update(
 ) -> TgUpdate {
     TgUpdate {
         update_id: id,
+        edited_message: None,
         message: Some(TgMessage {
+            message_id: id as i64,
             chat_type: "private".into(),
             chat_id: 42,
             from_username: Some(username.into()),
@@ -807,7 +811,9 @@ fn media_update(
 fn group_update(id: u64) -> TgUpdate {
     TgUpdate {
         update_id: id,
+        edited_message: None,
         message: Some(TgMessage {
+            message_id: id as i64,
             chat_type: "group".into(),
             chat_id: -100,
             from_username: Some("yurvon".into()),
@@ -858,6 +864,7 @@ fn deps(
         tick_state: Arc::new(MemTickState::default()),
         reply_cap_ms,
         reply_poll_ms,
+        debounce_ms: 20,
         retry_pause_ms: 10,
     }
 }
@@ -891,6 +898,7 @@ fn supervisor(
     sup.token_of = Arc::new(move |env| tokens.get(env).cloned());
     sup.reply_cap_ms = 300;
     sup.reply_poll_ms = 10;
+    sup.debounce_ms = 20;
     sup.guard = GuardTiming {
         backoff_base_ms: 200,
         backoff_cap_ms: 1_000,
@@ -1213,6 +1221,7 @@ async fn send_failure_holds_offset_and_retries() {
     let sessions = FakeSessions::new();
     let state = Arc::new(FakeState::default());
     tg.fail_send.store(true, Ordering::SeqCst);
+    let (_guard, records) = trap_events();
     let task = spawn_bot_task(deps(
         tg.clone(),
         sessions.clone(),
@@ -1221,9 +1230,19 @@ async fn send_failure_holds_offset_and_retries() {
         10,
         BotLive::new(Some("yurvon".into()), None, "м".into()),
     ));
-    // сбой отправки: offset держится, апдейт не подтверждён
-    let held = wait_until(|| tg.polls.load(Ordering::SeqCst) >= 2, 3000).await;
-    assert!(held, "раннер сделал повторный полл после сбоя");
+    // сбой отправки при сбросе батча: offset держится, сброс повторяется
+    let held = wait_until(
+        || {
+            records
+                .lock()
+                .expect("trap lock")
+                .iter()
+                .any(|r| r.contains("bot.flush_failed"))
+        },
+        3000,
+    )
+    .await;
+    assert!(held, "раннер не зафиксировал повтор сброса после сбоя");
     assert_eq!(
         state.bot_offset(SLUG),
         None,
@@ -3025,4 +3044,130 @@ async fn lessons_read_failure_keeps_last_known_no_revocation() {
         snap[2].1, "после восстановления",
         "повторной доставки/отзыва нет — носитель не менялся"
     );
+}
+
+// ---------- буфер ввода (#1596) ----------
+
+/// Правка сообщения приходит отдельным edited_message-апдейтом.
+fn edited_update(id: u64, message_id: i64, username: &str, text: &str) -> TgUpdate {
+    let mut u = private_update(id, username, text);
+    u.edited_message = u.message.take();
+    u.edited_message.as_mut().expect("edited").message_id = message_id;
+    u
+}
+
+/// Инстанс 24.11: пост доехал после трёх сообщений (больший update_id).
+/// Батч обязан поставить материал раньше команд, а не узаконить обгон.
+#[tokio::test]
+async fn late_forward_material_precedes_following_messages() {
+    let tg = FakeTg::new(vec![
+        private_update(9, "yurvon", "первое"),
+        private_update(10, "yurvon", "второе"),
+        private_update(11, "yurvon", "третье"),
+        private_update(12, "yurvon", "пост про Hy-MT3"),
+    ]);
+    tg.queue.lock().expect("l")[3]
+        .message
+        .as_mut()
+        .expect("m")
+        .forward = Some("канал @ai".into());
+    let sessions = FakeSessions::new();
+    let task = spawn_bot_task(deps(
+        tg.clone(),
+        sessions.clone(),
+        Arc::new(FakeState::default()),
+        300,
+        10,
+        BotLive::new(Some("yurvon".into()), None, "м".into()),
+    ));
+    let ok = wait_until(|| sessions.prompts_snapshot().len() == 1, 2000).await;
+    task.abort();
+    assert!(ok, "батч не сброшен в сессию");
+    let prompts = sessions.prompts_snapshot();
+    let p = &prompts[0].1;
+    for text in ["первое", "второе", "третье", "пост про Hy-MT3"] {
+        assert!(p.contains(text), "элемент батча потерян: {p}");
+    }
+    let marker = p.find("[Пересланный пост — канал @ai]").expect("маркер");
+    let first = p.find("первое").expect("первое сообщение");
+    assert!(marker < first, "материал обогнан последующими: {p}");
+}
+
+/// Правка в окне заменяет оригинал, не дублируя его в батче.
+#[tokio::test]
+async fn edited_message_replaces_original_in_batch() {
+    let tg = FakeTg::new(vec![
+        private_update(20, "yurvon", "старый текст"),
+        edited_update(21, 20, "yurvon", "новый текст"),
+    ]);
+    let sessions = FakeSessions::new();
+    let task = spawn_bot_task(deps(
+        tg,
+        sessions.clone(),
+        Arc::new(FakeState::default()),
+        300,
+        10,
+        BotLive::new(Some("yurvon".into()), None, "м".into()),
+    ));
+    let ok = wait_until(|| sessions.prompts_snapshot().len() == 1, 2000).await;
+    task.abort();
+    assert!(ok, "батч не сброшен");
+    let p = &sessions.prompts_snapshot()[0].1;
+    assert!(p.contains("новый текст"), "правка не доехала: {p}");
+    assert!(!p.contains("старый текст"), "оригинал продублирован: {p}");
+}
+
+/// Новое сообщение в окне перезапускает таймер: два сообщения — один батч.
+#[tokio::test]
+async fn new_message_resets_window_into_one_batch() {
+    let tg = FakeTg::new(vec![private_update(30, "yurvon", "первый")]);
+    let sessions = FakeSessions::new();
+    let mut d = deps(
+        tg.clone(),
+        sessions.clone(),
+        Arc::new(FakeState::default()),
+        300,
+        10,
+        BotLive::new(Some("yurvon".into()), None, "м".into()),
+    );
+    d.debounce_ms = 250;
+    let task = spawn_bot_task(d);
+    sleep(Duration::from_millis(60)).await;
+    tg.inject(private_update(31, "yurvon", "второй"));
+    let ok = wait_until(|| sessions.prompts_snapshot().len() == 1, 2000).await;
+    sleep(Duration::from_millis(300)).await;
+    task.abort();
+    assert!(ok, "батч не сброшен");
+    let prompts = sessions.prompts_snapshot();
+    assert_eq!(prompts.len(), 1, "окно не перезапустилось: {prompts:?}");
+    assert!(prompts[0].1.contains("первый") && prompts[0].1.contains("второй"));
+}
+
+/// Offset персистится только после сброса; локальный poll-offset при этом
+/// уже двигается — повторного чтения того же апдейта в ране нет.
+#[tokio::test]
+async fn offset_persisted_only_after_flush() {
+    let state = Arc::new(FakeState::default());
+    let tg = FakeTg::new(vec![private_update(40, "yurvon", "проверка offset")]);
+    let sessions = FakeSessions::new();
+    let mut d = deps(
+        tg,
+        sessions.clone(),
+        state.clone(),
+        300,
+        10,
+        BotLive::new(Some("yurvon".into()), None, "м".into()),
+    );
+    d.debounce_ms = 300;
+    let task = spawn_bot_task(d);
+    sleep(Duration::from_millis(80)).await;
+    assert!(
+        state.bot_offset(SLUG).is_none(),
+        "offset записан до сброса батча"
+    );
+    let ok = wait_until(|| sessions.prompts_snapshot().len() == 1, 2000).await;
+    sleep(Duration::from_millis(30)).await;
+    task.abort();
+    assert!(ok, "батч не сброшен");
+    assert_eq!(state.bot_offset(SLUG), Some(41));
 }

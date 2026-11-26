@@ -1,17 +1,17 @@
-//! Бот-задача: цикл TG long-poll → входящее → prompt вечной opencode-сессии
-//! (методичка префиксом) → ожидание реплая опросом хвоста → sendMessage
-//! чанками. Сообщения обрабатываются последовательно — контекст сессии
-//! консистентен. Спавны — вне спавн-бюджета (bootstrap-гейтвей, #1150).
+//! Бот-задача: цикл TG long-poll → буфер ввода (#1596) → один prompt
+//! вечной opencode-сессии на батч → ожидание реплая → sendMessage чанками.
+//! Сообщения обрабатываются последовательно — контекст сессии консистентен.
+//! Спавны — вне спавн-бюджета (bootstrap-гейтвей, #1150).
 
-use super::BotLive;
+use super::{inbox, BotLive};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use uwuwu_domain::{AgentSlot, BotModel, ModelRef};
+#[cfg(test)]
+use uwuwu_usecase::bots::TgMessage;
 use uwuwu_usecase::bots::{
-    build_lessons_prompt, build_lessons_revoked_prompt, build_prompt, chunk_reply,
-    classify_message, BotStateStore, Incoming, MediaKind, TelegramGateway, TgMedia, TgMessage,
-    TgUpdate,
+    classify_message, BotStateStore, Incoming, InputBuffer, TelegramGateway, TgUpdate,
 };
 use uwuwu_usecase::{
     AgentSessionGateway, DreamerMark, Liveness, SessionSpec, TickStateStore, UsecaseResult,
@@ -22,12 +22,15 @@ pub(crate) const RETRY_PAUSE_MS: u64 = 10_000;
 const FALLBACK: &str = "Не успел ответить — напиши ещё раз.";
 /// Потолок скачивания Bot API: документированные «20 MB» — двоичные,
 /// граница getFile ровно 20 971 520 B (план #1171).
-const TG_MAX_FILE_BYTES: i64 = 20 * 1024 * 1024;
-const REFUSE_KIND: &str = "Такой тип файлов не принимаю (видео/голос/стикер) — пришли фото \
+pub(crate) const TG_MAX_FILE_BYTES: i64 = 20 * 1024 * 1024;
+pub(crate) const REFUSE_KIND: &str =
+    "Такой тип файлов не принимаю (видео/голос/стикер) — пришли фото \
 или файлом (как документ), либо кинь файл прямо в задачу на GitHub.";
-const REFUSE_OVERSIZE: &str = "Файл слишком большой (>20 МБ) — Telegram не даёт ботам его \
+pub(crate) const REFUSE_OVERSIZE: &str =
+    "Файл слишком большой (>20 МБ) — Telegram не даёт ботам его \
 скачать. Приложи файл прямо в задачу на GitHub.";
-const REFUSE_FAILED: &str = "Не смог забрать файл — пришли заново или кинь прямо в задачу \
+pub(crate) const REFUSE_FAILED: &str =
+    "Не смог забрать файл — пришли заново или кинь прямо в задачу \
 на GitHub.";
 
 /// Структурные поля спеки: фиксируются на жизнь задачи (смена = рестарт
@@ -56,36 +59,75 @@ pub(crate) struct BotDeps {
     /// Потолок ожидания реплая и шаг опроса (константы — поля ради тестов).
     pub reply_cap_ms: u64,
     pub reply_poll_ms: u64,
+    /// Окно буфера ввода (#1596): минута в проде, короткое в тестах.
+    pub debounce_ms: u64,
     /// Пауза между поллами: после сбоя обработки и в poll-fail ветке.
     pub retry_pause_ms: u64,
 }
 
-/// Запустить бот-задачу; падение задачи — рестарт с луп-гвардом супервизора.
+enum Absorb {
+    /// Ввод принят в буфер — окно перезапускается.
+    Done,
+    /// Апдейт поглощён без ввода — таймер не трогается.
+    Noop,
+    /// Сбой отправки greeting — offset держится до ретрая.
+    Held,
+}
+
+/// Запустить бот-задача; падение задачи — рестарт с луп-гвардом супервизора.
 pub(crate) fn spawn_bot_task(deps: BotDeps) -> JoinHandle<()> {
     let slug = deps.slug.clone();
     tokio::spawn(async move {
         tracing::info!(event = "bot.started", slug = %deps.slug, "Бот-задача запущена");
-        let mut offset = deps.state.bot_offset(&deps.slug);
+        let mut buffer = InputBuffer::default();
+        let mut deadline: Option<Instant> = None;
+        // Запросный offset двигается при приёме; в state он пишется только
+        // после успешного сброса (#1596) — рестарт перечитает бандл.
+        let mut poll_offset = deps.state.bot_offset(&deps.slug);
         loop {
-            match deps.tg.get_updates(offset, TG_POLL_SEC).await {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                flush_pending(&deps, &buffer).await;
+                buffer = InputBuffer::default();
+                deadline = None;
+                continue;
+            }
+            // 25-секундный long-poll не перескакивает через дедлайн окна.
+            let wait_secs = deadline
+                .map(|d| {
+                    d.saturating_duration_since(Instant::now())
+                        .as_secs()
+                        .clamp(1, TG_POLL_SEC)
+                })
+                .unwrap_or(TG_POLL_SEC);
+            match deps.tg.get_updates(poll_offset, wait_secs).await {
                 Ok(updates) => {
-                    for u in updates {
-                        if !handle_update(&deps, &u).await {
-                            // Обработка не удалась: offset НЕ двигается —
-                            // апдейт и хвост батча переедут с следующим
-                            // поллом (план #1150: offset персистится после
-                            // отправки; дубль при ретрае лучше потери).
-                            tracing::warn!(event = "bot.offset_held", slug = %deps.slug,
-                                update_id = u.update_id, "Апдейт не обработан — ретрай");
-                            tokio::time::sleep(Duration::from_millis(deps.retry_pause_ms)).await;
-                            break;
+                    let mut held = false;
+                    for u in &updates {
+                        match absorb_update(&deps, u, &mut buffer).await {
+                            Absorb::Done => {
+                                poll_offset = Some(u.update_id + 1);
+                                deadline =
+                                    Some(Instant::now() + Duration::from_millis(deps.debounce_ms));
+                            }
+                            Absorb::Noop => {
+                                poll_offset = Some(u.update_id + 1);
+                                // Поглощённые апдейты подтверждаются сразу,
+                                // но не раньше сброса ждущего батча:
+                                // иначе падение потеряло бы ждущие вводы.
+                                if buffer.is_empty() {
+                                    confirm_offset(&deps, u.update_id + 1, "поглощённого апдейта");
+                                }
+                            }
+                            Absorb::Held => {
+                                held = true;
+                                break;
+                            }
                         }
-                        offset = Some(u.update_id + 1);
-                        deps.state.set_bot_offset(&deps.slug, u.update_id + 1);
-                        if let Err(e) = deps.state.save() {
-                            tracing::warn!(event = "bot.state_save_failed", slug = %deps.slug,
-                                error = %e, "Offset не персистится");
-                        }
+                    }
+                    if held {
+                        tracing::warn!(event = "bot.offset_held", slug = %slug,
+                            "greeting не отправлен — offset держится до ретрая");
+                        tokio::time::sleep(Duration::from_millis(deps.retry_pause_ms)).await;
                     }
                 }
                 Err(e) => {
@@ -98,45 +140,63 @@ pub(crate) fn spawn_bot_task(deps: BotDeps) -> JoinHandle<()> {
     })
 }
 
-/// Апдейт: true — обработан/поглощён (offset можно двигать), false —
-/// сбой обработки (offset держится до успешного ретрая).
-async fn handle_update(deps: &BotDeps, u: &TgUpdate) -> bool {
-    let Some(m) = &u.message else {
-        return true; // не-message апдейт поглощается без обработки
-    };
-    if let Err(e) = process_message(deps, m).await {
-        tracing::warn!(event = "bot.process_failed", slug = %deps.slug,
-            update_id = u.update_id, error = %e, "Апдейт не обработан");
-        return false;
+/// Сброс с ретраем и подтверждение offset батча (#1596): offset пишется
+/// только после успешной доставки, при сбое бандл остаётся в буфере.
+async fn flush_pending(deps: &BotDeps, buffer: &InputBuffer) {
+    while let Err(e) = inbox::flush(deps, buffer).await {
+        tracing::warn!(event = "bot.flush_failed", slug = %deps.slug, error = %e,
+            "Сброс буфера не удался — повтор");
+        tokio::time::sleep(Duration::from_millis(deps.retry_pause_ms)).await;
     }
-    true
+    let max_id = buffer.max_update_id();
+    if max_id > 0 {
+        confirm_offset(deps, max_id + 1, "батча");
+    }
 }
 
-pub(crate) async fn process_message(deps: &BotDeps, m: &TgMessage) -> UsecaseResult<()> {
-    let view = deps.live.view();
-    let Some(incoming) = classify_message(m, view.owner.as_deref()) else {
-        tracing::info!(event = "bot.skipped", slug = %deps.slug, chat_id = m.chat_id,
-            "Не private или не владелец — молча");
-        return Ok(());
-    };
-    match incoming {
-        Incoming::Text(text) => {
-            if text == "/start" {
-                if let Some(greeting) = view.greeting {
-                    return send(deps, m.chat_id, &greeting).await;
-                }
-            }
-            run_turn(
-                deps,
-                m.chat_id,
-                &format!("{}{text}", forward_line(&m.forward)),
-            )
-            .await
-        }
-        Incoming::Media { caption, media } => {
-            process_media(deps, m.chat_id, caption, media, &m.forward).await
-        }
+fn confirm_offset(deps: &BotDeps, offset: u64, source: &str) {
+    deps.state.set_bot_offset(&deps.slug, offset);
+    if let Err(e) = deps.state.save() {
+        tracing::warn!(event = "bot.state_save_failed", slug = %deps.slug, error = %e,
+            "Offset {source} не персистится");
     }
+}
+
+/// Апдейт → буфер. message и edited_message идут одним путём (#1596);
+/// не-private/чужой/не-сообщение поглощаются без перезапуска окна.
+async fn absorb_update(deps: &BotDeps, u: &TgUpdate, buffer: &mut InputBuffer) -> Absorb {
+    let (message, is_edit) = match (&u.message, &u.edited_message) {
+        (Some(m), _) => (m, false),
+        (None, Some(m)) => (m, true),
+        (None, None) => return Absorb::Noop,
+    };
+    let view = deps.live.view();
+    let Some(incoming) = classify_message(message, view.owner.as_deref()) else {
+        tracing::info!(event = "bot.skipped", slug = %deps.slug, chat_id = message.chat_id,
+            "Не private или не владелец — молча");
+        return Absorb::Noop;
+    };
+    if matches!(&incoming, Incoming::Text(text) if text == "/start") {
+        if let Some(greeting) = view.greeting {
+            if let Err(e) = send(deps, message.chat_id, &greeting).await {
+                tracing::warn!(event = "bot.greeting_failed", slug = %deps.slug, error = %e,
+                    "Greeting не отправлен — offset держится");
+                return Absorb::Held;
+            }
+        }
+        return Absorb::Noop;
+    }
+    buffer.push(u.update_id, message.clone(), is_edit);
+    Absorb::Done
+}
+
+/// Адаптер для прямых вызовов одного сообщения из тестов: тот же сброс,
+/// что и в раннере, без накопления окна. В проде не используется.
+#[cfg(test)]
+pub(crate) async fn process_message(deps: &BotDeps, m: &TgMessage) -> UsecaseResult<()> {
+    let mut buffer = InputBuffer::default();
+    buffer.push(0, m.clone(), false);
+    inbox::flush(deps, &buffer).await
 }
 
 /// Форвард-маркер промпта (#1416): строка-префикс с источником; для
@@ -151,67 +211,9 @@ pub(crate) fn forward_line(forward: &Option<String>) -> String {
     }
 }
 
-/// Media-ветка (#1171): photo/document ≤ 20 MiB — скачать → asset store →
-/// промпт с URL (обычный ход сессии); oversize/чужой тип/сбой — явный
-/// ТГ-отказ. Ни одна ветка не проходит молча; отказ поглощает апдейт
-/// (Ok — не ретрай: перманентные ошибки залочили бы очередь бота).
-async fn process_media(
-    deps: &BotDeps,
-    chat_id: i64,
-    caption: Option<String>,
-    media: TgMedia,
-    forward: &Option<String>,
-) -> UsecaseResult<()> {
-    if media.kind == MediaKind::Other {
-        tracing::info!(event = "bot.media_refused", slug = %deps.slug,
-            kind = "other", "Медиа-тип не поддержан — явный отказ");
-        return send(deps, chat_id, REFUSE_KIND).await;
-    }
-    if media.file_size.is_some_and(|s| s > TG_MAX_FILE_BYTES) {
-        tracing::info!(event = "bot.media_oversize", slug = %deps.slug,
-            kind = "pre_check", "Файл больше потолка Bot API — явный отказ");
-        return send(deps, chat_id, REFUSE_OVERSIZE).await;
-    }
-    let bytes = match deps.tg.download_file(&media.file_id).await {
-        Ok(b) => b,
-        Err(uwuwu_usecase::UsecaseError::TelegramTooBig(_)) => {
-            tracing::info!(event = "bot.media_oversize", slug = %deps.slug,
-                kind = "get_file_400", "getFile: file is too big — явный отказ");
-            return send(deps, chat_id, REFUSE_OVERSIZE).await;
-        }
-        Err(_) => {
-            tracing::warn!(event = "bot.media_refused", slug = %deps.slug,
-                kind = "download_failed", "Скачивание не удалось — явный отказ");
-            return send(deps, chat_id, REFUSE_FAILED).await;
-        }
-    };
-    let url = match deps
-        .assets
-        .put(&deps.slug, media.kind, media.file_name.as_deref(), &bytes)
-        .await
-    {
-        Ok(u) => u,
-        Err(_) => {
-            tracing::warn!(event = "bot.media_refused", slug = %deps.slug,
-                kind = "upload_failed", "Загрузка ассета не удалась — явный отказ");
-            return send(deps, chat_id, REFUSE_FAILED).await;
-        }
-    };
-    tracing::info!(event = "bot.media_delivered", slug = %deps.slug,
-        kind = ?media.kind, "Файл забран и приложен к контексту сессии");
-    let caption_line = caption.unwrap_or_else(|| "Подписи нет".into());
-    let prefix = forward_line(forward);
-    let media_text = format!(
-        "{prefix}Владелец прислал файл: {url}\n{caption_line}\n\
-Если оформляешь заявку — вложи эту ссылку в тело задачи (markdown), \
-чтобы контент попал в разбор."
-    );
-    run_turn(deps, chat_id, &media_text).await
-}
-
 /// Ход сессии (общий для текста и media): методичка при устаревании,
 /// prompt вечной сессии, ожидание реплая, отправка владельцу.
-async fn run_turn(deps: &BotDeps, chat_id: i64, text: &str) -> UsecaseResult<()> {
+pub(crate) async fn run_turn(deps: &BotDeps, chat_id: i64, text: &str) -> UsecaseResult<()> {
     let view = deps.live.view();
     let session = ensure_session(deps).await?;
     // Методичка НЕ префиксует каждое сообщение (владелец 16.11):
@@ -233,14 +235,14 @@ async fn run_turn(deps: &BotDeps, chat_id: i64, text: &str) -> UsecaseResult<()>
         && (!lessons_empty || stored_lessons.is_some());
     let prompt_text = if deps.structural.agent.is_some() {
         if need_lessons && lessons_empty {
-            build_lessons_revoked_prompt(text)
+            uwuwu_usecase::bots::build_lessons_revoked_prompt(text)
         } else if need_lessons {
-            build_lessons_prompt(&view.lessons, text)
+            uwuwu_usecase::bots::build_lessons_prompt(&view.lessons, text)
         } else {
             text.to_string()
         }
     } else if need_manual {
-        build_prompt(&view.manual, text)
+        uwuwu_usecase::bots::build_prompt(&view.manual, text)
     } else {
         text.to_string()
     };
@@ -350,8 +352,8 @@ async fn wait_reply(deps: &BotDeps, session: &str, baseline_ms: u64) -> Option<S
     }
 }
 
-async fn send(deps: &BotDeps, chat_id: i64, text: &str) -> UsecaseResult<()> {
-    for chunk in chunk_reply(text) {
+pub(crate) async fn send(deps: &BotDeps, chat_id: i64, text: &str) -> UsecaseResult<()> {
+    for chunk in uwuwu_usecase::bots::chunk_reply(text) {
         deps.tg.send_message(chat_id, &chunk).await?;
     }
     Ok(())

@@ -92,6 +92,8 @@ pub struct BotSupervisor {
     /// Потолок/шаг ожидания реплая (поля ради тестов).
     pub(crate) reply_cap_ms: u64,
     pub(crate) reply_poll_ms: u64,
+    /// Окно буфера ввода (#1596): минута по записи владельца 24.11.
+    pub(crate) debounce_ms: u64,
     pub(crate) guard: GuardTiming,
     /// Политика автокомпакта (#1221): None — механика off (safe default,
     /// секция [compact] конфига отсутствует).
@@ -122,6 +124,12 @@ impl BotSupervisor {
             // методички/длинные генерации; полл 2с ловит ответ раньше
             reply_cap_ms: 3_600_000,
             reply_poll_ms: 2_000,
+            // Оверрайд только для мок-стенда e2e (по лекалу UWUWU_TG_API):
+            // прод-окно — минута по записи владельца 24.11 (#1596).
+            debounce_ms: std::env::var("UWUWU_BOT_DEBOUNCE_MS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(60_000),
             guard: GuardTiming::default(),
             compact: None,
             running: Mutex::new(HashMap::new()),
@@ -593,6 +601,7 @@ impl BotSupervisor {
             tick_state: self.tick_state.clone(),
             reply_cap_ms: self.reply_cap_ms,
             reply_poll_ms: self.reply_poll_ms,
+            debounce_ms: self.debounce_ms,
             retry_pause_ms: RETRY_PAUSE_MS,
         };
         Some(spawn_bot_task(deps))

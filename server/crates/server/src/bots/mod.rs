@@ -5,6 +5,7 @@
 //! осознанно сбрасывается); token_env/enabled → stop/start, сессия живёт.
 
 mod asset_store;
+mod inbox;
 mod runner;
 #[cfg(test)]
 mod runner_tests;

@@ -86,23 +86,27 @@ impl TelegramClient {
         Ok(value["result"].clone())
     }
 
-    /// Апдейт ТГ → TgUpdate (не-message типы — без сообщения).
+    /// Апдейт ТГ → TgUpdate: message и edited_message — обе ветки доезжают
+    /// в буфер ввода (#1596); прочие типы — без сообщения, поглощаются.
     /// Индексация через Value (Null на отсутствующих ключах), НЕ через
     /// &Map: прямой m["chat"] на Map паникует «no entry found for key» —
     /// ядовитый апдейт без chat/from (посты каналов, edited_*) убивал
     /// бот-задачу каждые тик рестарт-лупом (инцидент 16.11).
     fn parse_update(raw: &Value) -> TgUpdate {
+        let parse = |m: &Value| TgMessage {
+            message_id: m["message_id"].as_i64().unwrap_or_default(),
+            chat_type: m["chat"]["type"].as_str().unwrap_or_default().to_string(),
+            chat_id: m["chat"]["id"].as_i64().unwrap_or_default(),
+            from_username: m["from"]["username"].as_str().map(String::from),
+            text: m["text"].as_str().map(String::from),
+            caption: m["caption"].as_str().map(String::from),
+            media: Self::parse_media(m),
+            forward: Self::parse_forward(m),
+        };
         TgUpdate {
             update_id: raw["update_id"].as_u64().unwrap_or_default(),
-            message: raw.get("message").map(|m| TgMessage {
-                chat_type: m["chat"]["type"].as_str().unwrap_or_default().to_string(),
-                chat_id: m["chat"]["id"].as_i64().unwrap_or_default(),
-                from_username: m["from"]["username"].as_str().map(String::from),
-                text: m["text"].as_str().map(String::from),
-                caption: m["caption"].as_str().map(String::from),
-                media: Self::parse_media(m),
-                forward: Self::parse_forward(m),
-            }),
+            message: raw.get("message").map(parse),
+            edited_message: raw.get("edited_message").map(parse),
         }
     }
 
@@ -216,7 +220,7 @@ impl TelegramGateway for TelegramClient {
                 json!({
                     "offset": offset,
                     "timeout": timeout_sec,
-                    "allowed_updates": ["message"],
+                    "allowed_updates": ["message", "edited_message"],
                 }),
             )
             .await?;
@@ -303,6 +307,41 @@ mod tests {
         let u = TelegramClient::parse_update(&raw);
         assert_eq!(u.update_id, 8);
         assert!(u.message.is_none());
+        assert!(u.edited_message.is_none());
+    }
+
+    /// #1596: правка сообщения — полноценный вход буфера с id оригинала.
+    #[test]
+    fn parses_edited_message_with_message_id() {
+        let raw = json!({
+            "update_id": 19,
+            "edited_message": {
+                "message_id": 77,
+                "from": {"id": 1, "username": "yurvon"},
+                "chat": {"id": 42, "type": "private"},
+                "text": "исправленный текст"
+            }
+        });
+        let u = TelegramClient::parse_update(&raw);
+        assert!(u.message.is_none());
+        let m = u.edited_message.expect("правка распарсена");
+        assert_eq!(m.message_id, 77);
+        assert_eq!(m.text.as_deref(), Some("исправленный текст"));
+        assert_eq!(m.chat_id, 42);
+    }
+
+    /// Инцидент 16.11: ядовитый edited-апдейт без chat/from не должен
+    /// паниковать парсер и убивать бот-задачу (#1596).
+    #[test]
+    fn poison_edited_update_absorbed_without_panic() {
+        let raw = json!({"update_id": 20, "edited_message": {"message_id": 78}});
+        let u = TelegramClient::parse_update(&raw);
+        assert_eq!(u.update_id, 20);
+        let m = u.edited_message.expect("форма распарсена");
+        assert_eq!(m.message_id, 78);
+        assert_eq!(m.chat_type, "");
+        assert_eq!(m.chat_id, 0);
+        assert_eq!(m.from_username, None);
     }
 
     /// #1171: photo-апдейт — массив PhotoSize, берём максимальный
@@ -589,5 +628,59 @@ mod tests {
         );
         let msg = err.to_string();
         assert!(msg.contains("409"), "статус 409 потерян в ошибке: {msg}");
+    }
+
+    /// #1596: без edited_message в allowed_updates правки не приедут —
+    /// пин на состав запроса, а не только на парсер.
+    #[tokio::test]
+    async fn get_updates_requests_edited_messages() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut data = Vec::new();
+            let mut buf = [0u8; 2048];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => data.extend_from_slice(&buf[..n]),
+                }
+                if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let cl: usize = data[..pos]
+                        .split(|b| *b == b'\n')
+                        .find_map(|line| {
+                            String::from_utf8_lossy(line)
+                                .to_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse().ok())
+                        })
+                        .unwrap_or(0);
+                    if data.len() >= pos + 4 + cl {
+                        break;
+                    }
+                }
+            }
+            let _ = tx.send(data);
+            let body = r#"{"ok":true,"result":[]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        });
+        let c = TelegramClient::with_base(&format!("http://127.0.0.1:{port}"), "tok".into());
+        let updates = c.get_updates(None, 0).await.expect("getUpdates ok");
+        assert!(updates.is_empty());
+        let request = rx.recv().expect("запрос перехвачен");
+        let request = String::from_utf8_lossy(&request);
+        assert!(
+            request.contains("edited_message"),
+            "allowed_updates без правок: {request}"
+        );
     }
 }
