@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 pub mod form;
+pub mod stand;
 
 use std::process::{Command, Stdio};
 
