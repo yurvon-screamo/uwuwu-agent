@@ -22,35 +22,15 @@
 //! пробы (5 мин) — резет-время ядро не вычисляет, пауза по факту
 //! повторных проб (граница плана #1477).
 
+mod common;
+
+use common::stand::{e2e_enabled, log_tail, mcp_call, spawn_stand, StandOptions, BEARER};
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-fn e2e_enabled() -> bool {
-    std::env::var("UWUWU_E2E").ok().as_deref() == Some("1")
-}
-
-/// Свободный TCP-порт (бинд :0, слушатель сразу отпускается — стендовые
-/// гонки портов закрыты повторными попытками health/старта).
-fn free_port() -> u16 {
-    std::net::TcpListener::bind(("127.0.0.1", 0))
-        .expect("bind :0")
-        .local_addr()
-        .expect("local_addr")
-        .port()
-}
-
-fn bin_exe(name: &str) -> PathBuf {
-    std::env::var(format!("CARGO_BIN_EXE_{name}"))
-        .unwrap_or_else(|_| {
-            panic!("CARGO_BIN_EXE_{name} не задан — собери бинари (cargo build --bins)")
-        })
-        .into()
-}
 
 /// Каноны стенда: имена событий и литералы лога/контракта — строковые
 /// константы на модуле; конфиг, мок и ассерты ссылаются на одни и те же
@@ -158,139 +138,6 @@ async fn spawn_quota_mock(pct: Arc<AtomicU8>, bad: Arc<AtomicU8>) -> u16 {
     port
 }
 
-struct Stand {
-    dir: PathBuf,
-    mock: Child,
-    server: Child,
-    port: u16,
-    mock_port: u16,
-}
-
-async fn spawn_stand(dir: &Path, quota_url: &str) -> Stand {
-    let server_port = free_port();
-    let mock_port = free_port();
-    let bearer = "e2e-stand-bearer";
-    let config = format!(
-        "mode = \"live\"\npoll_sec = 10\nport = {server_port}\n\n\
-         [hub]\nrepo = \"e2e/hub\"\ndriver = \"memory\"\n\n\
-         [executor]\nname = \"mock\"\nurl = \"http://127.0.0.1:{mock_port}\"\n\n\
-         [quota]\nbase_url = \"{quota_url}\"\npath = \"{quota_path}\"\napi_key_env = \"{quota_key_env}\"\n\n\
-         [policy]\ncup = 2\n\n[policy.peak]\nenabled = false\nstart_min = 360\nend_min = 600\n\n\
-         [[project]]\nname = \"stand\"\nboard = \"stand\"\nrepo = \"e2e/stand\"\n\
-         checkout = \"{dir}/checkout\"\nenv_root = \"{dir}\"\n",
-        server_port = server_port,
-        mock_port = mock_port,
-        quota_url = quota_url,
-        quota_path = QUOTA_PATH,
-        quota_key_env = KEY_ENV_STR,
-        dir = dir.display()
-    );
-    std::fs::write(dir.join("config.toml"), config).expect("config");
-    std::fs::create_dir_all(dir.join("checkout")).expect("checkout");
-
-    let mock_log = std::fs::File::create(dir.join("mock.log")).expect("mock log");
-    let mock = Command::new(bin_exe("mock_opencode"))
-        .env("MOCK_MODE", "plain")
-        .env("MOCK_PORT", mock_port.to_string())
-        .env("MOCK_STEP_MS", "500")
-        .stdout(Stdio::from(mock_log.try_clone().expect("mock log clone")))
-        .stderr(Stdio::from(mock_log))
-        .spawn()
-        .expect("spawn mock_opencode");
-    let server_log = std::fs::File::create(dir.join("server.log")).expect("server log");
-    let server = Command::new(bin_exe("uwuwu-server"))
-        .env("UWUWU_SERVER_CONFIG", dir.join("config.toml"))
-        .env("UWUWU_SERVER_STATE", dir.join("state.json"))
-        .env("UWUWU_SERVER_BEARER", bearer)
-        .env("UWUWU_OPENCODE_PASSWORD", "e2e")
-        .env("GH_TOKEN", "e2e-dummy-token")
-        .env(KEY_ENV_STR, E2E_QUOTA_KEY)
-        .env("UWUWU_MOCK_SEED", "stand:903:In Progress")
-        .env("RUST_LOG", "info")
-        .stdout(Stdio::from(
-            server_log.try_clone().expect("server log clone"),
-        ))
-        .stderr(Stdio::from(server_log))
-        .spawn()
-        .expect("spawn uwuwu-server");
-    let stand = Stand {
-        dir: dir.to_path_buf(),
-        mock,
-        server,
-        port: server_port,
-        mock_port,
-    };
-    let http = reqwest::Client::new();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    assert!(
-        health(&http, stand.port, bearer, deadline).await,
-        "сервер стенда не поднялся\n{}",
-        log_tail(&stand.dir.join("server.log"))
-    );
-    stand
-}
-
-impl Drop for Stand {
-    fn drop(&mut self) {
-        let _ = self.server.kill();
-        let _ = self.mock.kill();
-        let _ = self.server.wait();
-        let _ = self.mock.wait();
-    }
-}
-
-fn log_tail(path: &Path) -> String {
-    let binding = std::fs::read_to_string(path).unwrap_or_default();
-    let lines: Vec<&str> = binding.lines().collect();
-    let start = lines.len().saturating_sub(30);
-    lines[start..].join("\n")
-}
-
-async fn health(http: &reqwest::Client, port: u16, bearer: &str, deadline: Instant) -> bool {
-    while Instant::now() < deadline {
-        if let Ok(resp) = http
-            .get(format!("http://127.0.0.1:{port}/health"))
-            .header("Authorization", format!("Bearer {bearer}"))
-            .timeout(Duration::from_secs(2))
-            .send()
-            .await
-        {
-            if resp.status().is_success() {
-                return true;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    false
-}
-
-async fn mcp_call(
-    http: &reqwest::Client,
-    port: u16,
-    bearer: &str,
-    tool: &str,
-    args: Value,
-) -> String {
-    let resp = http
-        .post(format!("http://127.0.0.1:{port}/mcp"))
-        .header("Authorization", format!("Bearer {bearer}"))
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": { "name": tool, "arguments": args }
-        }))
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
-        .expect("MCP POST");
-    let body: Value = resp.json().await.expect("MCP JSON");
-    body["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string()
-}
-
 /// Событие в JSON-логе сервера: последняя строка, где `fields.event`
 /// равен искомому (None — события не было).
 fn last_event(log: &Path, event: &str) -> Option<Value> {
@@ -318,13 +165,26 @@ async fn limit_pause_holds_row_then_releases_when_window_drains() {
 
     let dir = std::env::temp_dir().join(format!("quota-stand-e2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("tempdir");
-    let bearer = "e2e-stand-bearer";
 
     let pct = Arc::new(AtomicU8::new(100)); // окно исчерпано
     let bad = Arc::new(AtomicU8::new(0)); // 401-ответы мока: нарушение контракта
     let quota_port = spawn_quota_mock(pct.clone(), bad.clone()).await;
-    let stand = spawn_stand(&dir, &format!("http://127.0.0.1:{quota_port}")).await;
+    let quota_url = format!("http://127.0.0.1:{quota_port}");
+    let quota_config = format!(
+        "[quota]\nbase_url = \"{quota_url}\"\npath = \"{QUOTA_PATH}\"\napi_key_env = \"{KEY_ENV_STR}\"\n\n"
+    );
+    let stand = spawn_stand(
+        &dir,
+        StandOptions {
+            config_extra: &quota_config,
+            pre_state: None,
+            server_env: &[
+                (KEY_ENV_STR, E2E_QUOTA_KEY),
+                ("UWUWU_MOCK_SEED", "stand:903:In Progress"),
+            ],
+        },
+    )
+    .await;
     let http = reqwest::Client::new();
     let server_log = stand.dir.join("server.log");
 
@@ -432,7 +292,7 @@ async fn limit_pause_holds_row_then_releases_when_window_drains() {
     let row = mcp_call(
         &http,
         stand.port,
-        bearer,
+        BEARER,
         "task_get",
         json!({ "number": 903, "project": PROJECT_STAND }),
     )
