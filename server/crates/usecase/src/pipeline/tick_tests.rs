@@ -8021,6 +8021,138 @@ async fn analyst_compact_probe_failure_aborts_whole_pass_1607() {
     );
 }
 
+/// Часы внутри пик-окна и с большим now_ms: idle-порог компакта
+/// подтверждён, но запуск хода должен быть отложен окном.
+struct PeakCompactClock;
+impl Clock for PeakCompactClock {
+    fn utc_minute(&self) -> UtcMinute {
+        UtcMinute {
+            minute_of_day: 400,
+            weekday: 3,
+        }
+    }
+    fn now_ms(&self) -> u64 {
+        20_000_000
+    }
+}
+
+#[tokio::test]
+async fn analyst_compact_defers_in_peak_window_1661() {
+    // Пик откладывает проход аналитика целиком (UC-05): ни адмиссии,
+    // ни метки коулдауна — ретрай возможен сразу после окна.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_master",
+        "opencode-go/hy4-flash-free#high",
+        "/tmp/checkout",
+    );
+    let mut fake = FakeSessions::new();
+    fake.activity_ms = Some(0);
+    fake.usage.lock().unwrap().insert("ses_master".into(), 90.0);
+    let sessions = Arc::new(fake);
+    let u = AnalystUseCase {
+        board: Arc::new(FakeBoard {
+            rows: std::sync::Mutex::new(vec![]),
+            log: Mutex::default(),
+            comments: vec![],
+            fields_fails: false,
+            set_session_fails: false,
+            set_pr_fails: AtomicBool::new(false),
+            clear_session_fails: AtomicBool::new(false),
+            status_fails: AtomicBool::new(false),
+        }),
+        boards: vec![analyst_board()],
+        sessions: Arc::new(SessionRouter::uniform(sessions.clone())),
+        state: state.clone(),
+        clock: Arc::new(PeakCompactClock),
+        models: Arc::new(crate::spawn_models::SpawnModels::canonical()),
+        cup: 7,
+        peak: PeakWindow {
+            enabled: true,
+            start_min: 360,
+            end_min: 600,
+        },
+        compact: Some(compact_policy_1607()),
+    };
+    u.tick().await.unwrap();
+    assert!(
+        sessions.compacted.lock().unwrap().is_empty(),
+        "пик-окно — адмиссий нет"
+    );
+    assert_eq!(
+        state.master_compact_ms("analyst", "p"),
+        0,
+        "отложка метку не ставит"
+    );
+}
+
+#[tokio::test]
+async fn analyst_compact_skips_dead_binding_1661() {
+    // Dead-привязка аналитика компактом не трогается (парность с #1634).
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_old",
+        "opencode-go/hy4-flash-free#high",
+        "/tmp/checkout",
+    );
+    let mut fake = FakeSessions::new();
+    fake.activity_ms = Some(0);
+    fake.dead_sessions.lock().unwrap().push("ses_old".into());
+    fake.usage.lock().unwrap().insert("ses_old".into(), 90.0);
+    let sessions = Arc::new(fake);
+    let u = analyst_compact_uc(
+        state.clone(),
+        sessions.clone(),
+        Arc::new(LostClock),
+        Some(compact_policy_1607()),
+        7,
+    );
+    u.tick().await.unwrap();
+    assert!(
+        sessions.compacted.lock().unwrap().is_empty(),
+        "мёртвая привязка пропущена"
+    );
+    assert_eq!(state.master_compact_ms("analyst", "p"), 0, "метки нет");
+}
+
+#[tokio::test]
+async fn analyst_compact_skips_unknown_binding_1661() {
+    // Unknown-привязка аналитика не даёт ложной тишины: компакта нет.
+    let state = Arc::new(MemState(Mutex::default()));
+    state.set_master_binding(
+        "analyst",
+        "p",
+        "ses_unknown",
+        "opencode-go/hy4-flash-free#high",
+        "/tmp/checkout",
+    );
+    let mut fake = FakeSessions::new();
+    fake.activity_ms = Some(0);
+    fake.liveness_unknown = true;
+    fake.usage
+        .lock()
+        .unwrap()
+        .insert("ses_unknown".into(), 90.0);
+    let sessions = Arc::new(fake);
+    let u = analyst_compact_uc(
+        state.clone(),
+        sessions.clone(),
+        Arc::new(LostClock),
+        Some(compact_policy_1607()),
+        7,
+    );
+    u.tick().await.unwrap();
+    assert!(
+        sessions.compacted.lock().unwrap().is_empty(),
+        "недостоверная привязка пропущена"
+    );
+    assert_eq!(state.master_compact_ms("analyst", "p"), 0, "метки нет");
+}
+
 #[tokio::test]
 async fn analyst_wave_orders_by_priority() {
     let state = Arc::new(MemState(Mutex::default()));

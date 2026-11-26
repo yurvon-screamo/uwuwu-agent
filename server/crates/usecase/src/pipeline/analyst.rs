@@ -2,8 +2,9 @@
 //! одну волну → одна мастер-сессия аналитика на проект (методичка
 //! agents/analyst: sourcing, соразмерность рамок, вердикты через MCP).
 
-use crate::bots::{compact_verdict, CompactFacts, CompactPolicy};
+use crate::bots::CompactPolicy;
 use crate::error::UsecaseResult;
+use crate::pipeline::compact_pass::CompactPass;
 use crate::ports::{SessionInfo, SessionSpec, TaskBoardRepo, TickStateStore};
 use crate::spawn_models::SpawnModels;
 use std::sync::Arc;
@@ -372,159 +373,24 @@ impl AnalystUseCase {
         Ok(spawned)
     }
 
-    /// Сессия потеряна исполнителем (404-класс): liveness-проба различает
-    /// Dead от транспортного Unknown — пропуск только по Dead, Unknown
-    /// завершает проход пробой (эталон — бот-супервизор, #1634).
-    async fn session_gone(&self, project: &str, session: &str) -> bool {
-        matches!(
-            self.sessions.project(project).liveness(session).await,
-            crate::ports::Liveness::Dead
-        )
-    }
-
-    /// Компакт-проход мастер-сессий (#1607, срез 4; форма — #1634):
-    /// матрица вердикта ботов на привязки аналитика; скан — по проектам
-    /// досок (привязки чужих ролей не трогаем). Семантика проб — по эталону
-    /// бот-супервизора; гейт CUP — на адмиссии аналитика (волны тика уже
-    /// в счётчике busy вызывающего), пик — целиком как будильник.
+    /// Компакт-проход аналитика (#1607, срез 4): общая механика — в
+    /// `pipeline::compact_pass`; роль задаёт префикс событий и пик-гейт
+    /// (у ревьювера пика нет — осознанное различие, не дрейф).
     async fn compact_pass(&self, policy: &CompactPolicy, scan: &[SessionInfo]) {
-        if crate::router::busy_count(scan) >= self.cup {
-            tracing::info!(
-                event = "analys.compact_held_cup",
-                active = crate::router::busy_count(scan),
-                cap = self.cup,
-                "Компакт-проход отложен: CUP cap"
-            );
-            return;
+        CompactPass {
+            role: analyst_role(),
+            event_prefix: "analys",
+            projects: &self.boards,
+            sessions: &self.sessions,
+            state: self.state.as_ref(),
+            clock: self.clock.as_ref(),
+            scan,
+            policy,
+            cup: self.cup,
+            peak: Some(&self.peak),
         }
-        // Пик-окно — как будильник: запуск хода откладывается целиком
-        // (план #1607; у ревьювера #1634 пик-гейта нет — осознанное
-        // различие, не дрейф: волна аналитика пик-гейта тоже не несёт,
-        // компакт здесь строже).
-        if self.peak.holds(self.clock.utc_minute()) {
-            tracing::info!(
-                event = "analys.compact_deferred_peak",
-                "Компакт-проход мастер-сессий отложен: пик-окно"
-            );
-            return;
-        }
-        let now = self.clock.now_ms();
-        let role = analyst_role();
-        let mut projects: Vec<&String> = self.boards.iter().map(|b| &b.project).collect();
-        projects.sort();
-        projects.dedup();
-        for project in projects {
-            let Some((session, bound_model, _)) = self.state.master_binding(role, project) else {
-                continue;
-            };
-            let gateway = self.sessions.project(project);
-            match gateway.liveness(&session).await {
-                crate::ports::Liveness::Alive => {}
-                crate::ports::Liveness::Dead => {
-                    tracing::debug!(
-                        event = "analys.compact_dead_skip",
-                        project = %project,
-                        "Мёртвая привязка компактом не трогается"
-                    );
-                    continue;
-                }
-                crate::ports::Liveness::Unknown => {
-                    tracing::debug!(
-                        event = "analys.compact_unknown_skip",
-                        project = %project,
-                        "Состояние привязки неизвестно — компакт пропущен"
-                    );
-                    continue;
-                }
-            }
-            let Ok(model) = SpawnModel::parse(&bound_model) else {
-                tracing::warn!(
-                    event = "analys.compact_model_unparseable",
-                    project = %project,
-                    "Привязка с непарсящейся моделью — компакт пропущен"
-                );
-                continue;
-            };
-            let busy_flag = scan
-                .iter()
-                .find(|s| s.id == session)
-                .map(|s| s.busy)
-                .unwrap_or(false);
-            let idle_ms = match gateway.last_activity_ms(&session).await {
-                Ok(ms) => ms.map(|ms| now.saturating_sub(ms)),
-                Err(e) => {
-                    if self.session_gone(project, &session).await {
-                        tracing::warn!(event = "analys.compact_session_gone", project = %project,
-                            session = %session, "Сессия потеряна исполнителем — привязка пропущена");
-                        continue;
-                    }
-                    tracing::warn!(event = "analys.compact_probe_failed", project = %project,
-                        error = %e, "Проба активности не удалась — компакт-проход завершён");
-                    return;
-                }
-            };
-            let usage_pct = match gateway.context_usage_pct(&session, &model.model).await {
-                Ok(u) => u,
-                Err(e) => {
-                    if self.session_gone(project, &session).await {
-                        tracing::warn!(event = "analys.compact_session_gone", project = %project,
-                            session = %session, "Сессия потеряна исполнителем — привязка пропущена");
-                        continue;
-                    }
-                    tracing::warn!(event = "analys.compact_probe_failed", project = %project,
-                        error = %e, "Проба занятости не удалась — компакт-проход завершён");
-                    return;
-                }
-            };
-            let verdict = compact_verdict(
-                &CompactFacts {
-                    busy: busy_flag,
-                    idle_ms,
-                    usage_pct,
-                    last_compact_ms: self.state.master_compact_ms(role, project),
-                    now_ms: now,
-                },
-                policy,
-            );
-            if !verdict.fire {
-                tracing::debug!(
-                    event = "analys.compact_skip",
-                    project = %project,
-                    reason = %verdict.reason,
-                    "Компакт: не стреляем"
-                );
-                continue;
-            }
-            // Whole-pass CUP-гейт выше; per-admission счётчик не нужен
-            // (форма #1634: проход либо идёт целиком, либо отложен).
-            // Метка ДО POST (ADR-082): коулдаун переживает рестарт сервера,
-            // повторная адмиссия исключена.
-            self.state.set_master_compact_ms(role, project, now);
-            if let Err(e) = self.state.save() {
-                tracing::warn!(event = "analys.compact_save_failed",
-                    project = %project, error = %e, "Метка компакта не персистится");
-            }
-            match gateway.compact_session(&session).await {
-                Ok(()) => {
-                    tracing::info!(
-                        event = "analys.compacted",
-                        project = %project,
-                        session = %session,
-                        reason = %verdict.reason,
-                        "Нативный compact admitted"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        event = "analys.compact_failed",
-                        project = %project,
-                        session = %session,
-                        error = %e,
-                        "Адмиссия компакта не удалась — ретрай по коулдауну"
-                    );
-                }
-            }
-        }
+        .run()
+        .await;
     }
 
     /// Тупик цикла: строка переведена в Needs attention + коммент владельцу.
