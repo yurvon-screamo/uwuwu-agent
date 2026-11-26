@@ -17,7 +17,8 @@ Body sections themselves stay Russian: task bodies are user-facing content the o
   Diagrams — mermaid in the issue body (GitHub renders it natively) or a picture asset;
   the `visual-diagrams` skill. Images/files — as attachments via `blob_put` (#1292): a key +
   a presigned link in the text (TTL 7 days; an expired one — re-sign via `blob_get`, replace the URL in
-  the carrier by hand).
+  the carrier by hand). Large files — omit `data_base64`, upload with `curl` to the presigned PUT URL
+  (TTL 5 min) from the shell, then paste the key and GET URL from the same receipt.
 - **No paired tildes outside code spans** in markdown fields of bodies and comments: on the hub a pair of tildes is
   GitHub strikethrough syntax — an accidental pair in a paragraph (`~30K`, `~250K`) silently changes
   how the text looks. Approximations — `≈` or «около», examples

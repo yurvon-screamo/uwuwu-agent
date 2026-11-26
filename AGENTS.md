@@ -138,7 +138,7 @@ The factory is only an alarm clock: it wakes on new comments/body edits; a task'
 - **noise is FORBIDDEN**: «taken», intermediate reports, body duplicates. Turn progress — the kanban status
   (In Progress → Review), results — into the body. A comment without a question to the user = noise
 - user attachments in a comment — for discussion; working screenshots the user puts into the body/comments (visible as links in the text, github-user-assets — download via the link) — reference them
-- **agent attachments — `blob_put`** (#1292): a file (a screenshot etc.) → key + presigned URL (TTL 7 days) → the link into the body/comment/doc with text tools; the link expired → `blob_get(key)` re-sign and replace in the carrier by hand (re-signing does not edit the carrier itself)
+- **agent attachments — `blob_put`** (#1292): a file (a screenshot etc.) → key + presigned URL (TTL 7 days) → the link into the body/comment/doc with text tools; the link expired → `blob_get(key)` re-sign and replace in the carrier by hand (re-signing does not edit the carrier itself); a large file — omit `data_base64`, upload the bytes with `curl` to the returned presigned PUT URL (TTL 5 min) from the shell, then paste the key and GET URL from that same receipt (an expired PUT URL — call `blob_put` again and rebuild the link table)
 - the user **resolves** threads for tidiness — this is NOT a signal to the agent, do not wait and do not react
 - the factory comments **only exceptions** (a session lost / failed to start ×3); restarts and mechanics — in the server log, not in the task
 
