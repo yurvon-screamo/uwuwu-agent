@@ -3269,8 +3269,10 @@ fn tester_fm_value(card: &str, key: &str) -> String {
 
 /// Полный путь живого пользователя: прочитать карточку с комментами →
 /// скопировать вывод от `--- fm ---` → записать копию через `task_body` и
-/// через `task_create`. Оракул — `body_hash`/`body_bytes` из той же копии:
-/// носитель обязан нести только тело, байт-в-байт равное телу источника.
+/// через `task_create`. Оракул пути `task_body` — `body_hash`/`body_bytes`
+/// из той же копии: носитель несёт тело источника байт-в-байт. Оракул пути
+/// `task_create` — строка, рождённая из чистого тела источника (create
+/// добавляет перевод строки): точное сравнение двух носителей.
 #[tokio::test]
 async fn tester_copy_of_card_with_comments_is_clean_on_both_write_paths() {
     let (tools, memory) = hub();
