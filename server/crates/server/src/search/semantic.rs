@@ -254,7 +254,15 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// Обычные юниты работают на production-таймаутах: стаб держит сокет
+    /// 700 мс после ответа, короткий бюджет здесь был бы источником флака.
     fn client(url: String) -> OllamaEmbeddings {
+        OllamaEmbeddings::new(url, EMBED_MODEL.to_string())
+    }
+
+    /// Только кейсы «ответа нет» получают короткий бюджет — иначе тест
+    /// ждал бы production-таймаут.
+    fn short_client(url: String) -> OllamaEmbeddings {
         OllamaEmbeddings::with_timeouts(
             url,
             EMBED_MODEL.to_string(),
@@ -287,7 +295,11 @@ mod tests {
         let body = " boom ".to_string();
         let len = body.len();
         let c = client(one_shot("HTTP/1.1 500 Internal Server Error", body, len));
-        assert!(c.embed_query("q").await.is_err(), "5xx -> State");
+        let err = c.embed_query("q").await.unwrap_err();
+        assert!(
+            matches!(err, UsecaseError::State(_)),
+            "5xx -> State, факт: {err:?}"
+        );
 
         let body = "{}".to_string();
         let len = body.len();
@@ -317,7 +329,30 @@ mod tests {
         // Заголовки пришли, рабочее тело короче объявленного Content-Length —
         // reqwest ждёт остаток; без таймаута на чтении вызов висел бы вечно.
         let body = embed_body(1, EMBED_MODEL_DIMS);
-        let c = client(one_shot("HTTP/1.1 200 OK", body, 100_000));
+        let c = short_client(one_shot("HTTP/1.1 200 OK", body, 100_000));
+        let started = std::time::Instant::now();
+        let err = c.embed_query("q").await.unwrap_err().to_string();
+        assert!(err.contains("timeout"), "fact: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "таймаут сработал"
+        );
+    }
+
+    /// TCP принят, но ответа нет вообще (признак стейл-туннеля): бюджет
+    /// должен оборвать ожидание, а не держать поиск-production-таймаут.
+    #[tokio::test]
+    async fn silent_server_fails_within_total_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf); // запрос прочитан, ответа нет
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+        });
+        let c = short_client(url);
         let started = std::time::Instant::now();
         let err = c.embed_query("q").await.unwrap_err().to_string();
         assert!(err.contains("timeout"), "fact: {err}");
