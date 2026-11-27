@@ -7,7 +7,7 @@
 //!
 //! Сценарий:
 //!   1. 21 строка Done, закрыты 3 суток назад (кандидаты при
-//!      `env_gc_days = 1`, батч-кап 20), 21-я — за капом первого прохода;
+//!      `env_gc_hours = 1`, батч-кап 20), 21-я — за капом первого прохода;
 //!   2. проход 1: `candidates=21, gone=0, batch=20, swept=20`;
 //!   3. проход 2: `candidates=1, gone=20, batch=1, swept=1`, вторая
 //!      shell-команда мока несёт только 21-ю строку;
@@ -53,7 +53,7 @@ async fn gone_marks_survive_passes_and_tail_reaches_the_script() {
     }
     let dir = std::env::temp_dir().join(format!("env-gc-stand-e2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    // 21 строка закрыта 3 суток назад (кандидаты при env_gc_days = 1;
+    // 21 строка закрыта 3 суток назад (кандидаты при env_gc_hours = 1;
     // батч-кап 20), 21-я — за капом первого прохода
     let seed: String = (3001..=3021u32)
         .map(|n| format!("stand:{n}:Done:low:3"))
@@ -62,7 +62,7 @@ async fn gone_marks_survive_passes_and_tail_reaches_the_script() {
     let stand = spawn_stand(
         &dir,
         StandOptions {
-            config_extra: "sweep_days = 7\nenv_gc_days = 1\nenv_gc_observe = false\n\n",
+            config_extra: "sweep_days = 7\nenv_gc_hours = 1\nenv_gc_observe = false\n\n",
             pre_state: None,
             server_env: &[("UWUWU_MOCK_SEED", seed.as_str())],
             capture_sessions: false,
