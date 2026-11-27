@@ -1,8 +1,8 @@
 //! Пины носителя промптов: методичка живёт в `agents/*.md`, сервер шлёт
 //! данные, маркер и указатель. Дефы читаются по пути внутри репо, а не
 //! через HOME-симлинк исполнителя (урок «тесты против машины»).
-//! Каждая клауза, убранная из Rust-литералов этим PR, закреплена здесь:
-//! удаление клаузы из дефа должно красинить тест.
+//! Клаузы, перенесённые из Rust-промптов в дефы (uwuwu#1647), закреплены
+//! здесь: удаление клаузы из дефа должно делать тест красным.
 
 use crate::pipeline::actions::{spawn_prompt, STAGE_PROMPTS};
 use crate::pipeline::analyst::analyst_prompt;
@@ -38,12 +38,13 @@ fn board() -> BoardPlan {
 }
 
 #[test]
-fn analyst_def_pins_every_clause_moved_from_rust() {
+fn analyst_def_pins_clauses_migrated_from_rust_prompts() {
     let analyst = agent_doc("analyst");
     assert_clauses(
         &analyst,
         "analyst",
         &[
+            "`task_get` each — the request body in full",
             "A requirement enters the statement **only from a source**",
             "Invented content is marked",
             "The elaboration artifact — **the reworked task body**",
@@ -53,6 +54,7 @@ fn analyst_def_pins_every_clause_moved_from_rust() {
             "a reproduction frame (you do not diagnose causes, no records)",
             "«what counts as the answer»",
             "Verdicts: elaborated",
+            "into **Review Analys**",
             "duplicate/garbage →",
             "a real blocker →",
             "a fork outside FT/NFT →",
@@ -64,7 +66,7 @@ fn analyst_def_pins_every_clause_moved_from_rust() {
 }
 
 #[test]
-fn analyst_reviewer_def_pins_every_clause_moved_from_rust() {
+fn analyst_reviewer_def_pins_clauses_migrated_from_rust_prompts() {
     let reviewer = agent_doc("analyst-reviewer");
     assert_clauses(
         &reviewer,
@@ -75,7 +77,9 @@ fn analyst_reviewer_def_pins_every_clause_moved_from_rust() {
             "**Form/dedup:**",
             "**Proportionality:**",
             "**Readiness:**",
+            "`task_get` — the reworked body; verify against the request's sources",
             "Verdicts: approve",
+            "into **Todo**",
             "request_changes →",
             "**Needs attention**",
             "The report — one comment per row",
@@ -85,7 +89,7 @@ fn analyst_reviewer_def_pins_every_clause_moved_from_rust() {
 }
 
 #[test]
-fn dreamer_def_pins_every_clause_moved_from_rust() {
+fn dreamer_def_pins_clauses_migrated_from_rust_prompts() {
     let dreamer = agent_doc("dreamer");
     assert_clauses(
         &dreamer,
@@ -95,8 +99,12 @@ fn dreamer_def_pins_every_clause_moved_from_rust() {
             "### 4. Project documentation hygiene",
             "Read the project docs **live**",
             "### 5. Experience (always)",
+            "- ADR: if the session shows an accepted architectural decision",
             "Extract transferable knowledge",
             "**mandatory dedup**",
+            "A close article exists —",
+            "none — create one",
+            "Nothing to take — a normal",
         ],
     );
 }
