@@ -234,7 +234,7 @@ pub struct PipelineCfg {
     pub sweep_days: u32,
     pub budget_floor: u64,
     pub env_gc_batch_cap: usize,
-    pub env_gc_days: u32,
+    #[serde(default)]
     pub env_gc_observe: bool,
     pub env_gc_verdict_deadline_ms: u64,
     pub env_gc_bootstrap_delete_attempts: u32,
@@ -491,6 +491,7 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
+        uwuwu_usecase::runtime_cfg::init_from_str(&raw).map_err(ConfigError::Validation)?;
         cfg.validate()?;
         cfg.validate_runtime()?;
         Ok(cfg)
@@ -524,6 +525,27 @@ impl Config {
         if b.presign_ttl_secs > 7 * 24 * 60 * 60 {
             return Err(ConfigError::Validation(
                 "[blob] presign_ttl_secs > 7 суток: подпись SigV4 не живёт дольше".into(),
+            ));
+        }
+        let s = self.search.as_ref().expect("validated");
+        for (name, ok) in [
+            ("semantic_sync_budget", s.semantic_sync_budget > 0),
+            ("embed_dims", s.embed_dims > 0),
+            ("embed_batch", s.embed_batch > 0),
+            ("connect_secs", s.connect_secs > 0),
+            ("query_total_secs", s.query_total_secs > 0),
+            ("batch_total_secs", s.batch_total_secs > 0),
+        ] {
+            if !ok {
+                return Err(ConfigError::Validation(format!(
+                    "[search] {name} должен быть > 0"
+                )));
+            }
+        }
+        let g = self.github.as_ref().expect("validated");
+        if g.status_ttl_secs < g.items_ttl_secs {
+            return Err(ConfigError::Validation(
+                "[github] status_ttl_secs < items_ttl_secs: инвариант #1346".into(),
             ));
         }
         Ok(())
@@ -1241,6 +1263,8 @@ env_root = "/tmp/env"
             "config.toml",
             "config.example.toml",
             "ops/config.memory.toml",
+            "ops/config.memory-multi.toml",
+            "ops/config.mock.toml",
         ] {
             let path = root.join(rel);
             Config::load(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));

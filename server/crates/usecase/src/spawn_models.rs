@@ -2,6 +2,8 @@
 //! flash/common/smart, агенты и `default` ссылаются на алиас. Сервер кладёт
 //! модель в тело спавна (`SessionSpec.model`), деф-файлы агентов моделей
 //! не несут. Уровень алиаса доступен в рантайме для сдвига из #1689.
+//! Значения карты — только в `[executor]` config.toml (uwuwu#1726):
+//! `canonical()` читает загруженный конфиг, код-канон удалён.
 
 use crate::model_aliases::{ModelAlias, ModelAliases};
 use crate::naming;

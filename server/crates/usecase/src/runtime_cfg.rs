@@ -7,8 +7,17 @@ use std::sync::OnceLock;
 
 static RAW: OnceLock<toml::Value> = OnceLock::new();
 
+/// Инициализация из фактически загруженного конфига: прод-поведение
+/// определяется файлом из UWUWU_SERVER_CONFIG, а не встроенной копией.
+pub fn init_from_str(src: &str) -> Result<(), String> {
+    let value: toml::Value = toml::from_str(src).map_err(|e| e.to_string())?;
+    let _ = RAW.set(value);
+    Ok(())
+}
+
 fn raw() -> &'static toml::Value {
     RAW.get_or_init(|| {
+        // Тестовый шов: in-process фикстуры не загружают файл через Config::load.
         let src = include_str!("../../../config.toml");
         toml::from_str(src).expect("server/config.toml: валидный TOML (uwuwu#1726)")
     })

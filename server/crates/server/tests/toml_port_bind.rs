@@ -43,6 +43,22 @@ driver = "memory"
 name = "kisa"
 url = "http://127.0.0.1:1"
 
+[executor.model_aliases]
+flash = "opencode-go/hy4-flash-free#high"
+common = "opencode-go/hy4-flash-free#high"
+smart = "zai-coding-plan/glm-5.4#high"
+
+[executor.models]
+default = "flash"
+developer = "flash"
+plan-reviewer = "smart"
+code-quality-reviewer = "smart"
+tester = "flash"
+test-reviewer = "smart"
+analyst = "flash"
+analyst-reviewer = "smart"
+dreamer = "common"
+
 [policy]
 cup = 1
 peak = {{ enabled = false, start_min = 0, end_min = 0 }}
@@ -74,8 +90,6 @@ sweep_batch_cap = 50
 sweep_days = 7
 budget_floor = 500
 env_gc_batch_cap = 20
-env_gc_days = 2
-env_gc_observe = false
 env_gc_verdict_deadline_ms = 900000
 env_gc_bootstrap_delete_attempts = 3
 clean_batch_cap = 50

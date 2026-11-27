@@ -209,32 +209,38 @@ async fn request_contract_pins_method_path_model_and_prefixes() {
     );
 }
 
-/// Размер батча и production-таймауты — часть контракта из описания PR.
+/// uwuwu#1726: батч и таймауты — значения из конфига, без литералов в тесте.
+/// Правка ключа [search] не требует правки кода или теста.
 #[tokio::test]
-async fn batch_size_and_timeouts_match_the_contract() {
+async fn batch_size_and_timeouts_follow_config() {
+    use uwuwu_usecase::runtime_cfg::search;
     let timeouts = ClientTimeouts::default();
-    assert_eq!(timeouts.connect, Duration::from_secs(2));
-    assert_eq!(timeouts.query_total, Duration::from_secs(15));
-    assert_eq!(timeouts.batch_total, Duration::from_secs(60));
+    assert_eq!(
+        timeouts.connect,
+        Duration::from_secs(search::connect_secs())
+    );
+    assert_eq!(
+        timeouts.query_total,
+        Duration::from_secs(search::query_total_secs())
+    );
+    assert_eq!(
+        timeouts.batch_total,
+        Duration::from_secs(search::batch_total_secs())
+    );
 
+    let batch = search::batch();
     let mock = MockEmbed::spawn(2);
-    let client = OllamaEmbeddings::new(mock.url.clone(), embed_model().to_string());
-    // Литералы, не константа из прода: иначе мутация размера батча остаётся
-    // невидимой — тест считал бы 40 как EMBED_BATCH+2.
-    let docs: Vec<_> = (0..40)
+    let client = OllamaEmbeddings::new(mock.url.clone(), embed_model());
+    let docs: Vec<_> = (0..batch + 2)
         .map(|i| (format!("T{i}"), format!("текст {i}")))
         .collect();
     let vecs = client.embed_docs(&docs).await.expect("два батча");
-    assert_eq!(vecs.len(), 40);
+    assert_eq!(vecs.len(), batch + 2);
 
     let requests = mock.requests();
-    assert_eq!(requests.len(), 2, "40 текстов — два вызова");
-    assert_eq!(
-        inputs(&requests[0].body).len(),
-        38,
-        "первый батч: 38 текстов"
-    );
-    assert_eq!(inputs(&requests[1].body).len(), 2, "второй батч: 2 текста");
+    assert_eq!(requests.len(), 2, "два вызова: батч и хвост");
+    assert_eq!(inputs(&requests[0].body).len(), batch, "первый батч");
+    assert_eq!(inputs(&requests[1].body).len(), 2, "второй батч: хвост");
 }
 
 /// NFT-1: URL задан, но Ollama недоступна — секция semantic честно пишет
