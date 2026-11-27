@@ -3864,6 +3864,37 @@ mod slot_mapping_tests {
     }
 
     #[test]
+    fn three_review_fields_hold_three_independent_sessions() {
+        // #1710, основной путь: все три стадии прошли ревью — каждая держит
+        // свою сессию; старое общее поле не разворачивается на соседние слоты
+        // Arrange
+        let mut raw = Fields::new();
+        raw.insert("Сессия план-ревью".into(), "ses_plan".into());
+        raw.insert("Сессия ревью кода".into(), "ses_result".into());
+        raw.insert("Сессия ревью тестов".into(), "ses_test".into());
+        // Act
+        let mut task = uwuwu_domain::Task::new(6, "t".into(), uwuwu_domain::Status::ReviewTesting);
+        task.apply_fields(map_task_fields(&raw));
+        // Assert
+        assert_eq!(
+            task.session_of(uwuwu_domain::Slot::PlanReview),
+            Some("ses_plan")
+        );
+        assert_eq!(
+            task.session_of(uwuwu_domain::Slot::ResultReview),
+            Some("ses_result")
+        );
+        assert_eq!(
+            task.session_of(uwuwu_domain::Slot::TestReview),
+            Some("ses_test")
+        );
+        assert!(
+            task.stage_needs_spawn().is_none(),
+            "все три стадии видят свои сессии — лишнего спавна нет"
+        );
+    }
+
+    #[test]
     fn steady_state_review_slots_are_exclusive() {
         // #1710: после план-ревью план-сессия лежит в своём поле; вход в
         // result/testing review обязан видеть пустые слоты и спавнить свежие

@@ -1591,4 +1591,67 @@ mod tests {
         );
         assert_eq!(t.session_of(Slot::ResultReview), None);
     }
+
+    /// Граница носителя (#1710): три сессии проходят полный round-trip
+    /// через IssueFieldStore — три разных поля, снятие среднего не трогает
+    /// крайние. До правки мок разворачивал план в результат, пин красный.
+    #[tokio::test]
+    async fn review_sessions_roundtrip_through_issue_fields() {
+        // Arrange
+        let hub = MemoryHub::with_seed(Some((11, Status::ReviewTesting)));
+        hub.read_board("B").await.expect("материализация сида");
+        // Act
+        hub.set_session("B", 11, Slot::PlanReview, "ses_plan")
+            .await
+            .expect("запись план-сессии");
+        hub.set_session("B", 11, Slot::ResultReview, "ses_result")
+            .await
+            .expect("запись result-сессии");
+        hub.set_session("B", 11, Slot::TestReview, "ses_test")
+            .await
+            .expect("запись test-сессии");
+        let fields = IssueFieldStore::load(&hub, 11).await.expect("поля");
+        // Assert
+        assert_eq!(
+            fields
+                .get(crate::github::F_PLAN_REVIEW_SESSION)
+                .map(String::as_str),
+            Some("ses_plan")
+        );
+        assert_eq!(
+            fields
+                .get(crate::github::F_RESULT_REVIEW_SESSION)
+                .map(String::as_str),
+            Some("ses_result")
+        );
+        assert_eq!(
+            fields
+                .get(crate::github::F_TEST_REVIEW_SESSION)
+                .map(String::as_str),
+            Some("ses_test")
+        );
+        // Act: снимаем только среднюю стадию
+        hub.clear_session("B", 11, Slot::ResultReview)
+            .await
+            .expect("clear result-слота");
+        let after = IssueFieldStore::load(&hub, 11).await.expect("поля после");
+        // Assert
+        assert_eq!(
+            after
+                .get(crate::github::F_PLAN_REVIEW_SESSION)
+                .map(String::as_str),
+            Some("ses_plan")
+        );
+        assert_eq!(
+            after.get(crate::github::F_RESULT_REVIEW_SESSION),
+            None,
+            "result-поле снято"
+        );
+        assert_eq!(
+            after
+                .get(crate::github::F_TEST_REVIEW_SESSION)
+                .map(String::as_str),
+            Some("ses_test")
+        );
+    }
 }
