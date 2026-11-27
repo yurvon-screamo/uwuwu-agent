@@ -1194,7 +1194,7 @@ mod tests {
         );
         assert!(
             S::can_transition_with(S::ReviewResult, S::NeedsAttention, false, true),
-            "grown scope can reach the owner question without clearing the flag"
+            "ребро вопроса владельца достижимо без снятия флага"
         );
         // без флага ребро закрыто — канон UC-01 побайтово
         assert!(

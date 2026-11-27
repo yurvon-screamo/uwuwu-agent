@@ -32,7 +32,7 @@ Load ALL relevant skills. Loading extra is better than losing important rules.
 - The plan's detail level — WHAT, not HOW
 - Simplicity First: what is the simplest thing that could work?
 - Explore the codebase: affected modules, dependencies, existing patterns
-- A UI slice must name the layout mechanism (the built-in primitives of the stack) and the alternative. Manual geometry needs a reason and a ceiling: the conditions that trigger a switch to the primitives
+- A UI slice must name the layout mechanism (the built-in primitives of the stack) and the alternative. Manual geometry needs a reason and a ceiling: the conditions that trigger a switch to the primitives.
 
 Build the logical dependency graph of components:
 

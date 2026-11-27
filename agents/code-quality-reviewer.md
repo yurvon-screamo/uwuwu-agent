@@ -174,7 +174,7 @@ Flag comment problems per the `rules-clean-code` - Comments criteria.
 
 **High**: security vulnerabilities, data-loss risks, critical bugs, deprecated methods that will stop working, hardcoded production secrets, architecture violations, significant performance problems, missing critical error handling, business logic in wrong layers, **the solution does not match the task (solves the wrong problem), critical over-complication (a much more complex solution than the task requires)**
 
-**Common**: missing edge-case handling, unclear naming, no validation, testability problems, excessive comments (repeating code, section headers instead of functions), commented-out code, growing file-complexity in a touched file between tasks (a note in the file header does not close it)
+**Common**: missing edge-case handling, unclear naming, no validation, testability problems, excessive comments (repeating code, section headers instead of functions), commented-out code. Growing file-complexity in a touched file between tasks is Common at minimum. A note in the file header does not close it.
 
 **Low**: minor style mismatches, documentation gaps
 
