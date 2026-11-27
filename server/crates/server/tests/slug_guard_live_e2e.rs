@@ -56,6 +56,15 @@
 //! Запуск:
 //!   UWUWU_E2E=1 cargo test -p uwuwu-server --test slug_guard_live_e2e -- --nocapture
 
+// Зеркало адаптеров вики для живого пина гонки (#1697): крейт только
+// бинарный, lib-таргета нет; модули тянут только crate::gherr и crate::wiki.
+#[allow(dead_code)]
+#[path = "../src/gherr.rs"]
+mod gherr;
+#[allow(dead_code, unused_imports)]
+#[path = "../src/wiki/mod.rs"]
+mod wiki;
+
 use base64::Engine as _;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -1204,6 +1213,198 @@ async fn slug_guard_live_e2e_main_scenario() {
             "риг {repo} не снесён: {error}\n\
              снеси руками: gh api -X DELETE /repos/{repo}",
             repo = rig.repo
+        ));
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n\n"));
+}
+
+// --- #1697: гонка чтение→коммит на живом GitWikiWriter --------------------
+
+/// Коммит писателя с ограниченным ретраем на spurious update_ref 422:
+/// упавший ff ничего не записал, повтор безопасен (шапка рига, п.7).
+async fn writer_commit(
+    writer: &wiki::GitWikiWriter,
+    path: &str,
+    body: &str,
+    message: &str,
+) {
+    let mut last = String::new();
+    for _ in 0..3 {
+        match writer.commit_file(path, body, message).await {
+            Ok(()) => return,
+            Err(error) => {
+                last = error.to_string();
+                if !last.contains("not fast-forward") {
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    panic!("коммит {path} не прошёл за 3 попытки: {last}");
+}
+
+/// Первый видимый в дереве blob по пути (дерево — источник для предпроверки).
+async fn wait_blob_sha(rig: &RigGithub, path: &str) -> String {
+    let deadline = tokio::time::Instant::now() + WAIT_TIMEOUT;
+    loop {
+        if let Some(sha) = rig.tree_blob_sha(path).await {
+            return sha;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "дерево не показало blob {path} за {WAIT_TIMEOUT:?}"
+        );
+        tokio::time::sleep(POLL_STEP).await;
+    }
+}
+
+async fn run_stale_sha_scenario(rig: RigGithub) {
+    if let Some(error) = &rig.creation_error {
+        panic!("{error}");
+    }
+    let path = "docs/Projects/uwuwu/Гонка-1697.md".to_string();
+    let body_a = "# версия A\n";
+    let body_b = "# версия B\n";
+    let writer = wiki::GitWikiWriter::new(rig.repo.clone(), rig.branch.clone(), rig.token.clone());
+    writer_commit(&writer, &path, body_a, "seed A 1697").await;
+    rig.wait_tree(&[path.clone()]).await;
+    let sha_a = wait_blob_sha(&rig, &path).await;
+
+    // Конкурирующий писатель обновляет док до B после снимка A.
+    let rival = wiki::GitWikiWriter::new(rig.repo.clone(), rig.branch.clone(), rig.token.clone());
+    writer_commit(&rival, &path, body_b, "competing B 1697").await;
+    rig.wait_tree_sha(&path, &sha_a).await;
+    let sha_b = wait_blob_sha(&rig, &path).await;
+    assert_ne!(sha_a, sha_b, "конкурирующий коммит не изменил blob");
+
+    let error = writer
+        .delete_file(&path, &sha_a, "delete stale 1697")
+        .await
+        .expect_err("удаление с просроченным снимком обязано отказаться");
+    assert!(
+        matches!(error, uwuwu_usecase::UsecaseError::RaceRef(_)),
+        "ожидался RaceRef, получено: {error}"
+    );
+    let live = rig.read_file(&path).await.expect("версия B должна остаться");
+    assert_eq!(live, body_b, "свежая версия B затёрта");
+
+    writer
+        .delete_file(&path, &sha_b, "delete fresh 1697")
+        .await
+        .expect("контрольное удаление со свежим sha");
+    println!("docs_delete race live: RaceRef на A, B цела, контрольный снос прошёл");
+}
+
+#[tokio::test]
+async fn docs_delete_stale_blob_sha_is_refused_live_e2e() {
+    let Some(token) = e2e_ready() else {
+        println!("e2e выключен: UWUWU_E2E=1 для живой пробы гонки docs_delete");
+        return;
+    };
+    let stamp = format!(
+        "{}{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis(),
+        std::process::id()
+    );
+    let dir = std::env::temp_dir().join(format!("uwuwu-rig-e2e-race-{stamp}"));
+    std::fs::create_dir_all(&dir).expect("rig dir");
+    let http = reqwest::Client::new();
+    let rig = RigGithub::create(&http, &token, &stamp).await;
+    let mut lease = RigLease {
+        repo: rig.repo.clone(),
+        deleted: false,
+    };
+    let outcome = tokio::spawn(run_stale_sha_scenario(rig.clone())).await;
+    let scenario_error = outcome.err().map(|join| {
+        join.into_panic()
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_else(|| "паника без сообщения".to_string())
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    let delete_result = rig.delete().await;
+    lease.deleted = delete_result.is_ok();
+    let mut problems = Vec::new();
+    if let Some(msg) = scenario_error {
+        problems.push(format!("docs_delete race e2e упал: {msg}"));
+    }
+    if let Err(error) = delete_result {
+        problems.push(format!(
+            "риг {} не снесён: {error} — снеси руками: gh api -X DELETE /repos/{}",
+            rig.repo, rig.repo
+        ));
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n\n"));
+}
+
+/// Равенство sha из ответа Contents и из свежего дерева — предпроверка
+/// среза 1 сверяет именно снимок Contents с базой дерева. Без S3.
+async fn run_sha_match_scenario(rig: RigGithub) {
+    if let Some(error) = &rig.creation_error {
+        panic!("{error}");
+    }
+    let path = "docs/Projects/uwuwu/Sha-1697.md".to_string();
+    let writer = wiki::GitWikiWriter::new(rig.repo.clone(), rig.branch.clone(), rig.token.clone());
+    writer_commit(&writer, &path, "# sha\n", "seed sha 1697").await;
+    rig.wait_tree(&[path.clone()]).await;
+    let tree_sha = wait_blob_sha(&rig, &path).await;
+    let (status, body) = api_call_retry(
+        &rig.http,
+        &rig.token,
+        reqwest::Method::GET,
+        &rig.contents_path(&path),
+    )
+    .await;
+    assert!(status.is_success(), "contents: HTTP {status} — {body}");
+    let contents_sha = body["sha"].as_str().expect("sha из Contents");
+    assert_eq!(
+        contents_sha, tree_sha,
+        "снимок Contents и база предпроверки разнятся"
+    );
+    println!("contents/tree blob sha live: совпали ({contents_sha})");
+}
+
+#[tokio::test]
+async fn contents_and_tree_blob_sha_match_live_e2e() {
+    let Some(token) = e2e_ready() else {
+        println!("e2e выключен: UWUWU_E2E=1 для живой пробы sha");
+        return;
+    };
+    let stamp = format!(
+        "{}{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis(),
+        std::process::id()
+    );
+    let http = reqwest::Client::new();
+    let rig = RigGithub::create(&http, &token, &stamp).await;
+    let mut lease = RigLease {
+        repo: rig.repo.clone(),
+        deleted: false,
+    };
+    let outcome = tokio::spawn(run_sha_match_scenario(rig.clone())).await;
+    let scenario_error = outcome.err().map(|join| {
+        join.into_panic()
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_else(|| "паника без сообщения".to_string())
+    });
+    let delete_result = rig.delete().await;
+    lease.deleted = delete_result.is_ok();
+    let mut problems = Vec::new();
+    if let Some(msg) = scenario_error {
+        problems.push(format!("sha-match e2e упал: {msg}"));
+    }
+    if let Err(error) = delete_result {
+        problems.push(format!(
+            "риг {} не снесён: {error} — снеси руками: gh api -X DELETE /repos/{}",
+            rig.repo, rig.repo
         ));
     }
     assert!(problems.is_empty(), "{}", problems.join("\n\n"));
