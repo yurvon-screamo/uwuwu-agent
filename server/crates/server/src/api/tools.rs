@@ -1258,7 +1258,11 @@ fn delete_refusal_error(error: &UsecaseError) -> String {
         UsecaseError::DocReadFailed(reason) => format!("refused: read-failed — {reason}"),
         UsecaseError::BackupFailed(reason) => format!("refused: backup-failed — {reason}"),
         UsecaseError::RaceRef(reason) => format!(
-            "refused: race-ref — {reason}; the delete was NOT retried, verify before repeating"
+            "refused: race-ref — {reason}; the delete was NOT retried, verify before repeating; any backup is for the read version only"
+        ),
+        UsecaseError::DocAbsentAtRef(reason) => format!("absent-at-ref: {reason}"),
+        UsecaseError::PrecheckUnavailable(reason) => format!(
+            "refused: precheck-unavailable — {reason}; no delete was committed; the backup, if any, is for the read version only"
         ),
         UsecaseError::DocAbsent(reason) => {
             format!("absent: doc «{reason}» does not exist (no backup, no mutation)")

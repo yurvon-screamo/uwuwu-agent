@@ -44,6 +44,13 @@ pub enum UsecaseError {
     BackupFailed(String),
     /// Удаление дока: ref изменился между чтением и коммитом (#1653).
     RaceRef(String),
+    /// Удаление дока (#1697): файла уже нет в дереве коммита, с которым
+    /// строилось удаление, — конкурент удалил его. Повтор не требуется.
+    DocAbsentAtRef(String),
+    /// Удаление дока (#1697): дерево коммита недоступно для проверки
+    /// версии (статус, усечение, битый ответ, транспорт). Какой-либо
+    /// мутации этим вердиктом не обещаем: ответ мог потеряться после PATCH.
+    PrecheckUnavailable(String),
     /// Эмбеддинг-маршрут упёрся в лимиты провайдера (HTTP 429, #1363):
     /// временная — ретрай осмыслен в том же часу; бэкофф из RetryInfo.
     RateLimited {
@@ -71,6 +78,8 @@ impl fmt::Display for UsecaseError {
             Self::DocReadFailed(m) => write!(f, "doc read failed: {m}"),
             Self::BackupFailed(m) => write!(f, "backup failed: {m}"),
             Self::RaceRef(m) => write!(f, "competing ref: {m}"),
+            Self::DocAbsentAtRef(m) => write!(f, "doc absent at ref: {m}"),
+            Self::PrecheckUnavailable(m) => write!(f, "precheck unavailable: {m}"),
             Self::RateLimited {
                 service,
                 retry_after_secs,

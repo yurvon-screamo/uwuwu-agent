@@ -7,6 +7,15 @@ use uwuwu_usecase::{DocDeleteCommit, PostCheck, UsecaseError, UsecaseResult};
 
 use crate::wiki::encode_path;
 
+/// Снимок версии дока для проверки перед коммитом (#1697): путь и blob sha
+/// из живого чтения. Проверяется в дереве того же head, от которого строится
+/// новый tree, — ff-only update_ref закрывает оставшееся окно гонки.
+#[derive(Debug, Clone, Copy)]
+struct ExpectedBlob<'a> {
+    path: &'a str,
+    sha: &'a str,
+}
+
 pub struct GitWikiWriter {
     repo: String,
     branch: String,
@@ -121,7 +130,7 @@ impl GitWikiWriter {
             .await?;
         let blob_sha = blob["sha"].as_str().unwrap_or_default().to_string();
         let entry = json!({ "path": path, "mode": "100644", "type": "blob", "sha": blob_sha });
-        self.commit_tree(json!([entry]), message).await?;
+        self.commit_tree(json!([entry]), message, None).await?;
         Ok(())
     }
 
@@ -130,10 +139,16 @@ impl GitWikiWriter {
     pub async fn delete_file(
         &self,
         path: &str,
-        _old_blob_sha: &str,
+        old_blob_sha: &str,
         message: &str,
     ) -> UsecaseResult<DocDeleteCommit> {
-        let commit_sha = self.commit_tree(tree_delete_entry(path), message).await?;
+        let expected = ExpectedBlob {
+            path,
+            sha: old_blob_sha,
+        };
+        let commit_sha = self
+            .commit_tree(tree_delete_entry(path), message, Some(expected))
+            .await?;
         let post_check = self.path_absent_at(&commit_sha, path).await;
         Ok(DocDeleteCommit {
             commit_sha,
@@ -141,8 +156,16 @@ impl GitWikiWriter {
         })
     }
 
-    /// ref → commit → base tree → новый tree → commit → ff-only update_ref.
-    async fn commit_tree(&self, tree: Value, message: &str) -> UsecaseResult<String> {
+    /// ref → commit → base tree → (предпроверка снимка) → новый tree →
+    /// commit → ff-only update_ref. Предпроверка идёт по дереву того же
+    /// head, из которого берётся base_tree: короткого окна между проверкой
+    /// и построением коммита нет (#1697).
+    async fn commit_tree(
+        &self,
+        tree: Value,
+        message: &str,
+        expected: Option<ExpectedBlob<'_>>,
+    ) -> UsecaseResult<String> {
         let (_, head) = self
             .call(
                 reqwest::Method::GET,
@@ -168,6 +191,10 @@ impl GitWikiWriter {
             .as_str()
             .unwrap_or_default()
             .to_string();
+        if let Some(expected) = expected {
+            let current_tree = self.precheck_tree(&base_tree, expected.path).await?;
+            check_expected_blob(&current_tree, &expected)?;
+        }
         let (_, tree_resp) = self
             .call(
                 reqwest::Method::POST,
@@ -201,6 +228,30 @@ impl GitWikiWriter {
             )));
         }
         Ok(new_sha)
+    }
+
+    /// Дерево коммита, от которого строится удаление. Статус проверяем
+    /// сами: gherr классифицирует только 403/429, остальные ответы call()
+    /// возвращает как Ok((status, Value)) — 502 с HTML-телом иначе стал бы
+    /// «no tree array» вместо честного HTTP-статуса (#1697).
+    async fn precheck_tree(&self, tree_sha: &str, path: &str) -> UsecaseResult<Value> {
+        let url = format!(
+            "/repos/{}/git/trees/{}?recursive=1",
+            self.repo,
+            encode_path(tree_sha)
+        );
+        let (status, body) = self
+            .call(reqwest::Method::GET, &url, None)
+            .await
+            .map_err(|e| {
+                UsecaseError::PrecheckUnavailable(format!("tree {tree_sha} for {path}: {e}"))
+            })?;
+        if !status.is_success() {
+            return Err(UsecaseError::PrecheckUnavailable(format!(
+                "tree {tree_sha} for {path}: HTTP {status}"
+            )));
+        }
+        Ok(body)
     }
 
     /// дерево коммита — независимый от Contents-кэша свидетель удаления.
@@ -252,6 +303,27 @@ impl GitWikiWriter {
         let next = append_to(current, line);
         self.commit_file(path, &next, message).await?;
         Ok(next.lines().count())
+    }
+}
+
+/// Сверка снимка живого чтения с деревом коммита (#1697). Чистая функция:
+/// ошибки дерева — PrecheckUnavailable, расхождение версии —
+/// RaceRef, уже удалённый файл — DocAbsentAtRef без совета повторить.
+fn check_expected_blob(tree: &Value, expected: &ExpectedBlob<'_>) -> UsecaseResult<()> {
+    match crate::wiki::witness::blob_sha_for(tree, expected.path) {
+        Ok(Some(actual)) if actual == expected.sha => Ok(()),
+        Ok(Some(actual)) => Err(UsecaseError::RaceRef(format!(
+            "gitwiki: blob sha changed for {} (read {}, at ref {})",
+            expected.path, expected.sha, actual
+        ))),
+        Ok(None) => Err(UsecaseError::DocAbsentAtRef(format!(
+            "gitwiki: {} already absent at ref (snapshot {}); no delete was committed, backup of the read version only",
+            expected.path, expected.sha
+        ))),
+        Err(error) => Err(UsecaseError::PrecheckUnavailable(format!(
+            "gitwiki: tree for {}: {error}",
+            expected.path
+        ))),
     }
 }
 
@@ -382,6 +454,10 @@ mod tests {
         assert_eq!(append_to("без переноса".into(), "B"), "без переноса\nB\n");
     }
 }
+
+#[cfg(test)]
+#[path = "gitwiki_tests.rs"]
+mod precheck_tests;
 
 #[cfg(test)]
 mod base64_tests {

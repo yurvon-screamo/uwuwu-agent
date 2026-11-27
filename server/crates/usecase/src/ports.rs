@@ -238,7 +238,10 @@ pub trait WikiRepo: Send + Sync {
     async fn append_doc(&self, slug: &str, line: &str, message: &str) -> UsecaseResult<usize>;
 
     /// Удаление файла дока ff-only коммитом; old_blob_sha — снимок живой
-    /// версии из квитанции. Несовпадение ref — явный RaceRef, без ретрая.
+    /// версии из квитанции. Несовпадение blob в дереве коммита — явный
+    /// RaceRef, без ретрая; файла уже нет — DocAbsentAtRef; дерево
+    /// недоступно — PrecheckUnavailable. In-memory моки — стабы и sha не
+    /// сверяют: контракт проверяется адаптером Git Data.
     async fn delete_doc(
         &self,
         slug: &str,
