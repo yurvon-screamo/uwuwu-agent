@@ -1182,7 +1182,7 @@ fn glm_models() -> Arc<crate::spawn_models::SpawnModels> {
 fn explicit_models() -> Arc<crate::spawn_models::SpawnModels> {
     let raws: HashMap<String, String> = [
         ("flash", "opencode-go/hy4-flash-free#high"),
-        ("common", "opencode-go/muse-spark-1.3-contributor#high"),
+        ("common", "opencode-go/hy4-flash-free#high"),
         ("smart", "zai-coding-plan/glm-5.4#high"),
     ]
     .into_iter()
@@ -11312,8 +11312,8 @@ async fn high_complexity_shifts_stage_spawn_model_by_one_level() {
         .iter()
         .find(|s| !s.bootstrap)
         .expect("рабочая сессия в спеках");
-    let want = uwuwu_domain::SpawnModel::parse("opencode-go/muse-spark-1.3-contributor#high")
-        .expect("common-алиас");
+    let want =
+        uwuwu_domain::SpawnModel::parse("opencode-go/hy4-flash-free#high").expect("common-алиас");
     assert_eq!(work.model, want.model, "дев: flash→common (+1)");
     let boot = specs.iter().find(|s| s.bootstrap).expect("bootstrap");
     let flash = uwuwu_domain::SpawnModel::parse("opencode-go/hy4-flash-free#high").unwrap();
@@ -11345,8 +11345,8 @@ async fn low_complexity_moves_reviewer_out_of_peak_gate() {
         .iter()
         .find(|s| !s.bootstrap)
         .expect("рабочая сессия в спеках");
-    let common = uwuwu_domain::SpawnModel::parse("opencode-go/muse-spark-1.3-contributor#high")
-        .expect("common-алиас");
+    let common =
+        uwuwu_domain::SpawnModel::parse("opencode-go/hy4-flash-free#high").expect("common-алиас");
     assert_eq!(work.model, common.model, "ревьювер на common (−1)");
 }
 

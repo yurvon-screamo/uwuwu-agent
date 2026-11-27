@@ -70,13 +70,12 @@ impl ModelAliases {
         }
     }
 
-    /// Канон владельца 26.11 (#1684): flash и smart — как раньше,
-    /// common — muse-spark-1.3-contributor (сверен живым каталогом).
+    /// Канон владельца: smart — как раньше, common с 27.11 — та же raw-модель,
+    /// что и flash (решение владельца; совпадение уровней допустимо временно).
     pub fn canonical() -> Self {
         Self::new(
             SpawnModel::parse("opencode-go/hy4-flash-free#high").expect("канон-алиас flash"),
-            SpawnModel::parse("opencode-go/muse-spark-1.3-contributor#high")
-                .expect("канон-алиас common"),
+            SpawnModel::parse("opencode-go/hy4-flash-free#high").expect("канон-алиас common"),
             SpawnModel::parse("zai-coding-plan/glm-5.4#high").expect("канон-алиас smart"),
         )
     }
