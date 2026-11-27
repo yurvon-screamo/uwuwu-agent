@@ -10,7 +10,7 @@ All work lives in a uwuwu task — no exceptions:
 - the user came directly or the task arrived from an external tracker → first create it in uwuwu (`uwuwu_task_create` with `title`/`project`/`body`), work on it, close through it
 - dialog/questions/reports — the task's comments, the statement and the result — in the body
 - **a large task body is edited sectionally** — `MCP uwuwu_task_body_section` (a section delta + base_hash from the fm of `task_get`); the full body (`uwuwu_task_body`) — for small bodies and the first write; a gh PATCH bypassing MCP — forbidden (#1152). Write-paths refuse loudly without content (read via task_get; deliberate clear — explicit empty string) and on unknown arguments (#1572); a radical section shrink repeats with `confirm: true` (#1409)
-- **you change UI — a screenshot into the task**: before/after (or the result), an image attachment into the task — without a screenshot UI work is not considered done. "Works" ≠ "not slop": a UI slice carries UX acceptance criteria on par with mechanical ones — a slop/UX markup pass (the screen.review tool: the ui-slop checklist plus custom questions on naming and UX logic; flags are an aim, your judgment is final), screenshots of new screens in all states (empty/loading/error/long strings/dark theme), a live run on real data volume — presentation scale ("what if 600 changes?"); the e2e contour is not replaced
+- **you change UI — a screenshot into the task**: before/after (or the result), an image attachment into the task — without a screenshot UI work is not considered done. "Works" ≠ "not slop": a UI slice carries UX acceptance criteria on par with mechanical ones — a slop/UX markup pass (the screen.review tool: the ui-slop checklist plus custom questions on naming and UX logic; flags are an aim, your judgment is final), screenshots of new screens in all states (empty/loading/error/long strings/dark theme), a live run on real data volume — presentation scale ("what if 600 changes?"); the e2e contour is not replaced. A UI change that alters layout needs a matrix of width in points × DPR. For a webview, check the fresh build, not only the headless rig.
 
 The only carve-out — the `/fast` command (`opencode.json`): the user invoked it in chat themselves
 for small quick work → act without a uwuwu task, the report straight into the chat. Everything else — per the pipeline above.
@@ -32,6 +32,7 @@ Load ALL relevant skills. Loading extra is better than losing important rules.
 - The plan's detail level — WHAT, not HOW
 - Simplicity First: what is the simplest thing that could work?
 - Explore the codebase: affected modules, dependencies, existing patterns
+- A UI slice must name the layout mechanism (the built-in primitives of the stack) and the alternative. Manual geometry needs a reason and a ceiling: the conditions that trigger a switch to the primitives
 
 Build the logical dependency graph of components:
 
@@ -138,6 +139,7 @@ Load ALL relevant skills. Loading extra is better than losing important rules.
 2. Follow the rules of all loaded skills
 3. Implement the code per your plan
 4. Verify the code (build/lint/test etc.)
+   When you fix a named root cause, grep the whole repository for that mechanism. Put unhandled occurrences into the report with a reason.
 5. Pre-push machine review — the `qlty_review` tool (scope `diff`, before commit/push): machine findings (introduced by the branch) are fixed before the push; the full report — a «Машинный ревью (qlty)» section into the task body (body edits: `uwuwu_task_body` in full; a large body — sectionally `uwuwu_task_body_section`, a section delta + base_hash). The CI gate (ADR-063) after the push — the second line, it does not see the tail/untracked.
 6. Before finishing, run an explicit dead-code search
 7. If the implementation has significant gotchas/tradeoffs — document them via `flow-code-documentation`

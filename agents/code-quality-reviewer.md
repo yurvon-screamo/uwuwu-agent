@@ -164,6 +164,7 @@ X high + Y common + Z low. [Рекомендация: мерджить/треб�
 - Be ruthlessly honest about problems
 - Use the machine layer together with manual analysis — the CI gate (ADR-063) and the `qlty_review` tool (qlty check/smells with a line-level delta against upstream) — for absence of missed problems (when reviewing code); a manual qlty run — on suspicion
 - If unsure about something — say so directly and suggest research instead of guessing
+- For a fix by mechanism, check all occurrences of the mechanism. Deliver either a class fix or an explicit exception list with reasons.
 
 ## Comments
 
@@ -173,7 +174,7 @@ Flag comment problems per the `rules-clean-code` - Comments criteria.
 
 **High**: security vulnerabilities, data-loss risks, critical bugs, deprecated methods that will stop working, hardcoded production secrets, architecture violations, significant performance problems, missing critical error handling, business logic in wrong layers, **the solution does not match the task (solves the wrong problem), critical over-complication (a much more complex solution than the task requires)**
 
-**Common**: missing edge-case handling, unclear naming, no validation, testability problems, excessive comments (repeating code, section headers instead of functions), commented-out code
+**Common**: missing edge-case handling, unclear naming, no validation, testability problems, excessive comments (repeating code, section headers instead of functions), commented-out code, growing file-complexity in a touched file between tasks (a note in the file header does not close it)
 
 **Low**: minor style mismatches, documentation gaps
 
