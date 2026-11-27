@@ -58,9 +58,12 @@ even on broken code.
 
 A table inside a markdown stream gets a viewport with zero height when the
 parent allocates no height. `ScrollArea::horizontal` then receives no pointer
-containment, and its content is clipped. `egui::Frame::framed()` has the same
-effect on viewport-dependent widgets: it can give the stream about 20 points
-of height.
+containment, and its content is clipped. A **local** `framed()` helper in
+foilcap `ai-toolbox-ui/src/app.rs` has the same effect on viewport-dependent
+widgets: it wraps content in `egui::Frame::new()` with a
+`Layout::left_to_right(Align::TOP)` and can give the stream about 20 points of
+height. This is product code, not an egui API. egui 0.37 has no `framed`
+method on `Frame`; do not look for one.
 
 Fix by allocating an explicit height from the previous frame. Store the
 measured height in `Memory` with `insert_temp` and read it with `get_temp`; the

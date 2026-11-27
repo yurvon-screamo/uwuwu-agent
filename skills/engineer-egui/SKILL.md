@@ -25,6 +25,7 @@ verify the API in docs.rs before reusing a snippet.
 | "Use a library or write our own?" | `references/ecosystem.md` | none |
 | Odd failure with no obvious cause | `references/gotchas.md` | none |
 | Reuse a storytold pattern | `references/upstream-storytold.md` | all examples |
+| Fetch a font or read the palette | `assets/README.md` | `examples/theme_tokens.rs` |
 
 ## Hard rules
 
