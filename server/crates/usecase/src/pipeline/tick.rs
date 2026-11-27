@@ -774,13 +774,11 @@ impl TickUseCase {
         // Peak-окно держит только этапы целевого провайдера (#1680):
         // модель слота уже известна из карты, остальные провайдеры
         // работают в окне. CUP и исключение High остаются в доменном gate.
-        let mut policy = view.plan.policy;
+        let complexity = task.complexity();
         let slot_model = Agent::of_slot(slot)
-            .map(|agent| self.models.for_agent(agent))
+            .map(|agent| self.models.for_agent_shifted(agent, complexity))
             .unwrap_or_else(|| self.models.for_default());
-        if !crate::spawn_models::peak_applies(&slot_model) {
-            policy.peak.enabled = false;
-        }
+        let policy = crate::spawn_models::peak_policy_for_model(view.plan.policy, &slot_model);
         let mut gated = gate(task, action, policy, *effects.active_now, view.now);
         if matches!(gated, Gate::HeldCup { .. })
             && view.plan.mode == Mode::Live
@@ -818,6 +816,20 @@ impl TickUseCase {
                 tracing::info!(
                     event = "spawn.deferred_peak",
                     number = task.number(),
+                    complexity = naming::complexity_name(complexity),
+                    shift = complexity.tier_delta(),
+                    alias = Agent::of_slot(slot)
+                        .map(|agent| {
+                            self.models
+                                .alias_for_key_shifted(naming::agent_name(agent), complexity)
+                                .as_str()
+                        })
+                        .unwrap_or_else(|| {
+                            self.models
+                                .alias_for_key_shifted("default", complexity)
+                                .as_str()
+                        }),
+                    model = %format!("{}/{}", slot_model.model.provider(), slot_model.model.id()),
                     "Spawn deferred: peak window"
                 );
             }

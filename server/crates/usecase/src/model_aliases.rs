@@ -34,6 +34,23 @@ impl ModelAlias {
             )),
         }
     }
+
+    /// Сдвиг на `delta` уровней по лестнице ALL с отсечением на границах
+    /// (#1689): flash - 1 = flash, smart + 1 = smart. Четвёртого уровня нет.
+    pub fn shift(self, delta: i8) -> Self {
+        // Исчерпывающий match: новый вариант enum не скомпилируется без
+        // явного уровня, паники в пути спавна нет.
+        let level = match self {
+            Self::Flash => 0i8,
+            Self::Common => 1,
+            Self::Smart => 2,
+        };
+        match (level + delta).clamp(0, 2) {
+            0 => Self::Flash,
+            1 => Self::Common,
+            _ => Self::Smart,
+        }
+    }
 }
 
 /// Raw-модели трёх алиасов — единственный носитель raw-модели (#1684).
@@ -53,13 +70,12 @@ impl ModelAliases {
         }
     }
 
-    /// Канон владельца 26.11 (#1684): flash и smart — как раньше,
-    /// common — muse-spark-1.3-contributor (сверен живым каталогом).
+    /// Канон владельца: smart — как раньше, common с 27.11 — та же raw-модель,
+    /// что и flash (решение владельца; совпадение уровней допустимо временно).
     pub fn canonical() -> Self {
         Self::new(
             SpawnModel::parse("opencode-go/hy4-flash-free#high").expect("канон-алиас flash"),
-            SpawnModel::parse("opencode-go/muse-spark-1.3-contributor#high")
-                .expect("канон-алиас common"),
+            SpawnModel::parse("opencode-go/hy4-flash-free#high").expect("канон-алиас common"),
             SpawnModel::parse("zai-coding-plan/glm-5.4#high").expect("канон-алиас smart"),
         )
     }
@@ -109,5 +125,21 @@ impl ModelAliases {
             value_of(ModelAlias::Common)?,
             value_of(ModelAlias::Smart)?,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alias_shift_clamps_at_flash_and_smart() {
+        assert_eq!(ModelAlias::Flash.shift(-1), ModelAlias::Flash);
+        assert_eq!(ModelAlias::Flash.shift(1), ModelAlias::Common);
+        assert_eq!(ModelAlias::Common.shift(1), ModelAlias::Smart);
+        assert_eq!(ModelAlias::Common.shift(-1), ModelAlias::Flash);
+        assert_eq!(ModelAlias::Smart.shift(1), ModelAlias::Smart);
+        assert_eq!(ModelAlias::Smart.shift(-1), ModelAlias::Common);
+        assert_eq!(ModelAlias::Common.shift(0), ModelAlias::Common);
     }
 }

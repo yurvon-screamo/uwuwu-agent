@@ -2,9 +2,11 @@
 //! контракта `SpawnModels`: раскладка, матрица секций, громкие отказы.
 
 use crate::model_aliases::{ModelAlias, ModelAliases};
-use crate::spawn_models::{canonical_assignments, SpawnModels};
+use crate::spawn_models::{
+    canonical_assignments, peak_applies, peak_policy_for_model, SpawnModels,
+};
 use std::collections::HashMap;
-use uwuwu_domain::{Agent, SpawnModel};
+use uwuwu_domain::{Agent, Complexity, PeakWindow, SpawnModel, SpawnPolicy};
 
 fn strings(pairs: &[(&str, &str)]) -> HashMap<String, String> {
     pairs
@@ -16,7 +18,7 @@ fn strings(pairs: &[(&str, &str)]) -> HashMap<String, String> {
 fn canonical_raws() -> HashMap<String, String> {
     strings(&[
         ("flash", "opencode-go/hy4-flash-free#high"),
-        ("common", "opencode-go/muse-spark-1.3-contributor#high"),
+        ("common", "opencode-go/hy4-flash-free#high"),
         ("smart", "zai-coding-plan/glm-5.4#high"),
     ])
 }
@@ -36,10 +38,82 @@ fn canonical_assignment_raws() -> HashMap<String, String> {
 }
 
 #[test]
+fn complexity_shift_moves_alias_before_raw_model_selection() {
+    let models =
+        SpawnModels::from_config(Some(&canonical_raws()), Some(&canonical_assignment_raws()))
+            .expect("явная карта валидна");
+    let flash = SpawnModel::parse("opencode-go/hy4-flash-free#high").unwrap();
+    let common = SpawnModel::parse("opencode-go/hy4-flash-free#high").unwrap();
+    let smart = SpawnModel::parse("zai-coding-plan/glm-5.4#high").unwrap();
+
+    assert_eq!(
+        models.for_agent_shifted(Agent::Developer, Complexity::Regular),
+        flash,
+        "общая сложность — без сдвига"
+    );
+    assert_eq!(
+        models.for_agent_shifted(Agent::Developer, Complexity::High),
+        common,
+        "высокая — flash→common"
+    );
+    assert_eq!(
+        models.for_agent_shifted(Agent::Developer, Complexity::Low),
+        flash,
+        "низкая на нижней границе — flash остаётся flash"
+    );
+    assert_eq!(
+        models.for_agent_shifted(Agent::PlanReviewer, Complexity::Low),
+        common,
+        "низкая — smart→common"
+    );
+    assert_eq!(
+        models.for_agent_shifted(Agent::PlanReviewer, Complexity::High),
+        smart,
+        "высокая на верхней границе — smart остаётся smart"
+    );
+}
+
+#[test]
+fn peak_filter_follows_shifted_model_including_synthetic_map() {
+    let policy = SpawnPolicy {
+        cup: 10,
+        peak: PeakWindow {
+            enabled: true,
+            start_min: 360,
+            end_min: 600,
+        },
+    };
+    let models =
+        SpawnModels::from_config(Some(&canonical_raws()), Some(&canonical_assignment_raws()))
+            .expect("явная карта валидна");
+    let shifted_reviewer = models.for_agent_shifted(Agent::PlanReviewer, Complexity::Low);
+    assert!(!peak_applies(&shifted_reviewer));
+    assert!(
+        !peak_policy_for_model(policy, &shifted_reviewer)
+            .peak
+            .enabled
+    );
+
+    // Синтетическая карта: common→smart даёт присутствие под peak GLM.
+    let synthetic = SpawnModels::from_config(
+        Some(&canonical_raws()),
+        Some(&strings(&[("tester", "common")])),
+    )
+    .expect("синтетическая карта валидна");
+    let shifted_tester = synthetic.for_agent_shifted(Agent::Tester, Complexity::High);
+    assert_eq!(
+        shifted_tester,
+        SpawnModel::parse("zai-coding-plan/glm-5.4#high").unwrap()
+    );
+    assert!(peak_applies(&shifted_tester));
+    assert_eq!(peak_policy_for_model(policy, &shifted_tester), policy);
+}
+
+#[test]
 fn canonical_carries_owner_model_map() {
     let models = SpawnModels::canonical();
     let flash = SpawnModel::parse("opencode-go/hy4-flash-free#high").unwrap();
-    let common = SpawnModel::parse("opencode-go/muse-spark-1.3-contributor#high").unwrap();
+    let common = SpawnModel::parse("opencode-go/hy4-flash-free#high").unwrap();
     let smart = SpawnModel::parse("zai-coding-plan/glm-5.4#high").unwrap();
 
     for agent in [Agent::Developer, Agent::Analyst, Agent::Tester] {
@@ -69,7 +143,7 @@ fn alias_level_stays_available_at_runtime() {
     assert_eq!(models.alias_for_key("default"), Some(ModelAlias::Flash));
     assert_eq!(
         models.model_for_alias(ModelAlias::Common),
-        &SpawnModel::parse("opencode-go/muse-spark-1.3-contributor#high").unwrap()
+        &SpawnModel::parse("opencode-go/hy4-flash-free#high").unwrap()
     );
 }
 

@@ -52,6 +52,8 @@ pub const F_BRANCH: &str = "Branch";
 /// Единое имя поля приоритета (пишется create-ом, читается enrichment-ом):
 /// источник — naming (usecase), здесь алиас для локальной конвенции.
 pub const F_PRIORITY: &str = uwuwu_usecase::F_PRIORITY;
+/// Сложность задачи (#1689): нативное issue-поле с опциями regular/high/low.
+pub const F_COMPLEXITY: &str = uwuwu_usecase::F_COMPLEXITY;
 
 /// Карта значений полей задачи (непустые).
 pub type Fields = HashMap<String, String>;
@@ -308,6 +310,17 @@ fn ensure_field_body(name: &str) -> Value {
             body["data_type"] = json!("single_select");
             body
         }
+        // сложность (#1689): три опции лестницы; priority в каждой —
+        // обязателен, иначе GitHub 422 на свежей среде (#1357).
+        uwuwu_usecase::F_COMPLEXITY => json!({
+            "name": name,
+            "data_type": "single_select",
+            "options": [
+                { "name": "regular", "color": "gray", "priority": 1 },
+                { "name": "high", "color": "red", "priority": 2 },
+                { "name": "low", "color": "blue", "priority": 3 },
+            ]
+        }),
         _ => json!({ "name": name, "data_type": "text" }),
     }
 }
@@ -403,6 +416,28 @@ mod tests {
         // прочие имена — текст (без options)
         let text = ensure_field_body("Сессия dev");
         assert_eq!(text["data_type"], "text");
+    }
+
+    /// Сложность (#1689): три опции лестницы, каждая с priority (422 без него).
+    #[test]
+    fn complexity_field_has_three_ordered_options() {
+        let body = ensure_field_body(uwuwu_usecase::F_COMPLEXITY);
+        assert_eq!(body["name"], uwuwu_usecase::F_COMPLEXITY);
+        assert_eq!(body["data_type"], "single_select");
+        let options = body["options"].as_array().expect("options");
+        let names: Vec<&str> = options
+            .iter()
+            .map(|o| o["name"].as_str().expect("option name"))
+            .collect();
+        assert_eq!(names, ["regular", "high", "low"]);
+        for (index, option) in options.iter().enumerate() {
+            assert_eq!(
+                option["priority"].as_u64(),
+                Some((index + 1) as u64),
+                "опция {} без priority (422 на свежей среде)",
+                option["name"]
+            );
+        }
     }
 
     /// 422 различается честно: already exists — идемпотентный ok,

@@ -221,6 +221,7 @@ impl TaskBoardRepo for RowsBoard {
         _automerge: Option<bool>,
         _direct: Option<bool>,
         _fact_track: Option<bool>,
+        _complexity: Option<&str>,
     ) -> UsecaseResult<()> {
         Ok(())
     }
@@ -435,7 +436,7 @@ async fn dreamer_spawn_carries_model_from_server_map() {
     assert_model(
         sessions.spec_of(),
         "дример-спавн",
-        "opencode-go/muse-spark-1.3-contributor#high",
+        "opencode-go/hy4-flash-free#high",
     );
 }
 

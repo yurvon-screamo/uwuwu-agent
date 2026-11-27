@@ -1531,9 +1531,12 @@ impl uwuwu_usecase::TaskBoardRepo for UnverifiedStatusBoard {
         automerge: Option<bool>,
         direct: Option<bool>,
         fact_track: Option<bool>,
+        complexity: Option<&str>,
     ) -> uwuwu_usecase::UsecaseResult<()> {
         self.inner
-            .set_board_cells(board, number, priority, automerge, direct, fact_track)
+            .set_board_cells(
+                board, number, priority, automerge, direct, fact_track, complexity,
+            )
             .await
     }
 

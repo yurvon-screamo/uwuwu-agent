@@ -400,6 +400,7 @@ impl TaskBoardRepo for MemoryHub {
         })
     }
 
+    #[allow(clippy::too_many_arguments)] // техдолг #1662, контракт порта #1689
     async fn set_board_cells(
         &self,
         _board: &str,
@@ -408,6 +409,7 @@ impl TaskBoardRepo for MemoryHub {
         automerge: Option<bool>,
         direct: Option<bool>,
         fact_track: Option<bool>,
+        complexity: Option<&str>,
     ) -> UsecaseResult<()> {
         self.with_state(|state| {
             // сид материализуется лениво — симметрично row_status/set_status
@@ -433,6 +435,18 @@ impl TaskBoardRepo for MemoryHub {
             }
             if let Some(f) = fact_track {
                 task.set_fact_track(f);
+            }
+            if let Some(c) = complexity {
+                let parsed = uwuwu_usecase::parse_complexity(c);
+                task.set_complexity(parsed);
+                // carrier-истина для проекции (#1689): без записи в
+                // state.fields apply_fields на каждом чтении сбросил бы
+                // сложность в дефолтную regular
+                state
+                    .fields
+                    .entry(number)
+                    .or_default()
+                    .set_complexity(parsed);
             }
             Ok(())
         })
@@ -1326,7 +1340,7 @@ mod tests {
     #[tokio::test]
     async fn board_cells_are_visible_to_read_board_immediately() {
         let hub = MemoryHub::with_seed(Some((7, Status::Analys)));
-        hub.set_board_cells("B", 7, Some("high"), Some(true), None, None)
+        hub.set_board_cells("B", 7, Some("high"), Some(true), None, None, None)
             .await
             .expect("запись ячеек");
         let rows = hub.read_board("B").await.expect("чтение доски");
@@ -1351,7 +1365,7 @@ mod tests {
             .create_issue("B", "uwuwu", "строка", "тело", Some("Refactoring"))
             .await
             .expect("создание строки");
-        hub.set_board_cells("B", n, Some("low"), Some(false), None, None)
+        hub.set_board_cells("B", n, Some("low"), Some(false), None, None, None)
             .await
             .expect("запись ячеек свежей строки");
         let rows = hub.read_board("B").await.expect("чтение доски");

@@ -169,7 +169,7 @@ fn unknown_alias_from_toml_is_loud_at_startup() {
 
         [model_aliases]
         flash = "opencode-go/hy4-flash-free#high"
-        common = "opencode-go/muse-spark-1.3-contributor#high"
+        common = "opencode-go/hy4-flash-free#high"
         smart = "zai-coding-plan/glm-5.4#high"
 
         [models]
