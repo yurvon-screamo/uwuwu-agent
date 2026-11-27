@@ -350,6 +350,7 @@ async fn docs_write_sanitizes_slug_like_docs_read() {
 async fn docs_write_degraded_tree_keeps_root_check_and_flags_skip() {
     // деградационная строка таблицы сбоев: root жив без дерева,
     // parent/suffix пропущены, клоза называет пропуск честно
+    let (_serial, _guard, records) = scoped_trap().await;
     let (tools, _) = tool_hub(
         Arc::new(TreeFailingWiki),
         blob_usecase(),
@@ -377,6 +378,7 @@ async fn docs_write_degraded_tree_keeps_root_check_and_flags_skip() {
         answer.contains("collision checks skipped (tree unavailable)"),
         "клоза деградации не названа в ответе: {answer}"
     );
+    assert_event(&records.lock().expect("trap lock"), "slug_guard.degraded");
 }
 
 /// Вики с мёртвым деревом: list_docs рвётся транспортом (502-шторм,
@@ -394,6 +396,25 @@ impl uwuwu_usecase::WikiRepo for TreeFailingWiki {
     async fn list_docs(&self, _prefix: &str) -> uwuwu_usecase::UsecaseResult<Vec<String>> {
         Err(uwuwu_usecase::UsecaseError::Board(
             "wiki transport down: tree".into(),
+        ))
+    }
+    async fn read_doc_with_sha(
+        &self,
+        slug: &str,
+    ) -> uwuwu_usecase::UsecaseResult<Option<uwuwu_usecase::DocSnapshot>> {
+        Ok(Some(uwuwu_usecase::DocSnapshot {
+            content: "# dead tree\n".into(),
+            blob_sha: format!("stub-{slug}"),
+        }))
+    }
+    async fn delete_doc(
+        &self,
+        _slug: &str,
+        _old_blob_sha: &str,
+        _message: &str,
+    ) -> uwuwu_usecase::UsecaseResult<uwuwu_usecase::DocDeleteCommit> {
+        Err(uwuwu_usecase::UsecaseError::PrecheckUnavailable(
+            "tree: HTTP 502".into(),
         ))
     }
     async fn write_doc(&self, _: &str, _: &str, _: &str) -> uwuwu_usecase::UsecaseResult<()> {
@@ -768,6 +789,7 @@ async fn docs_append_degraded_tree_refuses_without_candidates() {
     // строка 4 таблицы сбоев: дерево Err + append на несуществующем —
     // отказ append-nonexistent без кандидатов (отказ-факт от дерева
     // не зависит, писатель авторитетен)
+    let (_serial, _guard, records) = scoped_trap().await;
     let (tools, _) = tool_hub(
         Arc::new(TreeFailingWiki),
         blob_usecase(),
@@ -788,6 +810,7 @@ async fn docs_append_degraded_tree_refuses_without_candidates() {
         !err.contains("suffix candidates"),
         "кандидаты из мёртвого дерева: {err}"
     );
+    assert_event(&records.lock().expect("trap lock"), "slug_guard.degraded");
 }
 
 // --- fm-гвард docs_write (#1444): шапка вики-дока переживает replace ---
@@ -1931,4 +1954,235 @@ async fn docs_delete_success_is_not_error_over_mcp_wire() {
         text.starts_with("deleted: «Projects/uwuwu/Проводимый»"),
         "{text}"
     );
+}
+
+// --- #1697: явная деградация слаг-гарда на четырёх сайтах -----------------
+
+use crate::rename_journal::test_support::{assert_event, trap_events};
+
+/// Ловушка событий — thread-local dispatcher; при параллельном прогоне
+/// соседние тесты оставляют на том же потоке чужой dispatcher. Сериализуем
+/// пины: один активный trap на прогон. Все тесты, которые порождают это
+/// событие, обязаны брать trap — иначе callsite кэширует «не интересно»
+/// до первого подписчика и последующие ассерты видят пустой лог.
+static TRAP_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn scoped_trap() -> (
+    tokio::sync::MutexGuard<'static, ()>,
+    tracing::dispatcher::DefaultGuard,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    let serial = TRAP_SERIAL.lock().await;
+    let (guard, records) = trap_events();
+    (serial, guard, records)
+}
+
+#[tokio::test]
+async fn docs_write_degraded_tree_logs_slug_guard_event() {
+    let (_serial, _guard, records) = scoped_trap().await;
+    let (tools, _) = tool_hub(
+        Arc::new(TreeFailingWiki),
+        blob_usecase(),
+        Arc::new(StubCronState::default()),
+    );
+    let answer = call(
+        &tools,
+        "docs_write",
+        json!({ "slug": "Experience/platform/degraded", "content": "# x\n" }),
+    )
+    .await
+    .expect("запись в шторм не блокируется");
+    assert!(
+        answer.contains("collision checks skipped (tree unavailable)"),
+        "{answer}"
+    );
+    let events = records.lock().expect("trap lock");
+    assert_event(&events, "slug_guard.degraded");
+}
+
+#[tokio::test]
+async fn docs_write_read_failure_with_fm_logs_its_own_reason() {
+    let (_serial, _guard, records) = scoped_trap().await;
+    let (tools, _) = tool_hub(
+        Arc::new(ReadFailingWiki),
+        blob_usecase(),
+        Arc::new(StubCronState::default()),
+    );
+    let answer = call(
+        &tools,
+        "docs_write",
+        json!({ "slug": "Experience/degraded-read", "content": "---\ntitle: x\n---\n\nтело\n" }),
+    )
+    .await
+    .expect("вход с fm не зависит от сбоя чтения");
+    assert!(
+        answer.contains("collision checks skipped (doc read failed)"),
+        "причина деградации не та: {answer}"
+    );
+    let events = records.lock().expect("trap lock");
+    assert_event(&events, "slug_guard.degraded");
+}
+
+#[tokio::test]
+async fn docs_append_degraded_tree_logs_slug_guard_event() {
+    let (_serial, _guard, records) = scoped_trap().await;
+    let (tools, _) = tool_hub(
+        Arc::new(TreeFailingWiki),
+        blob_usecase(),
+        Arc::new(StubCronState::default()),
+    );
+    let err = call(
+        &tools,
+        "docs_append",
+        json!({ "slug": "cli/x", "line": "строка" }),
+    )
+    .await
+    .expect_err("append-nonexistent");
+    assert!(err.contains("append-nonexistent"), "{err}");
+    let events = records.lock().expect("trap lock");
+    assert!(
+        events.iter().any(|e| e == "slug_guard.degraded"),
+        "нет slug_guard.degraded: {events:?}; err={err}"
+    );
+}
+
+#[tokio::test]
+async fn docs_delete_degraded_tree_refuses_and_logs() {
+    let (_serial, _guard, records) = scoped_trap().await;
+    let (tools, _) = tool_hub(
+        Arc::new(TreeFailingWiki),
+        blob_usecase(),
+        Arc::new(StubCronState::default()),
+    );
+    let err = call(
+        &tools,
+        "docs_delete",
+        json!({ "slug": "Projects/uwuwu/degraded" }),
+    )
+    .await
+    .expect_err("fail-closed при мёртвом дереве");
+    assert!(
+        err.contains("precheck-unavailable"),
+        "вердикт предпроверки не назван: {err}"
+    );
+    assert!(
+        err.contains("collision checks skipped (tree unavailable)"),
+        "деградация гарда не названа: {err}"
+    );
+    let events = records.lock().expect("trap lock");
+    assert_event(&events, "slug_guard.degraded");
+}
+
+/// Отказы удаления: стаб возвращает нужный вариант ошибки, пин проверяет
+/// только оформление текста — поведение адаптера закреплено в срезе 1.
+struct DeleteFailingWiki {
+    error: uwuwu_usecase::UsecaseError,
+}
+
+#[async_trait::async_trait]
+impl uwuwu_usecase::WikiRepo for DeleteFailingWiki {
+    async fn read_doc(&self, _slug: &str) -> uwuwu_usecase::UsecaseResult<Option<String>> {
+        Ok(Some("# doc\n".into()))
+    }
+    async fn list_docs(&self, _prefix: &str) -> uwuwu_usecase::UsecaseResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+    async fn doc_shas(&self) -> uwuwu_usecase::UsecaseResult<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
+    async fn write_doc(&self, _: &str, _: &str, _: &str) -> uwuwu_usecase::UsecaseResult<()> {
+        Ok(())
+    }
+    async fn append_doc(&self, _: &str, _: &str, _: &str) -> uwuwu_usecase::UsecaseResult<usize> {
+        Ok(0)
+    }
+    async fn read_doc_with_sha(
+        &self,
+        _slug: &str,
+    ) -> uwuwu_usecase::UsecaseResult<Option<uwuwu_usecase::DocSnapshot>> {
+        Ok(Some(uwuwu_usecase::DocSnapshot {
+            content: "# doc\n".into(),
+            blob_sha: "A".into(),
+        }))
+    }
+    async fn delete_doc(
+        &self,
+        _slug: &str,
+        _old_blob_sha: &str,
+        _message: &str,
+    ) -> uwuwu_usecase::UsecaseResult<uwuwu_usecase::DocDeleteCommit> {
+        Err(self.error.clone())
+    }
+}
+
+async fn delete_error_text(error: uwuwu_usecase::UsecaseError) -> String {
+    let (tools, _) = tool_hub(
+        Arc::new(DeleteFailingWiki { error }),
+        blob_usecase(),
+        Arc::new(StubCronState::default()),
+    );
+    call(
+        &tools,
+        "docs_delete",
+        json!({ "slug": "Projects/uwuwu/texts" }),
+    )
+    .await
+    .expect_err("отказ")
+}
+
+#[tokio::test]
+async fn delete_refusal_texts_keep_backup_scope_honest() {
+    use uwuwu_usecase::UsecaseError;
+
+    let race = delete_error_text(UsecaseError::RaceRef("blob changed".into())).await;
+    assert!(
+        race.contains("any backup is for the read version only"),
+        "{race}"
+    );
+
+    let absent = delete_error_text(UsecaseError::DocAbsentAtRef(
+        "already absent at ref; no delete was committed, backup of the read version only".into(),
+    ))
+    .await;
+    assert!(!absent.contains("no backup"), "{absent}");
+    assert!(
+        absent.contains("backup of the read version only"),
+        "{absent}"
+    );
+
+    let precheck =
+        delete_error_text(UsecaseError::PrecheckUnavailable("tree: HTTP 502".into())).await;
+    assert!(precheck.contains("no delete was committed"), "{precheck}");
+    assert!(precheck.contains("HTTP 502"), "{precheck}");
+
+    let board = delete_error_text(UsecaseError::Board("transport down".into())).await;
+    assert!(
+        !board.contains("no delete was committed") && !board.contains("вики не изменена"),
+        "нейтральный catch-all обещает слишком много: {board}"
+    );
+}
+
+#[test]
+fn docs_descriptors_declare_slug_guard_degradation() {
+    let list = super::tools::tool_descriptors();
+    let description = |name: &str| -> String {
+        list.as_array()
+            .expect("список тулов")
+            .iter()
+            .find(|t| t["name"].as_str() == Some(name))
+            .expect("тул на месте")["description"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    for (name, marker) in [
+        ("docs_write", "collision checks are skipped"),
+        ("docs_delete", "refused before mutation"),
+    ] {
+        let text = description(name);
+        assert!(
+            text.contains(marker),
+            "дескриптор {name} не оговаривает деградацию: {text}"
+        );
+    }
 }

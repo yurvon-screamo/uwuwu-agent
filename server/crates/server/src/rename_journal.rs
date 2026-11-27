@@ -93,7 +93,7 @@ impl StatusPreImageStore for JsonStatusPreImages {
 
 #[cfg(test)]
 #[path = "rename_journal_test_support.rs"]
-mod test_support;
+pub(crate) mod test_support;
 #[cfg(test)]
 #[path = "rename_journal_tests.rs"]
 mod tests;

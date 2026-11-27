@@ -94,7 +94,7 @@ impl TreeWitness<'_> {
 
 /// Blob-sha документа в свежем дереве. Неполный/усечённый ответ не
 /// доказывает отсутствие: честная ошибка вместо вердикта Created.
-fn blob_sha_for<'a>(tree: &'a Value, path: &str) -> UsecaseResult<Option<&'a str>> {
+pub(crate) fn blob_sha_for<'a>(tree: &'a Value, path: &str) -> UsecaseResult<Option<&'a str>> {
     if tree["truncated"].as_bool().unwrap_or(false) {
         return Err(UsecaseError::Board(format!(
             "wiki tree truncated — cannot confirm absence of {path}"
