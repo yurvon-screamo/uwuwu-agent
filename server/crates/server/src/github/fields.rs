@@ -13,8 +13,40 @@ use uwuwu_usecase::IssueFieldStore;
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 pub const F_DEV_SESSION: &str = "Сессия dev";
+/// Legacy-поле, покрывавшее все три ревью-слота (#1710). Только чтение
+/// когорты с пустым новым план-полем; новой записи не получает.
 pub const F_REVIEW_SESSION: &str = "Сессия ревью";
+pub const F_PLAN_REVIEW_SESSION: &str = "Сессия план-ревью";
+pub const F_RESULT_REVIEW_SESSION: &str = "Сессия ревью кода";
+pub const F_TEST_REVIEW_SESSION: &str = "Сессия ревью тестов";
 pub const F_TEST_SESSION: &str = "Сессия тест";
+
+/// Единственный источник имени поля сессии слота: три ревью-стадии —
+/// три независимых ячейки (канон #1626); дев-семья и тестер — свои поля.
+pub fn review_session_field(slot: uwuwu_domain::Slot) -> &'static str {
+    use uwuwu_domain::Slot;
+    match slot {
+        Slot::Dev | Slot::Design => F_DEV_SESSION,
+        Slot::PlanReview => F_PLAN_REVIEW_SESSION,
+        Slot::ResultReview => F_RESULT_REVIEW_SESSION,
+        Slot::TestReview => F_TEST_REVIEW_SESSION,
+        Slot::Test => F_TEST_SESSION,
+    }
+}
+
+/// Патч записи сессии:эксклюзивное поле слота плюс условная очистка legacy
+/// (только для ревью-слотов и только если legacy-поле есть в каталоге).
+pub fn review_store_patch(
+    slot: uwuwu_domain::Slot,
+    session: &str,
+    legacy_present: bool,
+) -> Vec<(&'static str, Option<String>)> {
+    let mut patch = vec![(review_session_field(slot), Some(session.to_string()))];
+    if slot.is_review() && legacy_present {
+        patch.push((F_REVIEW_SESSION, None));
+    }
+    patch
+}
 /// Ветка задачи (фабрика пишет при спавне; PR-рид гейтится ею — hub.rs).
 pub const F_BRANCH: &str = "Branch";
 /// Единое имя поля приоритета (пишется create-ом, читается enrichment-ом):
@@ -147,6 +179,12 @@ impl IssueFields {
         let mut catalog = self.catalog().await?;
         let mut batch = Vec::new();
         for (name, value) in patch {
+            // Очистка отсутствующего поля — no-op: не создаём заново поле,
+            // которое владелец снёс (класс #1271; #1710 legacy-ветка).
+            if value.as_deref().is_none_or(str::is_empty) && resolve_field(&catalog, name).is_none()
+            {
+                continue;
+            }
             // self-heal: отсутствующее поле создаём (инцидент #1149 —
             // create задачи падал целиком из-за неготового «Тип»)
             let fid = match resolve_field(&catalog, name) {
@@ -197,6 +235,12 @@ impl IssueFields {
             )));
         }
         Ok(())
+    }
+
+    /// Признак поля в каталоге без создания (Sources: #1710 legacy-ветка):
+    /// cleared-патч не должен пересоздавать снесённое владельцем поле.
+    pub(crate) async fn has_field(&self, name: &str) -> UsecaseResult<bool> {
+        Ok(self.catalog().await?.contains_key(name))
     }
 
     /// Создать глобальное поле, если его нет (каталог дрогнуть).
@@ -377,6 +421,53 @@ mod tests {
         assert!(
             !field_422_already_exists(&other),
             "не-already 422 не маскируется: {other}"
+        );
+    }
+
+    #[test]
+    fn review_session_field_is_exclusive_per_slot() {
+        use uwuwu_domain::Slot;
+        let names: Vec<_> = [
+            Slot::Dev,
+            Slot::Design,
+            Slot::PlanReview,
+            Slot::ResultReview,
+            Slot::TestReview,
+            Slot::Test,
+        ]
+        .into_iter()
+        .map(review_session_field)
+        .collect();
+        assert_eq!(
+            names,
+            vec![
+                F_DEV_SESSION,
+                F_DEV_SESSION,
+                F_PLAN_REVIEW_SESSION,
+                F_RESULT_REVIEW_SESSION,
+                F_TEST_REVIEW_SESSION,
+                F_TEST_SESSION,
+            ]
+        );
+    }
+
+    #[test]
+    fn review_store_patch_clears_legacy_only_for_review() {
+        use uwuwu_domain::Slot;
+        let patch = review_store_patch(Slot::ResultReview, "ses_result", true);
+        assert_eq!(
+            patch,
+            vec![
+                (F_RESULT_REVIEW_SESSION, Some("ses_result".into())),
+                (F_REVIEW_SESSION, None),
+            ]
+        );
+        let patch = review_store_patch(Slot::Dev, "ses_dev", true);
+        assert_eq!(patch, vec![(F_DEV_SESSION, Some("ses_dev".into()))]);
+        let patch = review_store_patch(Slot::PlanReview, "ses_plan", false);
+        assert_eq!(
+            patch,
+            vec![(F_PLAN_REVIEW_SESSION, Some("ses_plan".into()))]
         );
     }
 

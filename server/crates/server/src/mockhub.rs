@@ -91,34 +91,26 @@ fn parse_seeds(raw: &str) -> Vec<SeedRow> {
         .collect()
 }
 
-/// Семейная ячейка слота: прод-носитель хранит одно значение поля на
-/// семью — «Сессия dev» покрывает Design|Dev, «Сессия ревью» —
-/// PlanReview|ResultReview (github/fields.rs; запись — mirror hub.rs
-/// set_session/clear_session). Мок хранит канонический ключ семьи,
-/// shadow-слоты разворачиваются на выдаче (expand_families).
+/// Семейная ячейка слота: только дев-семья делит поле «Сессия dev»
+/// (Design|Dev). Ревью-стадии с #1710 держат три независимых поля —
+/// mirror github/fields.rs review_session_field и hub.rs set_session.
 fn family_cell(slot: Slot) -> Slot {
     match slot {
         Slot::Design => Slot::Dev,
-        Slot::ResultReview => Slot::PlanReview,
         other => other,
     }
 }
 
 /// Разворот семейных ячеек на выдаче (mirror github/hub.rs
-/// map_task_fields): одно значение поля видно обоим слотам семьи —
+/// map_task_fields): только дев-семья видит одно значение —
 /// Design-строка видит свою сессию, а после перехода в In Progress
 /// тот же сеанс читается в дев-слоте (прод-геометрия «переезда»
 /// дев-сессии, #1237): тик не спавнит дубль, wake-путь получает
-/// адресата.
+/// адресата. Ревью-слоты не разворачиваются (#1710).
 fn expand_families(fields: &TaskFields) -> TaskFields {
     let mut out = fields.clone();
-    for (canonical, shadow) in [
-        (Slot::Dev, Slot::Design),
-        (Slot::PlanReview, Slot::ResultReview),
-    ] {
-        if let Some(s) = out.session(canonical).cloned() {
-            out.set_session(shadow, s);
-        }
+    if let Some(s) = out.session(Slot::Dev).cloned() {
+        out.set_session(Slot::Design, s);
     }
     out
 }
@@ -918,6 +910,9 @@ impl IssueFieldStore for MemoryHub {
             if let Some(f) = state.fields.get(&number) {
                 for (name, slot) in [
                     (crate::github::F_DEV_SESSION, Slot::Dev),
+                    (crate::github::F_PLAN_REVIEW_SESSION, Slot::PlanReview),
+                    (crate::github::F_RESULT_REVIEW_SESSION, Slot::ResultReview),
+                    (crate::github::F_TEST_REVIEW_SESSION, Slot::TestReview),
                     (crate::github::F_REVIEW_SESSION, Slot::PlanReview),
                     (crate::github::F_TEST_SESSION, Slot::Test),
                 ] {
@@ -988,6 +983,9 @@ impl IssueFieldStore for MemoryHub {
             for (name, value) in patch {
                 let slot = match *name {
                     crate::github::F_DEV_SESSION => Some(Slot::Dev),
+                    crate::github::F_PLAN_REVIEW_SESSION => Some(Slot::PlanReview),
+                    crate::github::F_RESULT_REVIEW_SESSION => Some(Slot::ResultReview),
+                    crate::github::F_TEST_REVIEW_SESSION => Some(Slot::TestReview),
                     crate::github::F_REVIEW_SESSION => Some(Slot::PlanReview),
                     crate::github::F_TEST_SESSION => Some(Slot::Test),
                     _ => None,
@@ -1529,10 +1527,28 @@ mod tests {
         assert_eq!(t.session_of(Slot::Dev), None);
     }
 
-    /// Ревью-семья — та же схема (#1237): «Сессия ревью» покрывает
-    /// PlanReview|ResultReview, clear одной стороны снимает обе.
+    #[test]
+    fn review_sessions_are_not_family_shared() {
+        // #1710: геометрия мока обязана совпадать с продом — ревью-слоты
+        // независимые ячейки, только дев-семья остаётся общей
+        assert_eq!(family_cell(Slot::ResultReview), Slot::ResultReview);
+        assert_eq!(family_cell(Slot::TestReview), Slot::TestReview);
+        let mut fields = TaskFields::default();
+        fields.set_session(
+            Slot::PlanReview,
+            uwuwu_domain::SessionRef::parse("ses_plan").expect("ses_"),
+        );
+        let expanded = expand_families(&fields);
+        assert_eq!(
+            expanded.session(Slot::PlanReview).map(|s| s.as_str()),
+            Some("ses_plan")
+        );
+        assert_eq!(expanded.session(Slot::ResultReview), None);
+    }
+
+    /// Ревью-ячейки независимы (#1710): каждая стадия держит свою сессию.
     #[tokio::test]
-    async fn review_family_cell_shared_across_review_slots() {
+    async fn review_session_cells_are_exclusive() {
         let hub = MemoryHub::with_seed(Some((9, Status::ReviewPlan)));
         hub.read_board("B").await.expect("материализация сида");
         hub.set_session("B", 9, Slot::PlanReview, "ses_review1")
@@ -1541,11 +1557,14 @@ mod tests {
         let rows = hub.read_board("B").await.expect("доска");
         let t = rows.iter().find(|t| t.number() == 9).expect("строка");
         assert_eq!(t.session_of(Slot::PlanReview), Some("ses_review1"));
-        assert_eq!(
-            t.session_of(Slot::ResultReview),
-            Some("ses_review1"),
-            "ревью-семья: одна ячейка на оба ревью-слота"
-        );
+        assert_eq!(t.session_of(Slot::ResultReview), None);
+        hub.set_session("B", 9, Slot::ResultReview, "ses_result1")
+            .await
+            .expect("запись result-сессии");
+        let rows = hub.read_board("B").await.expect("доска");
+        let t = rows.iter().find(|t| t.number() == 9).expect("строка");
+        assert_eq!(t.session_of(Slot::PlanReview), Some("ses_review1"));
+        assert_eq!(t.session_of(Slot::ResultReview), Some("ses_result1"));
         hub.clear_session("B", 9, Slot::ResultReview)
             .await
             .expect("clear result-слотом");
@@ -1553,8 +1572,8 @@ mod tests {
         let t = rows.iter().find(|t| t.number() == 9).expect("строка");
         assert_eq!(
             t.session_of(Slot::PlanReview),
-            None,
-            "clear одной стороны снимает семейную ячейку"
+            Some("ses_review1"),
+            "clear result-слота не трогает план-сессию"
         );
         assert_eq!(t.session_of(Slot::ResultReview), None);
     }

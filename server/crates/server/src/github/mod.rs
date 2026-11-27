@@ -16,6 +16,9 @@ mod pv2_tests;
 /// наблюдаемого запроса (~40 c снапшот), ниже poll_sec (180 c).
 pub(crate) const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-pub use fields::{F_DEV_SESSION, F_REVIEW_SESSION, F_TEST_SESSION};
+pub use fields::{
+    F_DEV_SESSION, F_PLAN_REVIEW_SESSION, F_RESULT_REVIEW_SESSION, F_REVIEW_SESSION,
+    F_TEST_REVIEW_SESSION, F_TEST_SESSION,
+};
 pub use hub::GitHubHub;
 pub use prgate::{parse_pr_url, GhPrGateway};
