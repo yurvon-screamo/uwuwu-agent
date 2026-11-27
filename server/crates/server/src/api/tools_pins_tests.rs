@@ -8,6 +8,7 @@
 use super::test_support::{blob_usecase, blob_usecase_missing, mcp_call, tool_hub, StubCronState};
 use super::tools::ToolHub;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// ToolHub фабрики test_support: MemoryHub как вики (docs_* армы пинов
@@ -2162,6 +2163,111 @@ async fn delete_refusal_texts_keep_backup_scope_honest() {
     assert!(
         !board.contains("no delete was committed") && !board.contains("вики не изменена"),
         "нейтральный catch-all обещает слишком много: {board}"
+    );
+}
+
+/// Порт-пин проводки снимка версии (#1714, ревью-раунд 1): настоящий
+/// диспетчер `docs_write` обязан взять sha из прочитанного `DocSnapshot`
+/// и отдать его именно в `write_doc_checked`. Unchecked write не вызывается.
+/// Фейк — порт WikiRepo, без HTTP-моков (ADR-110).
+#[derive(Default)]
+struct SnapshotCapturingWiki {
+    captured: std::sync::Mutex<Option<(String, Option<String>)>>,
+    plain_writes: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl uwuwu_usecase::WikiRepo for SnapshotCapturingWiki {
+    async fn read_doc(&self, _slug: &str) -> uwuwu_usecase::UsecaseResult<Option<String>> {
+        Ok(None)
+    }
+    async fn read_doc_snapshot(
+        &self,
+        _slug: &str,
+    ) -> uwuwu_usecase::UsecaseResult<Option<uwuwu_usecase::DocSnapshot>> {
+        Ok(Some(uwuwu_usecase::DocSnapshot {
+            content: "---\ntitle: A\n---\n\nверсия A\n".into(),
+            blob_sha: "sha-A-1714".into(),
+        }))
+    }
+    async fn list_docs(&self, _prefix: &str) -> uwuwu_usecase::UsecaseResult<Vec<String>> {
+        Ok(vec![])
+    }
+    async fn doc_shas(&self) -> uwuwu_usecase::UsecaseResult<Vec<(String, String)>> {
+        Ok(vec![])
+    }
+    async fn write_doc(
+        &self,
+        _slug: &str,
+        _content: &str,
+        _message: &str,
+    ) -> uwuwu_usecase::UsecaseResult<()> {
+        self.plain_writes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn write_doc_checked(
+        &self,
+        _slug: &str,
+        content: &str,
+        _message: &str,
+        expected_sha: Option<&str>,
+    ) -> uwuwu_usecase::UsecaseResult<()> {
+        *self.captured.lock().expect("capture") =
+            Some((content.to_string(), expected_sha.map(str::to_string)));
+        Err(uwuwu_usecase::UsecaseError::RaceRef(
+            "competing commit in pin".into(),
+        ))
+    }
+    async fn append_doc(
+        &self,
+        _slug: &str,
+        _line: &str,
+        _message: &str,
+    ) -> uwuwu_usecase::UsecaseResult<usize> {
+        Ok(0)
+    }
+}
+
+#[tokio::test]
+async fn docs_write_carries_snapshot_sha_to_checked_write() {
+    let wiki = Arc::new(SnapshotCapturingWiki::default());
+    let (tools, _memory) = tool_hub(
+        wiki.clone(),
+        blob_usecase(),
+        Arc::new(StubCronState::default()),
+    );
+
+    let error = call(
+        &tools,
+        "docs_write",
+        json!({ "slug": "Experience/rig1714/write", "content": "# новая.verсия\n" }),
+    )
+    .await
+    .expect_err("RaceRef отказан");
+
+    let (content, expected_sha) = wiki
+        .captured
+        .lock()
+        .expect("capture")
+        .clone()
+        .expect("write_doc_checked вызван");
+    assert_eq!(
+        expected_sha.as_deref(),
+        Some("sha-A-1714"),
+        "expected_sha обязан прийти из DocSnapshot: {expected_sha:?}"
+    );
+    assert_eq!(
+        wiki.plain_writes.load(Ordering::SeqCst),
+        0,
+        "unchecked write обошёл проверку версии"
+    );
+    assert!(
+        content.contains("title: A"),
+        "fm-шапка из снимка потеряна: {content}"
+    );
+    assert!(
+        error.contains("refused: race-ref"),
+        "отказ точки входа не назван: {error}"
     );
 }
 

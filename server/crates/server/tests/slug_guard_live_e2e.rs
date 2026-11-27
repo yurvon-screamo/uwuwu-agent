@@ -72,6 +72,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
+use uwuwu_usecase::WikiRepo;
 
 /// Имя рига уникально и при параллельных прогонах одного бинарника:
 /// миллисекунды + pid совпадали у тестов, стартовавших в одну миллисекунду,
@@ -1449,4 +1450,129 @@ async fn contents_and_tree_blob_sha_match_live_e2e() {
     let delete_result = rig.delete().await;
     lease.deleted = delete_result.is_ok();
     finish_live_rig(&rig, &dir, outcome, delete_result, "sha-match").await;
+}
+
+// --- #1714: гонка чтение→коммит в write-путях (append_line / docs_write) ----
+
+/// Contents видит ровно ожидаемую версию (lag git-data → Contents до ~20 с).
+async fn wait_contents_exact(rig: &RigGithub, path: &str, expected: &str) {
+    let deadline = tokio::time::Instant::now() + WAIT_TIMEOUT;
+    loop {
+        if rig.read_file(path).await.as_deref() == Some(expected) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "contents не показал ожидаемую версию {path} за {WAIT_TIMEOUT:?}"
+        );
+        tokio::time::sleep(POLL_STEP).await;
+    }
+}
+
+/// Lost update на адаптере: снимок A жив, конкурент уже коммитил B в
+/// git-data. Оба write-пути со снимком A обязаны отказать RaceRef, B цела;
+/// повтор со свежим снимком B проходит (регресс легальной записи).
+async fn run_write_race_scenario(rig: RigGithub, _dir: PathBuf, stamp: String) {
+    if let Some(error) = &rig.creation_error {
+        panic!("{error}");
+    }
+    let slug = format!("Experience/rig{stamp}/write-race");
+    let path = format!("docs/{slug}.md");
+    let body_a = "# версия A\n";
+    let body_b = "# версия B\n";
+    let writer = wiki::GitWikiWriter::new(rig.repo.clone(), rig.branch.clone(), rig.token.clone());
+    writer_commit(&writer, &path, body_a, "seed A 1714").await;
+    rig.wait_tree(std::slice::from_ref(&path)).await;
+    let sha_a = wait_blob_sha(&rig, &path).await;
+    let snapshot_a = uwuwu_usecase::DocSnapshot {
+        content: body_a.to_string(),
+        blob_sha: sha_a.clone(),
+    };
+
+    let rival = wiki::GitWikiWriter::new(rig.repo.clone(), rig.branch.clone(), rig.token.clone());
+    writer_commit(&rival, &path, body_b, "competing B 1714").await;
+    rig.wait_tree_sha(&path, &sha_a).await;
+    let sha_b = wait_blob_sha(&rig, &path).await;
+    assert_ne!(sha_a, sha_b, "конкурирующий коммит не изменил blob");
+
+    // append_line по снимку A: предпроверка дерева видит B.
+    let error = writer
+        .append_line_with_snapshot(&path, "строка гонки 1714", "append stale 1714", &snapshot_a)
+        .await
+        .expect_err("append с просроченным снимком обязан отказаться");
+    assert!(
+        matches!(error, uwuwu_usecase::UsecaseError::RaceRef(_)),
+        "append: ожидался RaceRef, получено: {error}"
+    );
+    assert_eq!(
+        rig.tree_blob_sha(&path).await,
+        Some(sha_b.clone()),
+        "append затёр свежую версию B"
+    );
+
+    // docs_write по снимку A: та же предпроверка на границе адаптера вики.
+    let github = wiki::GitHubWiki::with_writer(
+        rig.repo.clone(),
+        rig.branch.clone(),
+        rig.token.clone(),
+        Some(std::sync::Arc::new(wiki::GitWikiWriter::new(
+            rig.repo.clone(),
+            rig.branch.clone(),
+            rig.token.clone(),
+        ))),
+    );
+    let error = github
+        .write_doc_checked(
+            &slug,
+            "# версия A — запись после гонки\n",
+            "write stale 1714",
+            Some(&sha_a),
+        )
+        .await
+        .expect_err("write с просроченным снимком обязан отказаться");
+    assert!(
+        matches!(error, uwuwu_usecase::UsecaseError::RaceRef(_)),
+        "write: ожидался RaceRef, получено: {error}"
+    );
+    assert_eq!(
+        rig.tree_blob_sha(&path).await,
+        Some(sha_b.clone()),
+        "docs_write затёр свежую версию B"
+    );
+
+    // Контроль: реальный append_line сам читает снимок из Contents и
+    // коммитит по нему — свежая версия B сохраняется, строка дописывается.
+    wait_contents_exact(&rig, &path, body_b).await;
+    let lines = writer
+        .append_line(&path, "строка после гонки", "append fresh 1714")
+        .await
+        .expect("append_line со свежим чтением");
+    assert!(lines >= 2, "append вернул строк: {lines}");
+    rig.wait_tree_sha(&path, &sha_b).await;
+    let sha_fresh = wait_blob_sha(&rig, &path).await;
+    github
+        .write_doc_checked(
+            &slug,
+            "# версия C — легальная запись\n",
+            "write fresh 1714",
+            Some(&sha_fresh),
+        )
+        .await
+        .expect("write со свежим снимком");
+    rig.wait_tree_sha(&path, &sha_fresh).await;
+    println!("write race live: RaceRef в обоих путях, B цела, свежие записи прошли");
+}
+
+#[tokio::test]
+async fn stale_snapshot_write_is_refused_live_e2e() {
+    let Some(token) = e2e_ready() else {
+        println!("e2e выключен: UWUWU_E2E=1 для живой пробы гонки write-путей");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let (dir, rig, mut lease, stamp) = start_live_rig("write", &http, &token).await;
+    let outcome = tokio::spawn(run_write_race_scenario(rig.clone(), dir.clone(), stamp)).await;
+    let delete_result = rig.delete().await;
+    lease.deleted = delete_result.is_ok();
+    finish_live_rig(&rig, &dir, outcome, delete_result, "write race").await;
 }

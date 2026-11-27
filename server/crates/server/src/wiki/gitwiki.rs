@@ -3,7 +3,7 @@
 //! Единый писатель — сервер (конвейер), конфликт ff громко отвергается.
 
 use serde_json::{json, Value};
-use uwuwu_usecase::{DocDeleteCommit, PostCheck, UsecaseError, UsecaseResult};
+use uwuwu_usecase::{DocDeleteCommit, DocSnapshot, PostCheck, UsecaseError, UsecaseResult};
 
 use crate::wiki::encode_path;
 
@@ -75,22 +75,20 @@ impl GitWikiWriter {
         UsecaseError::Board(format!("gitwiki: {msg}"))
     }
 
-    /// Читает текущее содержимое файла; на Contents-404 сверяется со
-    /// свежим деревом: None — файла нет и в дереве (#1653).
-    pub async fn read(&self, path: &str) -> UsecaseResult<Option<String>> {
+    /// Чтение с blob SHA из того же ответа (#1714): снимок для проверки
+    /// версии перед коммитом. Contents без sha не доказывает версию — отказ.
+    pub async fn read_with_sha(&self, path: &str) -> UsecaseResult<Option<DocSnapshot>> {
         let (status, body) = self
             .call(reqwest::Method::GET, &contents_url(&self.repo, path), None)
             .await?;
         if status.as_u16() == 404 {
-            // #1653: append не должен отказывать ложным AppendMissing
-            // по устаревшему Contents-чтению; дерево — свежий свидетель.
             return crate::wiki::witness::TreeWitness {
                 http: &self.http,
                 token: &self.token,
                 repo: &self.repo,
                 branch: &self.branch,
             }
-            .read(path)
+            .read_with_sha(path)
             .await;
         }
         if !status.is_success() {
@@ -101,12 +99,33 @@ impl GitWikiWriter {
             .unwrap_or_default()
             .replace('\n', "");
         let bytes = base64_std(&b64).ok_or_else(|| Self::err(format!("read {path}: base64")))?;
-        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+        let blob_sha = body["sha"].as_str().unwrap_or_default().to_string();
+        if blob_sha.is_empty() {
+            return Err(Self::err(format!("read {path}: no live blob sha")));
+        }
+        Ok(Some(DocSnapshot {
+            content: String::from_utf8_lossy(&bytes).into_owned(),
+            blob_sha,
+        }))
     }
 
-    /// Коммит файла с сообщением (ff-only на branch).
+    /// Коммит файла с сообщением (ff-only на branch), без снимка версии:
+    /// сиды и ассеты, где проверять нечего. Docs-пути используют checked-вариант.
     pub async fn commit_file(&self, path: &str, content: &str, message: &str) -> UsecaseResult<()> {
         self.commit_bytes(path, content.as_bytes(), message).await
+    }
+
+    /// Коммит файла со снимком версии (#1714): расхождение blob в дереве
+    /// того же HEAD — RaceRef, без повторной мутации.
+    pub async fn commit_file_checked(
+        &self,
+        path: &str,
+        content: &str,
+        message: &str,
+        expected_sha: &str,
+    ) -> UsecaseResult<()> {
+        self.commit_bytes_with(path, content.as_bytes(), message, Some(expected_sha))
+            .await
     }
 
     /// Коммит бинарного файла (ассеты ботов, #1171): blob — base64
@@ -117,6 +136,16 @@ impl GitWikiWriter {
         path: &str,
         content: &[u8],
         message: &str,
+    ) -> UsecaseResult<()> {
+        self.commit_bytes_with(path, content, message, None).await
+    }
+
+    async fn commit_bytes_with(
+        &self,
+        path: &str,
+        content: &[u8],
+        message: &str,
+        expected_sha: Option<&str>,
     ) -> UsecaseResult<()> {
         let (_, blob) = self
             .call(
@@ -130,7 +159,8 @@ impl GitWikiWriter {
             .await?;
         let blob_sha = blob["sha"].as_str().unwrap_or_default().to_string();
         let entry = json!({ "path": path, "mode": "100644", "type": "blob", "sha": blob_sha });
-        self.commit_tree(json!([entry]), message, None).await?;
+        let expected = expected_sha.map(|sha| ExpectedBlob { path, sha });
+        self.commit_tree(json!([entry]), message, expected).await?;
         Ok(())
     }
 
@@ -295,13 +325,29 @@ impl GitWikiWriter {
     /// только у write-пути; писатель знает факт существования
     /// авторитетно, до записи).
     pub async fn append_line(&self, path: &str, line: &str, message: &str) -> UsecaseResult<usize> {
-        let Some(current) = self.read(path).await? else {
+        // Снимок content+sha из одного чтения: между чтением и коммитом
+        // конкуренту не даётся тихой перезаписи (#1714).
+        let Some(snapshot) = self.read_with_sha(path).await? else {
             return Err(UsecaseError::AppendMissing(format!(
                 "doc does not exist: {path}"
             )));
         };
-        let next = append_to(current, line);
-        self.commit_file(path, &next, message).await?;
+        self.append_line_with_snapshot(path, line, message, &snapshot)
+            .await
+    }
+
+    /// Append по снимку версии — та же логика, но снимок приходит от
+    /// вызывающего (детерминированная проба гонки на живом адаптере).
+    pub async fn append_line_with_snapshot(
+        &self,
+        path: &str,
+        line: &str,
+        message: &str,
+        snapshot: &DocSnapshot,
+    ) -> UsecaseResult<usize> {
+        let next = append_to(snapshot.content.clone(), line);
+        self.commit_file_checked(path, &next, message, &snapshot.blob_sha)
+            .await?;
         Ok(next.lines().count())
     }
 }
