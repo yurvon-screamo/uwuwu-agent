@@ -91,29 +91,25 @@ impl GitHubWiki {
                 self.branch
             )));
         }
-        let list: Vec<(String, String)> = body["tree"]
-            .as_array()
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(|e| {
-                        let path = e["path"].as_str()?;
-                        let sha = e["sha"].as_str()?;
-                        let ok = e["type"].as_str()? == "blob"
-                            && path.ends_with(".md")
-                            && path.starts_with("docs/");
-                        ok.then(|| {
-                            (
-                                path.trim_start_matches("docs/")
-                                    .trim_end_matches(".md")
-                                    .to_string(),
-                                sha.to_string(),
-                            )
-                        })
-                    })
-                    .collect()
+        let entries = tree_entries(&body, "shas_cache")?;
+        let list: Vec<(String, String)> = entries
+            .iter()
+            .filter_map(|e| {
+                let path = e["path"].as_str()?;
+                let sha = e["sha"].as_str()?;
+                let ok = e["type"].as_str()? == "blob"
+                    && path.ends_with(".md")
+                    && path.starts_with("docs/");
+                ok.then(|| {
+                    (
+                        path.trim_start_matches("docs/")
+                            .trim_end_matches(".md")
+                            .to_string(),
+                        sha.to_string(),
+                    )
+                })
             })
-            .unwrap_or_default();
+            .collect();
         *self.shas_cache.lock().expect("shas lock") = Some((Instant::now(), list.clone()));
         Ok(list)
     }
@@ -184,24 +180,20 @@ impl GitHubWiki {
                 self.branch
             )));
         }
-        let tree: Vec<String> = body["tree"]
-            .as_array()
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(|e| {
-                        let path = e["path"].as_str()?;
-                        let is_blob = e["type"].as_str()? == "blob";
-                        let is_md = path.ends_with(".md");
-                        (is_blob && is_md && path.starts_with("docs/")).then(|| {
-                            path.trim_start_matches("docs/")
-                                .trim_end_matches(".md")
-                                .to_string()
-                        })
-                    })
-                    .collect()
+        let entries = tree_entries(&body, "docs_tree")?;
+        let tree: Vec<String> = entries
+            .iter()
+            .filter_map(|e| {
+                let path = e["path"].as_str()?;
+                let is_blob = e["type"].as_str()? == "blob";
+                let is_md = path.ends_with(".md");
+                (is_blob && is_md && path.starts_with("docs/")).then(|| {
+                    path.trim_start_matches("docs/")
+                        .trim_end_matches(".md")
+                        .to_string()
+                })
             })
-            .unwrap_or_default();
+            .collect();
         *self.tree_cache.lock().expect("tree lock") = Some((Instant::now(), tree.clone()));
         Ok(tree)
     }
@@ -223,6 +215,10 @@ impl WikiRepo for GitHubWiki {
             )));
         }
         Ok(Some(doc))
+    }
+
+    async fn read_doc_snapshot(&self, slug: &str) -> UsecaseResult<Option<DocSnapshot>> {
+        self.read_doc_with_sha(slug).await
     }
 
     async fn delete_doc(
@@ -268,12 +264,49 @@ impl WikiRepo for GitHubWiki {
             .await
     }
 
+    async fn write_doc_checked(
+        &self,
+        slug: &str,
+        content: &str,
+        message: &str,
+        expected_sha: Option<&str>,
+    ) -> UsecaseResult<()> {
+        let Some(w) = &self.writer else {
+            return Err(UsecaseError::Board("wiki write is not configured".into()));
+        };
+        self.invalidate_caches();
+        let path = format!("docs/{slug}.md");
+        match expected_sha {
+            Some(sha) => w.commit_file_checked(&path, content, message, sha).await,
+            None => w.commit_file(&path, content, message).await,
+        }
+    }
+
     async fn append_doc(&self, slug: &str, line: &str, message: &str) -> UsecaseResult<usize> {
         let Some(w) = &self.writer else {
             return Err(UsecaseError::Board("wiki write is not configured".into()));
         };
         w.append_line(&format!("docs/{slug}.md"), line, message)
             .await
+    }
+}
+
+/// Дерево в ответе 200 обязано быть массивом (#1714, L-4): отсутствие
+/// `tree` — деградация листинга, а не пустое дерево. Ошибка не кэшируется,
+/// событие с именем и причиной уходит в логи.
+fn tree_entries<'a>(body: &'a Value, kind: &str) -> UsecaseResult<&'a [Value]> {
+    match body["tree"].as_array() {
+        Some(entries) => Ok(entries.as_slice()),
+        None => {
+            tracing::warn!(
+                event = "wiki.tree.invalid",
+                kind,
+                "response has no tree array — listing is unavailable"
+            );
+            Err(UsecaseError::Board(format!(
+                "wiki {kind}: response has no tree array"
+            )))
+        }
     }
 }
 
@@ -296,6 +329,21 @@ pub(crate) fn encode_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn tree_entries_rejects_response_without_tree_array() {
+        for body in [json!({}), json!({"tree": "not-an-array"}), Value::Null] {
+            let error = tree_entries(&body, "docs_tree").expect_err("массива нет");
+            assert!(matches!(error, UsecaseError::Board(_)), "{error}");
+            assert!(error.to_string().contains("no tree array"), "{error}");
+        }
+    }
+
+    #[test]
+    fn tree_entries_accepts_genuinely_empty_tree() {
+        assert!(tree_entries(&json!({"tree": []}), "shas_cache").is_ok());
+    }
 
     #[test]
     fn mutation_invalidates_both_tree_and_sha_caches() {

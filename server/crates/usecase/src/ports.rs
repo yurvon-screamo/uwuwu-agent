@@ -226,6 +226,16 @@ pub trait WikiRepo: Send + Sync {
             "wiki {slug}: read_doc_with_sha is not implemented"
         )))
     }
+
+    /// Снимок для write-пути (#1714): содержимое и blob sha из одного
+    /// чтения. Дефолт — адаптер без версий: sha неизвестен, проверка
+    /// коммита не требуется; GitHub-адаптер переопределяет живым чтением.
+    async fn read_doc_snapshot(&self, slug: &str) -> UsecaseResult<Option<DocSnapshot>> {
+        Ok(self.read_doc(slug).await?.map(|content| DocSnapshot {
+            content,
+            blob_sha: String::new(),
+        }))
+    }
     /// Пути .md под префиксом (напр. «Projects/uwuwu»), без docs/.
     async fn list_docs(&self, prefix: &str) -> UsecaseResult<Vec<String>>;
     /// Слаги + git blob-sha всех доков (одно дерево): инкрементальный
@@ -235,6 +245,22 @@ pub trait WikiRepo: Send + Sync {
     async fn doc_shas(&self) -> UsecaseResult<Vec<(String, String)>>;
     /// Перезапись дока (commit в ветку, ff-only).
     async fn write_doc(&self, slug: &str, content: &str, message: &str) -> UsecaseResult<()>;
+
+    /// Перезапись со снимком версии (#1714): `expected_sha` — blob sha из
+    /// чтения, на котором построен `content`. Расхождение в дереве коммита —
+    /// RaceRef без повторной мутации; None — адаптер без живой версии.
+    /// Дефолт делегирует обычной записи, чтобы моки не несли версию.
+    async fn write_doc_checked(
+        &self,
+        slug: &str,
+        content: &str,
+        message: &str,
+        expected_sha: Option<&str>,
+    ) -> UsecaseResult<()> {
+        let _ = expected_sha;
+        self.write_doc(slug, content, message).await
+    }
+
     /// Append строки в конец существующего дока (ff-only). Несуществующий
     /// таргет — доменный отказ AppendMissing (#1613: append не создаёт,
     /// создание — только docs_write); возвращает строк после записи

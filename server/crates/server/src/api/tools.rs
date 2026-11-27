@@ -620,7 +620,7 @@ impl ToolHub {
         // док нужен веткам переноса/создания; сбой чтения громко рвёт
         // запись — кроме входа с собственным fm, той ветке док не нужен
         // (read Err при входе с fm оставляет существование неизвестным).
-        let (existing, read_failed) = match self.wiki.read_doc(&slug).await {
+        let (existing, read_failed) = match self.wiki.read_doc_snapshot(&slug).await {
             Ok(doc) => (doc, None),
             Err(e) => {
                 if fm_guard::split(&incoming).is_none() {
@@ -666,11 +666,19 @@ impl ToolHub {
             }
         }
         let now = jst_stamp(crate::clock::SystemClock.now_ms());
-        let (content, verdict) = fm_guard::guard(existing.as_deref(), &incoming, &slug, &now);
+        let expected_sha = existing
+            .as_ref()
+            .and_then(|doc| (!doc.blob_sha.is_empty()).then_some(doc.blob_sha.as_str()));
+        let (content, verdict) = fm_guard::guard(
+            existing.as_ref().map(|doc| doc.content.as_str()),
+            &incoming,
+            &slug,
+            &now,
+        );
         self.wiki
-            .write_doc(&slug, &content, &message)
+            .write_doc_checked(&slug, &content, &message, expected_sha)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| write_refusal_error(&e))?;
         let mut fact = match verdict {
             fm_guard::FmGuard::Verbatim => {
                 format!("doc «{slug}» written — fm header from payload kept verbatim")
@@ -1312,6 +1320,19 @@ fn delete_absent_error(slug: &str, candidates: &[String]) -> String {
         out.push_str(&format!("; suffix candidates: {}", candidates.join(", ")));
     }
     out
+}
+
+/// Отказы записи: имя ветки и причина — без ретрая и без тихого успеха.
+fn write_refusal_error(error: &UsecaseError) -> String {
+    match error {
+        UsecaseError::RaceRef(reason) => format!(
+            "refused: race-ref — {reason}; the write was NOT retried, verify before repeating"
+        ),
+        UsecaseError::PrecheckUnavailable(reason) => {
+            format!("refused: precheck-unavailable — {reason}; no write was committed")
+        }
+        other => other.to_string(),
+    }
 }
 
 /// Отказы удаления: имя ветки и причина, без повторной мутации.
