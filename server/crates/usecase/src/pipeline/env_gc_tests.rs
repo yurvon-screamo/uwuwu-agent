@@ -4,8 +4,8 @@
 //! мгновенно — темп ожидания инфра-забота адаптера.
 
 use super::env_gc::{
-    env_gc_bootstrap_title, sweep_envs, EnvGcCtx, EnvGcOutcome, EnvGcPolicy, ENV_GC_BATCH_CAP,
-    ENV_GC_VERDICT_DEADLINE_MS, TASK_ENV_GC_SCRIPT,
+    env_gc_bootstrap_title, sweep_envs, EnvGcCtx, EnvGcGone, EnvGcOutcome, EnvGcPolicy,
+    ENV_GC_BATCH_CAP, ENV_GC_VERDICT_DEADLINE_MS, TASK_ENV_GC_SCRIPT,
 };
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::ports::{
@@ -435,6 +435,39 @@ fn policy(now: u64, observe: bool) -> EnvGcPolicy {
     }
 }
 
+struct Pass<'a> {
+    tasks: &'a [Task],
+    gw: &'a Arc<FakeGcSessions>,
+    board: &'a Arc<FakeBoard>,
+    now: u64,
+    observe: bool,
+    gone: &'a EnvGcGone,
+}
+
+async fn run_pass_on_board(board_name: &str, pass: &Pass<'_>) -> EnvGcOutcome {
+    let router = SessionRouter::uniform(pass.gw.clone());
+    let sessions = router.project("p");
+    let ctx = EnvGcCtx {
+        board_name,
+        checkout: "/checkout",
+        env_root: ENV_ROOT,
+        tasks: pass.tasks,
+        sessions,
+        models: &SpawnModels::canonical(),
+        board: pass.board.as_ref(),
+        gone: pass.gone,
+    };
+    sweep_envs(&ctx, policy(pass.now, pass.observe))
+        .await
+        .expect("проход не падает")
+}
+
+async fn run_pass(pass: &Pass<'_>) -> EnvGcOutcome {
+    // Ключ метки включает доску — изоляция проверяется проходом по другой
+    // доске через run_pass_on_board, здесь доска фикс-контура.
+    run_pass_on_board("Задачи uwuwu", pass).await
+}
+
 async fn run(
     tasks: &[Task],
     gw: &Arc<FakeGcSessions>,
@@ -442,20 +475,16 @@ async fn run(
     now: u64,
     observe: bool,
 ) -> EnvGcOutcome {
-    let router = SessionRouter::uniform(gw.clone());
-    let sessions = router.project("p");
-    let ctx = EnvGcCtx {
-        board_name: "Задачи uwuwu",
-        checkout: "/checkout",
-        env_root: ENV_ROOT,
+    let gone = EnvGcGone::default();
+    run_pass(&Pass {
         tasks,
-        sessions,
-        models: &SpawnModels::canonical(),
-        board: board.as_ref(),
-    };
-    sweep_envs(&ctx, policy(now, observe))
-        .await
-        .expect("проход не падает")
+        gw,
+        board,
+        now,
+        observe,
+        gone: &gone,
+    })
+    .await
 }
 
 const NOW: u64 = 1_800_000_000_000;
@@ -601,6 +630,180 @@ async fn batch_cap_bounds_dispatch_per_pass_in_one_command() {
         .skip(1)
         .collect();
     assert_eq!(rows.len(), ENV_GC_BATCH_CAP);
+}
+
+#[tokio::test]
+async fn absent_rows_do_not_starve_next_batch() {
+    // 21 кандидат: первые 20 уже исчезли (ABSENT), 21-й жив. Второй
+    // проход обязан дойти до 21-го, а не снова слать первые 20.
+    let gw = fake(Vec::new());
+    verdict_default(&gw, "ABSENT");
+    let tasks: Vec<Task> = (1..=21u64)
+        .map(|i| done_closed(i, THREE_DAYS + (22 - i) * 1000, NOW))
+        .collect();
+
+    // Act
+    let gone = EnvGcGone::default();
+    let board = FakeBoard::all_done();
+    let pass = Pass {
+        tasks: &tasks,
+        gw: &gw,
+        board: &board,
+        now: NOW,
+        observe: false,
+        gone: &gone,
+    };
+    let first = run_pass(&pass).await;
+    assert_eq!(first.absent, ENV_GC_BATCH_CAP);
+    assert_eq!(first.gone, 0);
+    verdict_on(&gw, "21", "SWEPT");
+    let second = run_pass(&pass).await;
+
+    // Assert
+    assert_eq!(second.gone, ENV_GC_BATCH_CAP);
+    assert_eq!(second.swept, 1, "21-й кандидат должен быть снесён");
+    let commands = gw.commands.lock().unwrap();
+    let second_rows: Vec<&str> = commands[1]
+        .split_whitespace()
+        .skip_while(|t| *t != "sweep")
+        .skip(1)
+        .collect();
+    assert_eq!(second_rows, ["21"], "второй батч не должен нести старые 20");
+}
+
+/// Исходы, при которых env всё ещё может быть жив: метка недопустима.
+#[derive(Debug, Clone, Copy)]
+enum BadOutcome {
+    Dirty,
+    NoRepo,
+    Foreign,
+    Fail,
+    MissingVerdict,
+    TransportFailure,
+    Deadline,
+}
+
+impl BadOutcome {
+    fn configure(self, gw: &Arc<FakeGcSessions>) {
+        match self {
+            Self::Dirty => verdict_default(gw, "DIRTY"),
+            Self::NoRepo => verdict_default(gw, "NOREPO"),
+            Self::Foreign => verdict_default(gw, "FOREIGN"),
+            Self::Fail => verdict_default(gw, "FAIL"),
+            Self::MissingVerdict => {
+                *gw.feed_override.lock().unwrap() = Some("ENV-GC 999 ABSENT".into());
+            }
+            Self::TransportFailure => *gw.command_fails.lock().unwrap() = true,
+            Self::Deadline => *gw.wait_none.lock().unwrap() = true,
+        }
+    }
+}
+
+#[tokio::test]
+async fn non_terminal_outcomes_are_retried_on_next_pass() {
+    for outcome in [
+        BadOutcome::Dirty,
+        BadOutcome::NoRepo,
+        BadOutcome::Foreign,
+        BadOutcome::Fail,
+        BadOutcome::MissingVerdict,
+        BadOutcome::TransportFailure,
+        BadOutcome::Deadline,
+    ] {
+        let gw = fake(Vec::new());
+        outcome.configure(&gw);
+        let tasks = [done_closed(55, THREE_DAYS, NOW)];
+        let gone = EnvGcGone::default();
+        let board = FakeBoard::all_done();
+        let pass = Pass {
+            tasks: &tasks,
+            gw: &gw,
+            board: &board,
+            now: NOW,
+            observe: false,
+            gone: &gone,
+        };
+
+        let first = run_pass(&pass).await;
+        assert_eq!(
+            first.dirty + first.failed + first.norepo + first.foreign,
+            1,
+            "{outcome:?} учтён без сноса и без метки"
+        );
+
+        *gw.feed_override.lock().unwrap() = None;
+        *gw.command_fails.lock().unwrap() = false;
+        *gw.wait_none.lock().unwrap() = false;
+        verdict_default(&gw, "SWEPT");
+        let second = run_pass(&pass).await;
+
+        assert_eq!(second.gone, 0, "{outcome:?} не должен ставить метку");
+        assert_eq!(
+            second.swept, 1,
+            "{outcome:?}: живой env не должен прятаться"
+        );
+        assert_eq!(gw.commands.lock().unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn swept_rows_are_excluded_from_next_batch() {
+    let gw = fake(Vec::new());
+    verdict_default(&gw, "SWEPT");
+    let tasks = [done_closed(88, THREE_DAYS, NOW)];
+    let gone = EnvGcGone::default();
+    let board = FakeBoard::all_done();
+    let pass = Pass {
+        tasks: &tasks,
+        gw: &gw,
+        board: &board,
+        now: NOW,
+        observe: false,
+        gone: &gone,
+    };
+
+    let first = run_pass(&pass).await;
+    let second = run_pass(&pass).await;
+
+    assert_eq!(first.swept, 1);
+    assert_eq!(first.gone, 0);
+    assert_eq!(second.candidates, 0);
+    assert_eq!(second.gone, 1);
+    assert_eq!(gw.commands.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn row_with_new_closed_at_is_a_candidate_again() {
+    // Reopen обнуляет closedAt: новая дата закрытия даёт новый ключ метки.
+    let gw = fake(Vec::new());
+    verdict_default(&gw, "ABSENT");
+    let gone = EnvGcGone::default();
+    let board = FakeBoard::all_done();
+    let old = done_closed(77, THREE_DAYS, NOW);
+    let old_pass = Pass {
+        tasks: &[old],
+        gw: &gw,
+        board: &board,
+        now: NOW,
+        observe: false,
+        gone: &gone,
+    };
+    run_pass(&old_pass).await;
+
+    verdict_default(&gw, "SWEPT");
+    let reopened = done_closed(77, THREE_DAYS - 1000, NOW);
+    let new_pass = Pass {
+        tasks: &[reopened],
+        gw: &gw,
+        board: &board,
+        now: NOW,
+        observe: false,
+        gone: &gone,
+    };
+    let out = run_pass(&new_pass).await;
+
+    assert_eq!(out.gone, 0);
+    assert_eq!(out.swept, 1);
 }
 
 #[tokio::test]
@@ -956,5 +1159,103 @@ async fn bootstrap_delete_failure_is_loud_and_bounded() {
         gw.deleted.lock().unwrap().as_slice(),
         ["ses_gc_1", "ses_gc_1", "ses_gc_1"],
         "ровно три попытки гашения — дальше рипер следующего прохода"
+    );
+}
+
+// ---------- пины тестера #1693 (остаток Low-1 ревью кода, круг 2) ----------
+
+#[tokio::test]
+async fn gone_mark_is_scoped_to_board() {
+    // Ключ метки включает доску: одноимённая строка другой доски —
+    // другой env, метка чужой доски её прятать не должна.
+    let gw = fake(Vec::new());
+    verdict_default(&gw, "SWEPT");
+    let gone = EnvGcGone::default();
+    let board = FakeBoard::all_done();
+
+    let tasks_a = [done_closed(77, THREE_DAYS, NOW)];
+    let pass_a = Pass {
+        tasks: &tasks_a,
+        gw: &gw,
+        board: &board,
+        now: NOW,
+        observe: false,
+        gone: &gone,
+    };
+    let first = run_pass_on_board("Задачи uwuwu", &pass_a).await;
+    assert_eq!(first.swept, 1);
+
+    let tasks_b = [done_closed(77, THREE_DAYS, NOW)];
+    let pass_b = Pass {
+        tasks: &tasks_b,
+        gw: &gw,
+        board: &board,
+        now: NOW,
+        observe: false,
+        gone: &gone,
+    };
+    let second = run_pass_on_board("Задачи origa", &pass_b).await;
+    assert_eq!(
+        second.gone, 0,
+        "метка доски uwuwu не прячет одноимённую строку origa"
+    );
+    assert_eq!(second.swept, 1, "одноимённая строка другой доски сносится");
+    assert_eq!(
+        gw.commands.lock().unwrap().len(),
+        2,
+        "второй проход диспатчит, а не молчит на метке чужой доски"
+    );
+}
+
+#[tokio::test]
+async fn gone_mark_is_scoped_to_row_number() {
+    // Компонента номера в ключе: две строки одной доски с равным closed_at
+    // (секундная точность GitHub) — разные env; метка первой не прячет
+    // вторую. Первый проход видит только строку 77 (ABSENT), второй —
+    // обе: 77 отсекается, 78 диспатчится и сносится.
+    let gw = fake(Vec::new());
+    let gone = EnvGcGone::default();
+    let board = FakeBoard::all_done();
+
+    verdict_on(&gw, "77", "ABSENT");
+    let tasks_first = [done_closed(77, THREE_DAYS, NOW)];
+    let pass_first = Pass {
+        tasks: &tasks_first,
+        gw: &gw,
+        board: &board,
+        now: NOW,
+        observe: false,
+        gone: &gone,
+    };
+    let first = run_pass(&pass_first).await;
+    assert_eq!(first.absent, 1);
+
+    verdict_default(&gw, "SWEPT");
+    let tasks_second = [
+        done_closed(77, THREE_DAYS, NOW),
+        done_closed(78, THREE_DAYS, NOW),
+    ];
+    let pass_second = Pass {
+        tasks: &tasks_second,
+        gw: &gw,
+        board: &board,
+        now: NOW,
+        observe: false,
+        gone: &gone,
+    };
+    let second = run_pass(&pass_second).await;
+    assert_eq!(second.gone, 1, "отсекается только помеченная строка 77");
+    assert_eq!(second.swept, 1, "строка 78 с тем же closed_at сносится");
+    let commands = gw.commands.lock().unwrap();
+    assert_eq!(commands.len(), 2);
+    let second_rows: Vec<&str> = commands[1]
+        .split_whitespace()
+        .skip_while(|t| *t != "sweep")
+        .skip(1)
+        .collect();
+    assert_eq!(
+        second_rows,
+        ["78"],
+        "второй батч — только непомеченная строка"
     );
 }

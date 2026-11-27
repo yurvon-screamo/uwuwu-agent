@@ -1,7 +1,7 @@
 //! Общий харнес e2e-стендов uwuwu-server: живой сервер + mock_opencode
 //! на свободных портах, ожидание health, MCP-вызовы и хвост лога.
 //! Вынесен из quota_limit_pause_stand_e2e.rs — делится с e2e-стендами
-//! (cron, quota, model_alias).
+//! (cron, quota, model_alias, env-gc).
 //! Каждый integration-таргет компилирует модуль целиком — не таргетные
 //! хелперы мертвы локально, не по факту (lint-уровень унаследован от common).
 
@@ -16,8 +16,11 @@ pub const BEARER: &str = "e2e-stand-bearer";
 
 /// То, чем один стенд отличается от другого: секции конфига и env сервера.
 pub struct StandOptions<'a> {
-    /// Секции после `[executor]`; пустая строка — дополнительных секций нет.
-    /// Секции разделяются пустой строкой, как в config.toml сервера.
+    /// Томл перед `[hub]`: верхнеуровневые ключи (например, `sweep_days`,
+    /// `env_gc_days`) или секции (например, `[quota]`). Пустая строка —
+    /// дополнительных ключей/секций нет. Верхнеуровневые ключи обязаны
+    /// стоять до первой секции — после `[executor]`/`[hub]` они
+    /// распарсились бы в чужую таблицу.
     pub config_extra: &'a str,
     /// Env сервера сверх базового (сид памяти, документы memory-hub и т.п.).
     pub server_env: &'a [(&'a str, &'a str)],
@@ -216,6 +219,8 @@ async fn capture_proxy(mock_port: u16, capture: PathBuf) -> u16 {
 pub async fn spawn_stand(dir: &Path, opts: StandOptions<'_>) -> Stand {
     let server_port = free_port();
     let mock_port = free_port();
+    // config_extra — до первой секции: верхнеуровневые ключи (sweep_days,
+    // env_gc_days) и секции ([quota]) валидны только вне чужих таблиц.
     let executor_port = if opts.capture_sessions {
         capture_proxy(mock_port, dir.join("capture.jsonl")).await
     } else {
@@ -223,9 +228,9 @@ pub async fn spawn_stand(dir: &Path, opts: StandOptions<'_>) -> Stand {
     };
     let config = format!(
         "mode = \"live\"\npoll_sec = 10\nport = {server_port}\n\n\
+         {config_extra}\
          [hub]\nrepo = \"e2e/hub\"\ndriver = \"memory\"\n\n\
          [executor]\nname = \"mock\"\nurl = \"http://127.0.0.1:{executor_port}\"\n\n\
-         {config_extra}\
          [policy]\ncup = 2\n\n[policy.peak]\nenabled = false\nstart_min = 360\nend_min = 600\n\n\
          [[project]]\nname = \"stand\"\nboard = \"stand\"\nrepo = \"e2e/stand\"\n\
          checkout = \"{dir}/checkout\"\nenv_root = \"{dir}\"\n",

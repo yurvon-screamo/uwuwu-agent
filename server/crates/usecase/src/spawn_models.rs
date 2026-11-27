@@ -16,15 +16,16 @@ pub fn peak_applies(model: &SpawnModel) -> bool {
     model.model.provider() == PEAK_PROVIDER
 }
 
-/// Раскладка опроса владельца 26.11 (#1684): flash — default/developer/
-/// analyst, common — tester/dreamer, smart — все ревьюверы.
+/// Раскладка владельца: 26.11 (#1684) flash — default/developer/analyst,
+/// common — tester/dreamer, smart — ревьюверы; 27.11 (#1693) tester → flash,
+/// живой конфиг не менялся, канон и `config.example.toml` следуют за ним.
 pub fn canonical_assignments() -> HashMap<String, ModelAlias> {
     HashMap::from([
         ("default", ModelAlias::Flash),
         ("developer", ModelAlias::Flash),
         ("plan-reviewer", ModelAlias::Smart),
         ("code-quality-reviewer", ModelAlias::Smart),
-        ("tester", ModelAlias::Common),
+        ("tester", ModelAlias::Flash),
         ("test-reviewer", ModelAlias::Smart),
         ("analyst", ModelAlias::Flash),
         ("analyst-reviewer", ModelAlias::Smart),

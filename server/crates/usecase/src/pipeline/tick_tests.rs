@@ -11280,11 +11280,7 @@ async fn review_and_test_spawns_carry_map_models_per_agent() {
             "code-quality-reviewer",
             "zai-coding-plan/glm-5.4#high",
         ),
-        (
-            Status::Testing,
-            "tester",
-            "opencode-go/muse-spark-1.3-contributor#high",
-        ),
+        (Status::Testing, "tester", "opencode-go/hy4-flash-free#high"),
     ];
     for (status, agent_name, raw) in cases {
         let (u, _, sessions, _) = usecase(vec![task(5, status)], PrState::Missing);

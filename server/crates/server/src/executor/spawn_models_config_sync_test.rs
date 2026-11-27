@@ -128,24 +128,24 @@ fn alias_raw_from_toml_drives_whole_group_and_noncanonical_assignment() {
         default = "flash"
         developer = "flash"
         analyst = "flash"
-        tester = "flash"
+        tester = "common"
         plan-reviewer = "smart"
     "#;
     let cfg: crate::config::ExecutorCfg = toml::from_str(raw).expect("валидный toml");
     let models = SpawnModels::from_config(cfg.model_aliases.as_ref(), cfg.models.as_ref())
         .expect("карта собирается");
     let want = uwuwu_domain::SpawnModel::parse("p/new-flash#high").unwrap();
+    let common = uwuwu_domain::SpawnModel::parse("p/common#high").unwrap();
     for key in ["default", "developer", "analyst"] {
         assert_eq!(models.get(key), Some(&want), "{key} — новый flash");
     }
-    // Назначение tester = flash отлично от канона (common): потеря слоя
+    // Назначение tester = common отлично от канона (flash): потеря слоя
     // назначений в клее подменила бы tester каноном и не была бы замечена.
     assert_eq!(
         models.get("tester"),
-        Some(&want),
-        "неканоническое назначение tester → flash не доехало"
+        Some(&common),
+        "неканоническое назначение tester → common не доехало"
     );
-    let common = uwuwu_domain::SpawnModel::parse("p/common#high").unwrap();
     assert_eq!(
         models.model_for_alias(uwuwu_usecase::ModelAlias::Common),
         &common,
