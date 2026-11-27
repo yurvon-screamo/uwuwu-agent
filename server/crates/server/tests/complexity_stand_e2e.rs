@@ -9,7 +9,8 @@
 //!   2. `task_create` со сложностью low → перевод в Result review → тик
 //!      спавнит код-ревьювера не на smart, а на common (−1); в `spawn.done`
 //!      — shift=-1, alias=common;
-//!   3. неканоническое значение отклоняется тулом до мутаций носителя.
+//!   3. дескриптор и сводка `task_list` не обещают сложность, неканоническое
+//!      значение отклоняется тулом до мутаций носителя.
 //!
 //! Тела POST /api/session ловит тестовый прокси общего харнеса
 //! (`capture.jsonl`): сам mock_opencode модель в лог не пишет.
@@ -62,17 +63,14 @@ const CONFIG_EXTRA: &str = "[executor.model_aliases]\n\
     analyst-reviewer = \"smart\"\n\
     dreamer = \"common\"\n\n";
 
-const FLASH: &str = "p/flash/high";
 const COMMON: &str = "p/common/high";
-const SMART: &str = "zai-coding-plan/glm-smart/high";
 /// Поле `model` в событии — метка провайдер/модель без вариант-хвоста.
-const FLASH_LOG: &str = "p/flash";
 const COMMON_LOG: &str = "p/common";
-const SMART_LOG: &str = "zai-coding-plan/glm-smart";
 
-/// Агент → модель из перехваченных живых POST /api/session:raw-метка
-/// provider/id/variant, чтобы сдвиг был виден до среза вариант-хвоста.
-fn captured_models(dir: &Path) -> HashMap<String, String> {
+/// (номер строки, агент) → model из перехваченных POST /api/session.
+/// Номер берётся из `location.directory` (`env_root/<number>`) — ключ по
+/// одному агенту был бы чувствителен к транзиентному спавну той же строки.
+fn captured_models(dir: &Path) -> HashMap<(u64, String), String> {
     let text = std::fs::read_to_string(dir.join("capture.jsonl")).unwrap_or_default();
     let mut seen = HashMap::new();
     for rec in text
@@ -87,31 +85,43 @@ fn captured_models(dir: &Path) -> HashMap<String, String> {
             continue;
         }
         let body = &rec["body"];
+        let Some(number) = body["location"]["directory"]
+            .as_str()
+            .and_then(|dir| dir.rsplit('/').next())
+            .and_then(|tail| tail.parse::<u64>().ok())
+        else {
+            continue;
+        };
         let model = ["providerID", "id", "variant"]
             .iter()
             .map(|key| body["model"][*key].as_str().unwrap_or_default())
             .collect::<Vec<_>>()
             .join("/");
         seen.insert(
-            body["agent"].as_str().unwrap_or("default").to_string(),
+            (
+                number,
+                body["agent"].as_str().unwrap_or("default").to_string(),
+            ),
             model,
         );
     }
     seen
 }
 
-/// Поля наблюдаемости из события `spawn.done` — те самые, по которым
-/// читается постмержная проба #1695.
-fn spawn_fields(dir: &Path, number: u64) -> Option<Value> {
+/// Поля наблюдаемости из `spawn.done` нужной стадии строки — первое
+/// событие с другим слотом (транзиентный спавн) не должно маскировать
+/// проверяемый ревью-спавн.
+fn spawn_fields(dir: &Path, number: u64, slot: &str) -> Option<Value> {
     let log = std::fs::read_to_string(dir.join("server.log")).unwrap_or_default();
     for line in log.lines() {
         let Ok(rec) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if rec["fields"]["event"].as_str() == Some("spawn.done")
-            && rec["fields"]["number"].as_u64() == Some(number)
+        let f = &rec["fields"];
+        if f["event"].as_str() == Some("spawn.done")
+            && f["number"].as_u64() == Some(number)
+            && f["slot"].as_str() == Some(slot)
         {
-            let f = &rec["fields"];
             return Some(json!({
                 "complexity": f["complexity"],
                 "shift": f["shift"],
@@ -121,6 +131,25 @@ fn spawn_fields(dir: &Path, number: u64) -> Option<Value> {
         }
     }
     None
+}
+
+/// tools/list через тот же JSON-RPC: дескриптор complexity — часть контракта.
+async fn tool_properties(http: &reqwest::Client, port: u16) -> Vec<Value> {
+    let resp = http
+        .post(format!("http://127.0.0.1:{port}/mcp"))
+        .header("Authorization", format!("Bearer {BEARER}"))
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}
+        }))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .expect("tools/list POST");
+    let body: Value = resp.json().await.expect("tools/list JSON");
+    body["result"]["tools"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn receipt_number(text: &str) -> u64 {
@@ -154,6 +183,19 @@ async fn complexity_shifts_live_stage_spawns_and_survives_roundtrip() {
     .await;
     let http = reqwest::Client::new();
 
+    // Контракт аргумента: create/edit несут complexity, list — нет.
+    let tools = tool_properties(&http, stand.port).await;
+    let props = |name: &str| {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or(&Value::Null)["inputSchema"]["properties"]
+            .clone()
+    };
+    assert!(props("task_create")["complexity"].is_object());
+    assert!(props("task_edit")["complexity"].is_object());
+    assert!(props("task_list").get("complexity").is_none());
+
     // 1. high: девелопер получает +1 уровень (flash → common).
     let created = mcp_call(
         &http,
@@ -161,7 +203,7 @@ async fn complexity_shifts_live_stage_spawns_and_survives_roundtrip() {
         BEARER,
         "task_create",
         json!({
-            "project": "stand", "title": "e2e high complexity",
+            "project": "stand", "title": "e2e high shift",
             "body": "## Постановка\n\nСдвиг +1.",
             "complexity": "high", "priority": "medium", "automerge": false
         }),
@@ -198,7 +240,7 @@ async fn complexity_shifts_live_stage_spawns_and_survives_roundtrip() {
         BEARER,
         "task_create",
         json!({
-            "project": "stand", "title": "e2e low complexity",
+            "project": "stand", "title": "e2e low shift",
             "body": "## Постановка\n\nСдвиг -1.",
             "complexity": "low", "priority": "medium", "automerge": false
         }),
@@ -227,6 +269,21 @@ async fn complexity_shifts_live_stage_spawns_and_survives_roundtrip() {
         assert!(moved.contains("updated"), "перевод low в {status}: {moved}");
     }
 
+    // task_list сознательно не несёт сложность: ни дескриптор, ни сводка.
+    let list = mcp_call(
+        &http,
+        stand.port,
+        BEARER,
+        "task_list",
+        json!({ "project": "stand" }),
+    )
+    .await;
+    assert!(
+        !list.contains("complexity"),
+        "сводка list выдала сложность: {list}"
+    );
+    assert!(list.contains(&high.to_string()) && list.contains(&low.to_string()));
+
     // 3. неканон отклоняется тулом; носитель не мутировал.
     let rejected = mcp_call(
         &http,
@@ -253,14 +310,16 @@ async fn complexity_shifts_live_stage_spawns_and_survives_roundtrip() {
         "отказ не мутировал сложность: {card}"
     );
 
-    // Ждём оба спавна и их структурированные поля.
+    // Ждём оба целевых спавна и их структурированные поля. Ключ capture —
+    // (номер, агент): транзиентный low-спавн девелопера не подменит
+    // проверяемый ревью-спавн; поле снимается строго нужной стадии.
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let captured = captured_models(&dir.0);
-        if captured.contains_key("developer")
-            && captured.contains_key("code-quality-reviewer")
-            && spawn_fields(&dir.0, high).is_some()
-            && spawn_fields(&dir.0, low).is_some()
+        if captured.contains_key(&(high, "developer".to_string()))
+            && captured.contains_key(&(low, "code-quality-reviewer".to_string()))
+            && spawn_fields(&dir.0, high, "Dev").is_some()
+            && spawn_fields(&dir.0, low, "ResultReview").is_some()
         {
             break;
         }
@@ -274,36 +333,28 @@ async fn complexity_shifts_live_stage_spawns_and_survives_roundtrip() {
 
     let captured = captured_models(&dir.0);
     assert_eq!(
-        captured.get("developer").map(String::as_str),
+        captured
+            .get(&(high, "developer".to_string()))
+            .map(String::as_str),
         Some(COMMON),
         "high: девелопер едет на common, базовый flash не просочился"
     );
     assert_eq!(
-        captured.get("code-quality-reviewer").map(String::as_str),
+        captured
+            .get(&(low, "code-quality-reviewer".to_string()))
+            .map(String::as_str),
         Some(COMMON),
         "low: ревьювер едет на common, базовый smart не просочился"
     );
-    assert_ne!(
-        captured.get("developer").map(String::as_str),
-        Some(FLASH),
-        "сдвиг +1 не сработал"
-    );
-    assert_ne!(
-        captured.get("code-quality-reviewer").map(String::as_str),
-        Some(SMART),
-        "сдвиг -1 не сработал"
-    );
 
-    let high_fields = spawn_fields(&dir.0, high).expect("поля high-спавна");
+    let high_fields = spawn_fields(&dir.0, high, "Dev").expect("поля high-спавна");
     assert_eq!(high_fields["complexity"], "high");
     assert_eq!(high_fields["shift"], 1);
     assert_eq!(high_fields["alias"], "common");
-    assert_ne!(high_fields["model"], FLASH_LOG, "сдвиг +1 не виден в логе");
     assert_eq!(high_fields["model"], COMMON_LOG);
-    let low_fields = spawn_fields(&dir.0, low).expect("поля low-спавна");
+    let low_fields = spawn_fields(&dir.0, low, "ResultReview").expect("поля low-спавна");
     assert_eq!(low_fields["complexity"], "low");
     assert_eq!(low_fields["shift"], -1);
     assert_eq!(low_fields["alias"], "common");
-    assert_ne!(low_fields["model"], SMART_LOG, "сдвиг -1 не виден в логе");
     assert_eq!(low_fields["model"], COMMON_LOG);
 }
