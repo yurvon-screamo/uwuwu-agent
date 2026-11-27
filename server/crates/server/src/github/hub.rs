@@ -546,6 +546,7 @@ impl GitHubHub {
     /// снимка нет или строки в нём нет — инвалидация (окно create:
     /// add_to_board инвалидирует до записи полей — свежий фетч мог
     /// закешироваться без полей).
+    #[allow(clippy::too_many_arguments)] // техдолг #1662, контракт порта #1689
     fn settle_board_cells(
         &self,
         board: &str,
@@ -554,6 +555,7 @@ impl GitHubHub {
         automerge: Option<bool>,
         direct: Option<bool>,
         fact_track: Option<bool>,
+        complexity: Option<&str>,
     ) {
         let now = std::time::Instant::now();
         let Some(hit) = self.snap_cache.get(board, now) else {
@@ -570,6 +572,9 @@ impl GitHubHub {
         for task in rows.iter_mut().filter(|t| t.number() == number) {
             if let Some(p) = priority {
                 task.set_priority(uwuwu_usecase::parse_priority(p));
+            }
+            if let Some(c) = complexity {
+                task.set_complexity(uwuwu_usecase::parse_complexity(c));
             }
             if let Some(a) = automerge {
                 task.set_automerge(a);
@@ -924,6 +929,8 @@ fn parse_page(items: &[Value], meta: &mut BoardMeta) -> Vec<Task> {
                 }
             }
             task.set_priority(uwuwu_usecase::parse_priority(&v.priority));
+            warn_complexity_if_unknown(Some(&v.complexity), number);
+            task.set_complexity(uwuwu_usecase::parse_complexity(&v.complexity));
             task.set_automerge(v.automerge);
             task.set_direct(v.direct);
             task.set_fact_track(v.fact_track);
@@ -939,10 +946,26 @@ fn parse_page(items: &[Value], meta: &mut BoardMeta) -> Vec<Task> {
         .collect()
 }
 
+/// Непустое неизвестное значение сложности на носителе — структурированный
+/// warn с номером задачи; пустое — норма, молча (#1689).
+fn warn_complexity_if_unknown(raw: Option<&String>, number: u64) {
+    if let Some(raw) = raw {
+        if !raw.trim().is_empty() && uwuwu_usecase::parse_complexity_strict(raw).is_err() {
+            tracing::warn!(
+                event = "complexity.unknown_value",
+                number = number,
+                raw_value = %raw,
+                "Сложность: неизвестное значение, применена общая"
+            );
+        }
+    }
+}
+
 /// Bulk-значения select-колонок доски (поля issue ленивые — fields.rs).
 struct ItemValues {
     status: String,
     priority: String,
+    complexity: String,
     automerge: bool,
     direct: bool,
     fact_track: bool,
@@ -952,6 +975,7 @@ fn item_values(item: &Value) -> ItemValues {
     let mut out = ItemValues {
         status: String::new(),
         priority: String::new(),
+        complexity: String::new(),
         automerge: false,
         direct: false,
         fact_track: false,
@@ -971,6 +995,7 @@ fn item_values(item: &Value) -> ItemValues {
                 crate::github::fields::F_PRIORITY | "Приоритет" => {
                     out.priority = value.to_string()
                 }
+                crate::github::fields::F_COMPLEXITY => out.complexity = value.to_string(),
                 // автомерж (#1232): новое имя, legacy «Autodone» — back-compat
                 "Automerge" | "Autodone" => out.automerge = value == "on" || value == "true",
                 uwuwu_usecase::F_DIRECT => out.direct = value == "on",
@@ -1054,7 +1079,13 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
         .get(uwuwu_usecase::F_DIRECT)
         .map(|v| v == "on")
         .unwrap_or(false);
-    TaskFields::new(assignments, vcs, priority, direct)
+    let complexity = raw
+        .get(crate::github::fields::F_COMPLEXITY)
+        .map(|value| uwuwu_usecase::parse_complexity(value))
+        .unwrap_or(uwuwu_domain::Complexity::Regular);
+    let mut fields = TaskFields::new(assignments, vcs, priority, direct);
+    fields.set_complexity(complexity);
+    fields
 }
 
 #[async_trait]
@@ -1178,6 +1209,7 @@ impl TaskBoardRepo for GitHubHub {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // техдолг #1662, контракт порта #1689
     async fn set_board_cells(
         &self,
         board: &str,
@@ -1186,6 +1218,7 @@ impl TaskBoardRepo for GitHubHub {
         automerge: Option<bool>,
         direct: Option<bool>,
         fact_track: Option<bool>,
+        complexity: Option<&str>,
     ) -> UsecaseResult<()> {
         // поля — нативные issue (REST), как и у set_branch
         let mut patch: Vec<(&str, Option<String>)> = Vec::new();
@@ -1193,6 +1226,12 @@ impl TaskBoardRepo for GitHubHub {
             patch.push((
                 crate::github::fields::F_PRIORITY,
                 Some(p.trim().to_string()),
+            ));
+        }
+        if let Some(c) = complexity {
+            patch.push((
+                crate::github::fields::F_COMPLEXITY,
+                Some(c.trim().to_string()),
             ));
         }
         if let Some(a) = automerge {
@@ -1218,7 +1257,9 @@ impl TaskBoardRepo for GitHubHub {
         }
         // read-your-writes (#1258): кеш-гигиена снапшота — write-through
         // записанных значений при живой строке, инвалидация при отсутствующей
-        self.settle_board_cells(board, number, priority, automerge, direct, fact_track);
+        self.settle_board_cells(
+            board, number, priority, automerge, direct, fact_track, complexity,
+        );
         Ok(())
     }
 
@@ -1282,6 +1323,7 @@ impl TaskBoardRepo for GitHubHub {
             uwuwu_usecase::parse_status(&status)
         };
         let raw = parse_field_values(&issue);
+        warn_complexity_if_unknown(raw.get(crate::github::fields::F_COMPLEXITY), number);
         let mut task = Task::new(number, title, status);
         task.apply_fields(map_task_fields(&raw));
         // automerge с носителя (fm-вью честен, баг-репорт тестировщика #1232:
@@ -1399,7 +1441,9 @@ impl TaskBoardRepo for GitHubHub {
                 None,
             )
             .await?;
-        Ok(map_task_fields(&parse_field_values(&issue)))
+        let raw = parse_field_values(&issue);
+        warn_complexity_if_unknown(raw.get(crate::github::fields::F_COMPLEXITY), number);
+        Ok(map_task_fields(&raw))
     }
 
     async fn rename_issue(&self, number: u64, title: &str) -> UsecaseResult<()> {
@@ -2543,7 +2587,7 @@ mod tests {
             ),
             std::time::Instant::now(),
         );
-        hub.settle_board_cells("B", 7, Some("high"), Some(true), None, None);
+        hub.settle_board_cells("B", 7, Some("high"), Some(true), None, None, None);
         let snap = hub
             .snap_cache
             .get("B", std::time::Instant::now())
@@ -2570,7 +2614,7 @@ mod tests {
             ),
             std::time::Instant::now(),
         );
-        hub.settle_board_cells("B", 7, Some("high"), None, None, None);
+        hub.settle_board_cells("B", 7, Some("high"), None, None, None, None);
         assert!(
             hub.snap_cache.get("B", std::time::Instant::now()).is_none(),
             "снимок без строки сброшен"
@@ -2581,7 +2625,7 @@ mod tests {
     #[test]
     fn board_cells_without_snapshot_is_clean_noop() {
         let hub = GitHubHub::new("o/r".into(), "t".into());
-        hub.settle_board_cells("B", 7, Some("high"), None, None, None);
+        hub.settle_board_cells("B", 7, Some("high"), None, None, None, None);
         assert!(hub.snap_cache.get("B", std::time::Instant::now()).is_none());
     }
 
@@ -2628,6 +2672,7 @@ mod tests {
                 n,
                 Some(probe_priority),
                 Some(probe_automerge),
+                None,
                 None,
                 None,
             )
@@ -2688,6 +2733,7 @@ mod tests {
                 n,
                 Some(base_priority_arg),
                 Some(base_automerge),
+                None,
                 None,
                 None,
             )
@@ -3774,6 +3820,7 @@ mod tests {
 #[cfg(test)]
 mod slot_mapping_tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn dev_session_field_fills_design_slot() {
@@ -3832,6 +3879,85 @@ mod slot_mapping_tests {
         assert!(
             task.stage_needs_spawn().is_none(),
             "TestReview-слот видит сессию — спавн-дубля нет"
+        );
+    }
+
+    struct EventTrap(Arc<Mutex<Vec<String>>>);
+    struct TrapFields(Arc<Mutex<Vec<String>>>);
+
+    impl tracing::field::Visit for TrapFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .lock()
+                .expect("trap lock")
+                .push(format!("{}={:?}", field.name(), value));
+        }
+    }
+
+    impl tracing::Subscriber for EventTrap {
+        fn enabled(&self, _meta: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _from: &tracing::span::Id, _to: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            event.record(&mut TrapFields(Arc::clone(&self.0)));
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn complexity_unknown_value_warns_but_empty_stays_silent() {
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(EventTrap(
+            Arc::clone(&records),
+        )));
+        let garbage = "мусор".to_string();
+        let empty = String::new();
+        warn_complexity_if_unknown(Some(&garbage), 77);
+        warn_complexity_if_unknown(Some(&empty), 78);
+        warn_complexity_if_unknown(None, 79);
+        drop(guard);
+        let logged = records.lock().expect("trap lock").clone();
+        assert!(
+            logged
+                .iter()
+                .any(|r| r.contains("complexity.unknown_value")),
+            "мусор породил warn: {logged:?}"
+        );
+        assert!(
+            logged.iter().any(|r| r == "number=77"),
+            "событие несёт номер задачи: {logged:?}"
+        );
+        assert!(
+            !logged.iter().any(|r| r == "number=78" || r == "number=79"),
+            "пустое/отсутствующее значение молча: {logged:?}"
+        );
+    }
+
+    #[test]
+    fn complexity_field_maps_to_domain_and_defaults_to_regular() {
+        let mut raw = Fields::new();
+        raw.insert(uwuwu_usecase::F_COMPLEXITY.into(), "высокая".into());
+        assert_eq!(
+            map_task_fields(&raw).complexity(),
+            uwuwu_domain::Complexity::High,
+            "русский алиас с носителя мапится в домен"
+        );
+        assert_eq!(
+            map_task_fields(&Fields::new()).complexity(),
+            uwuwu_domain::Complexity::Regular,
+            "отсутствующее поле — общая сложность"
+        );
+        raw.insert(uwuwu_usecase::F_COMPLEXITY.into(), "мусор".into());
+        assert_eq!(
+            map_task_fields(&raw).complexity(),
+            uwuwu_domain::Complexity::Regular,
+            "мусор на носителе не роняет резолв"
         );
     }
 

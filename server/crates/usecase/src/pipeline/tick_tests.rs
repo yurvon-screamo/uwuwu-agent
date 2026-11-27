@@ -11,7 +11,7 @@ use crate::ports::{
 };
 use crate::router::SessionRouter;
 use async_trait::async_trait;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use uwuwu_domain::{
@@ -108,6 +108,7 @@ impl TaskBoardRepo for FakeBoard {
         _a: Option<bool>,
         _d: Option<bool>,
         _f: Option<bool>,
+        _c: Option<&str>,
     ) -> UsecaseResult<()> {
         Ok(())
     }
@@ -168,6 +169,9 @@ impl TaskBoardRepo for FakeBoard {
                 // флаг безусловно — фейк без него молча сбрасывал бы
                 // set_direct снапшота на каждом enrichment
                 f.set_direct(t.direct());
+                // сложность (#1689): REST-носитель каноничен, как и у direct —
+                // без неё apply_fields сбрасывал бы сдвиг на каждом тике
+                f.set_complexity(t.complexity());
                 f
             })
             .unwrap_or_default())
@@ -1173,6 +1177,27 @@ fn glm_models() -> Arc<crate::spawn_models::SpawnModels> {
     ))
 }
 
+/// Явная карта через `from_config` — тесты сдвига не зависят от канон-
+/// конструктора, который удаляет #1726.
+fn explicit_models() -> Arc<crate::spawn_models::SpawnModels> {
+    let raws: HashMap<String, String> = [
+        ("flash", "opencode-go/hy4-flash-free#high"),
+        ("common", "opencode-go/muse-spark-1.3-contributor#high"),
+        ("smart", "zai-coding-plan/glm-5.4#high"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value.to_string()))
+    .collect();
+    let assignments = crate::spawn_models::canonical_assignments()
+        .into_iter()
+        .map(|(key, alias)| (key, alias.as_str().to_string()))
+        .collect();
+    Arc::new(
+        crate::spawn_models::SpawnModels::from_config(Some(&raws), Some(&assignments))
+            .expect("явная карта валидна"),
+    )
+}
+
 /// Юзкейс в пик-окне с настраиваемыми комментами (будильник-сценарии).
 fn peak_usecase(
     rows: Vec<Task>,
@@ -2015,6 +2040,7 @@ impl TaskBoardRepo for CommentBoard {
         _a: Option<bool>,
         _d: Option<bool>,
         _f: Option<bool>,
+        _c: Option<&str>,
     ) -> UsecaseResult<()> {
         Ok(())
     }
@@ -9834,6 +9860,7 @@ impl TaskBoardRepo for FakeMultiBoard {
         _a: Option<bool>,
         _d: Option<bool>,
         _f: Option<bool>,
+        _c: Option<&str>,
     ) -> UsecaseResult<()> {
         Ok(())
     }
@@ -10290,6 +10317,7 @@ impl TaskBoardRepo for CloseBoard {
         _a: Option<bool>,
         _d: Option<bool>,
         _f: Option<bool>,
+        _c: Option<&str>,
     ) -> UsecaseResult<()> {
         Ok(())
     }
@@ -11258,6 +11286,184 @@ async fn stage_spawn_carries_model_from_server_map() {
     for spec in specs.iter() {
         assert_eq!(spec.model, want.model, "модель спавна = default карты");
         assert_eq!(spec.variant, want.variant, "default — вариант карты");
+    }
+}
+
+#[tokio::test]
+async fn high_complexity_shifts_stage_spawn_model_by_one_level() {
+    // #1689: сложность — отдельная ось; дев со сложной задачей уходит
+    // с flash на common, bootstrap (default) остаётся на flash.
+    let mut row = task(1, Status::InProgress);
+    row.set_complexity(uwuwu_domain::Complexity::High);
+    let (u, _, sessions, _) = fixture_usecase_with_models(
+        vec![row],
+        Vec::new(),
+        Arc::new(MemState::empty()),
+        Arc::new(FixedClock),
+        FakeSessions::new(),
+        explicit_models(),
+    );
+
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+
+    assert_eq!(out.spawns_done, 1, "спавн стадии состоялся");
+    let specs = sessions.specs.lock().unwrap();
+    let work = specs
+        .iter()
+        .find(|s| !s.bootstrap)
+        .expect("рабочая сессия в спеках");
+    let want = uwuwu_domain::SpawnModel::parse("opencode-go/muse-spark-1.3-contributor#high")
+        .expect("common-алиас");
+    assert_eq!(work.model, want.model, "дев: flash→common (+1)");
+    let boot = specs.iter().find(|s| s.bootstrap).expect("bootstrap");
+    let flash = uwuwu_domain::SpawnModel::parse("opencode-go/hy4-flash-free#high").unwrap();
+    assert_eq!(boot.model, flash.model, "bootstrap без сдвига");
+}
+
+#[tokio::test]
+async fn low_complexity_moves_reviewer_out_of_peak_gate() {
+    // #1689: smart (GLM) → common (opencode-go) снимает peak-задержку,
+    // хотя приоритет Medium и окно GLM активны (#1680).
+    let mut row = task(7, Status::ReviewPlan);
+    row.set_priority(Priority::Medium);
+    row.set_complexity(uwuwu_domain::Complexity::Low);
+    let (u, _, sessions, _) = fixture_usecase_with_models(
+        vec![row],
+        Vec::new(),
+        Arc::new(MemState::empty()),
+        Arc::new(PeakClock),
+        FakeSessions::new(),
+        explicit_models(),
+    );
+
+    let out = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+
+    assert_eq!(out.deferred_peak, 0, "сдвинутый ревьювер не откладывается");
+    assert_eq!(out.spawns_done, 1, "спавн состоялся в окне");
+    let specs = sessions.specs.lock().unwrap();
+    let work = specs
+        .iter()
+        .find(|s| !s.bootstrap)
+        .expect("рабочая сессия в спеках");
+    let common = uwuwu_domain::SpawnModel::parse("opencode-go/muse-spark-1.3-contributor#high")
+        .expect("common-алиас");
+    assert_eq!(work.model, common.model, "ревьювер на common (−1)");
+}
+
+#[tokio::test]
+async fn low_complexity_wakeup_passes_peak() {
+    // #1689: alive-wakeup ревьювера low (smart→common) не держится GLM-окном;
+    // High по-прежнему проходит.
+    for (number, priority, complexity) in [
+        (41, Priority::Medium, uwuwu_domain::Complexity::Low),
+        (42, Priority::High, uwuwu_domain::Complexity::Regular),
+    ] {
+        let mut row = plan_review_task(number, &format!("ses_rev_wake_{number}"));
+        row.set_priority(priority);
+        row.set_complexity(complexity);
+        let state = Arc::new(MemState::empty());
+        state
+            .0
+            .lock()
+            .unwrap()
+            .statuses
+            .push((number, Status::ReviewPlan));
+        state.mark_spawn("Задачи uwuwu", number, Slot::PlanReview, 500);
+        state.set_last_seen_status("Задачи uwuwu", number, Status::ReviewPlan);
+        let (u, _, sessions, _) = fixture_usecase_with_models(
+            vec![row],
+            vec![CommentRef {
+                id: "c1".into(),
+                created_ms: 3000,
+                body: "свежий коммент".into(),
+            }],
+            state,
+            Arc::new(PeakClock),
+            FakeSessions::new(),
+            explicit_models(),
+        );
+
+        let out = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+
+        assert_eq!(out.wakeups_deferred, 0, "{number}: будильник не отложен");
+        assert_eq!(out.wakeups, 1, "{number}: будильник доставлен");
+        assert!(!sessions.prompts.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn low_complexity_dead_respawn_passes_peak() {
+    // #1689: dead-respawn ревьювера low уходит на common в окне GLM.
+    for (number, priority, complexity) in [
+        (43, Priority::Medium, uwuwu_domain::Complexity::Low),
+        (44, Priority::High, uwuwu_domain::Complexity::Regular),
+    ] {
+        let session = format!("ses_rev_dead_{number}");
+        let mut row = plan_review_task(number, &session);
+        row.set_priority(priority);
+        row.set_complexity(complexity);
+        let state = Arc::new(MemState::empty());
+        state
+            .0
+            .lock()
+            .unwrap()
+            .statuses
+            .push((number, Status::ReviewPlan));
+        let sessions = FakeSessions::new();
+        sessions.dead_sessions.lock().unwrap().push(session.clone());
+        let (u, _, sessions, _) = fixture_usecase_with_models(
+            vec![row],
+            Vec::new(),
+            state,
+            Arc::new(PeakClock),
+            sessions,
+            explicit_models(),
+        );
+
+        let out = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+
+        assert_eq!(out.wakeups_deferred, 0, "{number}: респавн не отложен");
+        assert!(
+            !sessions.spawned.lock().unwrap().is_empty(),
+            "{number}: респавн состоялся"
+        );
+    }
+}
+
+#[tokio::test]
+async fn low_complexity_lost_resurrection_passes_peak() {
+    // #1689: resurrection потерянной сессии ревьювера low тоже идёт
+    // через отфильтрованный пик-гейт (третий переписанный гейт).
+    for (number, priority, complexity) in [
+        (45, Priority::Medium, uwuwu_domain::Complexity::Low),
+        (46, Priority::High, uwuwu_domain::Complexity::Regular),
+    ] {
+        let session = format!("ses_rev_lost_{number}");
+        let mut row = plan_review_task(number, &session);
+        row.set_priority(priority);
+        row.set_complexity(complexity);
+        let sessions = FakeSessions::new();
+        sessions.prompt_lost.lock().unwrap().push(session.clone());
+        let state = Arc::new(MemState::empty());
+        state.mark_spawn("Задачи uwuwu", number, Slot::PlanReview, 500);
+        state.set_last_seen_status("Задачи uwuwu", number, Status::ReviewPlan);
+        let (u, _, _sessions, _) = fixture_usecase_with_models(
+            vec![row],
+            vec![CommentRef {
+                id: "c1".into(),
+                created_ms: 3000,
+                body: "доставка потеряна".into(),
+            }],
+            state,
+            Arc::new(PeakClock),
+            sessions,
+            explicit_models(),
+        );
+
+        let out = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+
+        assert_eq!(out.lost_deferred, 0, "{number}: resurrection не отложена");
+        assert_eq!(out.spawns_done, 1, "{number}: resurrect-спавн состоялся");
     }
 }
 

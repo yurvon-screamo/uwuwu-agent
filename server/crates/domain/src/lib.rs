@@ -29,8 +29,8 @@ pub use guard::{
     SLOT_SESSION_LIVE_MS,
 };
 pub use project::{Goal, Persona, Project, ProjectName};
-pub use task::Priority;
 pub use task::{BranchName, PrUrl, SessionRef, Slot, Status, Task, TaskFields, Vcs};
+pub use task::{Complexity, Priority};
 pub use task_type::TaskType;
 
 // внутренние виды расписания — параметр Schedule::new (парсер юзкейс-слоя)

@@ -221,6 +221,7 @@ impl TaskBoardRepo for RowsBoard {
         _automerge: Option<bool>,
         _direct: Option<bool>,
         _fact_track: Option<bool>,
+        _complexity: Option<&str>,
     ) -> UsecaseResult<()> {
         Ok(())
     }

@@ -214,6 +214,7 @@ pub fn tool_descriptors() -> Value {
                 "body": string("markdown body (problem statement); a copied task_get header and comments tail are stripped"),
                 "type": string(&type_enum_list()),
                 "priority": string("high|medium|low; default medium"),
+                "complexity": string("regular|high|low; default regular; shifts the model tier by 0/+1/-1"),
                 "automerge": json!({"type":"boolean","description":"automerge: merge the PR on entering Review, the row stays in Review; default true (direct — false)"}),
                 "direct": json!({"type":"boolean","description":"direct task (#1357): row goes straight to In Progress, the agent finalizes to Review itself bypassing factory stages. Only on the owner's direct order — verbatim quote of the order in the body; default false"}),
                 "fact_track": json!({"type":"boolean","description":"fact_track task (#1631): shortened pipe without Design and Testing — only In Progress → Result review → Review. Create-only, immutable, mutually exclusive with direct; default false"})
@@ -221,7 +222,7 @@ pub fn tool_descriptors() -> Value {
         ),
         tool(
             "task_edit",
-            "Edit task cells: status/branch/PR/priority/title/type",
+            "Edit task cells: status/branch/PR/priority/title/type/complexity",
             object(json!({
                 "number": integer("task number"),
                 "project": string("project; default uwuwu"),
@@ -229,6 +230,7 @@ pub fn tool_descriptors() -> Value {
                 "branch": string("branch name"),
                 "pr": string("PR URL"),
                 "priority": string("high|medium|low"),
+                "complexity": string("regular|high|low; empty — leave untouched"),
                 "title": string("new title"),
                 "type": string(&(type_enum_list() + "; empty — leave untouched")),
                 "automerge": json!({"type":"boolean","description":"automerge on/off (back-tagging old rows)"}),
@@ -502,7 +504,7 @@ impl ToolHub {
         let card = self.tasks.card(project, number).await.map_err(view_err)?;
         let view = card.issue;
         let mut out = format!(
-            "#{} {} — {}\n\n--- fm ---\nbranch: {}\npr: {}\nautomerge: {}\ndirect: {}\nfact_track: {}\ntype: {}\nbody_hash: {}\nbody_bytes: {}\n\n",
+            "#{} {} — {}\n\n--- fm ---\nbranch: {}\npr: {}\nautomerge: {}\ndirect: {}\nfact_track: {}\ncomplexity: {}\ntype: {}\nbody_hash: {}\nbody_bytes: {}\n\n",
             view.task.number(),
             view.task.title(),
             uwuwu_usecase::status_name(view.task.status()),
@@ -511,6 +513,7 @@ impl ToolHub {
             view.task.automerge(),
             view.task.direct(),
             view.task.fact_track(),
+            uwuwu_usecase::complexity_name(view.task.complexity()),
             // канонное имя (словарь MCP-поверхности); None — «—» как
             // branch/pr (native-null хвост, дефолт Task; #1271)
             view.task
@@ -831,6 +834,7 @@ impl ToolHub {
             body_md: arg_str(args, "body"),
             kind,
             priority: arg_str(args, "priority"),
+            complexity: parse_complexity_arg(args)?.unwrap_or_default(),
             automerge,
             direct,
             fact_track,
@@ -866,6 +870,7 @@ impl ToolHub {
             branch: str_arg(args, "branch"),
             pr: str_arg(args, "pr"),
             priority: str_arg(args, "priority"),
+            complexity: parse_complexity_arg(args)?,
             title: str_arg(args, "title"),
             automerge: args.get("automerge").and_then(|v| v.as_bool()),
             owner_answer,
@@ -1130,6 +1135,26 @@ fn parse_type_arg(raw: &str) -> Result<Option<uwuwu_domain::TaskType>, String> {
     uwuwu_usecase::parse_task_type(raw)
         .map(Some)
         .ok_or_else(|| format!("unknown type «{raw}»: {}", type_enum_list()))
+}
+
+/// Разбор аргумента `complexity` (create/edit, #1689): отсутствие/null —
+/// None, не-строка и неканоническая строка — громкий отказ до мутаций доски.
+fn parse_complexity_arg(args: &Value) -> Result<Option<String>, String> {
+    let raw = match args.get("complexity") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(raw)) => raw,
+        Some(other) => {
+            return Err(format!(
+                "complexity: expecting string (regular|high|low), got {other} — no silent default"
+            ))
+        }
+    };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    uwuwu_usecase::parse_complexity_strict(raw)
+        .map(|c| Some(uwuwu_usecase::complexity_name(c).to_string()))
+        .map_err(|error| format!("complexity: {error}"))
 }
 
 /// Значение строкового аргумента: отсутствующий или не-строковый — пустая строка.

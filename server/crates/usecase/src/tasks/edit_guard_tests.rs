@@ -111,6 +111,7 @@ impl TaskBoardRepo for StaleBoard {
         _a: Option<bool>,
         _d: Option<bool>,
         _f: Option<bool>,
+        _c: Option<&str>,
     ) -> UsecaseResult<()> {
         Ok(())
     }

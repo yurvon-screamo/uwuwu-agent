@@ -51,9 +51,10 @@ pub use error::{UsecaseError, UsecaseResult, ViewError};
 pub use goals::{gist_of, Goal, GoalsRepo, GoalsView};
 pub use model_aliases::{ModelAlias, ModelAliases};
 pub use naming::{
-    agent_name, parse_agent, parse_priority, parse_status, parse_task_type, priority_name,
-    schedule_label, slot_key, status_name, status_names, task_type_name, task_type_native_name,
-    F_AUTOMERGE, F_DIRECT, F_FACT_TRACK, F_PRIORITY, TASK_TYPES,
+    agent_name, complexity_name, parse_agent, parse_complexity, parse_complexity_strict,
+    parse_priority, parse_status, parse_task_type, priority_name, schedule_label, slot_key,
+    status_name, status_names, task_type_name, task_type_native_name, F_AUTOMERGE, F_COMPLEXITY,
+    F_DIRECT, F_FACT_TRACK, F_PRIORITY, TASK_TYPES,
 };
 pub use pipeline::env_gc;
 pub use pipeline::sweeper;
