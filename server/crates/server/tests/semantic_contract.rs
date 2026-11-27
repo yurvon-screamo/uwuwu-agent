@@ -336,8 +336,8 @@ async fn exhausted_legacy_budget_does_not_stop_sync() {
     );
 }
 
-/// Емкостный гард прод-тика (в проде — `SEMANTIC_SYNC_BUDGET = 19`) — не квота:
-/// тик ограничен 19 доками,
+/// Емкостный гард прод-тика (в проде — `SEMANTIC_SYNC_BUDGET = 512`) — не квота:
+/// тест держит механизм на дешёвом явном значении 19,
 /// остаток доезжает следующим тиком, третий тик — no-op.
 #[tokio::test]
 async fn sync_capacity_guard_limits_tick_to_19_docs() {

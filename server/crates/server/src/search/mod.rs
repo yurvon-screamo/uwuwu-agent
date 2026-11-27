@@ -13,4 +13,5 @@ pub use semantic_backend::LanceSemanticBackend;
 
 /// Документов за один тик semantic-sync: емкостный гард (120 с сайдкара и
 /// соседние модели владельца на той же Ollama), а не квотный (#1363 → #1687).
-pub const SEMANTIC_SYNC_BUDGET: usize = 19;
+/// Реально за тик укладывается `min(512, сколько успевается за 120 с)`.
+pub const SEMANTIC_SYNC_BUDGET: usize = 512;
