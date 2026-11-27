@@ -1454,6 +1454,21 @@ async fn contents_and_tree_blob_sha_match_live_e2e() {
 
 // --- #1714: гонка чтение→коммит в write-путях (append_line / docs_write) ----
 
+/// Contents видит ровно ожидаемую версию (lag git-data → Contents до ~20 с).
+async fn wait_contents_exact(rig: &RigGithub, path: &str, expected: &str) {
+    let deadline = tokio::time::Instant::now() + WAIT_TIMEOUT;
+    loop {
+        if rig.read_file(path).await.as_deref() == Some(expected) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "contents не показал ожидаемую версию {path} за {WAIT_TIMEOUT:?}"
+        );
+        tokio::time::sleep(POLL_STEP).await;
+    }
+}
+
 /// Lost update на адаптере: снимок A жив, конкурент уже коммитил B в
 /// git-data. Оба write-пути со снимком A обязаны отказать RaceRef, B цела;
 /// повтор со свежим снимком B проходит (регресс легальной записи).
@@ -1479,10 +1494,6 @@ async fn run_write_race_scenario(rig: RigGithub, _dir: PathBuf, stamp: String) {
     rig.wait_tree_sha(&path, &sha_a).await;
     let sha_b = wait_blob_sha(&rig, &path).await;
     assert_ne!(sha_a, sha_b, "конкурирующий коммит не изменил blob");
-    let snapshot_b = uwuwu_usecase::DocSnapshot {
-        content: body_b.to_string(),
-        blob_sha: sha_b.clone(),
-    };
 
     // append_line по снимку A: предпроверка дерева видит B.
     let error = writer
@@ -1529,16 +1540,13 @@ async fn run_write_race_scenario(rig: RigGithub, _dir: PathBuf, stamp: String) {
         "docs_write затёр свежую версию B"
     );
 
-    // Контроль: свежий снимок проходит, append сохраняет B и дописывает строку.
+    // Контроль: реальный append_line сам читает снимок из Contents и
+    // коммитит по нему — свежая версия B сохраняется, строка дописывается.
+    wait_contents_exact(&rig, &path, body_b).await;
     let lines = writer
-        .append_line_with_snapshot(
-            &path,
-            "строка после гонки",
-            "append fresh 1714",
-            &snapshot_b,
-        )
+        .append_line(&path, "строка после гонки", "append fresh 1714")
         .await
-        .expect("append со свежим снимком");
+        .expect("append_line со свежим чтением");
     assert!(lines >= 2, "append вернул строк: {lines}");
     rig.wait_tree_sha(&path, &sha_b).await;
     let sha_fresh = wait_blob_sha(&rig, &path).await;
