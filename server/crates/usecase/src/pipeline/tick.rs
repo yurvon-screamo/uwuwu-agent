@@ -817,8 +817,18 @@ impl TickUseCase {
                     event = "spawn.deferred_peak",
                     number = task.number(),
                     complexity = naming::complexity_name(complexity),
-                    shift = complexity.shift(),
-                    alias = crate::naming::agent_name(Agent::of_slot(slot).unwrap_or(Agent::Developer)),
+                    shift = complexity.tier_delta(),
+                    alias = Agent::of_slot(slot)
+                        .map(|agent| {
+                            self.models
+                                .alias_for_key_shifted(naming::agent_name(agent), complexity)
+                                .as_str()
+                        })
+                        .unwrap_or_else(|| {
+                            self.models
+                                .alias_for_key_shifted("default", complexity)
+                                .as_str()
+                        }),
                     model = %format!("{}/{}", slot_model.model.provider(), slot_model.model.id()),
                     "Spawn deferred: peak window"
                 );

@@ -382,7 +382,7 @@ impl TaskWriter for TaskWriteUseCase {
         // тип уехал в теле POST create (нативный issue Type, #1271):
         // атомарно, дрейф между issue и полем невозможен; тихий дроп
         // без push-доступа ловит сверка эха на границе носителя
-        // Приоритет/Automerge/Direct/FactTrack — ячейки снапшота доски:
+        // Приоритет/Complexity/Automerge/Direct/FactTrack — ячейки снапшота доски:
         // единая точка записи board-адаптера с кеш-гигиеной (#1258; add_to_board
         // инвалидирует ДО записи полей — окно кеша без полей закрывается
         // адаптером). Автомерж пишется всегда — состояние на носителе явно
@@ -529,7 +529,7 @@ impl TaskWriter for TaskWriteUseCase {
         if !field_patch.is_empty() {
             self.fields.store(number, &field_patch).await?;
         }
-        // Приоритет/Automerge — ячейки снапшота доски: единая точка записи
+        // Приоритет/Complexity/Automerge — ячейки снапшота доски: единая точка записи
         // board-адаптера с кеш-гигиеной (read-your-writes #1258); мимо неё
         // значения протухали в снапшоте до TTL (проба на проде 18.11)
         if patch.priority.is_some() || patch.automerge.is_some() || patch.complexity.is_some() {
@@ -2643,15 +2643,17 @@ mod tests {
         assert_eq!(strip_task_get_header(&md), "## Постановка\nтекст");
     }
 
-    /// Терминатор «конец входа» (#1604) в форме B: шапка актуального
-    /// рендера без хвостового переноса срезается в пустоту — на границе
-    /// записи это отказ #1572.
+    /// Прежний рендер (8 ключей, без complexity) остаётся читаемым:
+    /// карточки, скопированные до #1689, не уезжают телом.
     #[test]
     fn task_get_previous_render_still_strips_as_legacy() {
         let md = "#1526 t — In Progress\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\nbody_bytes: 42\n\n## Постановка\nтекст";
         assert_eq!(strip_task_get_header(md), "## Постановка\nтекст");
     }
 
+    /// Терминатор «конец входа» (#1604) в форме B: шапка актуального
+    /// рендера без хвостового переноса срезается в пустоту — на границе
+    /// записи это отказ #1572.
     #[test]
     fn task_get_fresh_render_card_without_newline_strips_to_empty() {
         let md = "#1632 t — In Progress\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ncomplexity: regular\ntype: bug\nbody_hash: h\nbody_bytes: 42";

@@ -122,16 +122,15 @@ impl SpawnModels {
     /// Сдвиг сложности (#1689): алиас ключа сдвигается на уровень до
     /// выбора raw-модели. Приоритет сюда не передаётся — только Complexity.
     pub fn for_key_shifted(&self, key: &str, complexity: Complexity) -> SpawnModel {
-        let alias = self.alias_for_key(key).unwrap_or_else(|| {
-            tracing::warn!(
-                event = "spawn_models.key_missing",
-                key = %key,
-                "Карта моделей: нет ключа — применён канон-алиас"
-            );
-            canonical_assignments()[key]
-        });
-        self.model_for_alias(alias.shift(complexity.shift()))
+        let alias = self.alias_or_canon(key);
+        self.model_for_alias(alias.shift(complexity.tier_delta()))
             .clone()
+    }
+
+    /// Уровень, на котором реально уходит сессия — для поля `alias` в логах.
+    /// Одна семантика на всех пяти событиях спавна/гейта (#1689 ревью).
+    pub fn alias_for_key_shifted(&self, key: &str, complexity: Complexity) -> ModelAlias {
+        self.alias_or_canon(key).shift(complexity.tier_delta())
     }
 
     /// То же для агента конвейера: один вызов для всех стадийных спавнов.
@@ -143,7 +142,7 @@ impl SpawnModels {
     pub fn for_agent(&self, agent: Agent) -> SpawnModel {
         self.get(naming::agent_name(agent))
             .cloned()
-            .unwrap_or_else(|| self.fallback(agent))
+            .unwrap_or_else(|| self.fallback(naming::agent_name(agent)))
     }
 
     /// Модель bootstrap-сессий подготовки env (ключ "default"). Рабочие
@@ -151,22 +150,38 @@ impl SpawnModels {
     pub fn for_default(&self) -> SpawnModel {
         self.get("default")
             .cloned()
-            .unwrap_or_else(|| self.fallback(Agent::Developer))
+            .unwrap_or_else(|| self.fallback("default"))
     }
 
-    /// Отсутствие ключа — не тихий дефолт: громкий warn + канон. Падать
-    /// нельзя — один неполный ключ не должен ронять весь конвейер.
-    fn fallback(&self, agent: Agent) -> SpawnModel {
-        let key = naming::agent_name(agent);
+    /// Единственный фолбэк «ключа нет в карте» для всех резолвов: один warn,
+    /// канон-алиас, а для ключа вне канона — flash без паники (#1689 ревью).
+    fn alias_or_canon(&self, key: &str) -> ModelAlias {
+        if let Some(alias) = self.alias_for_key(key) {
+            return alias;
+        }
         tracing::warn!(
             event = "spawn_models.key_missing",
             key = %key,
             "Карта моделей: нет ключа — секция [executor.models] неполна, \
-             применён канон-дефолт"
+             применён канон-алиас"
         );
-        Self::canonical()
+        canonical_assignments()
             .get(key)
-            .cloned()
-            .expect("канон несёт ключ агента")
+            .copied()
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    event = "spawn_models.key_unknown",
+                    key = %key,
+                    "Ключ вне канона — применён базовый flash"
+                );
+                ModelAlias::Flash
+            })
+    }
+
+    /// Отсутствие ключа — не тихий дефолт: громкий warn + канон. Падать
+    /// нельзя — один неполный ключ не должен ронять весь конвейер.
+    fn fallback(&self, key: &str) -> SpawnModel {
+        let alias = self.alias_or_canon(key);
+        Self::canonical().model_for_alias(alias).clone()
     }
 }

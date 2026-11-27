@@ -3820,6 +3820,7 @@ mod tests {
 #[cfg(test)]
 mod slot_mapping_tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn dev_session_field_fills_design_slot() {
@@ -3878,6 +3879,63 @@ mod slot_mapping_tests {
         assert!(
             task.stage_needs_spawn().is_none(),
             "TestReview-слот видит сессию — спавн-дубля нет"
+        );
+    }
+
+    struct EventTrap(Arc<Mutex<Vec<String>>>);
+    struct TrapFields(Arc<Mutex<Vec<String>>>);
+
+    impl tracing::field::Visit for TrapFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .lock()
+                .expect("trap lock")
+                .push(format!("{}={:?}", field.name(), value));
+        }
+    }
+
+    impl tracing::Subscriber for EventTrap {
+        fn enabled(&self, _meta: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _from: &tracing::span::Id, _to: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            event.record(&mut TrapFields(Arc::clone(&self.0)));
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn complexity_unknown_value_warns_but_empty_stays_silent() {
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(EventTrap(
+            Arc::clone(&records),
+        )));
+        let garbage = "мусор".to_string();
+        let empty = String::new();
+        warn_complexity_if_unknown(Some(&garbage), 77);
+        warn_complexity_if_unknown(Some(&empty), 78);
+        warn_complexity_if_unknown(None, 79);
+        drop(guard);
+        let logged = records.lock().expect("trap lock").clone();
+        assert!(
+            logged
+                .iter()
+                .any(|r| r.contains("complexity.unknown_value")),
+            "мусор породил warn: {logged:?}"
+        );
+        assert!(
+            logged.iter().any(|r| r == "number=77"),
+            "событие несёт номер задачи: {logged:?}"
+        );
+        assert!(
+            !logged.iter().any(|r| r == "number=78" || r == "number=79"),
+            "пустое/отсутствующее значение молча: {logged:?}"
         );
     }
 

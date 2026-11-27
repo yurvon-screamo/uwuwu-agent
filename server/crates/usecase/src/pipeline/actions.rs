@@ -148,13 +148,20 @@ impl TickUseCase {
         self.state
             .clear_round_reentry_pending(&board.board, task.number());
         let alias = Agent::of_slot(slot)
-            .and_then(|agent| self.models.alias_for_key(naming::agent_name(agent)))
-            .map(|alias| alias.as_str())
-            .unwrap_or("default");
+            .map(|agent| {
+                self.models
+                    .alias_for_key_shifted(naming::agent_name(agent), complexity)
+                    .as_str()
+            })
+            .unwrap_or_else(|| {
+                self.models
+                    .alias_for_key_shifted("default", complexity)
+                    .as_str()
+            });
         tracing::info!(event = "spawn.done", number = task.number(), slot = ?slot,
             session = %work, env = %env_repo,
             complexity = crate::naming::complexity_name(complexity),
-            shift = complexity.shift(),
+            shift = complexity.tier_delta(),
             alias = alias,
             model = %model_label,
             "Spawn done");
@@ -321,8 +328,18 @@ impl TickUseCase {
                         event = "wakeup.deferred_peak",
                         number = task.number(),
                         complexity = crate::naming::complexity_name(complexity),
-                        shift = complexity.shift(),
-                        alias = crate::naming::agent_name(Agent::of_slot(slot).unwrap_or(Agent::Developer)),
+                        shift = complexity.tier_delta(),
+                        alias = Agent::of_slot(slot)
+                            .map(|agent| {
+                                self.models
+                                    .alias_for_key_shifted(naming::agent_name(agent), complexity)
+                                    .as_str()
+                            })
+                            .unwrap_or_else(|| {
+                                self.models
+                                    .alias_for_key_shifted("default", complexity)
+                                    .as_str()
+                            }),
                         model = %format!("{}/{}", slot_model.model.provider(), slot_model.model.id()),
                         "Wakeup deferred: peak window"
                     );
@@ -418,8 +435,18 @@ impl TickUseCase {
                         event = "respawn.held_by_policy",
                         number = task.number(),
                         complexity = crate::naming::complexity_name(complexity),
-                        shift = complexity.shift(),
-                        alias = crate::naming::agent_name(Agent::of_slot(slot).unwrap_or(Agent::Developer)),
+                        shift = complexity.tier_delta(),
+                        alias = Agent::of_slot(slot)
+                            .map(|agent| {
+                                self.models
+                                    .alias_for_key_shifted(naming::agent_name(agent), complexity)
+                                    .as_str()
+                            })
+                            .unwrap_or_else(|| {
+                                self.models
+                                    .alias_for_key_shifted("default", complexity)
+                                    .as_str()
+                            }),
                         model = %format!("{}/{}", slot_model.model.provider(), slot_model.model.id()),
                         "Respawn held: пик-окно/CUP"
                     );
@@ -794,8 +821,18 @@ impl TickUseCase {
                 event = "lost.held_by_policy",
                 number = task.number(),
                 complexity = crate::naming::complexity_name(complexity),
-                shift = complexity.shift(),
-                alias = crate::naming::agent_name(Agent::of_slot(slot).unwrap_or(Agent::Developer)),
+                shift = complexity.tier_delta(),
+                alias = Agent::of_slot(slot)
+                    .map(|agent| {
+                        self.models
+                            .alias_for_key_shifted(naming::agent_name(agent), complexity)
+                            .as_str()
+                    })
+                    .unwrap_or_else(|| {
+                        self.models
+                            .alias_for_key_shifted("default", complexity)
+                            .as_str()
+                    }),
                 model = %format!("{}/{}", slot_model.model.provider(), slot_model.model.id()),
                 "Respawn потерянной сессии held: пик/CUP"
             );

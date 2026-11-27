@@ -966,6 +966,31 @@ async fn task_complexity_create_get_edit_roundtrip() {
             .contains("regular|high|low"),
         "отказ несёт перечень канона"
     );
+    let after_reject = call(
+        &tools,
+        "task_get",
+        json!({ "project": "uwuwu", "number": n }),
+    )
+    .await
+    .expect("task_get после отказа");
+    assert!(
+        after_reject.contains("complexity: low"),
+        "отказ не мутировал носитель: {after_reject}"
+    );
+    let wrong_type = call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": n, "complexity": 42 }),
+    )
+    .await;
+    assert!(wrong_type.is_err(), "не-строка не подменяется молча");
+    assert!(
+        wrong_type
+            .err()
+            .unwrap_or_default()
+            .contains("expecting string"),
+        "отказ объясняет форму аргумента"
+    );
 }
 
 /// direct-круг (#1357) на MemoryHub-носителе: create(direct) рождает

@@ -834,7 +834,7 @@ impl ToolHub {
             body_md: arg_str(args, "body"),
             kind,
             priority: arg_str(args, "priority"),
-            complexity: parse_complexity_arg(&arg_str(args, "complexity"))?.unwrap_or_default(),
+            complexity: parse_complexity_arg(args)?.unwrap_or_default(),
             automerge,
             direct,
             fact_track,
@@ -870,7 +870,7 @@ impl ToolHub {
             branch: str_arg(args, "branch"),
             pr: str_arg(args, "pr"),
             priority: str_arg(args, "priority"),
-            complexity: parse_complexity_arg(&arg_str(args, "complexity"))?,
+            complexity: parse_complexity_arg(args)?,
             title: str_arg(args, "title"),
             automerge: args.get("automerge").and_then(|v| v.as_bool()),
             owner_answer,
@@ -1137,9 +1137,18 @@ fn parse_type_arg(raw: &str) -> Result<Option<uwuwu_domain::TaskType>, String> {
         .ok_or_else(|| format!("unknown type «{raw}»: {}", type_enum_list()))
 }
 
-/// Разбор аргумента `complexity` (create/edit, #1689): пусто — None,
-/// неканоническое значение — громкий отказ до мутаций доски.
-fn parse_complexity_arg(raw: &str) -> Result<Option<String>, String> {
+/// Разбор аргумента `complexity` (create/edit, #1689): отсутствие/null —
+/// None, не-строка и неканоническая строка — громкий отказ до мутаций доски.
+fn parse_complexity_arg(args: &Value) -> Result<Option<String>, String> {
+    let raw = match args.get("complexity") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(raw)) => raw,
+        Some(other) => {
+            return Err(format!(
+                "complexity: expecting string (regular|high|low), got {other} — no silent default"
+            ))
+        }
+    };
     if raw.trim().is_empty() {
         return Ok(None);
     }

@@ -98,7 +98,7 @@ pub trait TaskBoardRepo: Send + Sync {
     /// (#1631) — как automerge: состояние на носителе явно, write-through
     /// тот же; оба пишутся только create (create-only, immutable), edit
     /// несёт None.
-    // Восемь аргументов — принятый техдолг #1662: рефактор в value-объект
+    // Семь параметров (без self) — принятый техдолг #1662: рефактор в value-объект
     // выходит за рамки введения сложности (#1689) и делается отдельно.
     #[allow(clippy::too_many_arguments)]
     async fn set_board_cells(

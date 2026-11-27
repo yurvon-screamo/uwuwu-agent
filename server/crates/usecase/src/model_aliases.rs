@@ -38,12 +38,18 @@ impl ModelAlias {
     /// Сдвиг на `delta` уровней по лестнице ALL с отсечением на границах
     /// (#1689): flash - 1 = flash, smart + 1 = smart. Четвёртого уровня нет.
     pub fn shift(self, delta: i8) -> Self {
-        let index = Self::ALL
-            .iter()
-            .position(|alias| *alias == self)
-            .expect("каждый алиас есть в ALL") as i8;
-        let shifted = (index + delta).clamp(0, Self::ALL.len() as i8 - 1) as usize;
-        Self::ALL[shifted]
+        // Исчерпывающий match: новый вариант enum не скомпилируется без
+        // явного уровня, паники в пути спавна нет.
+        let level = match self {
+            Self::Flash => 0i8,
+            Self::Common => 1,
+            Self::Smart => 2,
+        };
+        match (level + delta).clamp(0, 2) {
+            0 => Self::Flash,
+            1 => Self::Common,
+            _ => Self::Smart,
+        }
     }
 }
 

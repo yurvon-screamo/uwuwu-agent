@@ -207,8 +207,9 @@ pub enum Complexity {
 }
 
 impl Complexity {
-    /// Сдвиг уровня модели: высокая +1, низкая -1, общая без сдвига.
-    pub fn shift(self) -> i8 {
+    /// Дельта уровня модели: высокая +1, низкая -1, общая без сдвига.
+    /// Не путать с `ModelAlias::shift(delta)`, который возвращает алиас.
+    pub fn tier_delta(self) -> i8 {
         match self {
             Self::High => 1,
             Self::Regular => 0,
@@ -1367,6 +1368,21 @@ mod tests {
         let mut mature = task(Status::Done);
         mature.set_closed_at(now - 49 * 3_600_000);
         assert!(mature.is_env_gc_candidate(now, 2), "49 ч — кандидат");
+    }
+
+    #[test]
+    fn apply_fields_carries_explicit_regular_complexity() {
+        let mut high = task(Status::Design);
+        let mut fields = TaskFields::default();
+        fields.set_complexity(Complexity::High);
+        high.apply_fields(fields);
+        assert_eq!(high.complexity(), Complexity::High);
+        // Регулярная сложность — явное значение, а не «нет данных»:
+        // гард по образцу Priority::Empty проглотил бы смену High→Regular.
+        let mut regular = TaskFields::default();
+        regular.set_complexity(Complexity::Regular);
+        high.apply_fields(regular);
+        assert_eq!(high.complexity(), Complexity::Regular);
     }
 
     #[test]

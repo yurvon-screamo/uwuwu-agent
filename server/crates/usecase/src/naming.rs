@@ -163,7 +163,7 @@ pub const F_DIRECT: &str = "Direct";
 /// task_edit его не принимает (чужой ключ — громкий отказ #1572).
 pub const F_FACT_TRACK: &str = "FactTrack";
 
-/// Имя нативного поляissue со сложностью задачи (#1689). Опции
+/// Имя нативного поля issue со сложностью задачи (#1689). Опции
 /// single_select — `regular|high|low`; русские формы принимает парсер.
 pub const F_COMPLEXITY: &str = "Complexity";
 
@@ -189,7 +189,7 @@ pub fn parse_complexity_strict(raw: &str) -> Result<Complexity, String> {
     }
 }
 
-/// Мягкое чтение carriers: пустое/неизвестное → Regular. Не испускает
+/// Мягкое чтение носителя: пустое/неизвестное → Regular. Не испускает
 /// событий — сайты с номером задачи вызывают strict сами и логируют
 /// только непустой мусор (#1689).
 pub fn parse_complexity(raw: &str) -> Complexity {
