@@ -18,7 +18,7 @@ fn strings(pairs: &[(&str, &str)]) -> HashMap<String, String> {
 fn canonical_raws() -> HashMap<String, String> {
     strings(&[
         ("flash", "opencode-go/hy4-flash-free#high"),
-        ("common", "opencode-go/muse-spark-1.3-contributor#high"),
+        ("common", "opencode-go/hy4-flash-free#high"),
         ("smart", "zai-coding-plan/glm-5.4#high"),
     ])
 }
@@ -43,7 +43,7 @@ fn complexity_shift_moves_alias_before_raw_model_selection() {
         SpawnModels::from_config(Some(&canonical_raws()), Some(&canonical_assignment_raws()))
             .expect("явная карта валидна");
     let flash = SpawnModel::parse("opencode-go/hy4-flash-free#high").unwrap();
-    let common = SpawnModel::parse("opencode-go/muse-spark-1.3-contributor#high").unwrap();
+    let common = SpawnModel::parse("opencode-go/hy4-flash-free#high").unwrap();
     let smart = SpawnModel::parse("zai-coding-plan/glm-5.4#high").unwrap();
 
     assert_eq!(
@@ -113,7 +113,7 @@ fn peak_filter_follows_shifted_model_including_synthetic_map() {
 fn canonical_carries_owner_model_map() {
     let models = SpawnModels::canonical();
     let flash = SpawnModel::parse("opencode-go/hy4-flash-free#high").unwrap();
-    let common = SpawnModel::parse("opencode-go/muse-spark-1.3-contributor#high").unwrap();
+    let common = SpawnModel::parse("opencode-go/hy4-flash-free#high").unwrap();
     let smart = SpawnModel::parse("zai-coding-plan/glm-5.4#high").unwrap();
 
     for agent in [Agent::Developer, Agent::Analyst, Agent::Tester] {
@@ -143,7 +143,7 @@ fn alias_level_stays_available_at_runtime() {
     assert_eq!(models.alias_for_key("default"), Some(ModelAlias::Flash));
     assert_eq!(
         models.model_for_alias(ModelAlias::Common),
-        &SpawnModel::parse("opencode-go/muse-spark-1.3-contributor#high").unwrap()
+        &SpawnModel::parse("opencode-go/hy4-flash-free#high").unwrap()
     );
 }
 
