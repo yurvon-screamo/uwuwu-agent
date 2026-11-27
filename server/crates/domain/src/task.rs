@@ -1192,6 +1192,10 @@ mod tests {
             S::can_transition_with(S::ReviewResult, S::UserReview, false, true),
             "fact_track-строка после код-ревью — сразу на приёмку"
         );
+        assert!(
+            S::can_transition_with(S::ReviewResult, S::NeedsAttention, false, true),
+            "grown scope can reach the owner question without clearing the flag"
+        );
         // без флага ребро закрыто — канон UC-01 побайтово
         assert!(
             !S::can_transition_with(S::ReviewResult, S::UserReview, false, false),
