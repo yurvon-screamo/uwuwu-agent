@@ -1,0 +1,31 @@
+{
+  "schema": "engineer-egui/font-manifest/1",
+  "note": "License texts are bundled. TTF binaries are not. Fetch from the pinned upstream, verify SHA-256, then copy the matching OFL text next to the file.",
+  "verified": "2026-11-27",
+  "fonts": [
+    {
+      "file": "Inter-Variable.ttf",
+      "face": "Inter 4.001 variable, body text",
+      "source": "https://github.com/google/fonts/tree/main/ofl/inter",
+      "upstream_file": "Inter[opsz,wght].ttf",
+      "license": "OFL-Inter.txt",
+      "sha256": "29160a80ff49ddcab2c97711247e08b1fab27a484a329ce8b813d820dc559031"
+    },
+    {
+      "file": "Archivo-Variable.ttf",
+      "face": "Archivo 2.001 variable, display text",
+      "source": "https://github.com/google/fonts/tree/main/ofl/archivo",
+      "upstream_file": "Archivo[wdth,wght].ttf",
+      "license": "OFL-Archivo.txt",
+      "sha256": "0e094a7d3c7c4c25cf1310c4b30014f1dae9332220b1c2c88f4fa996f0b05053"
+    },
+    {
+      "file": "GeistMono-Variable.ttf",
+      "face": "Geist Mono 1.701 variable, labels and buttons",
+      "source": "https://github.com/google/fonts/tree/main/ofl/geistmono",
+      "upstream_file": "GeistMono[wght].ttf",
+      "license": "OFL-GeistMono.txt",
+      "sha256": "d00e590b8eb3a59acc329b2d044fd143ae935090b7da33199ebee27cc7de8196"
+    }
+  ]
+}
