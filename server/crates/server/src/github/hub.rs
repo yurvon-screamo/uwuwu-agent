@@ -1017,9 +1017,9 @@ fn trunc(s: &str) -> String {
 fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
     use uwuwu_domain::{Slot, TaskFields, Vcs};
     let s = |v: Option<&String>| v.and_then(|s| uwuwu_domain::SessionRef::parse(s));
-    // слоты: dev/review/test; review-поле покрывает оба ревью-слота,
-    // dev-поле — оба слота дев-семьи (Design/Dev — единая сессия, канон
-    // дев-семьи — usecase/pipeline/tick.rs «едина между этапами и
+    // Слоты: три ревью-стадии — три независимых поля (#1710, канон #1626);
+    // dev-поле покрывает оба слота дев-семьи (Design/Dev — единая сессия,
+    // канон дев-семьи — usecase/pipeline/tick.rs «едина между этапами и
     // откатами (требование владельца)», носитель — семейные поля
     // fields.rs + set_session): иначе Design-строка читается без
     // сессии и тик бесконечно пытается спавнить дубль (инцидент
@@ -1031,16 +1031,25 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
             crate::github::fields::F_DEV_SESSION,
             vec![Slot::Dev, Slot::Design],
         ),
-        (
-            crate::github::fields::F_REVIEW_SESSION,
-            vec![Slot::PlanReview, Slot::ResultReview, Slot::TestReview],
-        ),
         (crate::github::fields::F_TEST_SESSION, vec![Slot::Test]),
     ] {
         if let Some(session) = s(raw.get(name)) {
             for slot in slots {
                 assignments.insert(slot, session.clone());
             }
+        }
+    }
+    for slot in [Slot::PlanReview, Slot::ResultReview, Slot::TestReview] {
+        let name = crate::github::fields::review_session_field(slot);
+        if let Some(session) = s(raw.get(name)) {
+            assignments.insert(slot, session);
+        }
+    }
+    // Legacy-когорта (#1710): старое общее поле читается только если новое
+    // план-поле пусто; X виден как план-сессия до первой эксклюзивной записи.
+    if let std::collections::btree_map::Entry::Vacant(entry) = assignments.entry(Slot::PlanReview) {
+        if let Some(session) = s(raw.get(crate::github::fields::F_REVIEW_SESSION)) {
+            entry.insert(session);
         }
     }
     // Приоритет с носителя: один парсер со snapshot-путём (naming::
@@ -1167,17 +1176,13 @@ impl TaskBoardRepo for GitHubHub {
         slot: uwuwu_domain::Slot,
         session: &str,
     ) -> UsecaseResult<()> {
-        let name = match slot {
-            uwuwu_domain::Slot::Dev => crate::github::fields::F_DEV_SESSION,
-            uwuwu_domain::Slot::PlanReview
-            | uwuwu_domain::Slot::ResultReview
-            | uwuwu_domain::Slot::TestReview => crate::github::fields::F_REVIEW_SESSION,
-            uwuwu_domain::Slot::Test => crate::github::fields::F_TEST_SESSION,
-            uwuwu_domain::Slot::Design => crate::github::fields::F_DEV_SESSION,
-        };
-        self.fields
-            .store(number, &[(name, Some(session.to_string()))])
-            .await?;
+        let legacy_present = slot.is_review()
+            && self
+                .fields
+                .has_field(crate::github::fields::F_REVIEW_SESSION)
+                .await?;
+        let patch = crate::github::fields::review_store_patch(slot, session, legacy_present);
+        self.fields.store(number, &patch).await?;
         self.invalidate_snapshot(_board);
         Ok(())
     }
@@ -1269,15 +1274,7 @@ impl TaskBoardRepo for GitHubHub {
         number: u64,
         slot: uwuwu_domain::Slot,
     ) -> UsecaseResult<()> {
-        let name = match slot {
-            uwuwu_domain::Slot::Dev | uwuwu_domain::Slot::Design => {
-                crate::github::fields::F_DEV_SESSION
-            }
-            uwuwu_domain::Slot::PlanReview
-            | uwuwu_domain::Slot::ResultReview
-            | uwuwu_domain::Slot::TestReview => crate::github::fields::F_REVIEW_SESSION,
-            uwuwu_domain::Slot::Test => crate::github::fields::F_TEST_SESSION,
-        };
+        let name = crate::github::fields::review_session_field(slot);
         self.fields.store(number, &[(name, None)]).await?;
         self.invalidate_snapshot(_board);
         Ok(())
@@ -3844,42 +3841,109 @@ mod slot_mapping_tests {
     }
 
     #[test]
-    fn review_session_field_fills_test_review_slot() {
-        // #1413: fm-ячейка «Сессия ревью» — общая для трёх ревью-слотов
-        // (вектора assignments — не-экзаустивная поверхность вне
-        // компилятора): строка в «Ревью тестирования» с живой ячейкой
-        // видит сессию — тик не спавнит дубли (класс инцидента 15/16.11)
+    fn review_session_field_is_exclusive_per_slot() {
+        // #1710: три стадии — три независимых поля-носителя; старое общее
+        // «Сессия ревью» больше не разворачивается на соседние слоты
         let mut raw = Fields::new();
-        raw.insert("Сессия ревью".into(), "ses_testrev".into());
-        let f = map_task_fields(&raw);
+        raw.insert("Сессия ревью тестов".into(), "ses_testrev".into());
         let mut task = uwuwu_domain::Task::new(2, "t".into(), uwuwu_domain::Status::ReviewTesting);
-        task.apply_fields(f);
+        task.apply_fields(map_task_fields(&raw));
         assert_eq!(
             task.session_of(uwuwu_domain::Slot::TestReview),
             Some("ses_testrev")
         );
-        assert_eq!(
-            task.session_of(uwuwu_domain::Slot::ResultReview),
-            Some("ses_testrev")
-        );
+        for slot in [
+            uwuwu_domain::Slot::PlanReview,
+            uwuwu_domain::Slot::ResultReview,
+            uwuwu_domain::Slot::Dev,
+            uwuwu_domain::Slot::Test,
+        ] {
+            assert_eq!(task.session_of(slot), None, "слот {slot:?} чужой");
+        }
+        assert!(task.stage_needs_spawn().is_none());
+    }
+
+    #[test]
+    fn three_review_fields_hold_three_independent_sessions() {
+        // #1710, основной путь: все три стадии прошли ревью — каждая держит
+        // свою сессию; старое общее поле не разворачивается на соседние слоты
+        // Arrange
+        let mut raw = Fields::new();
+        raw.insert("Сессия план-ревью".into(), "ses_plan".into());
+        raw.insert("Сессия ревью кода".into(), "ses_result".into());
+        raw.insert("Сессия ревью тестов".into(), "ses_test".into());
+        // Act
+        let mut task = uwuwu_domain::Task::new(6, "t".into(), uwuwu_domain::Status::ReviewTesting);
+        task.apply_fields(map_task_fields(&raw));
+        // Assert
         assert_eq!(
             task.session_of(uwuwu_domain::Slot::PlanReview),
-            Some("ses_testrev")
+            Some("ses_plan")
         );
         assert_eq!(
-            task.session_of(uwuwu_domain::Slot::Dev),
-            None,
-            "ревью-ячейка не течёт в дев-слот"
+            task.session_of(uwuwu_domain::Slot::ResultReview),
+            Some("ses_result")
         );
         assert_eq!(
-            task.session_of(uwuwu_domain::Slot::Test),
-            None,
-            "ревью-ячейка не течёт в тест-слот"
+            task.session_of(uwuwu_domain::Slot::TestReview),
+            Some("ses_test")
         );
         assert!(
             task.stage_needs_spawn().is_none(),
-            "TestReview-слот видит сессию — спавн-дубля нет"
+            "все три стадии видят свои сессии — лишнего спавна нет"
         );
+    }
+
+    #[test]
+    fn steady_state_review_slots_are_exclusive() {
+        // #1710: после план-ревью план-сессия лежит в своём поле; вход в
+        // result/testing review обязан видеть пустые слоты и спавнить свежие
+        let mut raw = Fields::new();
+        raw.insert("Сессия план-ревью".into(), "ses_plan".into());
+        let mut task = uwuwu_domain::Task::new(3, "t".into(), uwuwu_domain::Status::ReviewResult);
+        task.apply_fields(map_task_fields(&raw));
+        assert_eq!(
+            task.session_of(uwuwu_domain::Slot::PlanReview),
+            Some("ses_plan")
+        );
+        assert_eq!(task.session_of(uwuwu_domain::Slot::ResultReview), None);
+        assert_eq!(task.session_of(uwuwu_domain::Slot::TestReview), None);
+        assert_eq!(
+            task.stage_needs_spawn(),
+            Some(uwuwu_domain::Slot::ResultReview)
+        );
+    }
+
+    #[test]
+    fn legacy_review_field_fills_only_plan_slot() {
+        // #1710: строка-когорта с единственным старым полем — X виден только
+        // как план-сессия, result/test пусты до первой эксклюзивной записи
+        let mut raw = Fields::new();
+        raw.insert("Сессия ревью".into(), "ses_old".into());
+        let mut task = uwuwu_domain::Task::new(4, "t".into(), uwuwu_domain::Status::ReviewResult);
+        task.apply_fields(map_task_fields(&raw));
+        assert_eq!(
+            task.session_of(uwuwu_domain::Slot::PlanReview),
+            Some("ses_old")
+        );
+        assert_eq!(task.session_of(uwuwu_domain::Slot::ResultReview), None);
+        assert_eq!(task.session_of(uwuwu_domain::Slot::TestReview), None);
+    }
+
+    #[test]
+    fn plan_field_wins_over_legacy() {
+        // #1710: новые строки не подменяются legacy-значением, если оно есть
+        let mut raw = Fields::new();
+        raw.insert("Сессия план-ревью".into(), "ses_plan".into());
+        raw.insert("Сессия ревью".into(), "ses_old".into());
+        let mut task = uwuwu_domain::Task::new(5, "t".into(), uwuwu_domain::Status::ReviewPlan);
+        task.apply_fields(map_task_fields(&raw));
+        assert_eq!(
+            task.session_of(uwuwu_domain::Slot::PlanReview),
+            Some("ses_plan")
+        );
+        assert_eq!(task.session_of(uwuwu_domain::Slot::ResultReview), None);
+        assert_eq!(task.session_of(uwuwu_domain::Slot::TestReview), None);
     }
 
     struct EventTrap(Arc<Mutex<Vec<String>>>);
