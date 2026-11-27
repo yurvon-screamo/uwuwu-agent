@@ -521,6 +521,42 @@ impl Config {
                 "[pipeline] sidecar_timeout_ms = 0 при ненулевом semantic_sync_timeout_ms".into(),
             ));
         }
+        // Карты моделей: единственный носитель — [executor]; отсутствие или
+        // неполная карта — отказ старта с именем ключа (uwuwu#1726).
+        let Some(aliases) = self.executor.model_aliases.as_ref() else {
+            return Err(ConfigError::Validation(
+                "отсутствует обязательная секция [executor.model_aliases]".into(),
+            ));
+        };
+        for key in ["flash", "common", "smart"] {
+            if !aliases.contains_key(key) {
+                return Err(ConfigError::Validation(format!(
+                    "[executor.model_aliases].{key}: нет алиаса"
+                )));
+            }
+        }
+        let Some(models) = self.executor.models.as_ref() else {
+            return Err(ConfigError::Validation(
+                "отсутствует обязательная секция [executor.models]".into(),
+            ));
+        };
+        for agent in [
+            "default",
+            "developer",
+            "plan-reviewer",
+            "code-quality-reviewer",
+            "tester",
+            "test-reviewer",
+            "analyst",
+            "analyst-reviewer",
+            "dreamer",
+        ] {
+            if !models.contains_key(agent) {
+                return Err(ConfigError::Validation(format!(
+                    "[executor.models].{agent}: нет назначения"
+                )));
+            }
+        }
         let b = self.blob.as_ref().expect("validated");
         if b.presign_ttl_secs > 7 * 24 * 60 * 60 {
             return Err(ConfigError::Validation(
