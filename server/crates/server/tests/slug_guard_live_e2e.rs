@@ -155,8 +155,9 @@ async fn spawn_server(dir: &Path, repo: &str) -> Stand {
         .env("UWUWU_HUB_REPO", repo)
         .env("RUST_LOG", "warn")
         // Окружение запустившего не протекает в стенд: GEMINI_API_KEY включает
-        // судью и LanceDB/FTS в каталоге стенда.
+        // судью, UWUWU_EMBED_URL — LanceDB/FTS в каталоге стенда (#1687).
         .env_remove("GEMINI_API_KEY")
+        .env_remove("UWUWU_EMBED_URL")
         .stdout(Stdio::from(log.try_clone().expect("log clone")))
         .stderr(Stdio::from(log))
         .spawn()

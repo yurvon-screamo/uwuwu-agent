@@ -1,0 +1,11 @@
+# rathole-клиент на kisa (systemd rathole-ollama): проброс локальной Ollama
+# в Railway-сервис relay. remote_addr = публичный TCP-домен relay
+# (Railway → relay → Settings → Networking → Generate TCP Domain).
+# Токен совпадает с RATHOLE_TOKEN сервиса relay.
+# Возвращён по слову владельца 26.11.2026 (#1687); снесён был #1500.
+[client]
+remote_addr = "mainline.proxy.rlwy.net:36390"
+
+[client.services.ollama]
+local_addr = "127.0.0.1:11434"
+token = "CHANGE_ME"

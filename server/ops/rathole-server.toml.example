@@ -3,13 +3,13 @@
 #   RATHOLE_TOKEN — общий секрет сервис-клиент (у владельца)
 #   PORT          — 2333 (внутренний порт Railway)
 # Start command сервиса (конфиг генерируется из env, файл в образ не нужен):
-#   sh -c 'printf "[server]\nbind_addr=\"0.0.0.0:%s\"\n\n[server.services.opencode]\ntoken=\"%s\"\nbind_addr=\"0.0.0.0:2335\"\n\n[server.services.opencode2]\ntoken=\"%s\"\nbind_addr=\"0.0.0.0:2336\"\n" "$PORT" "$RATHOLE_TOKEN" "$RATHOLE_TOKEN" > /tmp/rathole.toml && rathole /tmp/rathole.toml'
+#   sh -c 'printf "[server]\nbind_addr=\"0.0.0.0:%s\"\n\n[server.services.opencode]\ntoken=\"%s\"\nbind_addr=\"0.0.0.0:2335\"\n\n[server.services.opencode2]\ntoken=\"%s\"\nbind_addr=\"0.0.0.0:2336\"\n\n[server.services.ollama]\ntoken=\"%s\"\nbind_addr=\"0.0.0.0:2334\"\n" "$PORT" "$RATHOLE_TOKEN" "$RATHOLE_TOKEN" "$RATHOLE_TOKEN" > /tmp/rathole.toml && rathole /tmp/rathole.toml'
 #
-# Схема: uwuwu-server → http://relay.railway.internal:2335 (opencode — kisa)
-# и :2336 (opencode2 — redmi) → туннель → исполнители opencode serve.
+# Схема: uwuwu-server → http://relay.railway.internal:2335 (opencode — kisa),
+# :2336 (opencode2 — redmi) → туннель → исполнители opencode serve;
+# :2334 (ollama — kisa) → туннель → локальные эмбеддинги uwuwu_search (#1687).
 # Наружу — только публичный TCP-домен relay (для rathole-клиентов исполнителей),
 # сервисные порты в интернет не торчат.
-# Легаси ollama-сервис (:2334) снесён — эмбеддинги переехали на Gemini API (#1363).
 #
 # Эквивалентный статический конфиг (если класть файл):
 [server]
@@ -27,3 +27,9 @@ bind_addr = "0.0.0.0:2335"
 [server.services.opencode2]
 token = "<RATHOLE_TOKEN>"
 bind_addr = "0.0.0.0:2336"
+
+# Локальные эмбеддинги: uwuwu-server → http://relay.railway.internal:2334
+# → туннель → kisa Ollama :11434 (возврат по слову владельца 26.11, #1687)
+[server.services.ollama]
+token = "CHANGE_ME"
+bind_addr = "0.0.0.0:2334"

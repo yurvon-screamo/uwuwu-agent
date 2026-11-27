@@ -1,0 +1,11 @@
+# Таймер пары on-boot refresh (#1312, #1687): одно срабатывание через 3 мин
+# после бута. OnBootSec без периодических On*Sec — живёт до следующего бута.
+[Unit]
+Description=Schedule one-shot rathole ollama tunnel refresh after boot
+
+[Timer]
+OnBootSec=3min
+Unit=rathole-ollama-boot-refresh.service
+
+[Install]
+WantedBy=timers.target

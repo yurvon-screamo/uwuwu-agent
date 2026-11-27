@@ -1,10 +1,9 @@
 //! Поиск: гибрид полнотекста (токены по кэшу доков) и семантики
 //! (векторный индекс). Семантика строится фоновой дотяжкой: тик
-//! индексирует изменённые доки батчами через Gemini Embedding 2 (#1363).
+//! индексирует изменённые доки батчами через локальную Ollama (#1687).
 
 use crate::error::UsecaseResult;
 use std::sync::Arc;
-use uwuwu_domain::UtcMinute;
 
 /// Публичный порт поиска (MCP search).
 pub struct SearchUseCase {
@@ -92,10 +91,4 @@ impl SearchUseCase {
         }
         Ok(out)
     }
-}
-
-/// Гейт дотяжки индекса: не жжём эмбеддинги в пик-окно GLM (будни
-/// 06:00–10:00 UTC); вне окна (вкл. выходные) — дотяжка идёт.
-pub fn sync_allowed(now: UtcMinute) -> bool {
-    !(now.weekday <= 5 && now.minute_of_day >= 360 && now.minute_of_day < 600)
 }

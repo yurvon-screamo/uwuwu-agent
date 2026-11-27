@@ -1,0 +1,10 @@
+# On-boot разовый рестарт rathole-клиента ollama-туннеля (#1312, #1687).
+# Ребут ноды оставляет релей со стейл-маршрутом: клиент running, транспорт
+# мёртв. Рестарт через 3 мин после загрузки пробивает свежий handshake.
+[Unit]
+Description=Refresh rathole ollama tunnel after boot (one-shot)
+After=rathole-ollama.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl --user try-restart rathole-ollama.service
