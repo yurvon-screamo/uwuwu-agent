@@ -27,7 +27,7 @@ fn canonical_assignment_raws() -> HashMap<String, String> {
         ("developer", "flash"),
         ("plan-reviewer", "smart"),
         ("code-quality-reviewer", "smart"),
-        ("tester", "common"),
+        ("tester", "flash"),
         ("test-reviewer", "smart"),
         ("analyst", "flash"),
         ("analyst-reviewer", "smart"),
@@ -42,12 +42,10 @@ fn canonical_carries_owner_model_map() {
     let common = SpawnModel::parse("opencode-go/muse-spark-1.3-contributor#high").unwrap();
     let smart = SpawnModel::parse("zai-coding-plan/glm-5.4#high").unwrap();
 
-    for agent in [Agent::Developer, Agent::Analyst] {
+    for agent in [Agent::Developer, Agent::Analyst, Agent::Tester] {
         assert_eq!(models.for_agent(agent), flash, "{agent:?} — flash");
     }
-    for agent in [Agent::Tester, Agent::Dreamer] {
-        assert_eq!(models.for_agent(agent), common, "{agent:?} — common");
-    }
+    assert_eq!(models.for_agent(Agent::Dreamer), common, "Dreamer — common");
     for agent in [
         Agent::PlanReviewer,
         Agent::CodeQualityReviewer,
@@ -62,7 +60,7 @@ fn canonical_carries_owner_model_map() {
 #[test]
 fn alias_level_stays_available_at_runtime() {
     let models = SpawnModels::canonical();
-    assert_eq!(models.alias_for_agent(Agent::Tester), ModelAlias::Common);
+    assert_eq!(models.alias_for_agent(Agent::Tester), ModelAlias::Flash);
     assert_eq!(
         models.alias_for_agent(Agent::PlanReviewer),
         ModelAlias::Smart
@@ -103,10 +101,7 @@ fn aliases_only_keep_canonical_assignments() {
         "Разработчик — новый flash"
     );
     assert_eq!(models.for_default(), want, "bootstrap — новый flash");
-    assert_eq!(
-        models.for_agent(Agent::Tester),
-        SpawnModel::parse("p/common#high").unwrap()
-    );
+    assert_eq!(models.for_agent(Agent::Tester), want, "tester — flash");
 }
 
 #[test]
@@ -263,14 +258,9 @@ fn one_alias_edit_changes_whole_group() {
     aliases.insert("flash".into(), "p/new-flash#high".into());
     let models = SpawnModels::from_config(Some(&aliases), None).unwrap();
     let want = SpawnModel::parse("p/new-flash#high").unwrap();
-    for key in ["default", "developer", "analyst"] {
+    for key in ["default", "developer", "analyst", "tester"] {
         assert_eq!(models.get(key), Some(&want), "{key} — новый flash");
     }
-    assert_eq!(
-        models.get("tester"),
-        SpawnModels::canonical().get("tester"),
-        "tester не задет правкой flash"
-    );
 }
 
 #[test]
