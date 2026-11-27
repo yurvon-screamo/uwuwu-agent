@@ -1222,12 +1222,7 @@ async fn slug_guard_live_e2e_main_scenario() {
 
 /// Коммит писателя с ограниченным ретраем на spurious update_ref 422:
 /// упавший ff ничего не записал, повтор безопасен (шапка рига, п.7).
-async fn writer_commit(
-    writer: &wiki::GitWikiWriter,
-    path: &str,
-    body: &str,
-    message: &str,
-) {
+async fn writer_commit(writer: &wiki::GitWikiWriter, path: &str, body: &str, message: &str) {
     let mut last = String::new();
     for _ in 0..3 {
         match writer.commit_file(path, body, message).await {
@@ -1268,7 +1263,7 @@ async fn run_stale_sha_scenario(rig: RigGithub) {
     let body_b = "# версия B\n";
     let writer = wiki::GitWikiWriter::new(rig.repo.clone(), rig.branch.clone(), rig.token.clone());
     writer_commit(&writer, &path, body_a, "seed A 1697").await;
-    rig.wait_tree(&[path.clone()]).await;
+    rig.wait_tree(std::slice::from_ref(&path)).await;
     let sha_a = wait_blob_sha(&rig, &path).await;
 
     // Конкурирующий писатель обновляет док до B после снимка A.
@@ -1286,7 +1281,10 @@ async fn run_stale_sha_scenario(rig: RigGithub) {
         matches!(error, uwuwu_usecase::UsecaseError::RaceRef(_)),
         "ожидался RaceRef, получено: {error}"
     );
-    let live = rig.read_file(&path).await.expect("версия B должна остаться");
+    let live = rig
+        .read_file(&path)
+        .await
+        .expect("версия B должна остаться");
     assert_eq!(live, body_b, "свежая версия B затёрта");
 
     writer
@@ -1350,7 +1348,7 @@ async fn run_sha_match_scenario(rig: RigGithub) {
     let path = "docs/Projects/uwuwu/Sha-1697.md".to_string();
     let writer = wiki::GitWikiWriter::new(rig.repo.clone(), rig.branch.clone(), rig.token.clone());
     writer_commit(&writer, &path, "# sha\n", "seed sha 1697").await;
-    rig.wait_tree(&[path.clone()]).await;
+    rig.wait_tree(std::slice::from_ref(&path)).await;
     let tree_sha = wait_blob_sha(&rig, &path).await;
     let (status, body) = api_call_retry(
         &rig.http,

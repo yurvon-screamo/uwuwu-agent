@@ -59,7 +59,10 @@ fn precheck_refuses_truncated_tree() {
         sha: "A",
     };
     let error = check_expected_blob(&current, &expected).expect_err("усечённое дерево");
-    assert!(matches!(error, UsecaseError::PrecheckUnavailable(_)), "{error}");
+    assert!(
+        matches!(error, UsecaseError::PrecheckUnavailable(_)),
+        "{error}"
+    );
 }
 
 #[test]
@@ -69,5 +72,8 @@ fn precheck_refuses_tree_without_entries_array() {
         sha: "A",
     };
     let error = check_expected_blob(&json!({}), &expected).expect_err("битый ответ");
-    assert!(matches!(error, UsecaseError::PrecheckUnavailable(_)), "{error}");
+    assert!(
+        matches!(error, UsecaseError::PrecheckUnavailable(_)),
+        "{error}"
+    );
 }

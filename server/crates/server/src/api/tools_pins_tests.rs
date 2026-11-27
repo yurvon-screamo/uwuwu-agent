@@ -350,7 +350,7 @@ async fn docs_write_sanitizes_slug_like_docs_read() {
 async fn docs_write_degraded_tree_keeps_root_check_and_flags_skip() {
     // деградационная строка таблицы сбоев: root жив без дерева,
     // parent/suffix пропущены, клоза называет пропуск честно
-    let (_serial, _guard, records) = scoped_trap();
+    let (_serial, _guard, records) = scoped_trap().await;
     let (tools, _) = tool_hub(
         Arc::new(TreeFailingWiki),
         blob_usecase(),
@@ -789,7 +789,7 @@ async fn docs_append_degraded_tree_refuses_without_candidates() {
     // строка 4 таблицы сбоев: дерево Err + append на несуществующем —
     // отказ append-nonexistent без кандидатов (отказ-факт от дерева
     // не зависит, писатель авторитетен)
-    let (_serial, _guard, records) = scoped_trap();
+    let (_serial, _guard, records) = scoped_trap().await;
     let (tools, _) = tool_hub(
         Arc::new(TreeFailingWiki),
         blob_usecase(),
@@ -1965,21 +1965,21 @@ use crate::rename_journal::test_support::{assert_event, trap_events};
 /// пины: один активный trap на прогон. Все тесты, которые порождают это
 /// событие, обязаны брать trap — иначе callsite кэширует «не интересно»
 /// до первого подписчика и последующие ассерты видят пустой лог.
-static TRAP_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static TRAP_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn scoped_trap() -> (
-    std::sync::MutexGuard<'static, ()>,
+async fn scoped_trap() -> (
+    tokio::sync::MutexGuard<'static, ()>,
     tracing::dispatcher::DefaultGuard,
     std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 ) {
-    let serial = TRAP_SERIAL.lock().expect("trap serial");
+    let serial = TRAP_SERIAL.lock().await;
     let (guard, records) = trap_events();
     (serial, guard, records)
 }
 
 #[tokio::test]
 async fn docs_write_degraded_tree_logs_slug_guard_event() {
-    let (_serial, _guard, records) = scoped_trap();
+    let (_serial, _guard, records) = scoped_trap().await;
     let (tools, _) = tool_hub(
         Arc::new(TreeFailingWiki),
         blob_usecase(),
@@ -2002,7 +2002,7 @@ async fn docs_write_degraded_tree_logs_slug_guard_event() {
 
 #[tokio::test]
 async fn docs_write_read_failure_with_fm_logs_its_own_reason() {
-    let (_serial, _guard, records) = scoped_trap();
+    let (_serial, _guard, records) = scoped_trap().await;
     let (tools, _) = tool_hub(
         Arc::new(ReadFailingWiki),
         blob_usecase(),
@@ -2025,7 +2025,7 @@ async fn docs_write_read_failure_with_fm_logs_its_own_reason() {
 
 #[tokio::test]
 async fn docs_append_degraded_tree_logs_slug_guard_event() {
-    let (_serial, _guard, records) = scoped_trap();
+    let (_serial, _guard, records) = scoped_trap().await;
     let (tools, _) = tool_hub(
         Arc::new(TreeFailingWiki),
         blob_usecase(),
@@ -2048,7 +2048,7 @@ async fn docs_append_degraded_tree_logs_slug_guard_event() {
 
 #[tokio::test]
 async fn docs_delete_degraded_tree_refuses_and_logs() {
-    let (_serial, _guard, records) = scoped_trap();
+    let (_serial, _guard, records) = scoped_trap().await;
     let (tools, _) = tool_hub(
         Arc::new(TreeFailingWiki),
         blob_usecase(),
@@ -2135,16 +2135,23 @@ async fn delete_refusal_texts_keep_backup_scope_honest() {
     use uwuwu_usecase::UsecaseError;
 
     let race = delete_error_text(UsecaseError::RaceRef("blob changed".into())).await;
-    assert!(race.contains("any backup is for the read version only"), "{race}");
+    assert!(
+        race.contains("any backup is for the read version only"),
+        "{race}"
+    );
 
     let absent = delete_error_text(UsecaseError::DocAbsentAtRef(
         "already absent at ref; no delete was committed, backup of the read version only".into(),
     ))
     .await;
     assert!(!absent.contains("no backup"), "{absent}");
-    assert!(absent.contains("backup of the read version only"), "{absent}");
+    assert!(
+        absent.contains("backup of the read version only"),
+        "{absent}"
+    );
 
-    let precheck = delete_error_text(UsecaseError::PrecheckUnavailable("tree: HTTP 502".into())).await;
+    let precheck =
+        delete_error_text(UsecaseError::PrecheckUnavailable("tree: HTTP 502".into())).await;
     assert!(precheck.contains("no delete was committed"), "{precheck}");
     assert!(precheck.contains("HTTP 502"), "{precheck}");
 
