@@ -69,8 +69,44 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
+
+/// Имя рига уникально и при параллельных прогонах одного бинарника:
+/// миллисекунды + pid совпадали у тестов, стартовавших в одну миллисекунду,
+/// и второй POST получал 422 «name already exists» (#1697, tester).
+static RIG_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn rig_stamp() -> String {
+    format!(
+        "{}{}{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis(),
+        std::process::id(),
+        RIG_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Fixture живого рига: уникальное имя, каталог стенда и guard на снос.
+/// Общая точка убирает копирование подготовки между живыми сценариями.
+async fn start_live_rig(
+    prefix: &str,
+    http: &reqwest::Client,
+    token: &str,
+) -> (PathBuf, RigGithub, RigLease, String) {
+    let stamp = rig_stamp();
+    let dir = std::env::temp_dir().join(format!("uwuwu-rig-e2e-{prefix}-{stamp}"));
+    std::fs::create_dir_all(&dir).expect("rig dir");
+    let rig = RigGithub::create(http, token, &stamp).await;
+    let lease = RigLease {
+        repo: rig.repo.clone(),
+        deleted: false,
+    };
+    (dir, rig, lease, stamp)
+}
 
 /// Верхняя граница ожидания видимости в GitHub: Contents отстаёт от
 /// git-data-коммита до десятков секунд.
@@ -1104,22 +1140,8 @@ async fn docs_delete_live_e2e_backup_and_restore() {
             return;
         }
     }
-    let stamp = format!(
-        "{}{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_millis(),
-        std::process::id()
-    );
-    let dir = std::env::temp_dir().join(format!("uwuwu-rig-e2e-dd-{stamp}"));
-    std::fs::create_dir_all(&dir).expect("rig dir");
     let http = reqwest::Client::new();
-    let rig = RigGithub::create(&http, &token, &stamp).await;
-    let mut lease = RigLease {
-        repo: rig.repo.clone(),
-        deleted: false,
-    };
+    let (dir, rig, mut lease, _stamp) = start_live_rig("dd", &http, &token).await;
     let outcome = tokio::spawn(run_doc_delete_scenario(dir.clone(), rig.clone())).await;
     let scenario_error = outcome.err().map(|join| {
         join.into_panic()
@@ -1152,25 +1174,10 @@ async fn slug_guard_live_e2e_main_scenario() {
         println!("e2e выключен: UWUWU_E2E=1 для живой пробы (риг тест создаёт сам)");
         return;
     };
-    let stamp = format!(
-        "{}{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_millis(),
-        std::process::id()
-    );
-    let dir = std::env::temp_dir().join(format!("uwuwu-rig-e2e-{stamp}"));
-    std::fs::create_dir_all(&dir).expect("rig dir");
     let http = reqwest::Client::new();
-
-    let rig = RigGithub::create(&http, &token, &stamp).await;
     // Guard с именем рига: если между POST и сносом всё же случится unwinding,
     // информация о ручном сносе не пропадёт.
-    let mut lease = RigLease {
-        repo: rig.repo.clone(),
-        deleted: false,
-    };
+    let (dir, rig, mut lease, stamp) = start_live_rig("main", &http, &token).await;
     println!(
         "риг создан: {} (ветка {}, стенд {dir:?})",
         rig.repo, rig.branch
@@ -1300,35 +1307,33 @@ async fn docs_delete_stale_blob_sha_is_refused_live_e2e() {
         println!("e2e выключен: UWUWU_E2E=1 для живой пробы гонки docs_delete");
         return;
     };
-    let stamp = format!(
-        "{}{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_millis(),
-        std::process::id()
-    );
-    let dir = std::env::temp_dir().join(format!("uwuwu-rig-e2e-race-{stamp}"));
-    std::fs::create_dir_all(&dir).expect("rig dir");
     let http = reqwest::Client::new();
-    let rig = RigGithub::create(&http, &token, &stamp).await;
-    let mut lease = RigLease {
-        repo: rig.repo.clone(),
-        deleted: false,
-    };
+    let (dir, rig, mut lease, _stamp) = start_live_rig("race", &http, &token).await;
     let outcome = tokio::spawn(run_stale_sha_scenario(rig.clone())).await;
+    let delete_result = rig.delete().await;
+    lease.deleted = delete_result.is_ok();
+    finish_live_rig(&rig, &dir, outcome, delete_result, "docs_delete race").await;
+}
+
+/// Общий teardown живых ригов #1697: сценарий исполняется в подзадаче, риг
+/// сносится на любом исходе; ошибка сноса не заменяет панику сценария.
+async fn finish_live_rig(
+    rig: &RigGithub,
+    dir: &Path,
+    outcome: Result<(), tokio::task::JoinError>,
+    delete_result: Result<(), String>,
+    label: &str,
+) {
     let scenario_error = outcome.err().map(|join| {
         join.into_panic()
             .downcast_ref::<String>()
             .cloned()
             .unwrap_or_else(|| "паника без сообщения".to_string())
     });
-    let _ = std::fs::remove_dir_all(&dir);
-    let delete_result = rig.delete().await;
-    lease.deleted = delete_result.is_ok();
+    let _ = std::fs::remove_dir_all(dir);
     let mut problems = Vec::new();
     if let Some(msg) = scenario_error {
-        problems.push(format!("docs_delete race e2e упал: {msg}"));
+        problems.push(format!("{label} e2e упал: {msg}"));
     }
     if let Err(error) = delete_result {
         problems.push(format!(
@@ -1337,6 +1342,72 @@ async fn docs_delete_stale_blob_sha_is_refused_live_e2e() {
         ));
     }
     assert!(problems.is_empty(), "{}", problems.join("\n\n"));
+}
+
+/// Конкурирующее удаление из BDD #1697: снимок A жив, но файла уже нет в
+/// дереве коммита, на котором строится удаление. Ожидаем `DocAbsentAtRef`
+/// без повторной мутации — не «race-ref» и не тихий успех.
+async fn run_competing_delete_scenario(rig: RigGithub) {
+    if let Some(error) = &rig.creation_error {
+        panic!("{error}");
+    }
+    let path = "docs/Projects/uwuwu/Снос-1697.md".to_string();
+    let writer = wiki::GitWikiWriter::new(rig.repo.clone(), rig.branch.clone(), rig.token.clone());
+    writer_commit(&writer, &path, "# версия A\n", "seed A 1697 competing").await;
+    rig.wait_tree(std::slice::from_ref(&path)).await;
+    let sha_a = wait_blob_sha(&rig, &path).await;
+
+    // Первый снос со свежим снимком — легальный, сдвигает ref.
+    writer
+        .delete_file(&path, &sha_a, "first delete 1697")
+        .await
+        .expect("первый снос со свежим sha");
+
+    // Дерево Git Data — свидетель отсутствия, в отличие от Contents с лагом.
+    let deadline = tokio::time::Instant::now() + WAIT_TIMEOUT;
+    loop {
+        if rig.tree_blob_sha(&path).await.is_none() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "дерево не показало отсутствие {path} за {WAIT_TIMEOUT:?}"
+        );
+        tokio::time::sleep(POLL_STEP).await;
+    }
+    let ref_before = rig.ref_sha().await;
+
+    // Повтор с тем же снимком: конкурент уже снёс файл. Без вердикта
+    // «уже отсутствует» повтор был бы тихим ff-коммитом удаления
+    // несуществующего пути и ложной квитанцией.
+    let error = writer
+        .delete_file(&path, &sha_a, "competing delete 1697")
+        .await
+        .expect_err("повторное удаление обязано отказаться");
+    assert!(
+        matches!(error, uwuwu_usecase::UsecaseError::DocAbsentAtRef(_)),
+        "ожидался DocAbsentAtRef, получено: {error}"
+    );
+    assert_eq!(
+        ref_before,
+        rig.ref_sha().await,
+        "отказ повторного удаления сдвинул ref — мутация была"
+    );
+    println!("docs_delete competing live: DocAbsentAtRef, ref не сдвинулся");
+}
+
+#[tokio::test]
+async fn docs_delete_competing_delete_is_absent_at_ref_live_e2e() {
+    let Some(token) = e2e_ready() else {
+        println!("e2e выключен: UWUWU_E2E=1 для живой пробы конкурирующего сноса");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let (dir, rig, mut lease, _stamp) = start_live_rig("absent", &http, &token).await;
+    let outcome = tokio::spawn(run_competing_delete_scenario(rig.clone())).await;
+    let delete_result = rig.delete().await;
+    lease.deleted = delete_result.is_ok();
+    finish_live_rig(&rig, &dir, outcome, delete_result, "docs_delete competing").await;
 }
 
 /// Равенство sha из ответа Contents и из свежего дерева — предпроверка
@@ -1372,38 +1443,10 @@ async fn contents_and_tree_blob_sha_match_live_e2e() {
         println!("e2e выключен: UWUWU_E2E=1 для живой пробы sha");
         return;
     };
-    let stamp = format!(
-        "{}{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_millis(),
-        std::process::id()
-    );
     let http = reqwest::Client::new();
-    let rig = RigGithub::create(&http, &token, &stamp).await;
-    let mut lease = RigLease {
-        repo: rig.repo.clone(),
-        deleted: false,
-    };
+    let (dir, rig, mut lease, _stamp) = start_live_rig("sha", &http, &token).await;
     let outcome = tokio::spawn(run_sha_match_scenario(rig.clone())).await;
-    let scenario_error = outcome.err().map(|join| {
-        join.into_panic()
-            .downcast_ref::<String>()
-            .cloned()
-            .unwrap_or_else(|| "паника без сообщения".to_string())
-    });
     let delete_result = rig.delete().await;
     lease.deleted = delete_result.is_ok();
-    let mut problems = Vec::new();
-    if let Some(msg) = scenario_error {
-        problems.push(format!("sha-match e2e упал: {msg}"));
-    }
-    if let Err(error) = delete_result {
-        problems.push(format!(
-            "риг {} не снесён: {error} — снеси руками: gh api -X DELETE /repos/{}",
-            rig.repo, rig.repo
-        ));
-    }
-    assert!(problems.is_empty(), "{}", problems.join("\n\n"));
+    finish_live_rig(&rig, &dir, outcome, delete_result, "sha-match").await;
 }
