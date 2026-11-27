@@ -9,11 +9,17 @@ use std::time::Duration;
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 /// Модель с явным тегом: голого `embeddinggemma-2` в хранилище нет.
-pub const EMBED_MODEL: &str = "embeddinggemma-2:740m";
-/// Нативная размерность модели (подтверждена живым /api/embed).
-pub const EMBED_MODEL_DIMS: usize = 768;
-/// Текстов в одном /api/embed-вызове (живой замер: 1,38 с на батч).
-pub const EMBED_BATCH: usize = 38;
+pub fn embed_model() -> String {
+    uwuwu_usecase::runtime_cfg::search::model()
+}
+/// Нативная размерность модели — из `[search] embed_dims` config.toml.
+pub fn search_dims() -> usize {
+    uwuwu_usecase::runtime_cfg::search::dims()
+}
+/// Текстов в одном /api/embed-вызове — из `[search] embed_batch`.
+pub fn embed_batch() -> usize {
+    uwuwu_usecase::runtime_cfg::search::batch()
+}
 const SERVICE: &str = "ollama-embeddings";
 
 /// Таймауты клиента: connect короткий, total — по классу вызова. Батч 60 с
@@ -27,10 +33,11 @@ pub struct ClientTimeouts {
 
 impl Default for ClientTimeouts {
     fn default() -> Self {
+        use uwuwu_usecase::runtime_cfg::search;
         Self {
-            connect: Duration::from_secs(2),
-            query_total: Duration::from_secs(15),
-            batch_total: Duration::from_secs(60),
+            connect: Duration::from_secs(search::connect_secs()),
+            query_total: Duration::from_secs(search::query_total_secs()),
+            batch_total: Duration::from_secs(search::batch_total_secs()),
         }
     }
 }
@@ -89,7 +96,7 @@ impl OllamaEmbeddings {
         total: Duration,
     ) -> UsecaseResult<Vec<Vec<f32>>> {
         let mut out = Vec::with_capacity(texts.len());
-        for chunk in texts.chunks(EMBED_BATCH) {
+        for chunk in texts.chunks(embed_batch()) {
             out.extend(self.embed_one(chunk, total).await?);
         }
         Ok(out)
@@ -148,10 +155,11 @@ impl OllamaEmbeddings {
                     .ok_or_else(|| UsecaseError::State(format!("{SERVICE}: empty embedding")))
             })
             .collect::<UsecaseResult<Vec<_>>>()?;
-        if let Some(v) = vecs.iter().find(|v| v.len() != EMBED_MODEL_DIMS) {
+        if let Some(v) = vecs.iter().find(|v| v.len() != search_dims()) {
             return Err(UsecaseError::State(format!(
-                "{SERVICE}: a {}-dim vector instead of {EMBED_MODEL_DIMS}",
-                v.len()
+                "{SERVICE}: a {}-dim vector instead of {}",
+                v.len(),
+                search_dims()
             )));
         }
         Ok(vecs)
@@ -257,7 +265,7 @@ mod tests {
     /// Обычные юниты работают на production-таймаутах: стаб держит сокет
     /// 700 мс после ответа, короткий бюджет здесь был бы источником флака.
     fn client(url: String) -> OllamaEmbeddings {
-        OllamaEmbeddings::new(url, EMBED_MODEL.to_string())
+        OllamaEmbeddings::new(url, embed_model().to_string())
     }
 
     /// Только кейсы «ответа нет» получают короткий бюджет — иначе тест
@@ -265,7 +273,7 @@ mod tests {
     fn short_client(url: String) -> OllamaEmbeddings {
         OllamaEmbeddings::with_timeouts(
             url,
-            EMBED_MODEL.to_string(),
+            embed_model().to_string(),
             ClientTimeouts {
                 connect: Duration::from_millis(200),
                 query_total: Duration::from_millis(200),
@@ -276,18 +284,18 @@ mod tests {
 
     fn embed_body(n: usize, dim: usize) -> String {
         let vecs: Vec<_> = (0..n).map(|_| vec![0.0f32; dim]).collect();
-        serde_json::json!({ "model": EMBED_MODEL, "embeddings": vecs }).to_string()
+        serde_json::json!({ "model": embed_model(), "embeddings": vecs }).to_string()
     }
 
     #[tokio::test]
     async fn success_batch_returns_768_dim_vectors() {
-        let body = embed_body(2, EMBED_MODEL_DIMS);
+        let body = embed_body(2, search_dims());
         let len = body.len();
         let c = client(one_shot("HTTP/1.1 200 OK", body, len));
         let docs = vec![("T".into(), "x".into()), ("T2".into(), "y".into())];
         let out = c.embed_docs(&docs).await.expect("respond ok");
         assert_eq!(out.len(), 2);
-        assert!(out.iter().all(|v| v.len() == EMBED_MODEL_DIMS));
+        assert!(out.iter().all(|v| v.len() == search_dims()));
     }
 
     #[tokio::test]
@@ -313,7 +321,7 @@ mod tests {
     #[tokio::test]
     async fn wrong_vector_count_and_dim_are_rejected() {
         // query шлёт один текст — два вектора в ответе должны отвергаться.
-        let body = embed_body(2, EMBED_MODEL_DIMS);
+        let body = embed_body(2, search_dims());
         let len = body.len();
         let c = client(one_shot("HTTP/1.1 200 OK", body, len));
         let err = c.embed_query("q").await.unwrap_err().to_string();
@@ -330,7 +338,7 @@ mod tests {
     async fn stalled_body_fails_within_total_timeout() {
         // Заголовки пришли, рабочее тело короче объявленного Content-Length —
         // reqwest ждёт остаток; без таймаута на чтении вызов висел бы вечно.
-        let body = embed_body(1, EMBED_MODEL_DIMS);
+        let body = embed_body(1, search_dims());
         let c = short_client(one_shot("HTTP/1.1 200 OK", body, 100_000));
         let started = std::time::Instant::now();
         let err = c.embed_query("q").await.unwrap_err().to_string();

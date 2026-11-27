@@ -33,8 +33,10 @@ pub struct ToolHub {
     pub goals: Arc<uwuwu_usecase::GoalsView>,
 }
 
-/// Дефолтный проект для инструментов без явного project.
-pub const DEFAULT_PROJECT: &str = "uwuwu";
+/// Дефолтный проект для инструментов без явного project — `[api] default_project` config.toml.
+pub fn default_project() -> String {
+    uwuwu_usecase::runtime_cfg::api::default_project()
+}
 
 /// Мутационные тулы: имена — семантический факт «тул мутирует носитель»
 /// (в дескрипторах не кодируется). Новый мутационный тул — добавь имя
@@ -438,7 +440,7 @@ impl ToolHub {
         let project = {
             let p = arg_str(args, "project");
             if p.is_empty() {
-                DEFAULT_PROJECT.to_string()
+                default_project()
             } else {
                 p
             }

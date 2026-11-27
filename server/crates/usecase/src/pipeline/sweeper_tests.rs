@@ -1,7 +1,7 @@
 //! Тесты клина холодного ящика (#1293): отбор, кап, бюджет-гайд,
 //! observe-гейт, отказ одной строки не роняет волну.
 
-use super::sweeper::{sweep_board, SweepPolicy, BUDGET_FLOOR, SWEEP_BATCH_CAP};
+use super::sweeper::{budget_floor, sweep_batch_cap, sweep_board, SweepPolicy};
 
 /// Политика тест-прохода: NOW и порог из аргументов.
 fn policy(now_ms: u64, age_days: u32, observe: bool) -> SweepPolicy {
@@ -176,18 +176,18 @@ async fn observe_logs_without_mutations() {
 async fn live_archives_oldest_first_within_cap() {
     let board = SweepBoard::new(None);
     let mut tasks = vec![closed_done(100, 3)]; // свежая — не кандидат
-    for i in 0..SWEEP_BATCH_CAP + 20 {
+    for i in 0..sweep_batch_cap() + 20 {
         tasks.push(closed_done(i as u64, 10 + i as u64 % 5));
     }
     let out = sweep_board(&board, "B", &tasks, policy(NOW, 7, false))
         .await
         .expect("live проход");
-    assert_eq!(out.candidates, SWEEP_BATCH_CAP + 20);
-    assert_eq!(out.archived, SWEEP_BATCH_CAP, "кап на проход");
+    assert_eq!(out.candidates, sweep_batch_cap() + 20);
+    assert_eq!(out.archived, sweep_batch_cap(), "кап на проход");
     let archived = board.archived();
-    assert_eq!(archived.len(), SWEEP_BATCH_CAP);
+    assert_eq!(archived.len(), sweep_batch_cap());
     // старейшие первыми: максимум возраста кандидатов архивирован первым
-    let max_age = (SWEEP_BATCH_CAP + 14) as u64;
+    let max_age = (sweep_batch_cap() + 14) as u64;
     assert!(
         archived.contains(&max_age),
         "самая старая строка ({max_age}) — среди первых архивированных"
@@ -214,7 +214,7 @@ async fn observe_does_not_invalidate_snapshot() {
 #[tokio::test]
 async fn wave_without_archived_does_not_invalidate() {
     // бюджет-гайд сработал до первой мутации: кеш никто не портил
-    let board = SweepBoard::new(Some(BUDGET_FLOOR - 1));
+    let board = SweepBoard::new(Some(budget_floor() - 1));
     let tasks = vec![closed_done(1, 10)];
     sweep_board(&board, "B", &tasks, policy(NOW, 7, false))
         .await
@@ -224,7 +224,7 @@ async fn wave_without_archived_does_not_invalidate() {
 
 #[tokio::test]
 async fn budget_floor_defers_rest_of_wave() {
-    let board = SweepBoard::new(Some(BUDGET_FLOOR - 1));
+    let board = SweepBoard::new(Some(budget_floor() - 1));
     let tasks = vec![closed_done(1, 10), closed_done(2, 12)];
     let out = sweep_board(&board, "B", &tasks, policy(NOW, 7, false))
         .await

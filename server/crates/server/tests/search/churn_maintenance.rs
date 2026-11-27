@@ -39,12 +39,12 @@ impl Embedder for FixedEmbedder {
     async fn embed_docs(&self, docs: &[(String, String)]) -> UsecaseResult<Vec<Vec<f32>>> {
         Ok(docs
             .iter()
-            .map(|_| vec![0.0f32; crate::search::semantic::EMBED_MODEL_DIMS])
+            .map(|_| vec![0.0f32; crate::search::semantic::search_dims()])
             .collect())
     }
 
     async fn embed_query(&self, _query: &str) -> UsecaseResult<Vec<f32>> {
-        Ok(vec![0.0f32; crate::search::semantic::EMBED_MODEL_DIMS])
+        Ok(vec![0.0f32; crate::search::semantic::search_dims()])
     }
 }
 

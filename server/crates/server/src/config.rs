@@ -189,6 +189,167 @@ pub struct Config {
     /// Проба квоты подписки провайдера (#1477); нет секции — off.
     #[serde(default)]
     pub quota: Option<QuotaCfg>,
+    /// Операционные значения рантайма (аудит uwuwu#1726). Секции обязательны
+    /// в загружаемом файле: `Config::load` отказывает старт с именем секции.
+    /// `Option` здесь — шов для тестовых inline-конфигов, не второй механизм.
+    #[serde(default)]
+    pub search: Option<SearchCfg>,
+    #[serde(default)]
+    pub pipeline: Option<PipelineCfg>,
+    #[serde(default)]
+    pub api: Option<ApiCfg>,
+    #[serde(default)]
+    pub github: Option<GithubCfg>,
+    #[serde(default)]
+    pub blob: Option<BlobCfg>,
+    #[serde(default)]
+    pub bots: Option<BotsCfg>,
+}
+
+/// Поиск и эмбеддинги: единственный носитель значений — `[search]` TOML.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchCfg {
+    pub semantic_sync_budget: usize,
+    pub embed_model: String,
+    pub embed_dims: usize,
+    pub embed_batch: usize,
+    pub connect_secs: u64,
+    pub query_total_secs: u64,
+    pub batch_total_secs: u64,
+    pub chunk_chars: usize,
+    pub digest_chars: usize,
+    pub recent_issues_cap: usize,
+    pub query_overfetch_factor: usize,
+    pub retention_secs: u64,
+    pub sync_backoff_ms: u64,
+}
+
+/// Значения конвейера: капы, пороги, таймауты, окна.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct PipelineCfg {
+    pub peak_provider: String,
+    pub sweep_batch_cap: usize,
+    pub sweep_days: u32,
+    pub budget_floor: u64,
+    pub env_gc_batch_cap: usize,
+    pub env_gc_days: u32,
+    pub env_gc_observe: bool,
+    pub env_gc_verdict_deadline_ms: u64,
+    pub env_gc_bootstrap_delete_attempts: u32,
+    pub clean_batch_cap: usize,
+    pub slot_session_live_ms: u64,
+    pub review_round_cap: u32,
+    pub clean_journal_cap: usize,
+    pub spawn_cooldown_ms: u64,
+    pub stall_silence_ms: u64,
+    pub stall_ping_every_ms: u64,
+    pub stall_max_pings: u32,
+    pub stall_soft_silence_ms: u64,
+    pub stall_soft_every_ms: u64,
+    pub probe_degrade_min_rows: usize,
+    pub session_lost_escalate_after: u32,
+    pub limit_signal_threshold: usize,
+    pub limit_signal_cooldown_ms: u64,
+    pub analyst_wave_cooldown_ms: u64,
+    pub analyst_cycle_limit: u32,
+    pub analyst_review_cooldown_ms: u64,
+    pub dreamer_idle_ms: u64,
+    pub dreamer_day_cap: u32,
+    pub cron_dir: String,
+    pub cron_run_silence_ms: u64,
+    pub cron_fire_cooldown_ms: u64,
+    pub cron_late_fire_window_ms: u64,
+    pub incident_threshold: usize,
+    pub incident_window_ms: u64,
+    pub incident_cooldown_ms: u64,
+    pub executor_unavailable_threshold: usize,
+    pub executor_unavailable_window_ms: u64,
+    pub executor_unavailable_cooldown_ms: u64,
+    pub task_env_command_budget_ms: u64,
+    pub verify_attempts: usize,
+    pub verify_pause_ms: u64,
+    pub board_verify_attempts: usize,
+    pub state_cap: usize,
+    pub post_retention_days: u64,
+    pub spawns_max_per_hour: usize,
+    pub judge_restart_recent_ms: u64,
+    pub spawn_budget_window_ms: u64,
+    pub memory_snapshot_period_ms: u64,
+    pub sidecar_timeout_ms: u64,
+    pub semantic_sync_timeout_ms: u64,
+    pub task_env_gc_script: String,
+}
+
+/// MCP-слой и карточки задач.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiCfg {
+    pub default_project: String,
+    pub card_comments: usize,
+    pub section_guard_floor: usize,
+    pub title_max_chars: usize,
+    pub goal_gist_glyphs: usize,
+    pub person_slug: String,
+    pub post_retention_days: u64,
+}
+
+/// REST-клиенты GitHub/Gitea.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct GithubCfg {
+    pub http_timeout_secs: u64,
+    pub page_size: usize,
+    pub max_pages: usize,
+    pub verify_gql_attempts: usize,
+    pub verify_gql_pause_ms: u64,
+    pub transport_retry_pause_ms: u64,
+    pub transport_retry_attempts: u32,
+    pub item_pages: usize,
+    pub items_ttl_secs: u64,
+    pub meta_ttl_secs: u64,
+    pub status_ttl_secs: u64,
+    pub snap_cache_ttl_secs: u64,
+    pub status_cache_ttl_secs: u64,
+    pub gql_backoff_secs: u64,
+    pub wiki_cache_ttl_secs: u64,
+    pub gql_budget_low: u64,
+    pub rest_per_page: usize,
+}
+
+/// Blob-канал (Tigris/S3).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlobCfg {
+    pub max_bytes: usize,
+    pub presign_ttl_secs: u64,
+    pub presign_put_ttl_secs: u64,
+    pub put_sign_ttl_secs: u64,
+}
+
+/// Боты и опенкод-клиент.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct BotsCfg {
+    pub tg_poll_sec: u64,
+    pub retry_pause_ms: u64,
+    pub tg_http_timeout_secs: u64,
+    pub guard_backoff_base_ms: u64,
+    pub guard_backoff_cap_ms: u64,
+    pub guard_healthy_ms: u64,
+    pub reply_cap_ms: u64,
+    pub reply_poll_ms: u64,
+    pub asset_name_max_bytes: usize,
+    pub chunk_reply_chars: usize,
+    pub bot_debounce_ms: u64,
+    pub user_msg_poll_ms: u64,
+    pub stale_update_ms: u64,
+    pub session_page_limit: usize,
+    pub session_max_pages: usize,
+    pub gate_http_timeout_secs: u64,
+    pub poll_limit: usize,
+    pub list_limit: usize,
 }
 
 /// Секция `[judge]` (#1364): порты вызовов и тримы контекста. Ключ —
@@ -331,7 +492,41 @@ impl Config {
             source,
         })?;
         cfg.validate()?;
+        cfg.validate_runtime()?;
         Ok(cfg)
+    }
+
+    /// Обязательность секций рантайма (uwuwu#1726): отсутствие = отказ старта
+    /// с именем секции, а не тихий дефолт из кода. Вызывается только на пути
+    /// файловой загрузки; inline-конфиги тестов собираются через билдер.
+    fn validate_runtime(&self) -> Result<(), ConfigError> {
+        for (name, present) in [
+            ("search", self.search.is_some()),
+            ("pipeline", self.pipeline.is_some()),
+            ("api", self.api.is_some()),
+            ("github", self.github.is_some()),
+            ("blob", self.blob.is_some()),
+            ("bots", self.bots.is_some()),
+        ] {
+            if !present {
+                return Err(ConfigError::Validation(format!(
+                    "отсутствует обязательная секция [{name}]"
+                )));
+            }
+        }
+        let p = self.pipeline.as_ref().expect("validated");
+        if p.semantic_sync_timeout_ms > 0 && p.sidecar_timeout_ms == 0 {
+            return Err(ConfigError::Validation(
+                "[pipeline] sidecar_timeout_ms = 0 при ненулевом semantic_sync_timeout_ms".into(),
+            ));
+        }
+        let b = self.blob.as_ref().expect("validated");
+        if b.presign_ttl_secs > 7 * 24 * 60 * 60 {
+            return Err(ConfigError::Validation(
+                "[blob] presign_ttl_secs > 7 суток: подпись SigV4 не живёт дольше".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
