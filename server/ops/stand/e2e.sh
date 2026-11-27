@@ -422,6 +422,30 @@ SLICED=$(grep -c '"event":"wakeup.self_echo_sliced"' "$LOG_SRV_ECHO" || true)
 [ "$DELIVERED" -eq 1 ] || fail "wake-доставок: $DELIVERED (ожидается ровно 1 — вердикт план-ревью продолжающейся сессии; 0 = per-slot-регресс, >1 = эхо)"
 say "фаза 5 ок: sliced=$SLICED, delivered=$DELIVERED — свой хвост срезается, чужой вердикт будит держащую сессию"
 
+# #1710: изоляция ревью-стадий на живом цикле — три независимых поля-носителя
+# дают три разные сессии; тайтл каждой несёт эмодзи своей стадии (#1212).
+REVIEW_SESS=""
+for SLOT in PlanReview ResultReview TestReview; do
+  SPAWNS=$(grep -c '"event":"spawn.done","number":'$SEED_N',"slot":"'$SLOT'"' "$LOG_SRV_ECHO" || true)
+  [ "$SPAWNS" -eq 1 ] || fail "$SLOT-спавнов: $SPAWNS (ожидается 1 — #1710)"
+  ID=$(grep -o '"event":"spawn.done","number":'$SEED_N',"slot":"'$SLOT'"[^}]*' "$LOG_SRV_ECHO" \
+    | head -1 | grep -o '"session":"[^"]*"' | head -1 | sed 's/"session":"//;s/"//' || true)
+  [ -n "$ID" ] || fail "$SLOT-сессия не заспавнена (#1710)"
+  REVIEW_SESS="$REVIEW_SESS $ID"
+done
+set -- $REVIEW_SESS
+[ "$1" != "$2" ] && [ "$1" != "$3" ] && [ "$2" != "$3" ] \
+  || fail "ревью-стадии шарят сессию (#1710): $REVIEW_SESS"
+curl -s --max-time 5 "http://127.0.0.1:$PORT_MOCK/api/session" >"$RUN_DIR/sessions-1710.json"
+python3 - "$RUN_DIR/sessions-1710.json" "$1" "$2" "$3" <<'PY' || fail "тайтлы ревью-сессий не соответствуют стадиям (#1710)"
+import json, sys
+by_id = {s["id"]: s.get("title", "") for s in json.load(open(sys.argv[1])).get("data", [])}
+for session_id, emoji in zip(sys.argv[2:], ("🔍", "🔬", "🧫")):
+    title = by_id.get(session_id, "")
+    assert emoji in title, f"{session_id}: {title!r} без маркера {emoji}"
+PY
+say "фаза 5+#1710 ок: три разные ревью-сессии с маркерами 🔍/🔬/🧫"
+
 say "фаза 6: слепой hold — список исполнителя недоступен, спавн без зрения невозможен (#1263)"
 # Гасим СВОИ остатки (pid-scoped); мок НЕ поднимаем — union-скан падает
 # на каждом тике, инверсия деградации держит спавн до восстановления

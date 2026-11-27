@@ -34,7 +34,7 @@ pub fn review_session_field(slot: uwuwu_domain::Slot) -> &'static str {
     }
 }
 
-/// Патч записи сессии:эксклюзивное поле слота плюс условная очистка legacy
+/// Патч записи сессии: эксклюзивное поле слота плюс условная очистка legacy
 /// (только для ревью-слотов и только если legacy-поле есть в каталоге).
 pub fn review_store_patch(
     slot: uwuwu_domain::Slot,
