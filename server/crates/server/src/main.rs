@@ -31,6 +31,8 @@ mod quota_tests;
 mod rename_journal;
 mod s3;
 mod search;
+#[cfg(test)]
+mod sidecar_timeout_tests;
 mod state;
 #[cfg(test)]
 mod task_env_sh_tests;
@@ -41,6 +43,7 @@ use config::{Config, ConfigError, ENV_CONFIG};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 use uwuwu_usecase::{
     Clock as _, ExecutorLoudness, IncidentLoudness, TickOutcome, TickUseCase,
@@ -564,6 +567,7 @@ async fn run(
 
         sidecars.push(Sidecar {
             name: "cron".to_string(),
+            timeout: Some(SIDECAR_TIMEOUT),
             tick: Box::new(move || {
                 let cron = cron.clone();
                 Box::pin(async move {
@@ -641,6 +645,7 @@ async fn run(
         });
         sidecars.push(Sidecar {
             name: "analys".into(),
+            timeout: Some(SIDECAR_TIMEOUT),
             tick: Box::new(move || {
                 let a = analyst.clone();
                 Box::pin(async move {
@@ -653,6 +658,7 @@ async fn run(
         });
         sidecars.push(Sidecar {
             name: "analys-review".into(),
+            timeout: Some(SIDECAR_TIMEOUT),
             tick: Box::new(move || {
                 let r = analyst_review.clone();
                 Box::pin(async move {
@@ -665,6 +671,7 @@ async fn run(
         });
         sidecars.push(Sidecar {
             name: "dreamer".into(),
+            timeout: Some(SIDECAR_TIMEOUT),
             tick: Box::new(move || {
                 let d = dreamer.clone();
                 Box::pin(async move {
@@ -699,6 +706,7 @@ async fn run(
         let bot_supervisor = Arc::new(bot_supervisor);
         sidecars.push(Sidecar {
             name: "bots".into(),
+            timeout: Some(SIDECAR_TIMEOUT),
             tick: Box::new(move || {
                 let s = bot_supervisor.clone();
                 Box::pin(async move {
@@ -726,6 +734,7 @@ async fn run(
             let sweep_clock = clock.clone();
             sidecars.push(Sidecar {
                 name: "sweeper".into(),
+                timeout: Some(SIDECAR_TIMEOUT),
                 tick: Box::new(move || {
                     let board = sweep_board_repo.clone();
                     let boards = sweep_boards.clone();
@@ -794,6 +803,7 @@ async fn run(
         let backoff_until = Arc::new(std::sync::Mutex::new(0u64));
         sidecars.push(Sidecar {
             name: "semantic-sync".into(),
+            timeout: None,
             tick: Box::new(move || {
                 let b = backend.clone();
                 let clock = clock2.clone();
@@ -984,8 +994,12 @@ async fn serve(port: u16, app: axum::Router) {
 }
 
 /// Сателлит тика: имя + замыкание-проход (мягкая изоляция отказов).
+const SIDECAR_TIMEOUT: Duration = Duration::from_secs(120);
+
 struct Sidecar {
     name: String,
+    /// `None` — тик длится столько, сколько нужно (semantic-sync).
+    timeout: Option<Duration>,
     #[allow(clippy::type_complexity)]
     tick: Box<
         dyn Fn() -> std::pin::Pin<
@@ -1000,15 +1014,24 @@ struct Sidecar {
 
 async fn sidecar_ticks(sidecars: &[Sidecar]) -> Result<(), uwuwu_usecase::UsecaseError> {
     for s in sidecars {
-        // таймаут: один зависший сайдкар не хоронит очередь остальных
-        // (инцидент 16.11: bot-события пропали при живом основном тике)
-        match tokio::time::timeout(std::time::Duration::from_secs(120), (s.tick)()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::error!(
-                event = "sidecar.tick_failed", sidecar = %s.name, error = %e, "Sidecar failed"),
-            Err(_) => tracing::error!(
-                event = "sidecar.timeout", sidecar = %s.name,
-                "Sidecar tick завис (>120с) — пропущен, очередь живёт"),
+        // Таймаут — политика сайдкара, а не глобальный предохранитель.
+        // semantic-sync индексирует до завершения: обрыв по времени (#1730)
+        // не давал дойти до события semantic.index_state и stagnировал индекс.
+        let result = match s.timeout {
+            Some(limit) => match tokio::time::timeout(limit, (s.tick)()).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::error!(
+                        event = "sidecar.timeout", sidecar = %s.name,
+                        "Sidecar tick exceeded its timeout — skipped, queue alive");
+                    continue;
+                }
+            },
+            None => (s.tick)().await,
+        };
+        if let Err(e) = result {
+            tracing::error!(
+                event = "sidecar.tick_failed", sidecar = %s.name, error = %e, "Sidecar failed");
         }
     }
     Ok(())
