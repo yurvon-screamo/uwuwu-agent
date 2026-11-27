@@ -182,6 +182,7 @@ async fn limit_pause_holds_row_then_releases_when_window_drains() {
                 (KEY_ENV_STR, E2E_QUOTA_KEY),
                 ("UWUWU_MOCK_SEED", "stand:903:In Progress"),
             ],
+            capture_sessions: false,
         },
     )
     .await;

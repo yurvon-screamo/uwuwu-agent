@@ -6,11 +6,11 @@
 # и opencode2 на 2336 (исполнитель redmi) видны только внутри Railway
 # (relay.railway.internal:23XX), в интернет не торчат — наружу смотрит
 # лишь control-порт (TCP proxy → rathole-клиенты исполнителей).
-# Легаси ollama-сервис (:2334) снесён — эмбеддинги переехали на
-# Gemini API (#1363).
+# Сервис ollama (:2334) возвращён по слову владельца 26.11 (#1687):
+# uwuwu-server → http://relay.railway.internal:2334 → туннель → kisa Ollama.
 set -e
 : "${RATHOLE_TOKEN:?RATHOLE_TOKEN не задан}"
 : "${PORT:?PORT не задан}"
-printf '[server]\nbind_addr="0.0.0.0:%s"\n\n[server.services.opencode]\ntoken="%s"\nbind_addr="0.0.0.0:2335"\n\n[server.services.opencode2]\ntoken="%s"\nbind_addr="0.0.0.0:2336"\n' \
-  "$PORT" "$RATHOLE_TOKEN" "$RATHOLE_TOKEN" > /tmp/rathole.toml
+printf '[server]\nbind_addr="0.0.0.0:%s"\n\n[server.services.opencode]\ntoken="%s"\nbind_addr="0.0.0.0:2335"\n\n[server.services.opencode2]\ntoken="%s"\nbind_addr="0.0.0.0:2336"\n\n[server.services.ollama]\ntoken="%s"\nbind_addr="0.0.0.0:2334"\n' \
+  "$PORT" "$RATHOLE_TOKEN" "$RATHOLE_TOKEN" "$RATHOLE_TOKEN" > /tmp/rathole.toml
 exec rathole /tmp/rathole.toml

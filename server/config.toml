@@ -30,19 +30,29 @@ name = "kisa"
 url = "https://opencode.uwuwu.net"
 # basic-пароль опенкода: env UWUWU_OPENCODE_PASSWORD
 
+# Алиасы моделей (#1684): raw-модель указывается один раз на алиасе.
+# Уровни flash < common < smart; канон и оба файла конфига синхронны.
+# Провайдер common — opencode-go, под peak GLM не попадает (#1680).
+[executor.model_aliases]
+flash = "opencode-go/hy4-flash-free#high"
+common = "opencode-go/muse-spark-1.3-contributor#high"
+smart = "zai-coding-plan/glm-5.4#high"
+
+# Агент/default → алиас. Raw-моделей здесь нет (#1684).
 [executor.models]
-default = "opencode-go/hy4-flash-free#high"
-developer = "opencode-go/hy4-flash-free#high"
-plan-reviewer = "zai-coding-plan/glm-5.4#high"
-code-quality-reviewer = "zai-coding-plan/glm-5.4#high"
-tester = "opencode-go/hy4-flash-free#high"
-test-reviewer = "zai-coding-plan/glm-5.4#high"
-analyst = "opencode-go/hy4-flash-free#high"
-analyst-reviewer = "zai-coding-plan/glm-5.4#high"
-dreamer = "opencode-go/hy4-flash-free#high"
+default = "flash"
+developer = "flash"
+plan-reviewer = "smart"
+code-quality-reviewer = "smart"
+tester = "flash"
+test-reviewer = "smart"
+analyst = "flash"
+analyst-reviewer = "smart"
+dreamer = "common"
 
 [policy]
-cup = 10
+# ВРЕМЕННО 20 на время разбора инцидентов 27.11 (вернуть 10!) — uwuwu #1707/#1708
+cup = 20
 # пик-окно провайдера zai-coding-plan (GLM): будни 06:00–10:00 UTC
 # (минуты от полуночи UTC), off = false; этапы других провайдеров не откладываются (#1680)
 peak = { enabled = true, start_min = 360, end_min = 600 }

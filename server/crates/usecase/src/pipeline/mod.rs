@@ -7,7 +7,7 @@ mod compact_pass;
 #[cfg(test)]
 mod cup_pins_tests;
 #[cfg(test)]
-mod degraded_list_support;
+pub(crate) mod degraded_list_support;
 #[cfg(test)]
 mod degraded_list_tests;
 pub mod dreamer;

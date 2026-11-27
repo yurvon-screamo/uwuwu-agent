@@ -1,29 +1,39 @@
-//! Эмбеддинги: Gemini Embedding 2 через generativelanguage API (задача #1363,
-//! решение владельца 19.11 — миграция с локальной Ollama; free tier принят
-//! осознанно). Контракт (ai.google.dev/gemini-api/docs/embeddings):
-//! batchEmbedContents с отдельным Content на каждый вход; task_type моделью
-//! не поддерживается — асимметричный retrieval через текстовые префиксы
-//! query/doc. Отказ маршрута — типизированная ошибка, не тихая слепота.
+//! Эмбеддинги: локальная Ollama embeddinggemma-2 через /api/embed (#1687,
+//! слово владельца 26.11 — возврат с внешнего Gemini free tier).
+//! Контракт модели (ollama.com/library/embeddinggemma-2): 768-dim,
+//! task-steered префиксы doc/query совпадают с прежним клиентом, MRL-усечение
+//! через options не применяется API. Отказ маршрута — типизированная ошибка.
 
 use async_trait::async_trait;
+use std::time::Duration;
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
-/// Модель эмбеддингов (stable, апрель 2026).
-pub const EMBED_MODEL: &str = "gemini-embedding-2";
-/// Размерность вектора: MRL-рекомендации 768/1536/3072, средний шаг —
-/// половина дефолтных 3072; усечённые размеры модель нормализует сама.
-pub const EMBED_MODEL_DIMS: usize = 1536;
-/// Текстов в одном batchEmbedContents-вызове (спайк #1363: батчи по ~38
-/// текстов ≈ 14–16k входных токенов проходят; кап 100 исторически).
+/// Модель с явным тегом: голого `embeddinggemma-2` в хранилище нет.
+pub const EMBED_MODEL: &str = "embeddinggemma-2:740m";
+/// Нативная размерность модели (подтверждена живым /api/embed).
+pub const EMBED_MODEL_DIMS: usize = 768;
+/// Текстов в одном /api/embed-вызове (живой замер: 1,38 с на батч).
 pub const EMBED_BATCH: usize = 38;
+const SERVICE: &str = "ollama-embeddings";
 
-const API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
-const SERVICE: &str = "gemini-embeddings";
-/// Кап бэкоффа на 429 (RetryInfo может обещать и больше — не тише прод-тика).
-pub const RATE_LIMIT_CAP_SECS: u64 = 15 * 60;
-/// Дефолт бэкоффа 429 без RetryInfo в теле (единый носитель — сайдкар берёт
-/// его же через этот экспорт; размазывать литерал по слоям запрещено).
-pub const RATE_LIMIT_DEFAULT_SECS: u64 = 300;
+/// Таймауты клиента: connect короткий, total — по классу вызова. Батч 60 с
+/// укладывается в гард тика 120 с; query 15 с не держит поиск в стейл-туннеле.
+#[derive(Debug, Clone, Copy)]
+pub struct ClientTimeouts {
+    pub connect: Duration,
+    pub query_total: Duration,
+    pub batch_total: Duration,
+}
+
+impl Default for ClientTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(2),
+            query_total: Duration::from_secs(15),
+            batch_total: Duration::from_secs(60),
+        }
+    }
+}
 
 /// Источник векторов для семантического индекса. Реализации несут формат
 /// префиксов провайдера сами — вызывающая сторона знает только (title, text).
@@ -35,105 +45,78 @@ pub trait Embedder: Send + Sync {
     async fn embed_query(&self, query: &str) -> UsecaseResult<Vec<f32>>;
 }
 
-/// Doc-структура asymmetric retrieval (доки Gemini Embedding 2): без тайтла —
-/// явный `title: none`.
+/// Doc-структура asymmetric retrieval (EmbeddingGemma 2): без тайтла — `none`.
 pub fn doc_text(title: &str, text: &str) -> String {
     let t = if title.is_empty() { "none" } else { title };
     format!("title: {t} | text: {text}")
 }
 
-/// Query-структура: задача поиска зашита префиксом (task_type не поддерживается).
+/// Query-структура: задача поиска зашита префиксом (task-steered модель).
 pub fn query_text(query: &str) -> String {
     format!("task: search result | query: {query}")
 }
 
-/// RetryInfo из тела 429: `details[]` с `retryDelay` ("26s", "1m").
-/// Возвращает секунды; без RetryInfo — None (вызывающая сторона ставит дефолт).
-/// pub(crate) — реюз контурами Google API (судья #1364), единственный парсер.
-pub(crate) fn parse_retry_delay(body: &serde_json::Value) -> Option<u64> {
-    let err = body.get("error")?;
-    for d in err.get("details")?.as_array()? {
-        let kind = d.get("@type")?.as_str()?;
-        if !kind.ends_with("RetryInfo") {
-            continue;
-        }
-        let raw = d.get("retryDelay")?.as_str()?;
-        // protobuf-Duration легален в дробной форме («26.5s») — округляем
-        // вверх: чуть переспать безопаснее, чем досрочно долбить квоту
-        let secs = if raw.ends_with('s') {
-            raw.trim_end_matches('s').parse::<f64>().ok()?.ceil() as u64
-        } else if raw.ends_with('m') {
-            (raw.trim_end_matches('m').parse::<f64>().ok()? * 60.0).ceil() as u64
-        } else {
-            return None;
-        };
-        return Some(secs);
-    }
-    None
-}
-
-pub struct GeminiEmbeddings {
-    api_key: String,
+pub struct OllamaEmbeddings {
+    base_url: String,
     model: String,
     http: reqwest::Client,
+    timeouts: ClientTimeouts,
 }
 
-impl GeminiEmbeddings {
-    pub fn new(api_key: String, model: String) -> Self {
+impl OllamaEmbeddings {
+    pub fn new(base_url: String, model: String) -> Self {
+        Self::with_timeouts(base_url, model, ClientTimeouts::default())
+    }
+
+    /// Шов для тестов: короткие таймауты вместо production-значений.
+    pub fn with_timeouts(base_url: String, model: String, timeouts: ClientTimeouts) -> Self {
+        let http = reqwest::Client::builder()
+            .user_agent(concat!("uwuwu-server/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(timeouts.connect)
+            .build()
+            .expect("reqwest client");
         Self {
-            api_key,
+            base_url,
             model,
-            http: reqwest::Client::builder()
-                .user_agent(concat!("uwuwu-server/", env!("CARGO_PKG_VERSION")))
-                .timeout(std::time::Duration::from_secs(120))
-                .build()
-                .expect("reqwest client"),
+            http,
+            timeouts,
         }
     }
 
-    /// Батчи по EMBED_BATCH — последовательные вызовы; каждый батч = 1 запрос.
-    async fn embed_many(&self, texts: Vec<String>) -> UsecaseResult<Vec<Vec<f32>>> {
+    async fn embed_many(
+        &self,
+        texts: Vec<String>,
+        total: Duration,
+    ) -> UsecaseResult<Vec<Vec<f32>>> {
         let mut out = Vec::with_capacity(texts.len());
         for chunk in texts.chunks(EMBED_BATCH) {
-            out.extend(self.embed_one(chunk).await?);
+            out.extend(self.embed_one(chunk, total).await?);
         }
         Ok(out)
     }
 
-    async fn embed_one(&self, texts: &[String]) -> UsecaseResult<Vec<Vec<f32>>> {
-        let requests: Vec<serde_json::Value> = texts
-            .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "model": format!("models/{}", self.model),
-                    "content": { "parts": [{ "text": t }] },
-                    "outputDimensionality": EMBED_MODEL_DIMS,
-                })
-            })
-            .collect();
-        let resp = self
-            .http
-            .post(format!(
-                "{API_BASE}/models/{}:batchEmbedContents",
-                self.model
-            ))
-            .header("x-goog-api-key", &self.api_key)
-            .json(&serde_json::json!({ "requests": requests }))
-            .send()
-            .await
-            .map_err(|e| UsecaseError::State(format!("{SERVICE} transport: {e}")))?;
-        let status = resp.status();
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| UsecaseError::State(format!("{SERVICE} body: {e}")))?;
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(UsecaseError::RateLimited {
-                service: SERVICE.into(),
-                // дефолт при отсутствии RetryInfo ставит сайдкар (RATE_LIMIT_DEFAULT_SECS)
-                retry_after_secs: parse_retry_delay(&body),
-            });
-        }
+    async fn embed_one(&self, texts: &[String], total: Duration) -> UsecaseResult<Vec<Vec<f32>>> {
+        // Таймаут покрывает ВСЁ сетевое взаимодействие: send + заголовки +
+        // тело ответа. stalling-body не должен держать поиск без верхней границы.
+        let (status, body) = tokio::time::timeout(total, async {
+            let resp = self
+                .http
+                .post(format!("{}/api/embed", self.base_url.trim_end_matches('/')))
+                .json(&serde_json::json!({ "model": self.model, "input": texts }))
+                .send()
+                .await
+                .map_err(|e| UsecaseError::State(format!("{SERVICE} transport: {e}")))?;
+            let status = resp.status();
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| UsecaseError::State(format!("{SERVICE} body: {e}")))?;
+            Ok::<_, UsecaseError>((status, body))
+        })
+        .await
+        .map_err(|_| {
+            UsecaseError::State(format!("{SERVICE}: request timeout after {total:?}"))
+        })??;
         if !status.is_success() {
             return Err(UsecaseError::State(format!(
                 "{SERVICE} HTTP {status}: {}",
@@ -156,21 +139,15 @@ impl GeminiEmbeddings {
         let vecs: Vec<Vec<f32>> = embs
             .iter()
             .map(|e| {
-                e.get("values")
-                    .and_then(|v| v.as_array())
+                e.as_array()
                     .map(|v| {
                         v.iter()
                             .filter_map(|x| x.as_f64().map(|f| f as f32))
-                            .collect::<Vec<f32>>()
+                            .collect()
                     })
                     .ok_or_else(|| UsecaseError::State(format!("{SERVICE}: empty embedding")))
             })
             .collect::<UsecaseResult<Vec<_>>>()?;
-        if vecs.iter().any(|v| v.is_empty()) {
-            return Err(UsecaseError::State(format!("{SERVICE}: empty embedding")));
-        }
-        // размерность — единая валидация для обоих путей (docs/query): при
-        // оверрайде модели без 1536 отказ будет внятным, а не «batch: …» из Lance
         if let Some(v) = vecs.iter().find(|v| v.len() != EMBED_MODEL_DIMS) {
             return Err(UsecaseError::State(format!(
                 "{SERVICE}: a {}-dim vector instead of {EMBED_MODEL_DIMS}",
@@ -182,15 +159,14 @@ impl GeminiEmbeddings {
 }
 
 #[async_trait]
-impl Embedder for GeminiEmbeddings {
+impl Embedder for OllamaEmbeddings {
     async fn embed_docs(&self, docs: &[(String, String)]) -> UsecaseResult<Vec<Vec<f32>>> {
         let texts = docs.iter().map(|(t, c)| doc_text(t, c)).collect();
-        self.embed_many(texts).await
+        self.embed_many(texts, self.timeouts.batch_total).await
     }
 
     async fn embed_query(&self, query: &str) -> UsecaseResult<Vec<f32>> {
-        // размерность валидирует embed_one — общий путь с embed_docs
-        self.embed_many(vec![query_text(query)])
+        self.embed_many(vec![query_text(query)], self.timeouts.query_total)
             .await?
             .into_iter()
             .next()
@@ -239,48 +215,152 @@ mod tests {
     }
 
     #[test]
-    fn retry_delay_parsed_from_retry_info() {
-        let body = serde_json::json!({
-            "error": {
-                "code": 429,
-                "message": "quota exceeded",
-                "details": [
-                    {"@type": "type.googleapis.com/google.rpc.QuotaFailure", "violations": []},
-                    {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "26s"}
-                ]
-            }
-        });
-        assert_eq!(parse_retry_delay(&body), Some(26));
-    }
-
-    #[test]
-    fn retry_delay_minutes_and_absent() {
-        let mins = serde_json::json!({
-            "error": {"details": [{"@type": "google.rpc.RetryInfo", "retryDelay": "2m"}]}
-        });
-        assert_eq!(parse_retry_delay(&mins), Some(120));
-        let none = serde_json::json!({"error": {"message": "no details"}});
-        assert_eq!(parse_retry_delay(&none), None);
-    }
-
-    #[test]
-    fn retry_delay_fractional_duration_rounds_up() {
-        // protobuf-Duration допускает дробные секунды — округление вверх
-        let frac = serde_json::json!({
-            "error": {"details": [{"@type": "google.rpc.RetryInfo", "retryDelay": "26.5s"}]}
-        });
-        assert_eq!(parse_retry_delay(&frac), Some(27));
-        let frac_min = serde_json::json!({
-            "error": {"details": [{"@type": "google.rpc.RetryInfo", "retryDelay": "1.5m"}]}
-        });
-        assert_eq!(parse_retry_delay(&frac_min), Some(90));
-    }
-
-    #[test]
     fn chunking_splits_long_docs() {
         let md = "абзац\n\n".repeat(400);
         let chunks = chunk_text(&md);
         assert!(chunks.len() > 1);
         assert!(chunks.iter().all(|c| c.len() <= 1400));
+    }
+
+    /// One-shot mock /api/embed: statusLine с выбранным Content-Length и
+    /// тело (может быть короче объявленного — кейс «тело встало»).
+    fn one_shot(status_line: &'static str, body: String, declared: usize) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 16 * 1024];
+            let mut got = 0usize;
+            while got < buf.len() {
+                let n = match sock.read(&mut buf[got..]) {
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                if n == 0 {
+                    break;
+                }
+                got += n;
+                if buf[..got].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let resp = format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n{body}"
+            );
+            let _ = sock.write_all(resp.as_bytes());
+            std::thread::sleep(std::time::Duration::from_millis(700));
+        });
+        format!("http://{addr}")
+    }
+
+    /// Обычные юниты работают на production-таймаутах: стаб держит сокет
+    /// 700 мс после ответа, короткий бюджет здесь был бы источником флака.
+    fn client(url: String) -> OllamaEmbeddings {
+        OllamaEmbeddings::new(url, EMBED_MODEL.to_string())
+    }
+
+    /// Только кейсы «ответа нет» получают короткий бюджет — иначе тест
+    /// ждал бы production-таймаут.
+    fn short_client(url: String) -> OllamaEmbeddings {
+        OllamaEmbeddings::with_timeouts(
+            url,
+            EMBED_MODEL.to_string(),
+            ClientTimeouts {
+                connect: Duration::from_millis(200),
+                query_total: Duration::from_millis(200),
+                batch_total: Duration::from_millis(200),
+            },
+        )
+    }
+
+    fn embed_body(n: usize, dim: usize) -> String {
+        let vecs: Vec<_> = (0..n).map(|_| vec![0.0f32; dim]).collect();
+        serde_json::json!({ "model": EMBED_MODEL, "embeddings": vecs }).to_string()
+    }
+
+    #[tokio::test]
+    async fn success_batch_returns_768_dim_vectors() {
+        let body = embed_body(2, EMBED_MODEL_DIMS);
+        let len = body.len();
+        let c = client(one_shot("HTTP/1.1 200 OK", body, len));
+        let docs = vec![("T".into(), "x".into()), ("T2".into(), "y".into())];
+        let out = c.embed_docs(&docs).await.expect("respond ok");
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|v| v.len() == EMBED_MODEL_DIMS));
+    }
+
+    #[tokio::test]
+    async fn http_error_and_missing_embeddings_are_state_errors() {
+        // JSON-тело: иначе разбор упадёт раньше проверки статуса и закрепит
+        // не ту ветку — мутация статуса на Session останется невидимой.
+        let body = r#"{"error":"boom"}"#.to_string();
+        let len = body.len();
+        let c = client(one_shot("HTTP/1.1 500 Internal Server Error", body, len));
+        let err = c.embed_query("q").await.unwrap_err();
+        assert!(
+            matches!(&err, UsecaseError::State(m) if m.contains("HTTP 500")),
+            "5xx -> State с кодом в тексте, факт: {err:?}"
+        );
+
+        let body = "{}".to_string();
+        let len = body.len();
+        let c = client(one_shot("HTTP/1.1 200 OK", body, len));
+        let err = c.embed_query("q").await.unwrap_err().to_string();
+        assert!(err.contains("no embeddings"), "fact: {err}");
+    }
+
+    #[tokio::test]
+    async fn wrong_vector_count_and_dim_are_rejected() {
+        // query шлёт один текст — два вектора в ответе должны отвергаться.
+        let body = embed_body(2, EMBED_MODEL_DIMS);
+        let len = body.len();
+        let c = client(one_shot("HTTP/1.1 200 OK", body, len));
+        let err = c.embed_query("q").await.unwrap_err().to_string();
+        assert!(err.contains("expected 1 vectors, got"), "fact: {err}");
+
+        let body = embed_body(1, 512);
+        let len = body.len();
+        let c = client(one_shot("HTTP/1.1 200 OK", body, len));
+        let err = c.embed_query("q").await.unwrap_err().to_string();
+        assert!(err.contains("512-dim vector"), "fact: {err}");
+    }
+
+    #[tokio::test]
+    async fn stalled_body_fails_within_total_timeout() {
+        // Заголовки пришли, рабочее тело короче объявленного Content-Length —
+        // reqwest ждёт остаток; без таймаута на чтении вызов висел бы вечно.
+        let body = embed_body(1, EMBED_MODEL_DIMS);
+        let c = short_client(one_shot("HTTP/1.1 200 OK", body, 100_000));
+        let started = std::time::Instant::now();
+        let err = c.embed_query("q").await.unwrap_err().to_string();
+        assert!(err.contains("timeout"), "fact: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "таймаут сработал"
+        );
+    }
+
+    /// TCP принят, но ответа нет вообще (признак стейл-туннеля): бюджет
+    /// должен оборвать ожидание, а не держать поиск-production-таймаут.
+    #[tokio::test]
+    async fn silent_server_fails_within_total_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf); // запрос прочитан, ответа нет
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+        });
+        let c = short_client(url);
+        let started = std::time::Instant::now();
+        let err = c.embed_query("q").await.unwrap_err().to_string();
+        assert!(err.contains("timeout"), "fact: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "таймаут сработал"
+        );
     }
 }

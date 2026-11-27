@@ -3,7 +3,7 @@
 //! за два прохода env-gc доезжает до хвоста кандидатов за батч-капом.
 //! Проводка `env_gc_loop` (один `EnvGcGone` на процесс) юнит-тестами через
 //! `sweep_envs` не видна: мутант «контейнер на каждый проход» красит только
-//! этот уровень (шесть одинаковых батчей, хвост не доезжает).
+//! этот уровень (второй проход снова несёт первые 20, хвост не доезжает).
 //!
 //! Сценарий:
 //!   1. 21 строка Done, закрыты 3 суток назад (кандидаты при
@@ -14,7 +14,7 @@
 //!   4. третий проход молчит: ни `env.gc.completed`, ни shell-вызовов.
 //!
 //! Запуск: UWUWU_E2E=1 cargo test -p uwuwu-server --test env_gc_stand_e2e
-//! Длительность ~1 мин: два прохода при poll_sec = 10 плюс окно тишины
+//! Длительность ~25 с: два прохода при poll_sec = 10 плюс окно тишины
 //! третьего прохода.
 
 mod common;
@@ -65,6 +65,7 @@ async fn gone_marks_survive_passes_and_tail_reaches_the_script() {
             config_extra: "sweep_days = 7\nenv_gc_days = 1\nenv_gc_observe = false\n\n",
             pre_state: None,
             server_env: &[("UWUWU_MOCK_SEED", seed.as_str())],
+            capture_sessions: false,
         },
     )
     .await;

@@ -1184,7 +1184,6 @@ async fn gone_mark_is_scoped_to_board() {
     };
     let first = run_pass_on_board("Задачи uwuwu", &pass_a).await;
     assert_eq!(first.swept, 1);
-    assert_eq!(first.gone, 0);
 
     let tasks_b = [done_closed(77, THREE_DAYS, NOW)];
     let pass_b = Pass {

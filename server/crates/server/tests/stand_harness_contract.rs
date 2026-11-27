@@ -3,7 +3,7 @@
 //! Три класса пинов:
 //!   1. Поведение хелперов, перенесённых в общий модуль (`log_tail`,
 //!      `e2e_enabled`) — чистая логика без живых процессов.
-//!   2. Инвариант дедупа: оба стенда потребуют общий модуль и не держат
+//!   2. Инвариант дедупа: все стенды требуют общий модуль и не держат
 //!      локальных копий харнеса.
 //!   3. Drop-гард харнеса: убивает и убирает оба дочерних процесса —
 //!      поведенческий тест на холостых процессах, сервер не нужен.
@@ -174,6 +174,7 @@ fn stand_drop_kills_and_reaps_both_children() {
 const CRON_SRC: &str = include_str!("cron_stand_e2e.rs");
 const QUOTA_SRC: &str = include_str!("quota_limit_pause_stand_e2e.rs");
 const ENV_GC_SRC: &str = include_str!("env_gc_stand_e2e.rs");
+const ALIAS_SRC: &str = include_str!("model_alias_stand_e2e.rs");
 
 #[test]
 fn stands_consume_shared_harness_without_local_copies() {
@@ -181,6 +182,7 @@ fn stands_consume_shared_harness_without_local_copies() {
         ("cron", CRON_SRC),
         ("quota", QUOTA_SRC),
         ("env-gc", ENV_GC_SRC),
+        ("alias", ALIAS_SRC),
     ] {
         assert!(src.contains("mod common;"), "{name}: нет mod common");
         assert!(
@@ -229,6 +231,11 @@ fn gated_stand_scenes_remain_registered() {
             "env-gc",
             ENV_GC_SRC,
             &["gone_marks_survive_passes_and_tail_reaches_the_script"][..],
+        ),
+        (
+            "alias",
+            ALIAS_SRC,
+            &["alias_layers_reach_live_spawns_and_one_edit_moves_whole_group"][..],
         ),
     ] {
         for scene in scenes {
