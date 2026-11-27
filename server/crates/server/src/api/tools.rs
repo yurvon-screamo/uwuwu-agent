@@ -322,7 +322,7 @@ pub fn tool_descriptors() -> Value {
         ),
         tool(
             "docs_write",
-            "Write doc by slug (full replace); fm header survives: carried over with fresh lastmod, canonical one created when absent, fm in the payload kept verbatim. Slug is sanitized like docs_read. New docs are refused (nothing written) when outside the wiki root (root-prefix: Experience, Projects, bot, cron, person), under a live file that is not a folder (parent-collision), or colliding with a live doc by path suffix (suffix-collision) — each refusal names the branch and candidates",
+            "Write doc by slug (full replace); fm header survives: carried over with fresh lastmod, canonical one created when absent, fm in the payload kept verbatim. Slug is sanitized like docs_read. New docs are refused (nothing written) when outside the wiki root (root-prefix: Experience, Projects, bot, cron, person), under a live file that is not a folder (parent-collision), or colliding with a live doc by path suffix (suffix-collision) — each refusal names the branch and candidates. When the tree read fails, collision checks are skipped; the receipt names the degradation and the server logs a warning",
             object(json!({
                 "slug": string("doc slug (without docs/ and .md); sanitized like docs_read"),
                 "content": string("full markdown"),
@@ -331,7 +331,7 @@ pub fn tool_descriptors() -> Value {
         ),
         tool(
             "docs_delete",
-            "Delete a wiki doc by full slug. A verbatim backup is stored in the private blob bucket BEFORE the ff-only delete; the receipt names the branch (deleted, absent, refused), the backup key and the post-check. Refuses slugs outside the wiki roots; a longer suffix twin is reported as information, not a refusal",
+            "Delete a wiki doc by full slug. A verbatim backup is stored in the private blob bucket BEFORE the ff-only delete; the receipt names the branch (deleted, absent, refused), the backup key and the post-check. Refuses slugs outside the wiki roots; a longer suffix twin is reported as information, not a refusal. When the tree read fails, the delete is refused before mutation: the error names the degradation; the snapshot is checked against the commit tree",
             object(json!({
                 "slug": string("doc slug (without docs/ and .md); sanitized like docs_read"),
                 "message": string("commit message; default delete")
@@ -618,14 +618,15 @@ impl ToolHub {
         // запись — кроме входа с собственным fm, той ветке док не нужен
         // (read Err при входе с fm оставляет существование неизвестным).
         let (existing, read_failed) = match self.wiki.read_doc(&slug).await {
-            Ok(doc) => (doc, false),
+            Ok(doc) => (doc, None),
             Err(e) => {
                 if fm_guard::split(&incoming).is_none() {
                     return Err(format!(
                         "fm-guard needs the current doc, read «{slug}» failed: {e}"
                     ));
                 }
-                (None, true)
+                log_slug_guard_degraded("docs_write", &slug, "doc read failed", &e);
+                (None, Some("doc read failed"))
             }
         };
         // слаг-гард (#1613): достоверно новый док — предикат по живому
@@ -634,16 +635,17 @@ impl ToolHub {
         // полный гард невозможен, но root-проверка (ни от чтения, ни от
         // дерева) остаётся — тихого пути семьи не остаётся. Сбой дерева —
         // деградация: root жив (константа), parent/suffix пропущены.
-        let mut degraded = false;
-        if read_failed {
+        let mut degraded = read_failed;
+        if degraded.is_some() {
             if let Some(candidates) = slug_guard::check_root(&slug) {
                 return Err(root_prefix_error(&slug, &candidates));
             }
         } else if existing.is_none() {
             let live = match self.wiki.list_docs("").await {
                 Ok(live) => live,
-                Err(_) => {
-                    degraded = true;
+                Err(e) => {
+                    log_slug_guard_degraded("docs_write", &slug, "tree unavailable", &e);
+                    degraded = Some("tree unavailable");
                     Vec::new()
                 }
             };
@@ -677,9 +679,7 @@ impl ToolHub {
                 format!("doc «{slug}» written — canonical fm header created (title/date/lastmod)")
             }
         };
-        if degraded {
-            fact.push_str(" — slug-guard degraded: collision checks skipped (tree unavailable)");
-        }
+        fact.push_str(&degraded_clause(degraded));
         ok_text(fact)
     }
 
@@ -691,8 +691,11 @@ impl ToolHub {
             return Err(empty_slug_error());
         }
         let (live, degraded) = match self.wiki.list_docs("").await {
-            Ok(live) => (live, false),
-            Err(_) => (Vec::new(), true),
+            Ok(live) => (live, None),
+            Err(e) => {
+                log_slug_guard_degraded("docs_delete", &slug, "tree unavailable", &e);
+                (Vec::new(), Some("tree unavailable"))
+            }
         };
         let verdict = delete_guard(&slug, &live);
         if let Some(refusal) = verdict.refusal {
@@ -715,7 +718,15 @@ impl ToolHub {
         match usecase.delete(request).await {
             Ok(receipt) => ok_text(delete_receipt_text(&receipt, degraded)),
             Err(UsecaseError::DocAbsent(_)) => Err(delete_absent_error(&slug, &verdict.twins)),
-            Err(e) => Err(delete_refusal_error(&e)),
+            Err(e) => {
+                let mut text = delete_refusal_error(&e);
+                if let Some(reason) = degraded {
+                    text.push_str(&format!(
+                        "\nslug-guard degraded: collision checks skipped ({reason})"
+                    ));
+                }
+                Err(text)
+            }
         }
     }
 
@@ -1149,6 +1160,27 @@ fn message_or(args: &Value, fallback: String) -> String {
     }
 }
 
+/// Единое событие деградации слаг-гарда (#1697): имя стабильно, причина —
+/// поле. Ошибка связывается, а не глушится.
+fn log_slug_guard_degraded(tool: &str, slug: &str, reason: &str, error: &impl std::fmt::Display) {
+    tracing::warn!(
+        event = "slug_guard.degraded",
+        tool,
+        slug,
+        reason,
+        error = %error,
+        "collision checks skipped"
+    );
+}
+
+/// Приписка квитанции: причина деградации — та, что действительно сработала.
+fn degraded_clause(degraded: Option<&'static str>) -> String {
+    match degraded {
+        Some(reason) => format!(" — slug-guard degraded: collision checks skipped ({reason})"),
+        None => String::new(),
+    }
+}
+
 /// Слаг-гард (#1613): слаг, вырожденный после санитайза, — отказ входа.
 fn empty_slug_error() -> String {
     "slug is required (nothing left after sanitization)".into()
@@ -1160,10 +1192,13 @@ async fn suffix_candidates_best_effort(
     wiki: &dyn uwuwu_usecase::WikiRepo,
     slug: &str,
 ) -> Vec<String> {
-    wiki.list_docs("")
-        .await
-        .map(|live| slug_guard::suffix_candidates(slug, &live))
-        .unwrap_or_default()
+    match wiki.list_docs("").await {
+        Ok(live) => slug_guard::suffix_candidates(slug, &live),
+        Err(e) => {
+            log_slug_guard_degraded("docs_append", slug, "tree unavailable", &e);
+            Vec::new()
+        }
+    }
 }
 
 /// Отказ append-nonexistent (#1613, развилка Б): имя ветки + строка-
@@ -1214,7 +1249,7 @@ fn suffix_collision_error(slug: &str, candidates: &[String]) -> String {
 }
 
 /// Квитанция удаления (#1658): ветка, бэкап, пост-проверка, тёзки.
-fn delete_receipt_text(receipt: &DeleteReceipt, degraded: bool) -> String {
+fn delete_receipt_text(receipt: &DeleteReceipt, degraded: Option<&'static str>) -> String {
     let mut out = format!(
         "deleted: «{}» (path {}, blob sha {}, commit {})",
         receipt.slug, receipt.path, receipt.old_blob_sha, receipt.commit_sha
@@ -1237,8 +1272,10 @@ fn delete_receipt_text(receipt: &DeleteReceipt, degraded: bool) -> String {
             receipt.suffix_twins.join(", ")
         ));
     }
-    if degraded {
-        out.push_str("\nslug-guard degraded: collision checks skipped (tree unavailable)");
+    if let Some(reason) = degraded {
+        out.push_str(&format!(
+            "\nslug-guard degraded: collision checks skipped ({reason})"
+        ));
     }
     out
 }
