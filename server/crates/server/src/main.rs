@@ -771,21 +771,21 @@ async fn run(
 
     // env-gc (#1431): снос env терминальных строк по доскам конфига.
     // Отдельная tokio-задача, не Sidecar: rm мульти-ГБ каталогов идёт
-    // за 120-секундным капом сайдкар-тика. env_gc_days = 0 — kill-switch:
+    // за 120-секундным капом сайдкар-тика. env_gc_hours = 0 — kill-switch:
     // задача вообще не заводится; observe-гейт — до live-флипа (срез 4).
-    if cfg.env_gc_days > 0 {
+    if cfg.env_gc_hours > 0 {
         let gc_observe = is_observe || cfg.env_gc_observe;
         tokio::spawn(env_gc_loop(EnvGcLoopArgs {
             usecase: usecase.clone(),
             boards: plan.boards.clone(),
             clock: clock.clone(),
-            days: cfg.env_gc_days,
+            hours: cfg.env_gc_hours,
             observe: gc_observe,
             poll_sec: cfg.poll_sec,
         }));
         tracing::info!(
             event = "env.gc.enabled",
-            days = cfg.env_gc_days,
+            hours = cfg.env_gc_hours,
             observe = gc_observe,
             boards = plan.boards.len(),
             "env-gc: снос env терминальных строк включён"
@@ -865,7 +865,7 @@ struct EnvGcLoopArgs {
     usecase: Arc<TickUseCase>,
     boards: Vec<uwuwu_usecase::BoardPlan>,
     clock: Arc<dyn uwuwu_usecase::Clock>,
-    days: u32,
+    hours: u32,
     observe: bool,
     poll_sec: u64,
 }
@@ -879,7 +879,7 @@ async fn env_gc_loop(args: EnvGcLoopArgs) {
         usecase,
         boards,
         clock,
-        days,
+        hours,
         observe,
         poll_sec,
     } = args;
@@ -900,7 +900,7 @@ async fn env_gc_loop(args: EnvGcLoopArgs) {
             };
             let policy = uwuwu_usecase::env_gc::EnvGcPolicy {
                 now_ms: clock.now_ms(),
-                age_days: days,
+                age_hours: hours,
                 observe,
             };
             let sessions = usecase.sessions.project(&b.project);

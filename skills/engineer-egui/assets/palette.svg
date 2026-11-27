@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="220" viewBox="0 0 760 220" role="img" aria-label="Craft dark theme token swatches">
+  <rect x="0" y="0" width="760" height="220" fill="#121316"/>
+  <g font-family="monospace" font-size="12" fill="#f2f1ee">
+    <text x="20" y="28">Craft dark tokens</text>
+    <rect x="20" y="44" width="96" height="56" fill="#121316" stroke="#f2f1ee" stroke-opacity="0.15"/>
+    <text x="20" y="116">bg</text><text x="20" y="132">#121316</text>
+    <rect x="136" y="44" width="96" height="56" fill="#060607" stroke="#f2f1ee" stroke-opacity="0.15"/>
+    <text x="136" y="116">sunken</text><text x="136" y="132">#060607</text>
+    <rect x="252" y="44" width="96" height="56" fill="#f2f1ee"/>
+    <text x="252" y="116">ink</text><text x="252" y="132">#f2f1ee</text>
+    <rect x="368" y="44" width="96" height="56" fill="#2d81ff"/>
+    <text x="368" y="116">accent</text><text x="368" y="132">#2d81ff</text>
+    <rect x="484" y="44" width="96" height="56" fill="#3fd6b8"/>
+    <text x="484" y="116">good</text><text x="484" y="132">#3fd6b8</text>
+    <rect x="600" y="44" width="96" height="56" fill="#ffc14d"/>
+    <text x="600" y="116">warn</text><text x="600" y="132">#ffc14d</text>
+    <rect x="20" y="160" width="96" height="12" fill="#f2f1ee" fill-opacity="0.15"/>
+    <text x="136" y="172">line: 1 point hairline, ink at alpha 38</text>
+    <rect x="368" y="160" width="96" height="12" fill="#ff6259"/>
+    <text x="484" y="172">bad #ff6259</text>
+  </g>
+</svg>

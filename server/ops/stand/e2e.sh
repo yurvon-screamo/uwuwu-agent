@@ -1071,7 +1071,7 @@ say "фаза 13 ок: lost-resurrection через lost-руку, луп-гва
 
 say "фаза 14: env-gc #1431 — observe логирует кандидатов, live сносит по вердикту мока"
 
-# env-gc: candidates из снапшота доски (терминальная + закрытие > 48 ч),
+# env-gc: candidates из снапшота доски (терминальная + закрытие > часа),
 # снос — bootstrap в чекауте + прямой shell скрипта (без slash-команд
 # и LLM-поворотов, #1526 — user-сообщения «ENV-GC …» вырезаны), вердикты —
 # stdout shell-сообщения (parse-all).
@@ -1082,7 +1082,7 @@ cat > "$CONFIG_EGC" <<EOF
 mode = "live"
 poll_sec = 10
 sweep_days = 7
-env_gc_days = 1
+env_gc_hours = 1
 env_gc_observe = false
 port = $PORT_SRV
 

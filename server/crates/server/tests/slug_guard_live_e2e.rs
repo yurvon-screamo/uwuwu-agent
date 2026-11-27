@@ -181,7 +181,7 @@ async fn spawn_server(dir: &Path, repo: &str) -> Stand {
     let bearer = "rig-e2e-bearer";
     let config = format!(
         "mode = \"observe\"\npoll_sec = 3600\nport = {port}\n\
-         sweep_days = 0\nenv_gc_days = 0\n\n\
+         sweep_days = 0\nenv_gc_hours = 0\n\n\
          [hub]\nrepo = \"{repo}\"\n\n\
          [executor]\nname = \"mock\"\nurl = \"http://127.0.0.1:1\"\n\n\
          [policy]\ncup = 1\n\n[policy.peak]\nenabled = false\nstart_min = 360\nend_min = 600\n\n\

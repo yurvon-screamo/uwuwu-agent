@@ -56,7 +56,7 @@ pub fn env_gc_bootstrap_title(board_name: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnvGcPolicy {
     pub now_ms: u64,
-    pub age_days: u32,
+    pub age_hours: u32,
     pub observe: bool,
 }
 
@@ -201,7 +201,7 @@ pub async fn sweep_envs(ctx: &EnvGcCtx<'_>, policy: EnvGcPolicy) -> UsecaseResul
     for t in ctx
         .tasks
         .iter()
-        .filter(|t| t.is_env_gc_candidate(policy.now_ms, policy.age_days))
+        .filter(|t| t.is_env_gc_candidate(policy.now_ms, policy.age_hours))
     {
         if ctx.gone.is_gone(ctx.board_name, t.number(), t.closed_at()) {
             out.gone += 1;

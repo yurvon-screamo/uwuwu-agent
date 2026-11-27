@@ -666,11 +666,20 @@ impl Task {
     }
 
     /// Кандидат env-gc (#1431): терминальная строка, чей env подлежит
-    /// сносу — issue закрыт строго старше `age_days` суток. Тот же
-    /// домен-рулет, что у клина холодного ящика: дата закрытия —
-    /// доказательство, без даты — консервативный пропуск.
-    pub fn is_env_gc_candidate(&self, now_ms: u64, age_days: u32) -> bool {
-        self.status.is_terminal() && self.closed_older_than(now_ms, age_days)
+    /// сносу — issue закрыт строго старше `age_hours` часов. В отличие
+    /// от клина холодного ящика (сутки), порог сноса — часовой: решение
+    /// владельца 27.11, env не должен висеть сутками после закрытия.
+    /// Дата закрытия — доказательство, без даты — консервативный пропуск.
+    pub fn is_env_gc_candidate(&self, now_ms: u64, age_hours: u32) -> bool {
+        self.status.is_terminal() && self.closed_older_than_hours(now_ms, age_hours)
+    }
+
+    /// Issue закрыт строго старше `age_hours` часов; без даты — false.
+    fn closed_older_than_hours(&self, now_ms: u64, age_hours: u32) -> bool {
+        let Some(closed) = self.closed_at else {
+            return false;
+        };
+        now_ms.saturating_sub(closed) > u64::from(age_hours) * 3_600_000
     }
 
     /// Issue закрыт строго старше `age_days` суток; без даты — false.
@@ -1359,15 +1368,15 @@ mod tests {
 
     #[test]
     fn env_gc_candidate_strictly_older_than_threshold() {
-        // Граница боевого порога 2 суток = «строго больше 48 ч» (#1431):
-        // 47 ч — нет, 49 ч — да
+        // Граница боевого порога 1 ч = «строго больше 60 мин» (решение
+        // владельца 27.11): 59 мин — нет, 61 мин — да
         let now = 1_800_000_000_000;
         let mut fresh = task(Status::Done);
-        fresh.set_closed_at(now - 47 * 3_600_000);
-        assert!(!fresh.is_env_gc_candidate(now, 2), "47 ч — свежая");
+        fresh.set_closed_at(now - 59 * 60_000);
+        assert!(!fresh.is_env_gc_candidate(now, 1), "59 мин — свежая");
         let mut mature = task(Status::Done);
-        mature.set_closed_at(now - 49 * 3_600_000);
-        assert!(mature.is_env_gc_candidate(now, 2), "49 ч — кандидат");
+        mature.set_closed_at(now - 61 * 60_000);
+        assert!(mature.is_env_gc_candidate(now, 1), "61 мин — кандидат");
     }
 
     #[test]
@@ -1393,16 +1402,16 @@ mod tests {
         // в тот же env), даже при закрытом issue давнем
         let mut active = task(Status::UserReview);
         active.set_closed_at(old);
-        assert!(!active.is_env_gc_candidate(now, 2));
+        assert!(!active.is_env_gc_candidate(now, 1));
         // Без даты закрытия — консервативный пропуск
         let deleted = task(Status::Deleted);
-        assert!(!deleted.is_env_gc_candidate(now, 2));
+        assert!(!deleted.is_env_gc_candidate(now, 1));
         // Терминальные с датой — кандидаты
         let mut done = task(Status::Done);
         done.set_closed_at(old);
-        assert!(done.is_env_gc_candidate(now, 2));
+        assert!(done.is_env_gc_candidate(now, 1));
         let mut soft = task(Status::Deleted);
         soft.set_closed_at(old);
-        assert!(soft.is_env_gc_candidate(now, 2));
+        assert!(soft.is_env_gc_candidate(now, 1));
     }
 }

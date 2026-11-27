@@ -431,7 +431,7 @@ fn done_closed(number: u64, age_ms: u64, now: u64) -> Task {
 fn policy(now: u64, observe: bool) -> EnvGcPolicy {
     EnvGcPolicy {
         now_ms: now,
-        age_days: 2,
+        age_hours: 1,
         observe,
     }
 }
@@ -520,10 +520,10 @@ async fn mature_done_row_dispatches_sweep_and_is_swept() {
 }
 
 #[tokio::test]
-async fn row_closed_within_48h_is_never_a_candidate() {
-    // Граница 47 ч против боевого порога 2 суток (#1431)
+async fn row_closed_within_hour_is_never_a_candidate() {
+    // Граница 59 мин против боевого порога 1 ч (решение владельца 27.11)
     let gw = fake(Vec::new());
-    let tasks = [done_closed(1431, 47 * 3_600_000, NOW)];
+    let tasks = [done_closed(1431, 59 * 60_000, NOW)];
     let out = run(&tasks, &gw, &FakeBoard::all_done(), NOW, false).await;
     assert_eq!(out.candidates, 0);
     assert!(gw.commands.lock().unwrap().is_empty());

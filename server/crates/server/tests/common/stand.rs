@@ -17,7 +17,7 @@ pub const BEARER: &str = "e2e-stand-bearer";
 /// То, чем один стенд отличается от другого: секции конфига и env сервера.
 pub struct StandOptions<'a> {
     /// Томл перед `[hub]`: верхнеуровневые ключи (например, `sweep_days`,
-    /// `env_gc_days`) или секции (например, `[quota]`). Пустая строка —
+    /// `env_gc_hours`) или секции (например, `[quota]`). Пустая строка —
     /// дополнительных ключей/секций нет. Верхнеуровневые ключи обязаны
     /// стоять до первой секции — после `[executor]`/`[hub]` они
     /// распарсились бы в чужую таблицу.
@@ -220,7 +220,7 @@ pub async fn spawn_stand(dir: &Path, opts: StandOptions<'_>) -> Stand {
     let server_port = free_port();
     let mock_port = free_port();
     // config_extra — до первой секции: верхнеуровневые ключи (sweep_days,
-    // env_gc_days) и секции ([quota]) валидны только вне чужих таблиц.
+    // env_gc_hours) и секции ([quota]) валидны только вне чужих таблиц.
     let executor_port = if opts.capture_sessions {
         capture_proxy(mock_port, dir.join("capture.jsonl")).await
     } else {
