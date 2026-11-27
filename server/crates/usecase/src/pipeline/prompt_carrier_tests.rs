@@ -1,6 +1,8 @@
 //! Пины носителя промптов: методичка живёт в `agents/*.md`, сервер шлёт
 //! данные, маркер и указатель. Дефы читаются по пути внутри репо, а не
 //! через HOME-симлинк исполнителя (урок «тесты против машины»).
+//! Каждая клауза, убранная из Rust-литералов этим PR, закреплена здесь:
+//! удаление клаузы из дефа должно красинить тест.
 
 use crate::pipeline::actions::{spawn_prompt, STAGE_PROMPTS};
 use crate::pipeline::analyst::analyst_prompt;
@@ -14,6 +16,12 @@ fn agent_doc(name: &str) -> String {
         .join(format!("{name}.md"));
     std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("agent def {} unreadable: {e}", path.display()))
+}
+
+fn assert_clauses(doc: &str, agent: &str, clauses: &[&str]) {
+    for clause in clauses {
+        assert!(doc.contains(clause), "{agent}: клауза «{clause}» потеряна");
+    }
 }
 
 const BOARD: &str = "BOARD-1647";
@@ -30,27 +38,66 @@ fn board() -> BoardPlan {
 }
 
 #[test]
-fn agent_defs_carry_the_methodology_the_server_no_longer_sends() {
-    // Arrange
+fn analyst_def_pins_every_clause_moved_from_rust() {
     let analyst = agent_doc("analyst");
-    let reviewer = agent_doc("analyst-reviewer");
-    let dreamer = agent_doc("dreamer");
-    let tester = agent_doc("tester");
-    let developer = agent_doc("developer");
+    assert_clauses(
+        &analyst,
+        "analyst",
+        &[
+            "A requirement enters the statement **only from a source**",
+            "Invented content is marked",
+            "The elaboration artifact — **the reworked task body**",
+            "per the TASK-TEMPLATE skeleton",
+            "Proportionality of frames by type",
+            "US/UC/NFT: local ID · frame · source",
+            "a reproduction frame (you do not diagnose causes, no records)",
+            "«what counts as the answer»",
+            "Verdicts: elaborated",
+            "duplicate/garbage →",
+            "a real blocker →",
+            "a fork outside FT/NFT →",
+            "You do not implement the task",
+            "do not write into the project's Design Spec",
+            "You do not create tasks",
+        ],
+    );
+}
 
-    // Assert — клаузы, ушедшие из Rust, а не отдельные слова.
-    assert!(analyst.contains("## The main rule — sourcing (ADR-102)"));
-    assert!(analyst.contains("Verdicts: elaborated") && analyst.contains("into **Review Analys**"));
-    assert!(analyst.contains("You do not implement the task"));
-    assert!(analyst.contains("do not write into the project's Design Spec"));
-    assert!(analyst.contains("You do not create tasks"));
-    assert!(reviewer.contains("- Verdicts: approve → `task_edit` into **Todo**"));
-    assert!(reviewer.contains("The report — one comment per row"));
-    assert!(reviewer.contains("no separate wave summary posts"));
-    assert!(dreamer.contains("### 1. Dumps") && dreamer.contains("### 5. Experience (always)"));
-    assert!(tester.contains("**Delta mode (a re-entry after the bug loop)**"));
-    assert!(
-        developer.contains("# PHASE: PLANNING") && developer.contains("# PHASE: IMPLEMENTATION")
+#[test]
+fn analyst_reviewer_def_pins_every_clause_moved_from_rust() {
+    let reviewer = agent_doc("analyst-reviewer");
+    assert_clauses(
+        &reviewer,
+        "analyst-reviewer",
+        &[
+            "**Sourcing (the main optic, ADR-102):**",
+            "Invented = request_changes.",
+            "**Form/dedup:**",
+            "**Proportionality:**",
+            "**Readiness:**",
+            "Verdicts: approve",
+            "request_changes →",
+            "**Needs attention**",
+            "The report — one comment per row",
+            "no separate wave summary posts",
+        ],
+    );
+}
+
+#[test]
+fn dreamer_def_pins_every_clause_moved_from_rust() {
+    let dreamer = agent_doc("dreamer");
+    assert_clauses(
+        &dreamer,
+        "dreamer",
+        &[
+            "Per-session run: the dump in full — the command from the prompt",
+            "### 4. Project documentation hygiene",
+            "Read the project docs **live**",
+            "### 5. Experience (always)",
+            "Extract transferable knowledge",
+            "**mandatory dedup**",
+        ],
     );
 }
 
@@ -68,6 +115,16 @@ fn developer_def_maps_both_stage_markers_to_phases() {
     // Assert — перестановка маркеров между фазами ломает пин.
     assert!(planning < design && design < implementation);
     assert!(implementation < dev);
+}
+
+#[test]
+fn tester_def_pins_reentry_delta_mode() {
+    let tester = agent_doc("tester");
+    assert_clauses(
+        &tester,
+        "tester",
+        &["**Delta mode (a re-entry after the bug loop)**"],
+    );
 }
 
 #[test]
