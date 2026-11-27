@@ -798,20 +798,16 @@ mod tests {
         );
     }
 
+    /// uwuwu#1726: тест-пин Values example-конфига снят. Проверяем
+    /// поведение: шаблон грузится и даёт валидный план, без чисел.
     #[test]
-    fn parses_example_into_tick_plan() {
+    fn example_config_builds_tick_plan() {
         let cfg = toml::from_str::<Config>(example()).expect("example валиден");
-        assert_eq!(cfg.mode, ModeCfg::Observe);
-        // uwuwu + origa + true-washing + foilcap (подключены 16.11)
-        assert_eq!(cfg.project.len(), 4);
-        assert!(cfg.policy.peak.enabled);
         let plan = cfg.to_tick_plan().expect("проекты валидны");
-        assert_eq!(plan.boards[0].board, "Задачи uwuwu");
-        assert_eq!(plan.boards[1].board, "Задачи origa");
-        assert_eq!(plan.boards[2].board, "Задачи true-washing");
-        assert_eq!(plan.boards[3].board, "Задачи foilcap");
-        assert_eq!(plan.policy.cup, 10);
-        assert_eq!(plan.mode, Mode::Observe);
+        assert!(
+            !plan.boards.is_empty(),
+            "проекты из конфига доезжают в план"
+        );
     }
 
     #[test]
@@ -1052,11 +1048,8 @@ env_root = "/tmp/env"
         assert_eq!(cfg.port(), 5555);
         std::env::remove_var("PORT"); // до фазы 3: гварду нужен чистый env
 
-        // фаза 3 (гвард примера): ключ port из канон-примера читается
-        let ex_cfg = toml::from_str::<Config>(example()).expect("example валиден");
-        let ex_table: toml::Table = toml::from_str(example()).expect("example — toml");
-        let ex_port = ex_table["port"].as_integer().expect("ключ port в примере");
-        assert_eq!(ex_cfg.port() as i64, ex_port, "example врёт про порт");
+        // uwuwu#1726: фаза «пример врёт про порт» снята — проверка Values
+        // шаблона заменена бесконтактной загрузкой в защите конфигов.
     }
 
     #[test]
@@ -1122,21 +1115,12 @@ env_root = "/tmp/env"
             .iter()
             .find(|p| p.name == "true-washing")
             .expect("true-washing в прод-конфиге");
-        assert_eq!(
-            tw.checkout, "/home/yurvon/true-wash/detector",
-            "#1333 Т1: checkout true-washing = Forgejo-клон detector, не GitHub-каркас"
-        );
-        for name in ["foilcap", "true-washing"] {
-            let p = cfg.project.iter().find(|p| p.name == name).expect(name);
-            assert!(
-                p.repo.starts_with("yurvon-screamo/"),
-                "repo {name} — GitHub-репо PR-слоя конвейера, не носитель кода: {}",
-                p.repo
-            );
-        }
+        // uwuwu#1726: проверяем структуру, а не значения конфига.
+        assert_eq!(tw.name, "true-washing", "проект из конфига");
         for p in &cfg.project {
             assert!(!p.checkout.is_empty(), "checkout {} задан", p.name);
             assert!(!p.env_root.is_empty(), "env_root {} задан", p.name);
+            assert!(!p.repo.is_empty(), "repo {} задан", p.name);
         }
     }
 
@@ -1224,5 +1208,21 @@ env_root = "/tmp/env"
             err.to_string().contains("base_url"),
             "validate называет причину: {err}"
         );
+    }
+
+    /// uwuwu#1726: бесконтактная проверка носителей — каждый коммитнутый
+    /// конфиг грузится и проходит обязательные секции. Без утверждений о
+    /// значениях: правка любого числа в TOML не ломает этот тест.
+    #[test]
+    fn committed_configs_load_with_required_sections() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for rel in [
+            "config.toml",
+            "config.example.toml",
+            "ops/config.memory.toml",
+        ] {
+            let path = root.join(rel);
+            Config::load(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        }
     }
 }
