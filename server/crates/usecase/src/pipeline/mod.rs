@@ -18,6 +18,8 @@ pub mod executor;
 pub mod incident;
 #[cfg(test)]
 mod prompt_carrier_tests;
+#[cfg(test)]
+mod tester_carrier_tests;
 pub mod sweeper;
 #[cfg(test)]
 mod sweeper_tests;
