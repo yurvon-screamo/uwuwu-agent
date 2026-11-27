@@ -746,6 +746,37 @@ fn descriptors_expose_fact_track_create_only() {
     );
 }
 
+/// #1689: сложность advertised на create/edit, но не на list — list читает
+/// только снапшот и не видит неприлинкованное issue-поле.
+#[test]
+fn descriptors_expose_complexity_except_on_task_list() {
+    let list = tool_descriptors();
+    let find = |name: &str| {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("{name} на поверхности"))["inputSchema"]["properties"]
+            .clone()
+    };
+    assert!(find("task_create").get("complexity").is_some());
+    assert!(find("task_edit").get("complexity").is_some());
+    assert!(find("task_list").get("complexity").is_none());
+    let edit = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"].as_str() == Some("task_edit"))
+        .expect("task_edit на поверхности");
+    assert!(
+        edit["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("complexity"),
+        "сводка task_edit обязана объявлять новый ключ"
+    );
+}
+
 /// #1619: ключ ответа владельца объявлен на task_edit — гард #1572
 /// принимает его как легальный, агент видит аргумент в tools/list.
 #[test]
@@ -877,6 +908,64 @@ async fn task_create_non_boolean_automerge_is_loud_not_on_mandate() {
     .await
     .expect("task_get ок");
     assert!(card.contains("automerge: true"), "мандат жив: {card}");
+}
+
+/// #1689: сложность проезжает create → task_get → edit и отклоняется
+/// на неканоническом значении до мутаций носителя.
+#[tokio::test]
+async fn task_complexity_create_get_edit_roundtrip() {
+    let (tools, _memory) = hub();
+    let created = call(
+        &tools,
+        "task_create",
+        json!({ "project": "uwuwu", "title": "сложная строка", "body": "тело", "complexity": "high" }),
+    )
+    .await
+    .expect("create со сложностью принят");
+    let n: u64 = created
+        .trim()
+        .split('#')
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .and_then(|s| s.parse().ok())
+        .expect("номер в ответе");
+    let card = call(
+        &tools,
+        "task_get",
+        json!({ "project": "uwuwu", "number": n }),
+    )
+    .await
+    .expect("task_get ок");
+    assert!(card.contains("complexity: high"), "fm: {card}");
+    call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": n, "complexity": "low" }),
+    )
+    .await
+    .expect("edit сложности принят");
+    let card = call(
+        &tools,
+        "task_get",
+        json!({ "project": "uwuwu", "number": n }),
+    )
+    .await
+    .expect("task_get ок");
+    assert!(card.contains("complexity: low"), "fm после edit: {card}");
+    let rejected = call(
+        &tools,
+        "task_edit",
+        json!({ "project": "uwuwu", "number": n, "complexity": "мусор" }),
+    )
+    .await;
+    assert!(rejected.is_err(), "неканон отклонён: {rejected:?}");
+    assert!(
+        rejected
+            .err()
+            .unwrap_or_default()
+            .contains("regular|high|low"),
+        "отказ несёт перечень канона"
+    );
 }
 
 /// direct-круг (#1357) на MemoryHub-носителе: create(direct) рождает

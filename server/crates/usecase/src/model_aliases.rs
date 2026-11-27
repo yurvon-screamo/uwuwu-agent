@@ -34,6 +34,17 @@ impl ModelAlias {
             )),
         }
     }
+
+    /// Сдвиг на `delta` уровней по лестнице ALL с отсечением на границах
+    /// (#1689): flash - 1 = flash, smart + 1 = smart. Четвёртого уровня нет.
+    pub fn shift(self, delta: i8) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|alias| *alias == self)
+            .expect("каждый алиас есть в ALL") as i8;
+        let shifted = (index + delta).clamp(0, Self::ALL.len() as i8 - 1) as usize;
+        Self::ALL[shifted]
+    }
 }
 
 /// Raw-модели трёх алиасов — единственный носитель raw-модели (#1684).
@@ -109,5 +120,21 @@ impl ModelAliases {
             value_of(ModelAlias::Common)?,
             value_of(ModelAlias::Smart)?,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alias_shift_clamps_at_flash_and_smart() {
+        assert_eq!(ModelAlias::Flash.shift(-1), ModelAlias::Flash);
+        assert_eq!(ModelAlias::Flash.shift(1), ModelAlias::Common);
+        assert_eq!(ModelAlias::Common.shift(1), ModelAlias::Smart);
+        assert_eq!(ModelAlias::Common.shift(-1), ModelAlias::Flash);
+        assert_eq!(ModelAlias::Smart.shift(1), ModelAlias::Smart);
+        assert_eq!(ModelAlias::Smart.shift(-1), ModelAlias::Common);
+        assert_eq!(ModelAlias::Common.shift(0), ModelAlias::Common);
     }
 }

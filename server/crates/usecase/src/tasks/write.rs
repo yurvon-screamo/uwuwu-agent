@@ -20,6 +20,9 @@ pub struct NewTask {
     /// Тип задачи; None — дефолт feature (канон).
     pub kind: Option<TaskType>,
     pub priority: String,
+    /// Сложность задачи (#1689): пустая строка означает дефолт regular,
+    /// который пишется на носитель явно (как automerge).
+    pub complexity: String,
     /// Автомерж: мерж PR при входе в Review, строка остаётся в Review (#1232).
     /// Дефолт true — пишется на носитель явно (create-письмо, не умолчание чтения).
     pub automerge: bool,
@@ -201,6 +204,8 @@ pub struct TaskPatch {
     pub branch: Option<String>,
     pub pr: Option<String>,
     pub priority: Option<String>,
+    /// Сложность задачи (#1689): None — не трогать.
+    pub complexity: Option<String>,
     pub title: Option<String>,
     /// Автомерж on/off (#1232): до-пометка старых строк, выключение.
     pub automerge: Option<bool>,
@@ -222,6 +227,7 @@ impl TaskPatch {
                 branch: None,
                 pr: None,
                 priority: None,
+                complexity: None,
                 title: None,
                 automerge: None,
                 kind: None,
@@ -394,6 +400,11 @@ impl TaskWriter for TaskWriteUseCase {
         } else {
             Some(spec.priority.as_str())
         };
+        let complexity = if spec.complexity.is_empty() {
+            Some(naming::complexity_name(uwuwu_domain::Complexity::Regular))
+        } else {
+            Some(spec.complexity.as_str())
+        };
         self.board
             .set_board_cells(
                 &board,
@@ -402,6 +413,7 @@ impl TaskWriter for TaskWriteUseCase {
                 Some(spec.automerge),
                 Some(spec.direct),
                 Some(spec.fact_track),
+                complexity,
             )
             .await?;
         // direct (#1357): строка рождается в In Progress — фабрика по ней
@@ -441,6 +453,7 @@ impl TaskWriter for TaskWriteUseCase {
         let mut want_pr: Option<String> = None;
         let mut want_priority: Option<String> = None;
         let mut want_automerge: Option<bool> = None;
+        let mut want_complexity: Option<String> = None;
         let mut status_delivery: Option<StatusDelivery> = None;
         let mut owner_answer_ignored = false;
         if let Some(status) = patch.status {
@@ -519,7 +532,7 @@ impl TaskWriter for TaskWriteUseCase {
         // Приоритет/Automerge — ячейки снапшота доски: единая точка записи
         // board-адаптера с кеш-гигиеной (read-your-writes #1258); мимо неё
         // значения протухали в снапшоте до TTL (проба на проде 18.11)
-        if patch.priority.is_some() || patch.automerge.is_some() {
+        if patch.priority.is_some() || patch.automerge.is_some() || patch.complexity.is_some() {
             self.board
                 .set_board_cells(
                     &board,
@@ -528,10 +541,12 @@ impl TaskWriter for TaskWriteUseCase {
                     patch.automerge,
                     None,
                     None,
+                    patch.complexity.as_deref(),
                 )
                 .await?;
             want_priority = patch.priority.clone();
             want_automerge = patch.automerge;
+            want_complexity = patch.complexity.clone();
         }
         // тип — нативный issue Type (#1271): PATCH {"type": имя}, мимо
         // снапшота доски; контрольное чтение ниже сверяет парс носителя
@@ -551,6 +566,7 @@ impl TaskWriter for TaskWriteUseCase {
                 pr: want_pr,
                 priority: want_priority,
                 automerge: want_automerge,
+                complexity: want_complexity,
                 kind: want_kind,
             },
         )
@@ -1113,9 +1129,20 @@ fn is_comment_stamp(line: &str) -> bool {
 /// реального рендера и краснеет при расхождении (#1604 — body_bytes;
 /// #1631 — fact_track).
 fn strip_task_get_header(md: &str) -> &str {
-    // Актуальный рендер (#1604+#1631): branch/pr/automerge/direct/
-    // fact_track/type/body_hash/body_bytes
-    const KEYS: [&str; 8] = [
+    // Актуальный рендер (#1689): complexity между fact_track и type
+    const KEYS: [&str; 9] = [
+        "branch: ",
+        "pr: ",
+        "automerge: ",
+        "direct: ",
+        "fact_track: ",
+        "complexity: ",
+        "type: ",
+        "body_hash: ",
+        "body_bytes: ",
+    ];
+    // Легаси-рендер #1604+#1631: без complexity, с body_bytes
+    const LEGACY_KEYS_8: [&str; 8] = [
         "branch: ",
         "pr: ",
         "automerge: ",
@@ -1153,6 +1180,7 @@ fn strip_task_get_header(md: &str) -> &str {
         pos,
         &[
             &KEYS[..],
+            &LEGACY_KEYS_8[..],
             &LEGACY_KEYS[..],
             &LEGACY_KEYS_6[..],
             &LEGACY_KEYS_NO_TYPE[..],
@@ -1252,6 +1280,7 @@ struct EditExpectations {
     pr: Option<String>,
     priority: Option<String>,
     automerge: Option<bool>,
+    complexity: Option<String>,
     kind: Option<TaskType>,
 }
 
@@ -1264,9 +1293,10 @@ impl EditExpectations {
                 &self.pr,
                 &self.priority,
                 self.automerge,
+                &self.complexity,
                 self.kind,
             ),
-            (None, None, None, None, None, None)
+            (None, None, None, None, None, None, None)
         )
     }
 
@@ -1296,6 +1326,11 @@ impl EditExpectations {
         if let Some(a) = self.automerge {
             if view.task.automerge() != a {
                 out.push("automerge");
+            }
+        }
+        if let Some(c) = &self.complexity {
+            if view.task.complexity() != naming::parse_complexity(c) {
+                out.push("complexity");
             }
         }
         if self.kind.is_some_and(|k| view.task.kind() != Some(k)) {
@@ -1640,6 +1675,7 @@ mod tests {
             body_md: body.into(),
             kind: None,
             priority: String::new(),
+            complexity: String::new(),
             automerge: true,
             direct: false,
             fact_track: false,
@@ -1658,6 +1694,8 @@ mod tests {
     #[derive(Default)]
     struct FakeBoard {
         cells: std::sync::Mutex<Vec<CellWrite>>,
+        /// Записи сложности (#1689) — отдельно от legacy-кортежа ячеек.
+        complexity_cells: std::sync::Mutex<Vec<(u64, Option<String>)>>,
         /// Номера, которые issues_with_title «находит» в репо — вход
         /// холодного ящика (#1293): create с таким тайтлом обязан падать.
         cold_hits: Vec<u64>,
@@ -1678,6 +1716,7 @@ mod tests {
         branch: Option<String>,
         pr: Option<String>,
         priority: Option<String>,
+        complexity: Option<String>,
         automerge: bool,
         direct: bool,
         fact_track: bool,
@@ -1694,6 +1733,7 @@ mod tests {
                 branch: None,
                 pr: None,
                 priority: None,
+                complexity: None,
                 automerge: false,
                 direct: false,
                 fact_track: false,
@@ -1730,6 +1770,12 @@ mod tests {
                 priority,
                 false,
             ));
+            task.set_complexity(
+                self.complexity
+                    .as_deref()
+                    .map(crate::naming::parse_complexity)
+                    .unwrap_or(uwuwu_domain::Complexity::Regular),
+            );
             task.set_kind(self.kind);
             task.set_automerge(self.automerge);
             task.set_direct(self.direct);
@@ -1773,14 +1819,20 @@ mod tests {
             a: Option<bool>,
             d: Option<bool>,
             f: Option<bool>,
+            _c: Option<&str>,
         ) -> UsecaseResult<()> {
             self.cells
                 .lock()
                 .expect("fake board")
                 .push((n, p.map(str::to_string), a, d, f));
+            self.complexity_cells
+                .lock()
+                .expect("fake board")
+                .push((n, _c.map(str::to_string)));
             if !self.phantom {
                 let mut c = self.carrier.lock().expect("fake carrier");
                 c.priority = p.map(str::to_string);
+                c.complexity = _c.map(str::to_string);
                 if let Some(a) = a {
                     c.automerge = a;
                 }
@@ -1955,6 +2007,7 @@ mod tests {
     ) -> TaskWriteUseCase {
         let board = Arc::new(FakeBoard {
             cells: std::sync::Mutex::default(),
+            complexity_cells: std::sync::Mutex::default(),
             phantom,
             read_err,
             ..Default::default()
@@ -1976,6 +2029,7 @@ mod tests {
     ) -> (TaskWriteUseCase, Arc<FakeBoard>) {
         let board = Arc::new(FakeBoard {
             cells: std::sync::Mutex::default(),
+            complexity_cells: std::sync::Mutex::default(),
             cold_hits,
             ..Default::default()
         });
@@ -2014,6 +2068,7 @@ mod tests {
         let fields = Arc::new(FakeFields::default());
         let board = Arc::new(FakeBoard {
             cells: std::sync::Mutex::default(),
+            complexity_cells: std::sync::Mutex::default(),
             cold_hits: Vec::new(),
             search_err: true,
             ..Default::default()
@@ -2042,6 +2097,7 @@ mod tests {
         let fields = Arc::new(FakeFields::default());
         let board = Arc::new(FakeBoard {
             cells: std::sync::Mutex::default(),
+            complexity_cells: std::sync::Mutex::default(),
             cold_hits: vec![1243],
             ..Default::default()
         });
@@ -2070,6 +2126,7 @@ mod tests {
         // !cold.is_empty() ломал бы идемпотентный rename — Low ревью)
         let board = Arc::new(FakeBoard {
             cells: std::sync::Mutex::default(),
+            complexity_cells: std::sync::Mutex::default(),
             cold_hits: vec![5],
             ..Default::default()
         });
@@ -2138,6 +2195,18 @@ mod tests {
         assert_eq!(
             board.cells.lock().expect("fake board").clone(),
             vec![(1, Some("low".into()), Some(true), Some(false), Some(false))],
+        );
+    }
+
+    #[tokio::test]
+    async fn create_writes_regular_complexity_explicitly() {
+        let fields = Arc::new(FakeFields::default());
+        let (u, board) = writecase(fields);
+        u.create("uwuwu", spec("тело")).await.unwrap();
+        assert_eq!(
+            board.complexity_cells.lock().expect("fake board").clone(),
+            vec![(1, Some("regular".into()))],
+            "create пишет дефолт явно — поле появляется на носителе с рождения"
         );
     }
 
@@ -2346,6 +2415,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn edit_patches_complexity_and_verifies_carrier() {
+        let fields = Arc::new(FakeFields::default());
+        let (u, board) = writecase(fields);
+        u.edit(
+            "uwuwu",
+            1,
+            TaskPatch {
+                complexity: Some("high".into()),
+                ..TaskPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            board.complexity_cells.lock().expect("fake board").clone(),
+            vec![(1, Some("high".into()))]
+        );
+        assert_eq!(
+            board
+                .carrier
+                .lock()
+                .expect("fake carrier")
+                .complexity
+                .as_deref(),
+            Some("high"),
+            "контрольное чтение видит записанную сложность"
+        );
+    }
+
     /// TaskPatch с одним automerge непуст — пустой патч не глотается.
     #[test]
     fn patch_with_automerge_is_not_empty() {
@@ -2534,7 +2633,7 @@ mod tests {
     fn card_copy_fresh_with_title(title: &str) -> String {
         format!(
             "{title}\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: \
-             false\nfact_track: false\ntype: bug\nbody_hash: h\nbody_bytes: 42\n\n## Постановка\nтекст"
+             false\nfact_track: false\ncomplexity: regular\ntype: bug\nbody_hash: h\nbody_bytes: 42\n\n## Постановка\nтекст"
         )
     }
 
@@ -2548,8 +2647,14 @@ mod tests {
     /// рендера без хвостового переноса срезается в пустоту — на границе
     /// записи это отказ #1572.
     #[test]
+    fn task_get_previous_render_still_strips_as_legacy() {
+        let md = "#1526 t — In Progress\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\nbody_bytes: 42\n\n## Постановка\nтекст";
+        assert_eq!(strip_task_get_header(md), "## Постановка\nтекст");
+    }
+
+    #[test]
     fn task_get_fresh_render_card_without_newline_strips_to_empty() {
-        let md = "#1632 t — In Progress\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ntype: bug\nbody_hash: h\nbody_bytes: 42";
+        let md = "#1632 t — In Progress\n\n--- fm ---\nbranch: b\npr: —\nautomerge: true\ndirect: false\nfact_track: false\ncomplexity: regular\ntype: bug\nbody_hash: h\nbody_bytes: 42";
         assert_eq!(strip_task_get_header(md), "");
     }
 

@@ -108,6 +108,7 @@ impl TaskBoardRepo for FakeBoard {
         _a: Option<bool>,
         _d: Option<bool>,
         _f: Option<bool>,
+        _c: Option<&str>,
     ) -> UsecaseResult<()> {
         Ok(())
     }
@@ -168,6 +169,9 @@ impl TaskBoardRepo for FakeBoard {
                 // флаг безусловно — фейк без него молча сбрасывал бы
                 // set_direct снапшота на каждом enrichment
                 f.set_direct(t.direct());
+                // сложность (#1689): REST-носитель каноничен, как и у direct —
+                // без неё apply_fields сбрасывал бы сдвиг на каждом тике
+                f.set_complexity(t.complexity());
                 f
             })
             .unwrap_or_default())
@@ -2015,6 +2019,7 @@ impl TaskBoardRepo for CommentBoard {
         _a: Option<bool>,
         _d: Option<bool>,
         _f: Option<bool>,
+        _c: Option<&str>,
     ) -> UsecaseResult<()> {
         Ok(())
     }
@@ -9837,6 +9842,7 @@ impl TaskBoardRepo for FakeMultiBoard {
         _a: Option<bool>,
         _d: Option<bool>,
         _f: Option<bool>,
+        _c: Option<&str>,
     ) -> UsecaseResult<()> {
         Ok(())
     }
@@ -10293,6 +10299,7 @@ impl TaskBoardRepo for CloseBoard {
         _a: Option<bool>,
         _d: Option<bool>,
         _f: Option<bool>,
+        _c: Option<&str>,
     ) -> UsecaseResult<()> {
         Ok(())
     }
@@ -11262,6 +11269,60 @@ async fn stage_spawn_carries_model_from_server_map() {
         assert_eq!(spec.model, want.model, "модель спавна = default карты");
         assert_eq!(spec.variant, want.variant, "default — вариант карты");
     }
+}
+
+#[tokio::test]
+async fn high_complexity_shifts_stage_spawn_model_by_one_level() {
+    // #1689: сложность — отдельная ось; дев со сложной задачей уходит
+    // с flash на common, bootstrap (default) остаётся на flash.
+    let mut row = task(1, Status::InProgress);
+    row.set_complexity(uwuwu_domain::Complexity::High);
+    let (u, _, sessions, _) = usecase(vec![row], PrState::Missing);
+
+    let out = u.run(&plan(Mode::Live, 7)).await.unwrap();
+
+    assert_eq!(out.spawns_done, 1, "спавн стадии состоялся");
+    let specs = sessions.specs.lock().unwrap();
+    let work = specs
+        .iter()
+        .find(|s| !s.bootstrap)
+        .expect("рабочая сессия в спеках");
+    let want = uwuwu_domain::SpawnModel::parse("opencode-go/muse-spark-1.3-contributor#high")
+        .expect("common-алиас");
+    assert_eq!(work.model, want.model, "дев: flash→common (+1)");
+    let boot = specs.iter().find(|s| s.bootstrap).expect("bootstrap");
+    let flash = uwuwu_domain::SpawnModel::parse("opencode-go/hy4-flash-free#high").unwrap();
+    assert_eq!(boot.model, flash.model, "bootstrap без сдвига");
+}
+
+#[tokio::test]
+async fn low_complexity_moves_reviewer_out_of_peak_gate() {
+    // #1689: smart (GLM) → common (opencode-go) снимает peak-задержку,
+    // хотя приоритет Medium и окно GLM активны (#1680).
+    let mut row = task(7, Status::ReviewPlan);
+    row.set_priority(Priority::Medium);
+    row.set_complexity(uwuwu_domain::Complexity::Low);
+    let (u, _, sessions, _) = fixture_usecase_with_models(
+        vec![row],
+        Vec::new(),
+        Arc::new(MemState::empty()),
+        Arc::new(PeakClock),
+        FakeSessions::new(),
+        Arc::new(crate::spawn_models::SpawnModels::canonical()),
+    );
+
+    let out = u.run(&peak_plan(Mode::Live, 7)).await.unwrap();
+
+    assert_eq!(out.deferred_peak, 0, "сдвинутый ревьювер не откладывается");
+    assert_eq!(out.spawns_done, 1, "спавн состоялся в окне");
+    let specs = sessions.specs.lock().unwrap();
+    let work = specs
+        .iter()
+        .find(|s| !s.bootstrap)
+        .expect("рабочая сессия в спеках");
+    let common = uwuwu_domain::SpawnModel::parse("opencode-go/muse-spark-1.3-contributor#high")
+        .expect("common-алиас");
+    assert_eq!(work.model, common.model, "ревьювер на common (−1)");
 }
 
 #[tokio::test]

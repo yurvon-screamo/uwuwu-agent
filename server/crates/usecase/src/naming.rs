@@ -3,7 +3,7 @@
 //! не бизнес-логика: домен не знает, как он называется снаружи. Меняется
 //! носитель — меняется этот модуль, домен нет.
 
-use uwuwu_domain::{Agent, Priority, Schedule, ScheduleKind, Slot, Status, TaskType};
+use uwuwu_domain::{Agent, Complexity, Priority, Schedule, ScheduleKind, Slot, Status, TaskType};
 
 /// Все валидные имена статуса на носителе: канон первым (запись/lookup
 /// предпочитает его), легаси-русские — чтение/резолв досок до rename
@@ -162,6 +162,39 @@ pub const F_DIRECT: &str = "Direct";
 /// Как direct: пишется только create (свойство рождения, immutable),
 /// task_edit его не принимает (чужой ключ — громкий отказ #1572).
 pub const F_FACT_TRACK: &str = "FactTrack";
+
+/// Имя нативного поляissue со сложностью задачи (#1689). Опции
+/// single_select — `regular|high|low`; русские формы принимает парсер.
+pub const F_COMPLEXITY: &str = "Complexity";
+
+/// Каноническое имя сложности (опция issue-поля и аргумент MCP).
+pub fn complexity_name(complexity: Complexity) -> &'static str {
+    match complexity {
+        Complexity::High => "high",
+        Complexity::Regular => "regular",
+        Complexity::Low => "low",
+    }
+}
+
+/// Строгий разбор сложности: канон и русские алиасы, регистр и пробелы
+/// не влияют. Пустое и неизвестное — ошибка: граница MCP обязана
+/// отклонять неканонические значения, сайты чтения различают пустое
+/// и мусор по `Err` и исходной строке (#1689).
+pub fn parse_complexity_strict(raw: &str) -> Result<Complexity, String> {
+    match raw.trim().to_lowercase().as_str() {
+        "high" | "высокая" => Ok(Complexity::High),
+        "regular" | "общая" => Ok(Complexity::Regular),
+        "low" | "низкая" => Ok(Complexity::Low),
+        _ => Err(format!("неизвестная сложность '{raw}' (regular|high|low)")),
+    }
+}
+
+/// Мягкое чтение carriers: пустое/неизвестное → Regular. Не испускает
+/// событий — сайты с номером задачи вызывают strict сами и логируют
+/// только непустой мусор (#1689).
+pub fn parse_complexity(raw: &str) -> Complexity {
+    parse_complexity_strict(raw).unwrap_or(Complexity::Regular)
+}
 
 /// Парсинг приоритета; пустое/неизвестное → Empty (ниже low в очереди CUP).
 /// Один парсер на все носители (snapshot, fm, enrichment): английские и
@@ -354,6 +387,23 @@ mod tests {
         // idea/analys выведены: старые значения — неизвестный тип
         assert_eq!(parse_task_type("idea"), None);
         assert_eq!(parse_task_type("analys"), None);
+    }
+
+    #[test]
+    fn complexity_parsing_distinguishes_empty_from_garbage() {
+        assert_eq!(parse_complexity_strict("high"), Ok(Complexity::High));
+        assert_eq!(parse_complexity_strict(" Высокая "), Ok(Complexity::High));
+        assert_eq!(parse_complexity_strict("regular"), Ok(Complexity::Regular));
+        assert_eq!(parse_complexity_strict("общая"), Ok(Complexity::Regular));
+        assert_eq!(parse_complexity_strict("низкая"), Ok(Complexity::Low));
+        assert!(parse_complexity_strict("").is_err());
+        assert!(parse_complexity_strict("мусор").is_err());
+        assert_eq!(parse_complexity(""), Complexity::Regular);
+        assert_eq!(parse_complexity("мусор"), Complexity::Regular);
+        assert_eq!(complexity_name(Complexity::High), "high");
+        assert_eq!(complexity_name(Complexity::Regular), "regular");
+        assert_eq!(complexity_name(Complexity::Low), "low");
+        assert_eq!(F_COMPLEXITY, "Complexity");
     }
 
     #[test]

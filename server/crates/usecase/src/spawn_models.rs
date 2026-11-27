@@ -6,7 +6,7 @@
 use crate::model_aliases::{ModelAlias, ModelAliases};
 use crate::naming;
 use std::collections::HashMap;
-use uwuwu_domain::{Agent, SpawnModel};
+use uwuwu_domain::{Agent, Complexity, SpawnModel, SpawnPolicy};
 
 /// Провайдер, для которого действует peak-окно (#1679/#1680).
 pub const PEAK_PROVIDER: &str = "zai-coding-plan";
@@ -14,6 +14,19 @@ pub const PEAK_PROVIDER: &str = "zai-coding-plan";
 /// Peak-гейт применяется только к этапам целевого провайдера.
 pub fn peak_applies(model: &SpawnModel) -> bool {
     model.model.provider() == PEAK_PROVIDER
+}
+
+/// Один механизм фильтра пика для всех четырёх точек гейта (#1680/#1689):
+/// нецелевой провайдер работает в окне. Решение — через `peak_applies`,
+/// без собственного литерала провайдера; `SpawnPolicy` копируется.
+pub fn peak_policy_for_model(policy: SpawnPolicy, model: &SpawnModel) -> SpawnPolicy {
+    if peak_applies(model) {
+        policy
+    } else {
+        let mut filtered = policy;
+        filtered.peak.enabled = false;
+        filtered
+    }
 }
 
 /// Раскладка владельца: 26.11 (#1684) flash — default/developer/analyst,
@@ -104,6 +117,26 @@ impl SpawnModels {
 
     pub fn model_for_alias(&self, alias: ModelAlias) -> &SpawnModel {
         self.aliases.get(alias)
+    }
+
+    /// Сдвиг сложности (#1689): алиас ключа сдвигается на уровень до
+    /// выбора raw-модели. Приоритет сюда не передаётся — только Complexity.
+    pub fn for_key_shifted(&self, key: &str, complexity: Complexity) -> SpawnModel {
+        let alias = self.alias_for_key(key).unwrap_or_else(|| {
+            tracing::warn!(
+                event = "spawn_models.key_missing",
+                key = %key,
+                "Карта моделей: нет ключа — применён канон-алиас"
+            );
+            canonical_assignments()[key]
+        });
+        self.model_for_alias(alias.shift(complexity.shift()))
+            .clone()
+    }
+
+    /// То же для агента конвейера: один вызов для всех стадийных спавнов.
+    pub fn for_agent_shifted(&self, agent: Agent, complexity: Complexity) -> SpawnModel {
+        self.for_key_shifted(naming::agent_name(agent), complexity)
     }
 
     /// Модель агента конвейера (по имени из naming::agent_name).

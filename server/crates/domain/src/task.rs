@@ -196,6 +196,27 @@ impl Priority {
     }
 }
 
+/// Сложность задачи (#1689): отдельная ось выбора модели. Не влияет на
+/// очередь (CUP, peak) и не смешивается с приоритетом.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Complexity {
+    High,
+    #[default]
+    Regular,
+    Low,
+}
+
+impl Complexity {
+    /// Сдвиг уровня модели: высокая +1, низкая -1, общая без сдвига.
+    pub fn shift(self) -> i8 {
+        match self {
+            Self::High => 1,
+            Self::Regular => 0,
+            Self::Low => -1,
+        }
+    }
+}
+
 /// Слот сессии стадии (ячейки «Сессия dev/ревью/тест»).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Slot {
@@ -247,6 +268,9 @@ pub struct TaskFields {
     /// (канон «high продолжают работать»; инцидент #1170 — приоритет
     /// не мапился вовсе, пик морозил даже high).
     priority: Priority,
+    /// Сложность с носителя (#1689): сдвигает уровень модели этапа.
+    /// Regular — валидное явное значение и дефолт для старых строк.
+    complexity: Complexity,
     /// Флаг direct (#1357): прямое поручение владельца. Единственный
     /// прод-продюсер — загрузчик носителя (REST issue_field_values,
     /// честен на любой доске); Pv2-скан ненадёжен — колонка Direct не
@@ -279,6 +303,7 @@ impl Default for TaskFields {
             assignments: std::collections::BTreeMap::new(),
             vcs: Vcs::Local,
             priority: Priority::Empty,
+            complexity: Complexity::Regular,
             direct: false,
         }
     }
@@ -296,6 +321,7 @@ impl TaskFields {
             assignments,
             vcs,
             priority,
+            complexity: Complexity::Regular,
             direct,
         }
     }
@@ -303,6 +329,16 @@ impl TaskFields {
     /// Приоритет с носителя (гейт пика читает его).
     pub fn priority(&self) -> Priority {
         self.priority
+    }
+
+    /// Сложность с носителя (сдвиг уровня модели, #1689).
+    pub fn complexity(&self) -> Complexity {
+        self.complexity
+    }
+
+    /// Запись сложности с носителя (мутации инкапсулирует сущность).
+    pub fn set_complexity(&mut self, complexity: Complexity) {
+        self.complexity = complexity;
     }
 
     /// Флаг direct с носителя (decide/гарды спавна читают его).
@@ -467,6 +503,8 @@ pub struct Task {
     title: String,
     status: Status,
     priority: Priority,
+    /// Сложность строки (#1689): сдвигает алиас модели этапа, в очередь не входит.
+    complexity: Complexity,
     automerge: bool,
     /// Прямое поручение владельца (#1357): строка рождается сразу в
     /// In Progress и финализируется агентом в Review, мимо фабричных
@@ -497,6 +535,7 @@ impl Task {
             title,
             status,
             priority: Priority::Empty,
+            complexity: Complexity::Regular,
             automerge: false,
             direct: false,
             fact_track: false,
@@ -545,6 +584,11 @@ impl Task {
         self.priority
     }
 
+    /// Сложность задачи (#1689): ось выбора модели, не очереди.
+    pub fn complexity(&self) -> Complexity {
+        self.complexity
+    }
+
     pub fn automerge(&self) -> bool {
         self.automerge
     }
@@ -580,6 +624,11 @@ impl Task {
     /// Управление приоритетом (владелец/триаж).
     pub fn set_priority(&mut self, p: Priority) {
         self.priority = p;
+    }
+
+    /// Запись сложности с носителя (снапшот/REST).
+    pub fn set_complexity(&mut self, complexity: Complexity) {
+        self.complexity = complexity;
     }
 
     /// Управление автомержем (владелец/триаж).
@@ -682,6 +731,11 @@ impl Task {
         if fields.priority != Priority::Empty {
             self.priority = fields.priority;
         }
+        // сложность — безусловная перезапись (#1689): Regular — валидное
+        // явное значение, совпадающее с дефолтом; мусор/пустое уже
+        // схлопнуты на границе носителя. Без этого смена High→Regular
+        // не доезжала бы через ленивый REST-путь.
+        self.complexity = fields.complexity;
         // direct — безусловная перезапись (#1616): скановое значение
         // ненадёжно (колонка Direct не прилинкована ни к одной доске —
         // всегда false), REST-носитель каноничен; Pv2-колонка, если

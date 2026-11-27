@@ -117,10 +117,12 @@ impl TickUseCase {
         // #1300: с пином агента дев-семья берёт модель из developer-ключа
         // карты (раньше шла по default-ключу); переход пинен тестом
         // dev_spawn_pins_the_developer_agent, ключи канонически одинаковы
+        let complexity = task.complexity();
         let work_model = match Agent::of_slot(slot) {
-            Some(agent) => self.models.for_agent(agent),
+            Some(agent) => self.models.for_agent_shifted(agent, complexity),
             None => self.models.for_default(),
         };
+        let model_label = format!("{}/{}", work_model.model.provider(), work_model.model.id());
         let work = sessions
             .create_session(&SessionSpec {
                 directory: env_repo.to_string(),
@@ -145,8 +147,17 @@ impl TickUseCase {
         // двойную доставку в новую сессию).
         self.state
             .clear_round_reentry_pending(&board.board, task.number());
+        let alias = Agent::of_slot(slot)
+            .and_then(|agent| self.models.alias_for_key(naming::agent_name(agent)))
+            .map(|alias| alias.as_str())
+            .unwrap_or("default");
         tracing::info!(event = "spawn.done", number = task.number(), slot = ?slot,
-            session = %work, env = %env_repo, "Spawn done");
+            session = %work, env = %env_repo,
+            complexity = crate::naming::complexity_name(complexity),
+            shift = complexity.shift(),
+            alias = alias,
+            model = %model_label,
+            "Spawn done");
         Ok(work)
     }
 
@@ -300,16 +311,19 @@ impl TickUseCase {
             Liveness::Alive => {
                 // будильник: пик держит не-high только у целевого провайдера
                 // (#1680); живой агент другого провайдера будится в окне.
+                let complexity = task.complexity();
                 let slot_model = Agent::of_slot(slot)
-                    .map(|agent| self.models.for_agent(agent))
+                    .map(|agent| self.models.for_agent_shifted(agent, complexity))
                     .unwrap_or_else(|| self.models.for_default());
-                if crate::spawn_models::peak_applies(&slot_model)
-                    && policy.peak.holds(now)
-                    && task.priority() != Priority::High
-                {
+                let slot_policy = crate::spawn_models::peak_policy_for_model(policy, &slot_model);
+                if slot_policy.peak.holds(now) && task.priority() != Priority::High {
                     tracing::info!(
                         event = "wakeup.deferred_peak",
                         number = task.number(),
+                        complexity = crate::naming::complexity_name(complexity),
+                        shift = complexity.shift(),
+                        alias = crate::naming::agent_name(Agent::of_slot(slot).unwrap_or(Agent::Developer)),
+                        model = %format!("{}/{}", slot_model.model.provider(), slot_model.model.id()),
                         "Wakeup deferred: peak window"
                     );
                     return Ok(WakeAct::Deferred);
@@ -391,12 +405,22 @@ impl TickUseCase {
                     }
                     None => {}
                 }
-                // респавн = фактический спавн — полный гейт (пик + CUP)
+                // респавн = фактический спавн — полный гейт (пик + CUP).
+                // Пик фильтруется по сдвинутой модели слота (#1689/#1680).
                 let spawn = Action::Spawn { slot };
-                if gate(task, &spawn, policy, global_active, now) != Gate::Allowed {
+                let complexity = task.complexity();
+                let slot_model = Agent::of_slot(slot)
+                    .map(|agent| self.models.for_agent_shifted(agent, complexity))
+                    .unwrap_or_else(|| self.models.for_default());
+                let slot_policy = crate::spawn_models::peak_policy_for_model(policy, &slot_model);
+                if gate(task, &spawn, slot_policy, global_active, now) != Gate::Allowed {
                     tracing::info!(
                         event = "respawn.held_by_policy",
                         number = task.number(),
+                        complexity = crate::naming::complexity_name(complexity),
+                        shift = complexity.shift(),
+                        alias = crate::naming::agent_name(Agent::of_slot(slot).unwrap_or(Agent::Developer)),
+                        model = %format!("{}/{}", slot_model.model.provider(), slot_model.model.id()),
                         "Respawn held: пик-окно/CUP"
                     );
                     return Ok(WakeAct::Deferred);
@@ -753,10 +777,15 @@ impl TickUseCase {
             return Ok(LostAct::Guarded);
         }
         let spawn = Action::Spawn { slot };
+        let complexity = task.complexity();
+        let slot_model = Agent::of_slot(slot)
+            .map(|agent| self.models.for_agent_shifted(agent, complexity))
+            .unwrap_or_else(|| self.models.for_default());
+        let slot_policy = crate::spawn_models::peak_policy_for_model(plan.policy, &slot_model);
         if gate(
             task,
             &spawn,
-            plan.policy,
+            slot_policy,
             global_active,
             self.clock.utc_minute(),
         ) != Gate::Allowed
@@ -764,6 +793,10 @@ impl TickUseCase {
             tracing::info!(
                 event = "lost.held_by_policy",
                 number = task.number(),
+                complexity = crate::naming::complexity_name(complexity),
+                shift = complexity.shift(),
+                alias = crate::naming::agent_name(Agent::of_slot(slot).unwrap_or(Agent::Developer)),
+                model = %format!("{}/{}", slot_model.model.provider(), slot_model.model.id()),
                 "Respawn потерянной сессии held: пик/CUP"
             );
             return Ok(LostAct::Deferred);
