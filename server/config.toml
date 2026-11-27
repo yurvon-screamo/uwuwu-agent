@@ -51,7 +51,8 @@ analyst-reviewer = "smart"
 dreamer = "common"
 
 [policy]
-cup = 10
+# ВРЕМЕННО 20 на время разбора инцидентов 27.11 (вернуть 10!) — uwuwu #1707/#1708
+cup = 20
 # пик-окно провайдера zai-coding-plan (GLM): будни 06:00–10:00 UTC
 # (минуты от полуночи UTC), off = false; этапы других провайдеров не откладываются (#1680)
 peak = { enabled = true, start_min = 360, end_min = 600 }
