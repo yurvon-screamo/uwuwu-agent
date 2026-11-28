@@ -1637,6 +1637,48 @@ mod tests {
         assert_eq!(task.session(Slot::ResultReview), None);
     }
 
+    /// Все канонические владельцы полей на границе `IssueFieldStore`:
+    /// каждое поле пишется в свой слот и читается обратно тем же полем.
+    /// Перебор идёт по контракту — новый владелец попадает в пин сам.
+    #[tokio::test]
+    async fn every_canonical_session_field_roundtrips_to_its_owner() {
+        use crate::github::{review_session_field, SESSION_FIELD_SLOTS};
+
+        // Arrange
+        let hub = MemoryHub::with_seed(Some((13, Status::ReviewTesting)));
+        hub.read_board("B").await.expect("сид");
+        let patch: Vec<_> = SESSION_FIELD_SLOTS
+            .iter()
+            .enumerate()
+            .map(|(i, &slot)| (review_session_field(slot), Some(format!("ses_owner{i}"))))
+            .collect();
+        // Act
+        IssueFieldStore::store(&hub, 13, &patch)
+            .await
+            .expect("запись канонических полей");
+        let fields = IssueFieldStore::load(&hub, 13).await.expect("поля");
+        let task = hub.issue_fields(13).await.expect("issue_fields");
+        // Assert: локальная сессия слота, а не равенство двух `Option`.
+        for (i, &slot) in SESSION_FIELD_SLOTS.iter().enumerate() {
+            let marker = format!("ses_owner{i}");
+            assert_eq!(
+                fields.get(review_session_field(slot)).map(String::as_str),
+                Some(marker.as_str()),
+                "поле слота {slot:?} прочитано не из своей сессии"
+            );
+            assert_eq!(
+                task.session(slot).map(|s| s.as_str()),
+                Some(marker.as_str()),
+                "слот {slot:?} получил чужую сессию"
+            );
+        }
+        // Design — псевдоним дев-поля, не отдельный владелец (#1237).
+        assert_eq!(
+            task.session(Slot::Design).map(|s| s.as_str()),
+            task.session(Slot::Dev).map(|s| s.as_str())
+        );
+    }
+
     /// Граница носителя (#1710): три сессии проходят полный round-trip
     /// через IssueFieldStore — три разных поля, снятие среднего не трогает
     /// крайние. До правки мок разворачивал план в результат, пин красный.
