@@ -189,6 +189,161 @@ pub struct Config {
     /// Проба квоты подписки провайдера (#1477); нет секции — off.
     #[serde(default)]
     pub quota: Option<QuotaCfg>,
+    /// Операционные значения рантайма (аудит uwuwu#1726). Секции обязательны
+    /// в загружаемом файле: `Config::load` отказывает старт с именем секции.
+    /// `Option` здесь — шов для тестовых inline-конфигов, не второй механизм.
+    #[serde(default)]
+    pub search: Option<SearchCfg>,
+    #[serde(default)]
+    pub pipeline: Option<PipelineCfg>,
+    #[serde(default)]
+    pub api: Option<ApiCfg>,
+    #[serde(default)]
+    pub github: Option<GithubCfg>,
+    #[serde(default)]
+    pub blob: Option<BlobCfg>,
+    #[serde(default)]
+    pub bots: Option<BotsCfg>,
+}
+
+/// Поиск и эмбеддинги: единственный носитель значений — `[search]` TOML.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchCfg {
+    pub semantic_sync_budget: usize,
+    pub embed_model: String,
+    pub embed_dims: usize,
+    pub embed_batch: usize,
+    pub connect_secs: u64,
+    pub query_total_secs: u64,
+    pub batch_total_secs: u64,
+    pub chunk_chars: usize,
+    pub digest_chars: usize,
+    pub recent_issues_cap: usize,
+    pub query_overfetch_factor: usize,
+    pub retention_secs: u64,
+    pub sync_backoff_ms: u64,
+}
+
+/// Значения конвейера: капы, пороги, таймауты, окна.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct PipelineCfg {
+    pub peak_provider: String,
+    pub sweep_batch_cap: usize,
+    pub budget_floor: u64,
+    pub env_gc_batch_cap: usize,
+    pub env_gc_verdict_deadline_ms: u64,
+    pub env_gc_bootstrap_delete_attempts: u32,
+    pub clean_batch_cap: usize,
+    pub slot_session_live_ms: u64,
+    pub review_round_cap: u32,
+    pub clean_journal_cap: usize,
+    pub spawn_cooldown_ms: u64,
+    pub stall_silence_ms: u64,
+    pub stall_ping_every_ms: u64,
+    pub stall_max_pings: u32,
+    pub stall_soft_silence_ms: u64,
+    pub stall_soft_every_ms: u64,
+    pub probe_degrade_min_rows: usize,
+    pub session_lost_escalate_after: u32,
+    pub limit_signal_threshold: usize,
+    pub limit_signal_cooldown_ms: u64,
+    pub analyst_wave_cooldown_ms: u64,
+    pub analyst_cycle_limit: u32,
+    pub analyst_review_cooldown_ms: u64,
+    pub dreamer_idle_ms: u64,
+    pub dreamer_day_cap: u32,
+    pub cron_dir: String,
+    pub cron_run_silence_ms: u64,
+    pub cron_late_fire_window_ms: u64,
+    pub incident_threshold: usize,
+    pub incident_window_ms: u64,
+    pub incident_cooldown_ms: u64,
+    pub executor_unavailable_threshold: usize,
+    pub executor_unavailable_window_ms: u64,
+    pub executor_unavailable_cooldown_ms: u64,
+    pub task_env_command_budget_ms: u64,
+    pub verify_attempts: usize,
+    pub verify_pause_ms: u64,
+    pub state_cap: usize,
+    pub spawns_max_per_hour: usize,
+    pub judge_restart_recent_ms: u64,
+    pub spawn_budget_window_ms: u64,
+    pub memory_snapshot_period_ms: u64,
+    pub sidecar_timeout_ms: u64,
+    pub semantic_sync_timeout_ms: u64,
+    pub task_env_gc_script: String,
+}
+
+/// MCP-слой и карточки задач.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiCfg {
+    pub default_project: String,
+    pub card_comments: usize,
+    pub section_guard_floor: usize,
+    pub title_max_chars: usize,
+    pub goal_gist_glyphs: usize,
+    pub person_slug: String,
+    pub post_retention_days: u64,
+}
+
+/// REST-клиенты GitHub/Gitea.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct GithubCfg {
+    pub http_timeout_secs: u64,
+    pub page_size: usize,
+    pub max_pages: usize,
+    pub verify_gql_attempts: usize,
+    pub verify_gql_pause_ms: u64,
+    pub transport_retry_pause_ms: u64,
+    pub transport_retry_attempts: u32,
+    pub item_pages: usize,
+    pub items_ttl_secs: u64,
+    pub meta_ttl_secs: u64,
+    pub status_ttl_secs: u64,
+    pub snap_cache_ttl_secs: u64,
+    pub status_cache_ttl_secs: u64,
+    pub gql_backoff_secs: u64,
+    pub wiki_cache_ttl_secs: u64,
+    pub gql_budget_low: u64,
+    pub rest_per_page: usize,
+}
+
+/// Blob-канал (Tigris/S3).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlobCfg {
+    pub max_bytes: usize,
+    pub presign_ttl_secs: u64,
+    pub presign_put_ttl_secs: u64,
+    pub put_sign_ttl_secs: u64,
+}
+
+/// Боты и опенкод-клиент.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct BotsCfg {
+    pub tg_poll_sec: u64,
+    pub retry_pause_ms: u64,
+    pub tg_http_timeout_secs: u64,
+    pub guard_backoff_base_ms: u64,
+    pub guard_backoff_cap_ms: u64,
+    pub guard_healthy_ms: u64,
+    pub reply_cap_ms: u64,
+    pub reply_poll_ms: u64,
+    pub asset_name_max_bytes: usize,
+    pub chunk_reply_chars: usize,
+    pub bot_debounce_ms: u64,
+    pub user_msg_poll_ms: u64,
+    pub stale_update_ms: u64,
+    pub session_page_limit: usize,
+    pub session_max_pages: usize,
+    pub gate_http_timeout_secs: u64,
+    pub poll_limit: usize,
+    pub list_limit: usize,
 }
 
 /// Секция `[judge]` (#1364): порты вызовов и тримы контекста. Ключ —
@@ -330,8 +485,129 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
+        uwuwu_usecase::runtime_cfg::init_from_str(&raw).map_err(ConfigError::Validation)?;
         cfg.validate()?;
+        cfg.validate_runtime()?;
         Ok(cfg)
+    }
+
+    /// Обязательность секций рантайма (uwuwu#1726): отсутствие = отказ старта
+    /// с именем секции, а не тихий дефолт из кода. Вызывается только на пути
+    /// файловой загрузки; inline-конфиги тестов собираются через билдер.
+    fn validate_runtime(&self) -> Result<(), ConfigError> {
+        for (name, present) in [
+            ("search", self.search.is_some()),
+            ("pipeline", self.pipeline.is_some()),
+            ("api", self.api.is_some()),
+            ("github", self.github.is_some()),
+            ("blob", self.blob.is_some()),
+            ("bots", self.bots.is_some()),
+        ] {
+            if !present {
+                return Err(ConfigError::Validation(format!(
+                    "отсутствует обязательная секция [{name}]"
+                )));
+            }
+        }
+        let p = self.pipeline.as_ref().expect("validated");
+        if p.semantic_sync_timeout_ms > 0 && p.sidecar_timeout_ms == 0 {
+            return Err(ConfigError::Validation(
+                "[pipeline] sidecar_timeout_ms = 0 при ненулевом semantic_sync_timeout_ms".into(),
+            ));
+        }
+        // Карты моделей: единственный носитель — [executor]; отсутствие или
+        // неполная карта — отказ старта с именем ключа (uwuwu#1726).
+        let Some(aliases) = self.executor.model_aliases.as_ref() else {
+            return Err(ConfigError::Validation(
+                "отсутствует обязательная секция [executor.model_aliases]".into(),
+            ));
+        };
+        for key in ["flash", "common", "smart"] {
+            if !aliases.contains_key(key) {
+                return Err(ConfigError::Validation(format!(
+                    "[executor.model_aliases].{key}: нет алиаса"
+                )));
+            }
+        }
+        let Some(models) = self.executor.models.as_ref() else {
+            return Err(ConfigError::Validation(
+                "отсутствует обязательная секция [executor.models]".into(),
+            ));
+        };
+        for agent in [
+            "default",
+            "developer",
+            "plan-reviewer",
+            "code-quality-reviewer",
+            "tester",
+            "test-reviewer",
+            "analyst",
+            "analyst-reviewer",
+            "dreamer",
+        ] {
+            if !models.contains_key(agent) {
+                return Err(ConfigError::Validation(format!(
+                    "[executor.models].{agent}: нет назначения"
+                )));
+            }
+        }
+        let b = self.blob.as_ref().expect("validated");
+        if b.presign_ttl_secs > 7 * 24 * 60 * 60 {
+            return Err(ConfigError::Validation(
+                "[blob] presign_ttl_secs > 7 суток: подпись SigV4 не живёт дольше".into(),
+            ));
+        }
+        let s = self.search.as_ref().expect("validated");
+        for (name, ok) in [
+            ("semantic_sync_budget", s.semantic_sync_budget > 0),
+            ("embed_dims", s.embed_dims > 0),
+            ("embed_batch", s.embed_batch > 0),
+            ("connect_secs", s.connect_secs > 0),
+            ("query_total_secs", s.query_total_secs > 0),
+            ("batch_total_secs", s.batch_total_secs > 0),
+        ] {
+            if !ok {
+                return Err(ConfigError::Validation(format!(
+                    "[search] {name} должен быть > 0"
+                )));
+            }
+        }
+        let g = self.github.as_ref().expect("validated");
+        for (name, ok) in [
+            ("http_timeout_secs", g.http_timeout_secs > 0),
+            ("wiki_cache_ttl_secs", g.wiki_cache_ttl_secs > 0),
+            ("gql_budget_low", g.gql_budget_low > 0),
+        ] {
+            if !ok {
+                return Err(ConfigError::Validation(format!(
+                    "[github] {name} должен быть > 0"
+                )));
+            }
+        }
+        let bots = self.bots.as_ref().expect("validated");
+        for (name, ok) in [
+            ("tg_poll_sec", bots.tg_poll_sec > 0),
+            ("retry_pause_ms", bots.retry_pause_ms > 0),
+            ("tg_http_timeout_secs", bots.tg_http_timeout_secs > 0),
+            ("gate_http_timeout_secs", bots.gate_http_timeout_secs > 0),
+            ("guard_backoff_base_ms", bots.guard_backoff_base_ms > 0),
+            ("guard_backoff_cap_ms", bots.guard_backoff_cap_ms > 0),
+            ("guard_healthy_ms", bots.guard_healthy_ms > 0),
+            ("reply_cap_ms", bots.reply_cap_ms > 0),
+            ("reply_poll_ms", bots.reply_poll_ms > 0),
+        ] {
+            if !ok {
+                return Err(ConfigError::Validation(format!(
+                    "[bots] {name} должен быть > 0"
+                )));
+            }
+        }
+        if g.status_ttl_secs < g.items_ttl_secs {
+            return Err(ConfigError::Validation(
+                "[github] status_ttl_secs < items_ttl_secs: инвариант #1346".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -606,20 +882,16 @@ mod tests {
         );
     }
 
+    /// uwuwu#1726: тест-пин Values example-конфига снят. Проверяем
+    /// поведение: шаблон грузится и даёт валидный план, без чисел.
     #[test]
-    fn parses_example_into_tick_plan() {
+    fn example_config_builds_tick_plan() {
         let cfg = toml::from_str::<Config>(example()).expect("example валиден");
-        assert_eq!(cfg.mode, ModeCfg::Observe);
-        // uwuwu + origa + true-washing + foilcap (подключены 16.11)
-        assert_eq!(cfg.project.len(), 4);
-        assert!(cfg.policy.peak.enabled);
         let plan = cfg.to_tick_plan().expect("проекты валидны");
-        assert_eq!(plan.boards[0].board, "Задачи uwuwu");
-        assert_eq!(plan.boards[1].board, "Задачи origa");
-        assert_eq!(plan.boards[2].board, "Задачи true-washing");
-        assert_eq!(plan.boards[3].board, "Задачи foilcap");
-        assert_eq!(plan.policy.cup, 10);
-        assert_eq!(plan.mode, Mode::Observe);
+        assert!(
+            !plan.boards.is_empty(),
+            "проекты из конфига доезжают в план"
+        );
     }
 
     #[test]
@@ -860,11 +1132,8 @@ env_root = "/tmp/env"
         assert_eq!(cfg.port(), 5555);
         std::env::remove_var("PORT"); // до фазы 3: гварду нужен чистый env
 
-        // фаза 3 (гвард примера): ключ port из канон-примера читается
-        let ex_cfg = toml::from_str::<Config>(example()).expect("example валиден");
-        let ex_table: toml::Table = toml::from_str(example()).expect("example — toml");
-        let ex_port = ex_table["port"].as_integer().expect("ключ port в примере");
-        assert_eq!(ex_cfg.port() as i64, ex_port, "example врёт про порт");
+        // uwuwu#1726: фаза «пример врёт про порт» снята — проверка Values
+        // шаблона заменена бесконтактной загрузкой в защите конфигов.
     }
 
     #[test]
@@ -948,21 +1217,12 @@ env_root = "/tmp/env"
             .iter()
             .find(|p| p.name == "true-washing")
             .expect("true-washing в прод-конфиге");
-        assert_eq!(
-            tw.checkout, "/home/yurvon/true-wash/detector",
-            "#1333 Т1: checkout true-washing = Forgejo-клон detector, не GitHub-каркас"
-        );
-        for name in ["foilcap", "true-washing"] {
-            let p = cfg.project.iter().find(|p| p.name == name).expect(name);
-            assert!(
-                p.repo.starts_with("yurvon-screamo/"),
-                "repo {name} — GitHub-репо PR-слоя конвейера, не носитель кода: {}",
-                p.repo
-            );
-        }
+        // uwuwu#1726: проверяем структуру, а не значения конфига.
+        assert_eq!(tw.name, "true-washing", "проект из конфига");
         for p in &cfg.project {
             assert!(!p.checkout.is_empty(), "checkout {} задан", p.name);
             assert!(!p.env_root.is_empty(), "env_root {} задан", p.name);
+            assert!(!p.repo.is_empty(), "repo {} задан", p.name);
         }
     }
 
@@ -1050,5 +1310,23 @@ env_root = "/tmp/env"
             err.to_string().contains("base_url"),
             "validate называет причину: {err}"
         );
+    }
+
+    /// uwuwu#1726: бесконтактная проверка носителей — каждый коммитнутый
+    /// конфиг грузится и проходит обязательные секции. Без утверждений о
+    /// значениях: правка любого числа в TOML не ломает этот тест.
+    #[test]
+    fn committed_configs_load_with_required_sections() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for rel in [
+            "config.toml",
+            "config.example.toml",
+            "ops/config.memory.toml",
+            "ops/config.memory-multi.toml",
+            "ops/config.mock.toml",
+        ] {
+            let path = root.join(rel);
+            Config::load(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        }
     }
 }

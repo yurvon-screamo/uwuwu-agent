@@ -4,7 +4,7 @@
 
 use std::time::Instant;
 
-use super::{EnvGcGone, EnvGcOutcome, ENV_GC_VERDICT_DEADLINE_MS, TASK_ENV_GC_SCRIPT};
+use super::{EnvGcGone, EnvGcOutcome, TASK_ENV_GC_SCRIPT};
 use crate::router::Gateway;
 use uwuwu_domain::{sighting_is_live, SessionSighting, Task};
 
@@ -210,7 +210,11 @@ pub(super) async fn collect_verdicts(ctx: &mut VerdictCtx<'_>) {
     let command = batch_command(targets);
     let started = Instant::now();
     let output = match sessions
-        .run_shell(bootstrap, &command, ENV_GC_VERDICT_DEADLINE_MS)
+        .run_shell(
+            bootstrap,
+            &command,
+            crate::pipeline::env_gc::env_gc_verdict_deadline_ms(),
+        )
         .await
     {
         Ok(output) => {
@@ -227,7 +231,7 @@ pub(super) async fn collect_verdicts(ctx: &mut VerdictCtx<'_>) {
                 event = "env.gc_fail",
                 board = board_name,
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                budget_ms = ENV_GC_VERDICT_DEADLINE_MS,
+                budget_ms = crate::pipeline::env_gc::env_gc_verdict_deadline_ms(),
                 batch = targets.len(),
                 error = %e,
                 "Скрипт сноса не исполнен — батч переедет следующим проходом"

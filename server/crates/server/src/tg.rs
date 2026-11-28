@@ -36,7 +36,9 @@ impl TelegramClient {
             base: base.trim_end_matches('/').to_string(),
             token,
             http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(35))
+                .timeout(Duration::from_secs(
+                    uwuwu_usecase::runtime_cfg::bots::tg_http_timeout_secs(),
+                ))
                 .build()
                 .expect("reqwest client"),
         }

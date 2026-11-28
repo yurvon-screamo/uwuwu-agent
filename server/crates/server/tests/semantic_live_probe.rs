@@ -16,7 +16,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use search::semantic::{OllamaEmbeddings, EMBED_MODEL};
+use search::semantic::{embed_model, OllamaEmbeddings};
 use search::semantic_backend::LanceSemanticBackend;
 use serde_json::Value;
 use uwuwu_usecase::{
@@ -268,7 +268,7 @@ fn embedder_from_env() -> OllamaEmbeddings {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .expect("UWUWU_EMBED_URL (живая проба; на kisa — http://127.0.0.1:11434)");
-    OllamaEmbeddings::new(url, EMBED_MODEL.to_string())
+    OllamaEmbeddings::new(url, embed_model().to_string())
 }
 
 fn init_json_logs() {

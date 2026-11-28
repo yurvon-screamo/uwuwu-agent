@@ -21,7 +21,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Батч-кап чистки (свойство клина холодного ящика: 50/проход).
-pub const CLEAN_BATCH_CAP: usize = 50;
+pub fn clean_batch_cap() -> usize {
+    crate::runtime_cfg::pipeline::clean_cap()
+}
 
 /// Свежая привязка строки к доске (мимо всех кэшей) — identity сноса.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,10 +210,11 @@ impl TaskCleanUseCase {
         let mut uniq: Vec<u64> = numbers.to_vec();
         uniq.sort_unstable();
         uniq.dedup();
-        if uniq.len() > CLEAN_BATCH_CAP {
+        if uniq.len() > clean_batch_cap() {
             return Err(UsecaseError::Board(format!(
-                "a batch of {} rows — the cap is {CLEAN_BATCH_CAP} (split the calls)",
-                uniq.len()
+                "a batch of {} rows — the cap is {} (split the calls)",
+                uniq.len(),
+                clean_batch_cap()
             )));
         }
         Ok(uniq)
@@ -952,11 +955,12 @@ mod tests {
     // --- батч-кап и конфиг ---
 
     #[tokio::test]
-    async fn batch_cap_rejects_over_50() {
+    async fn batch_cap_rejects_over_configured_cap() {
         let (u, _, _) = rig();
-        let numbers: Vec<u64> = (1..=51).collect();
-        let err = u.plan("uwuwu", &numbers).await.expect_err("кап 50");
-        assert!(err.to_string().contains("50"), "текст: {err}");
+        let cap = clean_batch_cap();
+        let numbers: Vec<u64> = (1..=cap as u64 + 1).collect();
+        let err = u.plan("uwuwu", &numbers).await.expect_err("кап из конфига");
+        assert!(err.to_string().contains(&cap.to_string()), "текст: {err}");
     }
 
     #[tokio::test]

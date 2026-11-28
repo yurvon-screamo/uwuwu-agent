@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use search::semantic::{ClientTimeouts, Embedder, OllamaEmbeddings, EMBED_MODEL, EMBED_MODEL_DIMS};
+use search::semantic::{embed_model, search_dims, ClientTimeouts, Embedder, OllamaEmbeddings};
 use search::semantic_backend::LanceSemanticBackend;
 use search::support::{lance_dir, FakeWiki, FixedEmbedder, TempDirGuard};
 use serde_json::Value;
@@ -116,8 +116,8 @@ impl MockEmbed {
                     .len();
                 sink.lock().expect("lock").push(req);
                 let answer = serde_json::json!({
-                    "model": EMBED_MODEL,
-                    "embeddings": vec![vec![0.0f32; EMBED_MODEL_DIMS]; inputs],
+                    "model": embed_model(),
+                    "embeddings": vec![vec![0.0f32; search_dims()]; inputs],
                 })
                 .to_string();
                 let resp = format!(
@@ -171,13 +171,13 @@ fn inputs(body: &str) -> Vec<String> {
 #[tokio::test]
 async fn request_contract_pins_method_path_model_and_prefixes() {
     let mock = MockEmbed::spawn(2);
-    let client = OllamaEmbeddings::new(mock.url.clone(), EMBED_MODEL.to_string());
+    let client = OllamaEmbeddings::new(mock.url.clone(), embed_model().to_string());
 
     let qv = client
         .embed_query("лимиты эмбеддингов")
         .await
         .expect("живой query-контракт");
-    assert_eq!(qv.len(), EMBED_MODEL_DIMS, "query-вектор 768-dim");
+    assert_eq!(qv.len(), search_dims(), "query-вектор 768-dim");
     let docs = vec![
         ("Projects/x".to_string(), "текст один".to_string()),
         (String::new(), "без тайтла".to_string()),
@@ -191,14 +191,14 @@ async fn request_contract_pins_method_path_model_and_prefixes() {
         assert_eq!(req.line, "POST /api/embed HTTP/1.1", "метод и путь");
     }
     let query: Value = serde_json::from_str(&requests[0].body).expect("query json");
-    assert_eq!(query["model"], Value::String(EMBED_MODEL.to_string()));
+    assert_eq!(query["model"], Value::String(embed_model().to_string()));
     assert_eq!(
         query["input"],
         serde_json::json!(["task: search result | query: лимиты эмбеддингов"]),
         "query — ровно один текст с task-префиксом"
     );
     let batch: Value = serde_json::from_str(&requests[1].body).expect("batch json");
-    assert_eq!(batch["model"], Value::String(EMBED_MODEL.to_string()));
+    assert_eq!(batch["model"], Value::String(embed_model().to_string()));
     assert_eq!(
         batch["input"],
         serde_json::json!([
@@ -209,32 +209,38 @@ async fn request_contract_pins_method_path_model_and_prefixes() {
     );
 }
 
-/// Размер батча и production-таймауты — часть контракта из описания PR.
+/// uwuwu#1726: батч и таймауты — значения из конфига, без литералов в тесте.
+/// Правка ключа [search] не требует правки кода или теста.
 #[tokio::test]
-async fn batch_size_and_timeouts_match_the_contract() {
+async fn batch_size_and_timeouts_follow_config() {
+    use uwuwu_usecase::runtime_cfg::search;
     let timeouts = ClientTimeouts::default();
-    assert_eq!(timeouts.connect, Duration::from_secs(2));
-    assert_eq!(timeouts.query_total, Duration::from_secs(15));
-    assert_eq!(timeouts.batch_total, Duration::from_secs(60));
+    assert_eq!(
+        timeouts.connect,
+        Duration::from_secs(search::connect_secs())
+    );
+    assert_eq!(
+        timeouts.query_total,
+        Duration::from_secs(search::query_total_secs())
+    );
+    assert_eq!(
+        timeouts.batch_total,
+        Duration::from_secs(search::batch_total_secs())
+    );
 
+    let batch = search::batch();
     let mock = MockEmbed::spawn(2);
-    let client = OllamaEmbeddings::new(mock.url.clone(), EMBED_MODEL.to_string());
-    // Литералы, не константа из прода: иначе мутация размера батча остаётся
-    // невидимой — тест считал бы 40 как EMBED_BATCH+2.
-    let docs: Vec<_> = (0..40)
+    let client = OllamaEmbeddings::new(mock.url.clone(), embed_model());
+    let docs: Vec<_> = (0..batch + 2)
         .map(|i| (format!("T{i}"), format!("текст {i}")))
         .collect();
     let vecs = client.embed_docs(&docs).await.expect("два батча");
-    assert_eq!(vecs.len(), 40);
+    assert_eq!(vecs.len(), batch + 2);
 
     let requests = mock.requests();
-    assert_eq!(requests.len(), 2, "40 текстов — два вызова");
-    assert_eq!(
-        inputs(&requests[0].body).len(),
-        38,
-        "первый батч: 38 текстов"
-    );
-    assert_eq!(inputs(&requests[1].body).len(), 2, "второй батч: 2 текста");
+    assert_eq!(requests.len(), 2, "два вызова: батч и хвост");
+    assert_eq!(inputs(&requests[0].body).len(), batch, "первый батч");
+    assert_eq!(inputs(&requests[1].body).len(), 2, "второй батч: хвост");
 }
 
 /// NFT-1: URL задан, но Ollama недоступна — секция semantic честно пишет
@@ -260,7 +266,7 @@ async fn dead_ollama_renders_unavailable_while_fulltext_lives() {
     }
     let dead = Arc::new(OllamaEmbeddings::new(
         "http://127.0.0.1:1".to_string(),
-        EMBED_MODEL.to_string(),
+        embed_model().to_string(),
     ));
     let backend = LanceSemanticBackend::open(dir, wiki, None, dead)
         .await

@@ -21,6 +21,7 @@ mod ports;
 mod router;
 #[cfg(test)]
 mod router_tests;
+pub mod runtime_cfg;
 mod search;
 #[cfg(test)]
 mod search_tests;
@@ -82,9 +83,9 @@ pub use tasks::board_status::{
 };
 pub use tasks::body_hash;
 pub use tasks::clean::{
-    CleanBoardRepo, CleanExecReport, CleanJournal, CleanJournalStore, CleanRow, CleanRowReport,
-    CleanVerdict, IssueProbe, RowBinding, TaskCleanUseCase, UndoOutcome, UndoReport,
-    CLEAN_BATCH_CAP,
+    clean_batch_cap, CleanBoardRepo, CleanExecReport, CleanJournal, CleanJournalStore, CleanRow,
+    CleanRowReport, CleanVerdict, IssueProbe, RowBinding, TaskCleanUseCase, UndoOutcome,
+    UndoReport,
 };
 pub use tasks::views::{sanitize_slug, DocsView, PersonView, TaskView};
 pub use tasks::write::{

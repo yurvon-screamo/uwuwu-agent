@@ -9,12 +9,13 @@ mod pv2_parse;
 #[cfg(test)]
 mod pv2_tests;
 
-/// Жёсткий таймаут исходящих HTTP GitHub-контура (#1502): клиент без таймаута
-/// при зависшем запросе (GitHub edge не отвечает) блокирует однопоточный
-/// tick_loop навсегда — инцидент 22.11 (gql 502-деградация + вечное висение,
-/// фабрика парализована). 120 c — выше максимального легитимного
-/// наблюдаемого запроса (~40 c снапшот), ниже poll_sec (180 c).
-pub(crate) const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Жёсткий таймаут HTTP-клиентов контура (#1502): клиент без таймаута при
+/// зависшем запросе блокирует однопоточный tick_loop. Значение — из
+/// `[github] http_timeout_secs` config.toml; положительность проверяется
+/// на старте (`Config::validate_runtime`).
+pub(crate) fn http_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(uwuwu_usecase::runtime_cfg::github::http_timeout_secs())
+}
 
 pub use fields::{
     review_session_field, session_field_slot, session_slots, LEGACY_REVIEW_SESSION,

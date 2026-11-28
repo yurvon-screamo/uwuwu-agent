@@ -228,7 +228,9 @@ impl OpencodeClient {
             password,
             http: reqwest::Client::builder()
                 .default_headers(headers)
-                .timeout(Duration::from_secs(20))
+                .timeout(Duration::from_secs(
+                    uwuwu_usecase::runtime_cfg::bots::gate_http_timeout_secs(),
+                ))
                 .build()
                 .expect("reqwest client"),
             model_limits: std::sync::Mutex::new(std::collections::HashMap::new()),

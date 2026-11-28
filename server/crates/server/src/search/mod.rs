@@ -8,10 +8,13 @@ mod query;
 mod semantic;
 mod semantic_backend;
 
-pub use semantic::{Embedder, OllamaEmbeddings, EMBED_MODEL};
+pub use semantic::{embed_model, Embedder, OllamaEmbeddings};
 pub use semantic_backend::LanceSemanticBackend;
 
 /// Документов за один тик semantic-sync: емкостный гард, а не квотный
 /// (#1363 → #1687). Лимита по времени нет — тик идёт до завершения (#1730);
-/// остальные сайдкары ограничены `SIDECAR_TIMEOUT` в `main.rs`.
-pub const SEMANTIC_SYNC_BUDGET: usize = 512;
+/// остальные сайдкары ограничены `[pipeline] sidecar_timeout_ms`.
+/// Значение — из `[search] semantic_sync_budget` config.toml (uwuwu#1726).
+pub fn semantic_sync_budget() -> usize {
+    uwuwu_usecase::runtime_cfg::search::budget()
+}

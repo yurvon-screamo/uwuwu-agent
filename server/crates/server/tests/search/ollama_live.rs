@@ -2,7 +2,7 @@
 //! прямой адрес Ollama на kisa (private relay из tests недостижим), расход —
 //! два запроса на прогон. Контракт: батч → 768-dim, query → один 768-вектор.
 
-use crate::search::semantic::{Embedder, OllamaEmbeddings, EMBED_MODEL, EMBED_MODEL_DIMS};
+use crate::search::semantic::{embed_model, search_dims, Embedder, OllamaEmbeddings};
 
 fn endpoint() -> String {
     std::env::var("UWUWU_EMBED_URL")
@@ -16,7 +16,7 @@ async fn live_ollama_client_embeds_docs_and_query() {
     if std::env::var("UWUWU_E2E").as_deref() != Ok("1") {
         return;
     }
-    let client = OllamaEmbeddings::new(endpoint(), EMBED_MODEL.to_string());
+    let client = OllamaEmbeddings::new(endpoint(), embed_model().to_string());
 
     let docs = vec![
         (
@@ -28,17 +28,14 @@ async fn live_ollama_client_embeds_docs_and_query() {
     let vecs = client.embed_docs(&docs).await.expect("живой док-батч");
     assert_eq!(vecs.len(), 2, "по вектору на каждый вход");
     assert!(
-        vecs.iter().all(|v| v.len() == EMBED_MODEL_DIMS),
-        "векторы {EMBED_MODEL_DIMS}-dim"
+        vecs.iter().all(|v| v.len() == search_dims()),
+        "векторы {}-dim",
+        search_dims()
     );
 
     let qv = client
         .embed_query("лимиты эмбеддингов")
         .await
         .expect("живой query");
-    assert_eq!(
-        qv.len(),
-        EMBED_MODEL_DIMS,
-        "query-вектор той же размерности"
-    );
+    assert_eq!(qv.len(), search_dims(), "query-вектор той же размерности");
 }

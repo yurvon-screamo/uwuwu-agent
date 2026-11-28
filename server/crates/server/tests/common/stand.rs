@@ -229,12 +229,20 @@ pub async fn spawn_stand(dir: &Path, opts: StandOptions<'_>) -> Stand {
     let config = format!(
         "mode = \"live\"\npoll_sec = 10\nport = {server_port}\n\n\
          {config_extra}\
+         {models}\
+         {runtime}\
          [hub]\nrepo = \"e2e/hub\"\ndriver = \"memory\"\n\n\
          [executor]\nname = \"mock\"\nurl = \"http://127.0.0.1:{executor_port}\"\n\n\
          [policy]\ncup = 2\n\n[policy.peak]\nenabled = false\nstart_min = 360\nend_min = 600\n\n\
          [[project]]\nname = \"stand\"\nboard = \"stand\"\nrepo = \"e2e/stand\"\n\
          checkout = \"{dir}/checkout\"\nenv_root = \"{dir}\"\n",
         config_extra = opts.config_extra,
+        models = if opts.config_extra.contains("[executor.model_aliases]") {
+            ""
+        } else {
+            super::DEFAULT_MODELS
+        },
+        runtime = super::RUNTIME_CFG,
         dir = dir.display()
     );
     std::fs::create_dir_all(dir.join("checkout")).expect("checkout");

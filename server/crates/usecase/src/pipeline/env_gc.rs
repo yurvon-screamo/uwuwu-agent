@@ -23,14 +23,18 @@ use row::{collect_verdicts, preflight_row, revalidate_row};
 
 /// Батч-кап прохода (путь клина): rm мульти-ГБ каталогов медленный,
 /// остаток переезжает следующими проходами.
-pub const ENV_GC_BATCH_CAP: usize = 20;
+pub fn env_gc_batch_cap() -> usize {
+    crate::runtime_cfg::pipeline::env_gc_cap()
+}
 
 /// Бюджет прохода (мс): пост-батчинг это цена прохода, а не строки —
 /// скрипт батча исполняется внутри синхронного POST shell (проба
 /// #1526: ответ после полного завершения shell-блока), per-request
 /// таймаут команды обязан его покрывать; недождённые строки переезжают
 /// следующим проходом.
-pub const ENV_GC_VERDICT_DEADLINE_MS: u64 = 15 * 60_000;
+pub fn env_gc_verdict_deadline_ms() -> u64 {
+    crate::runtime_cfg::pipeline::env_gc_deadline_ms()
+}
 
 /// Прямой вызов скрипта сноса в cwd bootstrap-сессии (чекаут проекта).
 /// Абсолютный $HOME-путь — как было в шаблоне slash-команды: носитель
@@ -249,7 +253,7 @@ pub async fn sweep_envs(ctx: &EnvGcCtx<'_>, policy: EnvGcPolicy) -> UsecaseResul
             updated_ms: s.updated_ms,
         })
         .collect();
-    let targets: Vec<&Task> = candidates.into_iter().take(ENV_GC_BATCH_CAP).collect();
+    let targets: Vec<&Task> = candidates.into_iter().take(env_gc_batch_cap()).collect();
     // Рипер протухших bootstrap-сессий — до создания своей, чтобы не
     // задеть текущий проход (титулы совпадают, своих id ещё нет).
     reap_stale_bootstraps(ctx.sessions, ctx.board_name, &list).await;

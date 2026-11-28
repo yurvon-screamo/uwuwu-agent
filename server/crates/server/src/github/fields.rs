@@ -4,7 +4,7 @@
 //! issue.issue_field_values (inline в GET issue), запись — батч POST,
 //! очистка — DELETE (404 = no-op). Живые пробы: старый cli (#1092).
 
-use super::HTTP_TIMEOUT;
+use super::http_timeout;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -130,7 +130,7 @@ impl IssueFields {
             token,
             http: reqwest::Client::builder()
                 .user_agent(concat!("uwuwu-server/", env!("CARGO_PKG_VERSION")))
-                .timeout(HTTP_TIMEOUT)
+                .timeout(http_timeout())
                 .build()
                 .expect("reqwest client"),
             catalog: Mutex::new(None),

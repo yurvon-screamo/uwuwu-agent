@@ -2,18 +2,22 @@
 //! flash/common/smart, агенты и `default` ссылаются на алиас. Сервер кладёт
 //! модель в тело спавна (`SessionSpec.model`), деф-файлы агентов моделей
 //! не несут. Уровень алиаса доступен в рантайме для сдвига из #1689.
+//! Значения карты — только в `[executor]` config.toml (uwuwu#1726):
+//! `canonical()` читает загруженный конфиг, код-канон удалён.
 
 use crate::model_aliases::{ModelAlias, ModelAliases};
 use crate::naming;
 use std::collections::HashMap;
 use uwuwu_domain::{Agent, Complexity, SpawnModel, SpawnPolicy};
 
-/// Провайдер, для которого действует peak-окно (#1679/#1680).
-pub const PEAK_PROVIDER: &str = "zai-coding-plan";
+/// Провайдер peak-окна живёт в `[pipeline] peak_provider` config.toml (uwuwu#1726).
+pub fn peak_provider() -> String {
+    crate::runtime_cfg::pipeline::peak_provider()
+}
 
 /// Peak-гейт применяется только к этапам целевого провайдера.
 pub fn peak_applies(model: &SpawnModel) -> bool {
-    model.model.provider() == PEAK_PROVIDER
+    model.model.provider() == peak_provider()
 }
 
 /// Один механизм фильтра пика для всех четырёх точек гейта (#1680/#1689):
@@ -33,20 +37,16 @@ pub fn peak_policy_for_model(policy: SpawnPolicy, model: &SpawnModel) -> SpawnPo
 /// common — tester/dreamer, smart — ревьюверы; 27.11 (#1693) tester → flash,
 /// живой конфиг не менялся, канон и `config.example.toml` следуют за ним.
 pub fn canonical_assignments() -> HashMap<String, ModelAlias> {
-    HashMap::from([
-        ("default", ModelAlias::Flash),
-        ("developer", ModelAlias::Flash),
-        ("plan-reviewer", ModelAlias::Smart),
-        ("code-quality-reviewer", ModelAlias::Smart),
-        ("tester", ModelAlias::Flash),
-        ("test-reviewer", ModelAlias::Smart),
-        ("analyst", ModelAlias::Flash),
-        ("analyst-reviewer", ModelAlias::Smart),
-        ("dreamer", ModelAlias::Common),
-    ])
-    .into_iter()
-    .map(|(key, alias)| (key.to_string(), alias))
-    .collect()
+    crate::runtime_cfg::executor::models()
+        .into_iter()
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                ModelAlias::parse(&value)
+                    .unwrap_or_else(|error| panic!("config.toml [executor.models].{key}: {error}")),
+            )
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]

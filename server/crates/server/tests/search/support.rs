@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use uwuwu_usecase::{UsecaseResult, WikiRepo};
 
-use super::semantic::{Embedder, EMBED_MODEL_DIMS};
+use super::semantic::{search_dims, Embedder};
 
 /// Фейк вики-репо: (markdown, git-sha) по слагу.
 pub struct FakeWiki {
@@ -55,14 +55,11 @@ pub struct FixedEmbedder;
 #[async_trait]
 impl Embedder for FixedEmbedder {
     async fn embed_docs(&self, docs: &[(String, String)]) -> UsecaseResult<Vec<Vec<f32>>> {
-        Ok(docs
-            .iter()
-            .map(|_| vec![0.0f32; EMBED_MODEL_DIMS])
-            .collect())
+        Ok(docs.iter().map(|_| vec![0.0f32; search_dims()]).collect())
     }
 
     async fn embed_query(&self, _query: &str) -> UsecaseResult<Vec<f32>> {
-        Ok(vec![0.0f32; EMBED_MODEL_DIMS])
+        Ok(vec![0.0f32; search_dims()])
     }
 }
 

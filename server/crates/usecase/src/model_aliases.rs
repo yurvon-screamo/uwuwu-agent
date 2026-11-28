@@ -73,11 +73,8 @@ impl ModelAliases {
     /// Канон владельца: smart — как раньше, common с 27.11 — та же raw-модель,
     /// что и flash (решение владельца; совпадение уровней допустимо временно).
     pub fn canonical() -> Self {
-        Self::new(
-            SpawnModel::parse("opencode-go/hy4-flash-free#high").expect("канон-алиас flash"),
-            SpawnModel::parse("opencode-go/hy4-flash-free#high").expect("канон-алиас common"),
-            SpawnModel::parse("zai-coding-plan/glm-5.4#high").expect("канон-алиас smart"),
-        )
+        let raw = crate::runtime_cfg::executor::aliases();
+        Self::from_map(&raw).expect("config.toml [executor.model_aliases]: валидный канон")
     }
 
     pub fn get(&self, alias: ModelAlias) -> &SpawnModel {

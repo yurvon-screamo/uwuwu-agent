@@ -11,12 +11,16 @@ use uwuwu_domain::Task;
 /// Батч-кап прохода: первая волна порядка сотен кандидатов размазывается
 /// по тикам (полсотни мутаций за проход при poll 180 c ≈ полчаса на
 /// первую волну), а не бьёт по GraphQL-бюджету залпом.
-pub const SWEEP_BATCH_CAP: usize = 50;
+pub fn sweep_batch_cap() -> usize {
+    crate::runtime_cfg::pipeline::sweep_cap()
+}
 
 /// Бюджет-гайд: мутации клина живут в том же часовом окне, что фича
 /// спасает — при remaining ниже порога архивации приостанавливаются
 /// до следующего тика (остаток волны переезжает, ничего не теряется).
-pub const BUDGET_FLOOR: u64 = 500;
+pub fn budget_floor() -> u64 {
+    crate::runtime_cfg::pipeline::budget_floor()
+}
 
 /// Итог прохода по одной доске (наблюдаемость первой волны).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -83,10 +87,10 @@ pub async fn sweep_board(
         }
         return Ok(out);
     }
-    for t in candidates.into_iter().take(SWEEP_BATCH_CAP) {
+    for t in candidates.into_iter().take(sweep_batch_cap()) {
         if board
             .gql_budget_remaining()
-            .is_some_and(|remaining| remaining < BUDGET_FLOOR)
+            .is_some_and(|remaining| remaining < budget_floor())
         {
             out.deferred_budget = out.candidates - out.archived - out.failed;
             tracing::warn!(

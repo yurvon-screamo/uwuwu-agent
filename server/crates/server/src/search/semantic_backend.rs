@@ -3,7 +3,7 @@
 //! Эмбеддинги — локальная Ollama embeddinggemma-2 через Embedder-трейт (#1687).
 //! Инкремент — doc_hash в мета-таблице.
 
-use crate::search::semantic::{chunk_text, Embedder, EMBED_MODEL_DIMS};
+use crate::search::semantic::{chunk_text, search_dims, Embedder};
 use async_trait::async_trait;
 use lancedb::arrow::arrow_array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, Int64Array, LargeStringArray,
@@ -66,7 +66,7 @@ fn vector_dim(schema: &ArrowSchema) -> Option<usize> {
 /// True — таблицы подлежат сносу (переиндексирует штатный sync).
 fn dims_stale(dim: Option<usize>) -> bool {
     match dim {
-        Some(d) => d != EMBED_MODEL_DIMS,
+        Some(d) => d != search_dims(),
         None => false, // нет таблицы/колонки — гарду делать нечего
     }
 }
@@ -80,7 +80,7 @@ fn chunks_schema() -> Arc<ArrowSchema> {
             "vector",
             DataType::FixedSizeList(
                 Arc::new(ArrowField::new("item", DataType::Float32, true)),
-                EMBED_MODEL_DIMS as i32,
+                search_dims() as i32,
             ),
             false,
         ),
@@ -125,7 +125,7 @@ impl LanceSemanticBackend {
             if dims_stale(dim) {
                 tracing::warn!(
                     event = "semantic.dim_migration",
-                    old_dim = ?dim, new_dim = EMBED_MODEL_DIMS,
+                    old_dim = ?dim, new_dim = search_dims(),
                     "vector dims changed — индекс снесён, sync перестроит из первоисточника"
                 );
                 db.drop_table(CHUNKS, &[])
@@ -325,7 +325,7 @@ impl LanceSemanticBackend {
         let values = Float32Array::from(flat);
         let vector_col = FixedSizeListArray::new(
             Arc::new(ArrowField::new("item", DataType::Float32, true)),
-            EMBED_MODEL_DIMS as i32,
+            search_dims() as i32,
             Arc::new(values) as ArrayRef,
             None,
         );
@@ -474,7 +474,7 @@ impl SemanticBackend for LanceSemanticBackend {
             event = "semantic.index_state",
             docs = docs,
             chunks = chunks,
-            dim = EMBED_MODEL_DIMS,
+            dim = search_dims(),
             "Lance index state"
         );
         if changed > 0 {
@@ -542,7 +542,7 @@ mod tests {
     #[test]
     fn dim_guard_flags_only_mismatch() {
         assert!(dims_stale(Some(1536))); // Gemini-эпоха против Ollama 768
-        assert!(!dims_stale(Some(EMBED_MODEL_DIMS)));
+        assert!(!dims_stale(Some(search_dims())));
         assert!(!dims_stale(None)); // пустой volume — миграции нет
     }
 }

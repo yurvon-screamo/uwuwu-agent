@@ -143,7 +143,7 @@ fn build_sessions(
     let spawn_cap: usize = std::env::var("UWUWU_SPAWNS_MAX_PER_HOUR")
         .ok()
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(10);
+        .unwrap_or(uwuwu_usecase::runtime_cfg::pipeline::spawns_max_per_hour());
     let shared_budget = Arc::new(std::sync::Mutex::new(uwuwu_domain::SpawnBudget::new(
         spawn_cap,
     )));
@@ -417,10 +417,8 @@ async fn run(
         .filter(|v| !v.is_empty());
     let semantic_backend: Option<Arc<dyn uwuwu_usecase::SemanticBackend>> = match embed_url {
         Some(url) => {
-            let embed: Arc<dyn search::Embedder> = Arc::new(search::OllamaEmbeddings::new(
-                url,
-                search::EMBED_MODEL.to_string(),
-            ));
+            let embed: Arc<dyn search::Embedder> =
+                Arc::new(search::OllamaEmbeddings::new(url, search::embed_model()));
             // github-хаб индексирует и задачи (юзер-стори «по вики/задачам»)
             let issues: Option<Arc<dyn uwuwu_usecase::IssueIndexSource>> = github_hub
                 .clone()
@@ -567,7 +565,7 @@ async fn run(
 
         sidecars.push(Sidecar {
             name: "cron".to_string(),
-            timeout: Some(SIDECAR_TIMEOUT),
+            timeout: Some(sidecar_timeout()),
             tick: Box::new(move || {
                 let cron = cron.clone();
                 Box::pin(async move {
@@ -645,7 +643,7 @@ async fn run(
         });
         sidecars.push(Sidecar {
             name: "analys".into(),
-            timeout: Some(SIDECAR_TIMEOUT),
+            timeout: Some(sidecar_timeout()),
             tick: Box::new(move || {
                 let a = analyst.clone();
                 Box::pin(async move {
@@ -658,7 +656,7 @@ async fn run(
         });
         sidecars.push(Sidecar {
             name: "analys-review".into(),
-            timeout: Some(SIDECAR_TIMEOUT),
+            timeout: Some(sidecar_timeout()),
             tick: Box::new(move || {
                 let r = analyst_review.clone();
                 Box::pin(async move {
@@ -671,7 +669,7 @@ async fn run(
         });
         sidecars.push(Sidecar {
             name: "dreamer".into(),
-            timeout: Some(SIDECAR_TIMEOUT),
+            timeout: Some(sidecar_timeout()),
             tick: Box::new(move || {
                 let d = dreamer.clone();
                 Box::pin(async move {
@@ -706,7 +704,7 @@ async fn run(
         let bot_supervisor = Arc::new(bot_supervisor);
         sidecars.push(Sidecar {
             name: "bots".into(),
-            timeout: Some(SIDECAR_TIMEOUT),
+            timeout: Some(sidecar_timeout()),
             tick: Box::new(move || {
                 let s = bot_supervisor.clone();
                 Box::pin(async move {
@@ -734,7 +732,7 @@ async fn run(
             let sweep_clock = clock.clone();
             sidecars.push(Sidecar {
                 name: "sweeper".into(),
-                timeout: Some(SIDECAR_TIMEOUT),
+                timeout: Some(sidecar_timeout()),
                 tick: Box::new(move || {
                     let board = sweep_board_repo.clone();
                     let boards = sweep_boards.clone();
@@ -816,13 +814,14 @@ async fn run(
                     if now < *backoff.lock().expect("backoff lock") {
                         return Ok(());
                     }
-                    // Емкостный гард тика: docs/sync, 512 документов за тик
-                    // (#1725), квотных гейтов нет (#1687). semantic-sync идёт до
-                    // завершения (#1730); остальные сайдкары — `SIDECAR_TIMEOUT`.
-                    match b.sync_index(search::SEMANTIC_SYNC_BUDGET).await {
+                    // Емкостный гард тика: docs/sync, бюджет из конфига
+                    // (uwuwu#1726), квотных гейтов нет (#1687). semantic-sync
+                    // идёт до завершения (#1730); остальные сайдкары ограничены
+                    // `[pipeline] sidecar_timeout_ms`.
+                    match b.sync_index(search::semantic_sync_budget()).await {
                         Ok(_) => Ok(()),
                         Err(e) => {
-                            let until = now + 3_600_000;
+                            let until = now + uwuwu_usecase::runtime_cfg::search::backoff_ms();
                             *backoff.lock().expect("backoff lock") = until;
                             tracing::warn!(event = "semantic.backoff",
                                 until_ms = until, error = %e,
@@ -995,7 +994,9 @@ async fn serve(port: u16, app: axum::Router) {
 }
 
 /// Сателлит тика: имя + замыкание-проход (мягкая изоляция отказов).
-const SIDECAR_TIMEOUT: Duration = Duration::from_secs(120);
+fn sidecar_timeout() -> Duration {
+    Duration::from_millis(uwuwu_usecase::runtime_cfg::pipeline::sidecar_timeout_ms())
+}
 
 struct Sidecar {
     name: String,

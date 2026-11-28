@@ -17,8 +17,12 @@ use uwuwu_usecase::{
     AgentSessionGateway, DreamerMark, Liveness, SessionSpec, TickStateStore, UsecaseResult,
 };
 
-pub(crate) const TG_POLL_SEC: u64 = 25;
-pub(crate) const RETRY_PAUSE_MS: u64 = 10_000;
+pub(crate) fn tg_poll_sec() -> u64 {
+    uwuwu_usecase::runtime_cfg::bots::tg_poll_sec()
+}
+pub(crate) fn retry_pause_ms() -> u64 {
+    uwuwu_usecase::runtime_cfg::bots::retry_pause_ms()
+}
 const FALLBACK: &str = "Не успел ответить — напиши ещё раз.";
 /// Потолок скачивания Bot API: документированные «20 MB» — двоичные,
 /// граница getFile ровно 20 971 520 B (план #1171).
@@ -96,9 +100,9 @@ pub(crate) fn spawn_bot_task(deps: BotDeps) -> JoinHandle<()> {
                 .map(|d| {
                     d.saturating_duration_since(Instant::now())
                         .as_secs()
-                        .clamp(1, TG_POLL_SEC)
+                        .clamp(1, tg_poll_sec())
                 })
-                .unwrap_or(TG_POLL_SEC);
+                .unwrap_or(tg_poll_sec());
             match deps.tg.get_updates(poll_offset, wait_secs).await {
                 Ok(updates) => {
                     let mut held = false;

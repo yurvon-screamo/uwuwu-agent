@@ -4,8 +4,8 @@
 //! мгновенно — темп ожидания инфра-забота адаптера.
 
 use super::env_gc::{
-    env_gc_bootstrap_title, sweep_envs, EnvGcCtx, EnvGcGone, EnvGcOutcome, EnvGcPolicy,
-    ENV_GC_BATCH_CAP, ENV_GC_VERDICT_DEADLINE_MS, TASK_ENV_GC_SCRIPT,
+    env_gc_batch_cap, env_gc_bootstrap_title, sweep_envs, EnvGcCtx, EnvGcGone, EnvGcOutcome,
+    EnvGcPolicy, TASK_ENV_GC_SCRIPT,
 };
 use crate::error::{UsecaseError, UsecaseResult};
 use crate::ports::{
@@ -507,7 +507,7 @@ async fn mature_done_row_dispatches_sweep_and_is_swept() {
     );
     assert_eq!(
         *gw.last_budget_ms.lock().unwrap(),
-        ENV_GC_VERDICT_DEADLINE_MS,
+        crate::runtime_cfg::pipeline::env_gc_deadline_ms(),
         "юзкейс носит бюджет прохода в команде"
     );
     assert_eq!(out.swept, 1);
@@ -622,7 +622,7 @@ async fn batch_cap_bounds_dispatch_per_pass_in_one_command() {
         .collect();
     let out = run(&tasks, &gw, &FakeBoard::all_done(), NOW, false).await;
     assert_eq!(out.candidates, 25);
-    assert_eq!(out.dispatched, ENV_GC_BATCH_CAP);
+    assert_eq!(out.dispatched, env_gc_batch_cap());
     let commands = gw.commands.lock().unwrap();
     assert_eq!(commands.len(), 1, "один shell на проход");
     let rows: Vec<&str> = commands[0]
@@ -630,17 +630,19 @@ async fn batch_cap_bounds_dispatch_per_pass_in_one_command() {
         .skip_while(|t| *t != "sweep")
         .skip(1)
         .collect();
-    assert_eq!(rows.len(), ENV_GC_BATCH_CAP);
+    assert_eq!(rows.len(), env_gc_batch_cap());
 }
 
 #[tokio::test]
 async fn absent_rows_do_not_starve_next_batch() {
-    // 21 кандидат: первые 20 уже исчезли (ABSENT), 21-й жив. Второй
-    // проход обязан дойти до 21-го, а не снова слать первые 20.
+    // cap+1 кандидатов: первые `cap` исчезли (ABSENT), последний жив.
+    // Второй проход обязан дойти до последнего, а не снова слать первые.
+    let cap = env_gc_batch_cap();
+    let last = cap as u64 + 1;
     let gw = fake(Vec::new());
     verdict_default(&gw, "ABSENT");
-    let tasks: Vec<Task> = (1..=21u64)
-        .map(|i| done_closed(i, THREE_DAYS + (22 - i) * 1000, NOW))
+    let tasks: Vec<Task> = (1..=last)
+        .map(|i| done_closed(i, THREE_DAYS + (last + 1 - i) * 1000, NOW))
         .collect();
 
     // Act
@@ -655,21 +657,25 @@ async fn absent_rows_do_not_starve_next_batch() {
         gone: &gone,
     };
     let first = run_pass(&pass).await;
-    assert_eq!(first.absent, ENV_GC_BATCH_CAP);
+    assert_eq!(first.absent, env_gc_batch_cap());
     assert_eq!(first.gone, 0);
-    verdict_on(&gw, "21", "SWEPT");
+    verdict_on(&gw, &last.to_string(), "SWEPT");
     let second = run_pass(&pass).await;
 
     // Assert
-    assert_eq!(second.gone, ENV_GC_BATCH_CAP);
-    assert_eq!(second.swept, 1, "21-й кандидат должен быть снесён");
+    assert_eq!(second.gone, cap);
+    assert_eq!(second.swept, 1, "последний кандидат должен быть снесён");
     let commands = gw.commands.lock().unwrap();
     let second_rows: Vec<&str> = commands[1]
         .split_whitespace()
         .skip_while(|t| *t != "sweep")
         .skip(1)
         .collect();
-    assert_eq!(second_rows, ["21"], "второй батч не должен нести старые 20");
+    assert_eq!(
+        second_rows,
+        [last.to_string().as_str()],
+        "второй батч не должен нести уже исчезнувшие строки"
+    );
 }
 
 /// Исходы, при которых env всё ещё может быть жив: метка недопустима.

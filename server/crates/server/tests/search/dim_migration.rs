@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::search::semantic::{Embedder, EMBED_MODEL_DIMS};
+use crate::search::semantic::{search_dims, Embedder};
 use crate::search::semantic_backend::LanceSemanticBackend;
 use lancedb::arrow::arrow_array::{
     FixedSizeListArray, Float32Array, Int32Array, Int64Array, LargeStringArray, RecordBatch,
@@ -160,7 +160,7 @@ async fn stale_1536_volume_is_dropped_and_rebuilt_by_sync() {
     assert_eq!(indexed, 1, "док переиндексирован штатным sync");
     assert_eq!(
         vector_dim_of(&dir).await,
-        Some(EMBED_MODEL_DIMS),
+        Some(search_dims()),
         "таблица пересоздана под размерность активного клиента"
     );
     drop(backend);
