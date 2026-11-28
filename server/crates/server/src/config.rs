@@ -573,6 +573,22 @@ impl Config {
             }
         }
         let g = self.github.as_ref().expect("validated");
+        if g.http_timeout_secs == 0 {
+            return Err(ConfigError::Validation(
+                "[github] http_timeout_secs должен быть > 0".into(),
+            ));
+        }
+        let bots = self.bots.as_ref().expect("validated");
+        for (name, ok) in [
+            ("tg_poll_sec", bots.tg_poll_sec > 0),
+            ("retry_pause_ms", bots.retry_pause_ms > 0),
+        ] {
+            if !ok {
+                return Err(ConfigError::Validation(format!(
+                    "[bots] {name} должен быть > 0"
+                )));
+            }
+        }
         if g.status_ttl_secs < g.items_ttl_secs {
             return Err(ConfigError::Validation(
                 "[github] status_ttl_secs < items_ttl_secs: инвариант #1346".into(),
