@@ -671,7 +671,11 @@ async fn absent_rows_do_not_starve_next_batch() {
         .skip_while(|t| *t != "sweep")
         .skip(1)
         .collect();
-    assert_eq!(second_rows, ["21"], "второй батч не должен нести старые 20");
+    assert_eq!(
+        second_rows,
+        [last.to_string().as_str()],
+        "второй батч не должен нести уже исчезнувшие строки"
+    );
 }
 
 /// Исходы, при которых env всё ещё может быть жив: метка недопустима.
