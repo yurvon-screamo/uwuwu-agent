@@ -293,7 +293,7 @@ successfully (timeouts do not block Done — that is exactly why they are invisi
 **The analysis** — per each signal point, from the sources live, not from dump memory: the task body (`uwuwu_task_get` — the «Комменты» section and the chronology),
 the PR (`gh pr view` / `gh pr diff`), the git state. The analysis formula: what the agent did →
 what was expected (an instruction, the canon, an owner quote) → what came out → the cause
-(an execution miss or a defect of the instruction/mechanics).
+(an execution miss or a defect of the instruction/mechanics). For a task with a UI delta, find decisions nobody made explicitly (custom mechanisms, manual geometry). If there is no ADR or record, flag it to the owner.
 
 **The registry** — the Experience article «Инцидент-реестр конвейера» (the slug
 `Experience/platform/Инцидент-реестр конвейера`; if the read did not match — find it via

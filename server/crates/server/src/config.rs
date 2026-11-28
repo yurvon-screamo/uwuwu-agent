@@ -573,15 +573,28 @@ impl Config {
             }
         }
         let g = self.github.as_ref().expect("validated");
-        if g.http_timeout_secs == 0 {
-            return Err(ConfigError::Validation(
-                "[github] http_timeout_secs должен быть > 0".into(),
-            ));
+        for (name, ok) in [
+            ("http_timeout_secs", g.http_timeout_secs > 0),
+            ("wiki_cache_ttl_secs", g.wiki_cache_ttl_secs > 0),
+            ("gql_budget_low", g.gql_budget_low > 0),
+        ] {
+            if !ok {
+                return Err(ConfigError::Validation(format!(
+                    "[github] {name} должен быть > 0"
+                )));
+            }
         }
         let bots = self.bots.as_ref().expect("validated");
         for (name, ok) in [
             ("tg_poll_sec", bots.tg_poll_sec > 0),
             ("retry_pause_ms", bots.retry_pause_ms > 0),
+            ("tg_http_timeout_secs", bots.tg_http_timeout_secs > 0),
+            ("gate_http_timeout_secs", bots.gate_http_timeout_secs > 0),
+            ("guard_backoff_base_ms", bots.guard_backoff_base_ms > 0),
+            ("guard_backoff_cap_ms", bots.guard_backoff_cap_ms > 0),
+            ("guard_healthy_ms", bots.guard_healthy_ms > 0),
+            ("reply_cap_ms", bots.reply_cap_ms > 0),
+            ("reply_poll_ms", bots.reply_poll_ms > 0),
         ] {
             if !ok {
                 return Err(ConfigError::Validation(format!(

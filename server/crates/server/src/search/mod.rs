@@ -11,9 +11,10 @@ mod semantic_backend;
 pub use semantic::{embed_model, Embedder, OllamaEmbeddings};
 pub use semantic_backend::LanceSemanticBackend;
 
-/// Документов за один тик semantic-sync: емкостный гард (120 с сайдкара и
-/// соседние модели владельца на той же Ollama), а не квотный (#1363 → #1687).
-/// Реально за тик укладывается `min(512, сколько успевается за 120 с)`.
+/// Документов за один тик semantic-sync: емкостный гард, а не квотный
+/// (#1363 → #1687). Лимита по времени нет — тик идёт до завершения (#1730);
+/// остальные сайдкары ограничены `[pipeline] sidecar_timeout_ms`.
+/// Значение — из `[search] semantic_sync_budget` config.toml (uwuwu#1726).
 pub fn semantic_sync_budget() -> usize {
     uwuwu_usecase::runtime_cfg::search::budget()
 }

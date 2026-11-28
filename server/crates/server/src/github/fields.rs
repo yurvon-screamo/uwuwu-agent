@@ -13,8 +13,79 @@ use uwuwu_usecase::IssueFieldStore;
 use uwuwu_usecase::{UsecaseError, UsecaseResult};
 
 pub const F_DEV_SESSION: &str = "Сессия dev";
+/// Legacy-поле, покрывавшее все три ревью-слота (#1710). Только чтение
+/// когорты с пустым новым план-полем; новой записи не получает.
 pub const F_REVIEW_SESSION: &str = "Сессия ревью";
+pub const F_PLAN_REVIEW_SESSION: &str = "Сессия план-ревью";
+pub const F_RESULT_REVIEW_SESSION: &str = "Сессия ревью кода";
+pub const F_TEST_REVIEW_SESSION: &str = "Сессия ревью тестов";
 pub const F_TEST_SESSION: &str = "Сессия тест";
+
+use uwuwu_domain::Slot;
+
+/// Канонические владельцы полей сессий. Design делит поле Dev (#1237),
+/// поэтому отдельным владельцем не значится. Порядок не зависит от `Slot::ALL`.
+pub const SESSION_FIELD_SLOTS: [Slot; 5] = [
+    Slot::Dev,
+    Slot::PlanReview,
+    Slot::ResultReview,
+    Slot::TestReview,
+    Slot::Test,
+];
+
+/// Legacy-поле #1710: имя для прогона, слот для мока. Односторонняя
+/// когорта, не четвёртое ревью-поле.
+pub struct LegacyReviewSession {
+    pub field: &'static str,
+    pub slot: Slot,
+}
+
+pub const LEGACY_REVIEW_SESSION: LegacyReviewSession = LegacyReviewSession {
+    field: F_REVIEW_SESSION,
+    slot: Slot::PlanReview,
+};
+
+/// Все слоты, которым соответствует имя поля. Для дев-поля — Dev и
+/// Design; для остальных — ровно один слот.
+pub fn session_slots(field: &str) -> impl Iterator<Item = Slot> + '_ {
+    Slot::ALL
+        .into_iter()
+        .filter(move |&slot| review_session_field(slot) == field)
+}
+
+/// Основной владелец поля на записи: поиск идёт по каноническим слотам,
+/// а не по `Slot::ALL`, чтобы дев-поле всегда давало Dev.
+pub fn session_field_slot(field: &str) -> Option<Slot> {
+    SESSION_FIELD_SLOTS
+        .into_iter()
+        .find(|&slot| review_session_field(slot) == field)
+}
+
+/// Единственный источник имени поля сессии слота: три ревью-стадии —
+/// три независимых ячейки (канон #1626); дев-семья и тестер — свои поля.
+pub fn review_session_field(slot: uwuwu_domain::Slot) -> &'static str {
+    match slot {
+        Slot::Dev | Slot::Design => F_DEV_SESSION,
+        Slot::PlanReview => F_PLAN_REVIEW_SESSION,
+        Slot::ResultReview => F_RESULT_REVIEW_SESSION,
+        Slot::TestReview => F_TEST_REVIEW_SESSION,
+        Slot::Test => F_TEST_SESSION,
+    }
+}
+
+/// Патч записи сессии: эксклюзивное поле слота плюс условная очистка legacy
+/// (только для ревью-слотов и только если legacy-поле есть в каталоге).
+pub fn review_store_patch(
+    slot: uwuwu_domain::Slot,
+    session: &str,
+    legacy_present: bool,
+) -> Vec<(&'static str, Option<String>)> {
+    let mut patch = vec![(review_session_field(slot), Some(session.to_string()))];
+    if slot.is_review() && legacy_present {
+        patch.push((F_REVIEW_SESSION, None));
+    }
+    patch
+}
 /// Ветка задачи (фабрика пишет при спавне; PR-рид гейтится ею — hub.rs).
 pub const F_BRANCH: &str = "Branch";
 /// Единое имя поля приоритета (пишется create-ом, читается enrichment-ом):
@@ -149,6 +220,12 @@ impl IssueFields {
         let mut catalog = self.catalog().await?;
         let mut batch = Vec::new();
         for (name, value) in patch {
+            // Очистка отсутствующего поля — no-op: не создаём заново поле,
+            // которое владелец снёс (класс #1271; #1710 legacy-ветка).
+            if value.as_deref().is_none_or(str::is_empty) && resolve_field(&catalog, name).is_none()
+            {
+                continue;
+            }
             // self-heal: отсутствующее поле создаём (инцидент #1149 —
             // create задачи падал целиком из-за неготового «Тип»)
             let fid = match resolve_field(&catalog, name) {
@@ -199,6 +276,12 @@ impl IssueFields {
             )));
         }
         Ok(())
+    }
+
+    /// Признак поля в каталоге без создания (Sources: #1710 legacy-ветка):
+    /// cleared-патч не должен пересоздавать снесённое владельцем поле.
+    pub(crate) async fn has_field(&self, name: &str) -> UsecaseResult<bool> {
+        Ok(self.catalog().await?.contains_key(name))
     }
 
     /// Создать глобальное поле, если его нет (каталог дрогнуть).
@@ -412,6 +495,96 @@ mod tests {
         assert!(
             !field_422_already_exists(&other),
             "не-already 422 не маскируется: {other}"
+        );
+    }
+
+    /// Независимое ожидание по слоту. Исчерпывающий `match`: новый вариант
+    /// `Slot` ломает сборку теста, пока для него не задано ожидание.
+    fn expected_session_field(slot: Slot) -> &'static str {
+        match slot {
+            Slot::Design | Slot::Dev => F_DEV_SESSION,
+            Slot::PlanReview => F_PLAN_REVIEW_SESSION,
+            Slot::ResultReview => F_RESULT_REVIEW_SESSION,
+            Slot::TestReview => F_TEST_REVIEW_SESSION,
+            Slot::Test => F_TEST_SESSION,
+        }
+    }
+
+    #[test]
+    fn review_session_field_is_exclusive_per_slot() {
+        // Перебор по доменному перечислению, а не по рукописному списку.
+        for slot in Slot::ALL {
+            assert_eq!(
+                review_session_field(slot),
+                expected_session_field(slot),
+                "слот {slot:?}"
+            );
+        }
+        assert_eq!(
+            review_session_field(Slot::Design),
+            review_session_field(Slot::Dev)
+        );
+    }
+
+    #[test]
+    fn canonical_session_slots_cover_every_domain_slot_except_design() {
+        for slot in Slot::ALL {
+            if slot == Slot::Design {
+                assert_eq!(review_session_field(slot), F_DEV_SESSION);
+                continue;
+            }
+            assert!(
+                SESSION_FIELD_SLOTS.contains(&slot),
+                "слот {slot:?} не попал в канонические владельцы полей"
+            );
+        }
+    }
+
+    #[test]
+    fn session_field_reverse_lookup_matches_owners() {
+        for slot in SESSION_FIELD_SLOTS {
+            let field = review_session_field(slot);
+            let owners: Vec<_> = session_slots(field)
+                .filter(|candidate| SESSION_FIELD_SLOTS.contains(candidate))
+                .collect();
+            assert_eq!(owners, vec![slot], "поле {field} не биективно владельцу");
+        }
+        let dev_slots: Vec<_> = session_slots(F_DEV_SESSION).collect();
+        assert_eq!(dev_slots.len(), 2);
+        assert!(dev_slots.contains(&Slot::Dev));
+        assert!(dev_slots.contains(&Slot::Design));
+        assert_eq!(session_field_slot(F_DEV_SESSION), Some(Slot::Dev));
+    }
+
+    #[test]
+    fn legacy_session_pair_is_not_a_canonical_field() {
+        assert_eq!(LEGACY_REVIEW_SESSION.slot, Slot::PlanReview);
+        for slot in SESSION_FIELD_SLOTS {
+            assert_ne!(
+                review_session_field(slot),
+                LEGACY_REVIEW_SESSION.field,
+                "legacy-поле стало каноническим у слота {slot:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_store_patch_clears_legacy_only_for_review() {
+        use uwuwu_domain::Slot;
+        let patch = review_store_patch(Slot::ResultReview, "ses_result", true);
+        assert_eq!(
+            patch,
+            vec![
+                (F_RESULT_REVIEW_SESSION, Some("ses_result".into())),
+                (F_REVIEW_SESSION, None),
+            ]
+        );
+        let patch = review_store_patch(Slot::Dev, "ses_dev", true);
+        assert_eq!(patch, vec![(F_DEV_SESSION, Some("ses_dev".into()))]);
+        let patch = review_store_patch(Slot::PlanReview, "ses_plan", false);
+        assert_eq!(
+            patch,
+            vec![(F_PLAN_REVIEW_SESSION, Some("ses_plan".into()))]
         );
     }
 
