@@ -1017,7 +1017,8 @@ fn trunc(s: &str) -> String {
 fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
     use uwuwu_domain::{Slot, TaskFields, Vcs};
     let s = |v: Option<&String>| v.and_then(|s| uwuwu_domain::SessionRef::parse(s));
-    // Слоты: три ревью-стадии — три независимых поля (#1710, канон #1626);
+    // Слоты выводятся из единого разворота github/fields.rs: три
+    // ревью-стадии — три независимых поля (#1710, канон #1626);
     // dev-поле покрывает оба слота дев-семьи (Design/Dev — единая сессия,
     // канон дев-семьи — usecase/pipeline/tick.rs «едина между этапами и
     // откатами (требование владельца)», носитель — семейные поля
@@ -1026,29 +1027,21 @@ fn map_task_fields(raw: &Fields) -> uwuwu_domain::TaskFields {
     // 15.11/16.11 — budget-отказы маскировали, budget-50 вскрыл бы
     // спавном дублей)
     let mut assignments = std::collections::BTreeMap::new();
-    for (name, slots) in [
-        (
-            crate::github::fields::F_DEV_SESSION,
-            vec![Slot::Dev, Slot::Design],
-        ),
-        (crate::github::fields::F_TEST_SESSION, vec![Slot::Test]),
-    ] {
-        if let Some(session) = s(raw.get(name)) {
-            for slot in slots {
-                assignments.insert(slot, session.clone());
-            }
-        }
-    }
-    for slot in [Slot::PlanReview, Slot::ResultReview, Slot::TestReview] {
-        let name = crate::github::fields::review_session_field(slot);
-        if let Some(session) = s(raw.get(name)) {
-            assignments.insert(slot, session);
+    for name in crate::github::SESSION_FIELD_SLOTS
+        .into_iter()
+        .map(crate::github::review_session_field)
+    {
+        let Some(session) = s(raw.get(name)) else {
+            continue;
+        };
+        for slot in crate::github::session_slots(name) {
+            assignments.insert(slot, session.clone());
         }
     }
     // Legacy-когорта (#1710): старое общее поле читается только если новое
     // план-поле пусто; X виден как план-сессия до первой эксклюзивной записи.
     if let std::collections::btree_map::Entry::Vacant(entry) = assignments.entry(Slot::PlanReview) {
-        if let Some(session) = s(raw.get(crate::github::fields::F_REVIEW_SESSION)) {
+        if let Some(session) = s(raw.get(crate::github::LEGACY_REVIEW_SESSION.field)) {
             entry.insert(session);
         }
     }
@@ -3861,6 +3854,68 @@ mod slot_mapping_tests {
             assert_eq!(task.session_of(slot), None, "слот {slot:?} чужой");
         }
         assert!(task.stage_needs_spawn().is_none());
+    }
+
+    /// Одинаковая изоляция носителей: один и тот же набор сессий даёт
+    /// одинаковый результат в развороте полей прогона и в моке. Ожидания —
+    /// конкретные сессии на всех шести слотах, не равенство `Option`.
+    #[tokio::test]
+    async fn carrier_session_geometry_matches_mock_for_every_slot() {
+        use uwuwu_domain::Slot;
+
+        // Arrange
+        let mut raw = Fields::new();
+        raw.insert(crate::github::F_DEV_SESSION.into(), "ses_dev".to_string());
+        raw.insert(
+            crate::github::F_PLAN_REVIEW_SESSION.into(),
+            "ses_plan".to_string(),
+        );
+        raw.insert(
+            crate::github::F_RESULT_REVIEW_SESSION.into(),
+            "ses_result".to_string(),
+        );
+        raw.insert(
+            crate::github::F_TEST_REVIEW_SESSION.into(),
+            "ses_testrev".to_string(),
+        );
+        raw.insert(crate::github::F_TEST_SESSION.into(), "ses_test".to_string());
+        let prod = map_task_fields(&raw);
+
+        let hub = crate::mockhub::MemoryHub::with_seed(Some((99, Status::ReviewTesting)));
+        hub.read_board("B").await.expect("сид");
+        for (slot, session) in [
+            (Slot::Dev, "ses_dev"),
+            (Slot::PlanReview, "ses_plan"),
+            (Slot::ResultReview, "ses_result"),
+            (Slot::TestReview, "ses_testrev"),
+            (Slot::Test, "ses_test"),
+        ] {
+            hub.set_session("B", 99, slot, session)
+                .await
+                .expect("запись сессии в мок");
+        }
+        let mock = hub.issue_fields(99).await.expect("поля мока");
+
+        // Act + Assert: по слоту, чтобы падение называло носитель и сессию.
+        for (slot, expected) in [
+            (Slot::Dev, Some("ses_dev")),
+            (Slot::Design, Some("ses_dev")),
+            (Slot::PlanReview, Some("ses_plan")),
+            (Slot::ResultReview, Some("ses_result")),
+            (Slot::TestReview, Some("ses_testrev")),
+            (Slot::Test, Some("ses_test")),
+        ] {
+            assert_eq!(
+                prod.session(slot).map(|s| s.as_str()),
+                expected,
+                "прогон: слот {slot:?}"
+            );
+            assert_eq!(
+                mock.session(slot).map(|s| s.as_str()),
+                expected,
+                "мок: слот {slot:?}"
+            );
+        }
     }
 
     #[test]

@@ -17,8 +17,13 @@ mod pv2_tests;
 pub(crate) const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 pub use fields::{
-    F_DEV_SESSION, F_PLAN_REVIEW_SESSION, F_RESULT_REVIEW_SESSION, F_REVIEW_SESSION,
-    F_TEST_REVIEW_SESSION, F_TEST_SESSION,
+    review_session_field, session_field_slot, session_slots, LEGACY_REVIEW_SESSION,
+    SESSION_FIELD_SLOTS,
+};
+#[cfg(test)]
+pub use fields::{
+    F_DEV_SESSION, F_PLAN_REVIEW_SESSION, F_RESULT_REVIEW_SESSION, F_TEST_REVIEW_SESSION,
+    F_TEST_SESSION,
 };
 pub use hub::GitHubHub;
 pub use prgate::{parse_pr_url, GhPrGateway};

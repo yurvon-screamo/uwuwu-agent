@@ -92,8 +92,8 @@ fn parse_seeds(raw: &str) -> Vec<SeedRow> {
 }
 
 /// Семейная ячейка слота: только дев-семья делит поле «Сессия dev»
-/// (Design|Dev). Ревью-стадии с #1710 держат три независимых поля —
-/// mirror github/fields.rs review_session_field и hub.rs set_session.
+/// (Design|Dev). Ревью-стадии с #1710 держат три независимых поля;
+/// геометрия полей — одна, в github/fields.rs::review_session_field.
 fn family_cell(slot: Slot) -> Slot {
     match slot {
         Slot::Design => Slot::Dev,
@@ -101,8 +101,8 @@ fn family_cell(slot: Slot) -> Slot {
     }
 }
 
-/// Разворот семейных ячеек на выдаче (mirror github/hub.rs
-/// map_task_fields): только дев-семья видит одно значение —
+/// Разворот семейных ячеек на выдаче (как github/hub.rs::map_task_fields):
+/// только дев-семья видит одно значение —
 /// Design-строка видит свою сессию, а после перехода в In Progress
 /// тот же сеанс читается в дев-слоте (прод-геометрия «переезда»
 /// дев-сессии, #1237): тик не спавнит дубль, wake-путь получает
@@ -918,21 +918,19 @@ fn phantom_writes() -> bool {
 #[async_trait]
 impl IssueFieldStore for MemoryHub {
     async fn load(&self, number: u64) -> UsecaseResult<HashMap<String, String>> {
-        use uwuwu_domain::Slot;
         self.with_state(|state| {
             let mut out = HashMap::new();
             if let Some(f) = state.fields.get(&number) {
-                for (name, slot) in [
-                    (crate::github::F_DEV_SESSION, Slot::Dev),
-                    (crate::github::F_PLAN_REVIEW_SESSION, Slot::PlanReview),
-                    (crate::github::F_RESULT_REVIEW_SESSION, Slot::ResultReview),
-                    (crate::github::F_TEST_REVIEW_SESSION, Slot::TestReview),
-                    (crate::github::F_REVIEW_SESSION, Slot::PlanReview),
-                    (crate::github::F_TEST_SESSION, Slot::Test),
-                ] {
+                for slot in crate::github::SESSION_FIELD_SLOTS {
+                    let name = crate::github::review_session_field(slot);
                     if let Some(s) = f.session(slot) {
                         out.insert(name.into(), s.as_str().to_string());
                     }
+                }
+                // Legacy-когорта #1710: алиас план-слота остаётся на чтении.
+                let legacy = crate::github::LEGACY_REVIEW_SESSION;
+                if let Some(s) = f.session(legacy.slot) {
+                    out.insert(legacy.field.into(), s.as_str().to_string());
                 }
                 if let Some(b) = f.branch() {
                     out.insert("Branch".into(), b.as_str().to_string());
@@ -978,7 +976,6 @@ impl IssueFieldStore for MemoryHub {
         if phantom_writes() {
             return Ok(());
         }
-        use uwuwu_domain::Slot;
         self.with_state(|state| {
             if !state.tasks.contains_key(&number) {
                 return Err(UsecaseError::Board(format!("mockhub: #{number} нет")));
@@ -995,15 +992,9 @@ impl IssueFieldStore for MemoryHub {
             }
             let f = state.fields.entry(number).or_default();
             for (name, value) in patch {
-                let slot = match *name {
-                    crate::github::F_DEV_SESSION => Some(Slot::Dev),
-                    crate::github::F_PLAN_REVIEW_SESSION => Some(Slot::PlanReview),
-                    crate::github::F_RESULT_REVIEW_SESSION => Some(Slot::ResultReview),
-                    crate::github::F_TEST_REVIEW_SESSION => Some(Slot::TestReview),
-                    crate::github::F_REVIEW_SESSION => Some(Slot::PlanReview),
-                    crate::github::F_TEST_SESSION => Some(Slot::Test),
-                    _ => None,
-                };
+                let legacy = crate::github::LEGACY_REVIEW_SESSION;
+                let slot = crate::github::session_field_slot(name)
+                    .or_else(|| (*name == legacy.field).then_some(legacy.slot));
                 if let (Some(slot), Some(v)) = (slot, value) {
                     if let Some(s) = uwuwu_domain::SessionRef::parse(v) {
                         f.set_session(slot, s);
@@ -1590,6 +1581,60 @@ mod tests {
             "clear result-слота не трогает план-сессию"
         );
         assert_eq!(t.session_of(Slot::ResultReview), None);
+    }
+
+    /// Владелец дев-поля (#1237 на границе): запись поля даёт Dev, а не
+    /// Design — иначе `load` читает чужую ячейку и сессия теряется.
+    #[tokio::test]
+    async fn dev_field_store_load_keeps_dev_owner() {
+        // Arrange
+        let hub = MemoryHub::with_seed(Some((10, Status::ReviewTesting)));
+        hub.read_board("B").await.expect("сид");
+        // Act
+        IssueFieldStore::store(
+            &hub,
+            10,
+            &[(crate::github::F_DEV_SESSION, Some("ses_dev".into()))],
+        )
+        .await
+        .expect("запись дев-поля");
+        // Assert
+        let fields = IssueFieldStore::load(&hub, 10).await.expect("поля");
+        assert_eq!(
+            fields.get(crate::github::F_DEV_SESSION).map(String::as_str),
+            Some("ses_dev")
+        );
+        let task = hub.issue_fields(10).await.expect("issue_fields");
+        assert_eq!(task.session(Slot::Dev).map(|s| s.as_str()), Some("ses_dev"));
+        assert_eq!(
+            task.session(Slot::Design).map(|s| s.as_str()),
+            Some("ses_dev")
+        );
+    }
+
+    /// Legacy-алиас #1710 сохраняется и на записи, и на чтении мока.
+    #[tokio::test]
+    async fn legacy_session_field_roundtrips_as_plan_alias() {
+        // Arrange
+        let hub = MemoryHub::with_seed(Some((12, Status::ReviewTesting)));
+        hub.read_board("B").await.expect("сид");
+        let legacy = crate::github::LEGACY_REVIEW_SESSION;
+        // Act
+        IssueFieldStore::store(&hub, 12, &[(legacy.field, Some("ses_plan".into()))])
+            .await
+            .expect("запись legacy-поля");
+        // Assert
+        let fields = IssueFieldStore::load(&hub, 12).await.expect("поля");
+        assert_eq!(
+            fields.get(legacy.field).map(String::as_str),
+            Some("ses_plan")
+        );
+        let task = hub.issue_fields(12).await.expect("issue_fields");
+        assert_eq!(
+            task.session(legacy.slot).map(|s| s.as_str()),
+            Some("ses_plan")
+        );
+        assert_eq!(task.session(Slot::ResultReview), None);
     }
 
     /// Граница носителя (#1710): три сессии проходят полный round-trip

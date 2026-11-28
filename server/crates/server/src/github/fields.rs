@@ -21,10 +21,49 @@ pub const F_RESULT_REVIEW_SESSION: &str = "Сессия ревью кода";
 pub const F_TEST_REVIEW_SESSION: &str = "Сессия ревью тестов";
 pub const F_TEST_SESSION: &str = "Сессия тест";
 
+use uwuwu_domain::Slot;
+
+/// Канонические владельцы полей сессий. Design делит поле Dev (#1237),
+/// поэтому отдельным владельцем не значится. Порядок не зависит от `Slot::ALL`.
+pub const SESSION_FIELD_SLOTS: [Slot; 5] = [
+    Slot::Dev,
+    Slot::PlanReview,
+    Slot::ResultReview,
+    Slot::TestReview,
+    Slot::Test,
+];
+
+/// Legacy-поле #1710: имя для прогона, слот для мока. Односторонняя
+/// когорта, не четвёртое ревью-поле.
+pub struct LegacyReviewSession {
+    pub field: &'static str,
+    pub slot: Slot,
+}
+
+pub const LEGACY_REVIEW_SESSION: LegacyReviewSession = LegacyReviewSession {
+    field: F_REVIEW_SESSION,
+    slot: Slot::PlanReview,
+};
+
+/// Все слоты, которым соответствует имя поля. Для дев-поля — Dev и
+/// Design; для остальных — ровно один слот.
+pub fn session_slots(field: &str) -> impl Iterator<Item = Slot> + '_ {
+    Slot::ALL
+        .into_iter()
+        .filter(move |&slot| review_session_field(slot) == field)
+}
+
+/// Основной владелец поля на записи: поиск идёт по каноническим слотам,
+/// а не по `Slot::ALL`, чтобы дев-поле всегда давало Dev.
+pub fn session_field_slot(field: &str) -> Option<Slot> {
+    SESSION_FIELD_SLOTS
+        .into_iter()
+        .find(|&slot| review_session_field(slot) == field)
+}
+
 /// Единственный источник имени поля сессии слота: три ревью-стадии —
 /// три независимых ячейки (канон #1626); дев-семья и тестер — свои поля.
 pub fn review_session_field(slot: uwuwu_domain::Slot) -> &'static str {
-    use uwuwu_domain::Slot;
     match slot {
         Slot::Dev | Slot::Design => F_DEV_SESSION,
         Slot::PlanReview => F_PLAN_REVIEW_SESSION,
@@ -461,29 +500,65 @@ mod tests {
 
     #[test]
     fn review_session_field_is_exclusive_per_slot() {
-        use uwuwu_domain::Slot;
-        let names: Vec<_> = [
-            Slot::Dev,
-            Slot::Design,
-            Slot::PlanReview,
-            Slot::ResultReview,
-            Slot::TestReview,
-            Slot::Test,
-        ]
-        .into_iter()
-        .map(review_session_field)
-        .collect();
+        // Arrange: ожидания по слоту, а не упорядоченный список.
+        let expected = [
+            (Slot::Dev, F_DEV_SESSION),
+            (Slot::Design, F_DEV_SESSION),
+            (Slot::PlanReview, F_PLAN_REVIEW_SESSION),
+            (Slot::ResultReview, F_RESULT_REVIEW_SESSION),
+            (Slot::TestReview, F_TEST_REVIEW_SESSION),
+            (Slot::Test, F_TEST_SESSION),
+        ];
+        // Act + Assert: падение называет слот.
+        for (slot, field) in expected {
+            assert_eq!(review_session_field(slot), field, "слот {slot:?}");
+        }
         assert_eq!(
-            names,
-            vec![
-                F_DEV_SESSION,
-                F_DEV_SESSION,
-                F_PLAN_REVIEW_SESSION,
-                F_RESULT_REVIEW_SESSION,
-                F_TEST_REVIEW_SESSION,
-                F_TEST_SESSION,
-            ]
+            review_session_field(Slot::Design),
+            review_session_field(Slot::Dev)
         );
+    }
+
+    #[test]
+    fn canonical_session_slots_cover_every_domain_slot_except_design() {
+        for slot in Slot::ALL {
+            if slot == Slot::Design {
+                assert_eq!(review_session_field(slot), F_DEV_SESSION);
+                continue;
+            }
+            assert!(
+                SESSION_FIELD_SLOTS.contains(&slot),
+                "слот {slot:?} не попал в канонические владельцы полей"
+            );
+        }
+    }
+
+    #[test]
+    fn session_field_reverse_lookup_matches_owners() {
+        for slot in SESSION_FIELD_SLOTS {
+            let field = review_session_field(slot);
+            let owners: Vec<_> = session_slots(field)
+                .filter(|candidate| SESSION_FIELD_SLOTS.contains(candidate))
+                .collect();
+            assert_eq!(owners, vec![slot], "поле {field} не биективно владельцу");
+        }
+        let dev_slots: Vec<_> = session_slots(F_DEV_SESSION).collect();
+        assert_eq!(dev_slots.len(), 2);
+        assert!(dev_slots.contains(&Slot::Dev));
+        assert!(dev_slots.contains(&Slot::Design));
+        assert_eq!(session_field_slot(F_DEV_SESSION), Some(Slot::Dev));
+    }
+
+    #[test]
+    fn legacy_session_pair_is_not_a_canonical_field() {
+        assert_eq!(LEGACY_REVIEW_SESSION.slot, Slot::PlanReview);
+        for slot in SESSION_FIELD_SLOTS {
+            assert_ne!(
+                review_session_field(slot),
+                LEGACY_REVIEW_SESSION.field,
+                "legacy-поле стало каноническим у слота {slot:?}"
+            );
+        }
     }
 
     #[test]
