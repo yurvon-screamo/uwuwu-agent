@@ -8,6 +8,8 @@ mod api;
 mod bots;
 mod clean_journal;
 mod clock;
+#[cfg(test)]
+mod comment_contract_tests;
 mod config;
 mod diag;
 #[cfg(test)]
