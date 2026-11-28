@@ -3811,6 +3811,7 @@ mod tests {
 mod slot_mapping_tests {
     use super::*;
     use std::sync::Mutex;
+    use uwuwu_domain::Slot;
 
     #[test]
     fn dev_session_field_fills_design_slot() {
@@ -3856,55 +3857,52 @@ mod slot_mapping_tests {
         assert!(task.stage_needs_spawn().is_none());
     }
 
+    /// Независимое ожидание по слоту. Исчерпывающий `match`: новый вариант
+    /// `Slot` ломает сборку теста, пока для него не задана сессия.
+    fn expected_carrier_session(slot: Slot) -> &'static str {
+        match slot {
+            Slot::Design | Slot::Dev => "ses_dev",
+            Slot::PlanReview => "ses_plan",
+            Slot::ResultReview => "ses_result",
+            Slot::TestReview => "ses_testrev",
+            Slot::Test => "ses_test",
+        }
+    }
+
     /// Одинаковая изоляция носителей: один и тот же набор сессий даёт
     /// одинаковый результат в развороте полей прогона и в моке. Ожидания —
-    /// конкретные сессии на всех шести слотах, не равенство `Option`.
+    /// конкретные сессии на всех слотах из `Slot::ALL`, не равенство `Option`.
     #[tokio::test]
     async fn carrier_session_geometry_matches_mock_for_every_slot() {
-        use uwuwu_domain::Slot;
-
-        // Arrange
+        // Arrange: поля и сессии выводятся из контракта, а не из литералов.
         let mut raw = Fields::new();
-        raw.insert(crate::github::F_DEV_SESSION.into(), "ses_dev".to_string());
-        raw.insert(
-            crate::github::F_PLAN_REVIEW_SESSION.into(),
-            "ses_plan".to_string(),
-        );
-        raw.insert(
-            crate::github::F_RESULT_REVIEW_SESSION.into(),
-            "ses_result".to_string(),
-        );
-        raw.insert(
-            crate::github::F_TEST_REVIEW_SESSION.into(),
-            "ses_testrev".to_string(),
-        );
-        raw.insert(crate::github::F_TEST_SESSION.into(), "ses_test".to_string());
-        let prod = map_task_fields(&raw);
-
         let hub = crate::mockhub::MemoryHub::with_seed(Some((99, Status::ReviewTesting)));
         hub.read_board("B").await.expect("сид");
-        for (slot, session) in [
-            (Slot::Dev, "ses_dev"),
-            (Slot::PlanReview, "ses_plan"),
-            (Slot::ResultReview, "ses_result"),
-            (Slot::TestReview, "ses_testrev"),
-            (Slot::Test, "ses_test"),
-        ] {
-            hub.set_session("B", 99, slot, session)
+        for slot in crate::github::SESSION_FIELD_SLOTS {
+            raw.insert(
+                crate::github::review_session_field(slot).into(),
+                expected_carrier_session(slot).to_string(),
+            );
+            hub.set_session("B", 99, slot, expected_carrier_session(slot))
                 .await
                 .expect("запись сессии в мок");
         }
+        // Arrange покрывает все поля носителя, включая тестовое.
+        for name in [
+            crate::github::F_DEV_SESSION,
+            crate::github::F_PLAN_REVIEW_SESSION,
+            crate::github::F_RESULT_REVIEW_SESSION,
+            crate::github::F_TEST_REVIEW_SESSION,
+            crate::github::F_TEST_SESSION,
+        ] {
+            assert!(raw.contains_key(name), "поле {name} не записано в Arrange");
+        }
+        let prod = map_task_fields(&raw);
         let mock = hub.issue_fields(99).await.expect("поля мока");
 
         // Act + Assert: по слоту, чтобы падение называло носитель и сессию.
-        for (slot, expected) in [
-            (Slot::Dev, Some("ses_dev")),
-            (Slot::Design, Some("ses_dev")),
-            (Slot::PlanReview, Some("ses_plan")),
-            (Slot::ResultReview, Some("ses_result")),
-            (Slot::TestReview, Some("ses_testrev")),
-            (Slot::Test, Some("ses_test")),
-        ] {
+        for slot in Slot::ALL {
+            let expected = Some(expected_carrier_session(slot));
             assert_eq!(
                 prod.session(slot).map(|s| s.as_str()),
                 expected,

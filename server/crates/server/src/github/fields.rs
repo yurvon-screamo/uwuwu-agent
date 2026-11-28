@@ -498,20 +498,27 @@ mod tests {
         );
     }
 
+    /// Независимое ожидание по слоту. Исчерпывающий `match`: новый вариант
+    /// `Slot` ломает сборку теста, пока для него не задано ожидание.
+    fn expected_session_field(slot: Slot) -> &'static str {
+        match slot {
+            Slot::Design | Slot::Dev => F_DEV_SESSION,
+            Slot::PlanReview => F_PLAN_REVIEW_SESSION,
+            Slot::ResultReview => F_RESULT_REVIEW_SESSION,
+            Slot::TestReview => F_TEST_REVIEW_SESSION,
+            Slot::Test => F_TEST_SESSION,
+        }
+    }
+
     #[test]
     fn review_session_field_is_exclusive_per_slot() {
-        // Arrange: ожидания по слоту, а не упорядоченный список.
-        let expected = [
-            (Slot::Dev, F_DEV_SESSION),
-            (Slot::Design, F_DEV_SESSION),
-            (Slot::PlanReview, F_PLAN_REVIEW_SESSION),
-            (Slot::ResultReview, F_RESULT_REVIEW_SESSION),
-            (Slot::TestReview, F_TEST_REVIEW_SESSION),
-            (Slot::Test, F_TEST_SESSION),
-        ];
-        // Act + Assert: падение называет слот.
-        for (slot, field) in expected {
-            assert_eq!(review_session_field(slot), field, "слот {slot:?}");
+        // Перебор по доменному перечислению, а не по рукописному списку.
+        for slot in Slot::ALL {
+            assert_eq!(
+                review_session_field(slot),
+                expected_session_field(slot),
+                "слот {slot:?}"
+            );
         }
         assert_eq!(
             review_session_field(Slot::Design),

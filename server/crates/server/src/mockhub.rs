@@ -1675,7 +1675,7 @@ mod tests {
         // Design — псевдоним дев-поля, не отдельный владелец (#1237).
         assert_eq!(
             task.session(Slot::Design).map(|s| s.as_str()),
-            task.session(Slot::Dev).map(|s| s.as_str())
+            Some("ses_owner0")
         );
     }
 
