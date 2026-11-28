@@ -17,7 +17,8 @@ pub const EMBED_BATCH: usize = 38;
 const SERVICE: &str = "ollama-embeddings";
 
 /// Таймауты клиента: connect короткий, total — по классу вызова. Батч 60 с
-/// укладывается в гард тика 120 с; query 15 с не держит поиск в стейл-туннеле.
+/// ограничивает один /api/embed-вызов, гарда времени у тика нет (#1730);
+/// query 15 с не держит поиск в стейл-туннеле.
 #[derive(Debug, Clone, Copy)]
 pub struct ClientTimeouts {
     pub connect: Duration,

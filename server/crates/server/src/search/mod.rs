@@ -13,5 +13,5 @@ pub use semantic_backend::LanceSemanticBackend;
 
 /// Документов за один тик semantic-sync: емкостный гард, а не квотный
 /// (#1363 → #1687). Лимита по времени нет — тик идёт до завершения (#1730);
-/// 120 с — таймаут остальных сайдкаров, не semantic-sync.
+/// остальные сайдкары ограничены `SIDECAR_TIMEOUT` в `main.rs`.
 pub const SEMANTIC_SYNC_BUDGET: usize = 512;
