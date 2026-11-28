@@ -17,6 +17,7 @@
 //! Запуск: UWUWU_E2E=1 cargo test -p uwuwu-server --test analyst_review_wave_stand_e2e
 //! Длительность ~2 мин: волны едут по тикам сервера (poll_sec 10).
 
+mod common;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -72,12 +73,16 @@ async fn spawn_stand(dir: &Path, seed: &str) -> Stand {
     let mock_port = free_port();
     let config = format!(
         "mode = \"live\"\npoll_sec = 10\nport = {server_port}\n\n\
+         {models}\
+         {runtime}\
          [hub]\nrepo = \"e2e/hub\"\ndriver = \"memory\"\n\n\
          [executor]\nname = \"mock\"\nurl = \"http://127.0.0.1:{mock_port}\"\n\n\
          [policy]\ncup = 7\n\n[policy.peak]\nenabled = false\nstart_min = 0\nend_min = 0\n\n\
          [compact]\nidle_min = 0\nmin_context_pct = 0.0\ncooldown_min = 1\n\n\
          [[project]]\nname = \"{PROJECT}\"\nboard = \"{BOARD}\"\nrepo = \"e2e/stand\"\n\
          checkout = \"{dir}/checkout\"\nenv_root = \"{dir}\"\n",
+        models = common::DEFAULT_MODELS,
+        runtime = common::RUNTIME_CFG,
         dir = dir.display()
     );
     std::fs::write(dir.join("config.toml"), config).expect("config");

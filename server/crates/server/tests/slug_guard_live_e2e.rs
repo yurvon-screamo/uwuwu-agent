@@ -183,6 +183,7 @@ async fn spawn_server(dir: &Path, repo: &str) -> Stand {
     let config = format!(
         "mode = \"observe\"\npoll_sec = 3600\nport = {port}\n\
          sweep_days = 0\nenv_gc_hours = 0\n\n\
+         {models}\
          {runtime}\
          [hub]\nrepo = \"{repo}\"\n\n\
          [executor]\nname = \"mock\"\nurl = \"http://127.0.0.1:1\"\n\n\
@@ -191,6 +192,7 @@ async fn spawn_server(dir: &Path, repo: &str) -> Stand {
          checkout = \"{dir}/checkout\"\nenv_root = \"{dir}\"\n",
         port = port,
         repo = repo,
+        models = common::DEFAULT_MODELS,
         runtime = common::RUNTIME_CFG,
         dir = dir.display()
     );

@@ -11,7 +11,8 @@ pub mod stand;
 
 /// Обязательные секции конфига для стендов (uwuwu#1726): один тестовый
 /// носитель вместо копий продовых значений по каждому харнесу.
-pub const RUNTIME_CFG: &str = r#"
+/// Карты моделей по умолчанию: только если харнес не задал свои.
+pub const DEFAULT_MODELS: &str = r#"
 [executor.model_aliases]
 flash = "opencode-go/hy4-flash-free#high"
 common = "opencode-go/hy4-flash-free#high"
@@ -26,6 +27,9 @@ test-reviewer = "smart"
 analyst = "flash"
 analyst-reviewer = "smart"
 dreamer = "common"
+"#;
+
+pub const RUNTIME_CFG: &str = r#"
 [search]
 semantic_sync_budget = 512
 embed_model = "embeddinggemma-2:740m"
@@ -41,6 +45,7 @@ query_overfetch_factor = 3
 retention_secs = 180
 sync_backoff_ms = 3600000
 [pipeline]
+sweep_days = 7
 peak_provider = "zai-coding-plan"
 sweep_batch_cap = 50
 budget_floor = 500
