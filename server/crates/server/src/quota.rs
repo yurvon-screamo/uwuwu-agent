@@ -6,7 +6,7 @@
 //! не краснит тест — он виден как Err → гейт отдаёт старую механику.
 
 use crate::config::QuotaCfg;
-use crate::github::HTTP_TIMEOUT;
+use crate::github::http_timeout;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use uwuwu_usecase::{QuotaProbe, QuotaSnapshot, UsecaseError, UsecaseResult};
@@ -60,7 +60,7 @@ impl ZaiQuotaProbe {
         Self {
             http: reqwest::Client::builder()
                 .user_agent(concat!("uwuwu-server/", env!("CARGO_PKG_VERSION")))
-                .timeout(HTTP_TIMEOUT)
+                .timeout(http_timeout())
                 .build()
                 .expect("reqwest client"),
             url,

@@ -7,7 +7,7 @@
 //! (pv2_parse.rs), дальнейший разрез выносит HTTP-контекст мутаций
 //! из кеш-политик без отдельной причины изменения.
 
-use super::HTTP_TIMEOUT;
+use super::http_timeout;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -104,7 +104,7 @@ impl Pv2Rest {
             token,
             http: reqwest::Client::builder()
                 .user_agent(concat!("uwuwu-server/", env!("CARGO_PKG_VERSION")))
-                .timeout(HTTP_TIMEOUT)
+                .timeout(http_timeout())
                 .build()
                 .expect("reqwest client"),
             meta: TtlCache::new(META_TTL),

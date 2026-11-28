@@ -238,6 +238,16 @@ pub mod blob {
     }
 }
 
+pub mod bots {
+    use super::*;
+    pub fn tg_poll_sec() -> u64 {
+        u64_of("bots", "tg_poll_sec")
+    }
+    pub fn retry_pause_ms() -> u64 {
+        u64_of("bots", "retry_pause_ms")
+    }
+}
+
 pub mod api {
     use super::*;
     pub fn default_project() -> String {

@@ -6,7 +6,7 @@
 //! локальный скользящий лимит (квоты волны общие, TPM-пик массовой тишины
 //! не долбим).
 
-use crate::github::HTTP_TIMEOUT;
+use crate::github::http_timeout;
 use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -79,7 +79,7 @@ impl GeminiJudge {
         Some(Self {
             http: reqwest::Client::builder()
                 .user_agent(concat!("uwuwu-server/", env!("CARGO_PKG_VERSION")))
-                .timeout(HTTP_TIMEOUT)
+                .timeout(http_timeout())
                 .build()
                 .expect("reqwest client"),
             key,

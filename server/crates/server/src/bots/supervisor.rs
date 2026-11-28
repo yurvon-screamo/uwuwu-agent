@@ -15,7 +15,7 @@ use uwuwu_usecase::{
     AgentSessionGateway, Clock, Liveness, TickStateStore, UsecaseResult, WikiRepo,
 };
 
-use super::runner::{spawn_bot_task, BotStructural, RETRY_PAUSE_MS};
+use super::runner::{retry_pause_ms, spawn_bot_task, BotStructural};
 use super::BotLive;
 
 /// Фабрика ТГ-клиента: прод — TelegramClient(token), тесты/e2e — фейки.
@@ -602,7 +602,7 @@ impl BotSupervisor {
             reply_cap_ms: self.reply_cap_ms,
             reply_poll_ms: self.reply_poll_ms,
             debounce_ms: self.debounce_ms,
-            retry_pause_ms: RETRY_PAUSE_MS,
+            retry_pause_ms: retry_pause_ms(),
         };
         Some(spawn_bot_task(deps))
     }

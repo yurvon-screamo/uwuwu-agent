@@ -14,7 +14,9 @@ mod pv2_tests;
 /// tick_loop навсегда — инцидент 22.11 (gql 502-деградация + вечное висение,
 /// фабрика парализована). 120 c — выше максимального легитимного
 /// наблюдаемого запроса (~40 c снапшот), ниже poll_sec (180 c).
-pub(crate) const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+pub(crate) fn http_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(uwuwu_usecase::runtime_cfg::github::http_timeout_secs())
+}
 
 pub use fields::{F_DEV_SESSION, F_REVIEW_SESSION, F_TEST_SESSION};
 pub use hub::GitHubHub;
