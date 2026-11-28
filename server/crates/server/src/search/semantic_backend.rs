@@ -444,8 +444,8 @@ impl SemanticBackend for LanceSemanticBackend {
     /// затем сообщить полноту индекса событием `semantic.index_state`.
     async fn sync_index(&self, budget: usize) -> UsecaseResult<usize> {
         // sha-инкремент: git blob-sha из дерева (один вызов) отсекает
-        // неизменённые ДО чтения содержимого — иначе сотни read_doc
-        // до первого изменённого = таймаут сайдкара (каскад 16.11)
+        // неизменённые ДО чтения содержимого — иначе сотни read_doc до
+        // первого изменённого (каскад 16.11); таймаут снят #1730, экономия чтений осталась.
         let shas: std::collections::HashMap<String, String> =
             self.wiki.doc_shas().await?.into_iter().collect();
         let known = self.known_hashes().await?;

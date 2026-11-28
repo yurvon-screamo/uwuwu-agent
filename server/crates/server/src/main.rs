@@ -816,8 +816,9 @@ async fn run(
                     if now < *backoff.lock().expect("backoff lock") {
                         return Ok(());
                     }
-                    // Емкостный гард тика: docs/sync, 120 с сайдкара и соседние
-                    // модели на Ollama (#1687); квотных гейтов больше нет.
+                    // Емкостный гард тика: docs/sync, 512 документов за тик
+                    // (#1725), квотных гейтов нет (#1687). semantic-sync идёт до
+                    // завершения (#1730); остальные сайдкары — `SIDECAR_TIMEOUT`.
                     match b.sync_index(search::SEMANTIC_SYNC_BUDGET).await {
                         Ok(_) => Ok(()),
                         Err(e) => {
