@@ -98,7 +98,7 @@ and do everything they would do.
    a re-run heals it.
 3. **Scale**: the main path — mandatory; then a few unhappy variations specifically against it
    (negatives and boundaries); deeper — by the residual risk, not by quota. The manual run is not replaced
-   by «tests are green»: tests check what the author thought of, poking — what they did not.
+   by «tests are green»: tests check what the author thought of, poking — what they did not. Zoom is a required state next to empty, loading, and error states. Run the matrix from the plan, not a single size.
 4. **Artifacts into the report**: commands with arguments and their output (compact), screen screenshots
    before/after and layout — as files in uwuwu-hub's `assets/` with links in the report comment,
    record surprises even on overall success.

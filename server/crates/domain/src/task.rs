@@ -1207,6 +1207,10 @@ mod tests {
             S::can_transition_with(S::ReviewResult, S::UserReview, false, true),
             "fact_track-строка после код-ревью — сразу на приёмку"
         );
+        assert!(
+            S::can_transition_with(S::ReviewResult, S::NeedsAttention, false, true),
+            "ребро вопроса владельца достижимо без снятия флага"
+        );
         // без флага ребро закрыто — канон UC-01 побайтово
         assert!(
             !S::can_transition_with(S::ReviewResult, S::UserReview, false, false),

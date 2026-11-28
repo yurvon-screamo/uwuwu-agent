@@ -85,7 +85,7 @@ rounds»).
 
 - **Challenge the approach itself**: does the chosen plan actually solve the user's original problem,
   not just correct technically? Is it an XY-problem (the user asks for X,
-  the real need is Y)?
+  the real need is Y)? Scope growth from a point fix to a rewrite without the owner's verbatim sanction is High. A `fact_track` row with a structural rewrite goes to the owner as a question before approval.
 - **Is there a simpler path**: configuration/a flag/documentation instead of code; extending
   the existing instead of a new service; a ready library instead of a custom solution;
   a point fix instead of a refactor. Is the plan over-complicated relative to the problem
@@ -204,7 +204,7 @@ converge with the plan's claims / the plan is not self-sufficient, critical over
 open or freshly merged PR (the territory scan), a dead string board pointer,
 hardcoded production secrets in configuration plans, violations of the project's architecture,
 readiness gaps that would make the implementer start making design decisions themselves
-(unfixed contracts, no verification strategy).
+(unfixed contracts, no verification strategy). A UI plan with manual geometry and no comparison against the stack's built-in primitives is High (the class “violations of the project's architecture”).
 
 **Common**: missed edge cases, unclear plan wording, no validation of
 assumptions, partial readiness gaps (a contract described but ambiguously), the plan relies on a stale project doc.
