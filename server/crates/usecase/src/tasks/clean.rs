@@ -955,11 +955,12 @@ mod tests {
     // --- батч-кап и конфиг ---
 
     #[tokio::test]
-    async fn batch_cap_rejects_over_50() {
+    async fn batch_cap_rejects_over_configured_cap() {
         let (u, _, _) = rig();
-        let numbers: Vec<u64> = (1..=51).collect();
-        let err = u.plan("uwuwu", &numbers).await.expect_err("кап 50");
-        assert!(err.to_string().contains("50"), "текст: {err}");
+        let cap = clean_batch_cap();
+        let numbers: Vec<u64> = (1..=cap as u64 + 1).collect();
+        let err = u.plan("uwuwu", &numbers).await.expect_err("кап из конфига");
+        assert!(err.to_string().contains(&cap.to_string()), "текст: {err}");
     }
 
     #[tokio::test]

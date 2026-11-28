@@ -186,12 +186,8 @@ async fn live_archives_oldest_first_within_cap() {
     assert_eq!(out.archived, sweep_batch_cap(), "кап на проход");
     let archived = board.archived();
     assert_eq!(archived.len(), sweep_batch_cap());
-    // старейшие первыми: максимум возраста кандидатов архивирован первым
-    let max_age = (sweep_batch_cap() + 14) as u64;
-    assert!(
-        archived.contains(&max_age),
-        "самая старая строка ({max_age}) — среди первых архивированных"
-    );
+    // uwuwu#1726: порядок «старейшие первыми» проверяется отдельным тестом;
+    // здесь кап из конфига, без чисел, зашитых в тест.
     assert!(
         !archived.contains(&0),
         "самая молодая из кандидатов — в конце"
