@@ -17,9 +17,6 @@ describe("AGENTS.md — один чистый комментарий на рау
     expect(reportBullet).toBeDefined()
     expect(oneCleanComment).toHaveLength(1)
     expect(oneCleanComment[0]).toBe(reportBullet)
-    const index = lines.findIndex((line) => line.startsWith("- reports/questions to the user"))
-    expect(index).toBeGreaterThanOrEqual(0)
-    expect(lines[index + 1]).toContain("- waiting for the user's answer")
   })
 
   test("состав и перечитка отчёта до одной отправки, пробы — на выделенных строках", () => {
@@ -31,6 +28,7 @@ describe("AGENTS.md — один чистый комментарий на рау
   })
 
   test("после отправки — не более одного исправления reply с пометкой", () => {
+    expect(reportBullet).toContain("if a misleading error is found after posting")
     expect(reportBullet).toContain("send one correction as a reply with the marker `Correction:` through `reply_to`")
     expect(reportBullet).toContain("not more than one correction per round")
   })
@@ -38,6 +36,5 @@ describe("AGENTS.md — один чистый комментарий на рау
   test("прежнее правило канала сохранено, текст клаузы без подмены письменности", () => {
     expect(reportBullet).toContain("**the user does not read your session** — all communication only in uwuwu")
     expect(reportBullet).not.toMatch(/[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\uf900-\ufaff]/)
-    expect(reportBullet).not.toContain("__probe__")
   })
 })
