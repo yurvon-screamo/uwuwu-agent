@@ -220,6 +220,9 @@ pub mod github {
     pub fn gql_budget_low() -> u64 {
         u64_of("github", "gql_budget_low")
     }
+    pub fn wiki_cache_ttl_secs() -> u64 {
+        u64_of("github", "wiki_cache_ttl_secs")
+    }
 }
 
 pub mod blob {
@@ -245,6 +248,27 @@ pub mod bots {
     }
     pub fn retry_pause_ms() -> u64 {
         u64_of("bots", "retry_pause_ms")
+    }
+    pub fn tg_http_timeout_secs() -> u64 {
+        u64_of("bots", "tg_http_timeout_secs")
+    }
+    pub fn gate_http_timeout_secs() -> u64 {
+        u64_of("bots", "gate_http_timeout_secs")
+    }
+    pub fn guard_backoff_base_ms() -> u64 {
+        u64_of("bots", "guard_backoff_base_ms")
+    }
+    pub fn guard_backoff_cap_ms() -> u64 {
+        u64_of("bots", "guard_backoff_cap_ms")
+    }
+    pub fn guard_healthy_ms() -> u64 {
+        u64_of("bots", "guard_healthy_ms")
+    }
+    pub fn reply_cap_ms() -> u64 {
+        u64_of("bots", "reply_cap_ms")
+    }
+    pub fn reply_poll_ms() -> u64 {
+        u64_of("bots", "reply_poll_ms")
     }
 }
 

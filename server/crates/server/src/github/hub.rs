@@ -406,7 +406,7 @@ impl GitHubHub {
         // бюджетная наблюдаемость: remaining несёт каждая страница строк
         if let Some(rl) = self.last_rate_limit.read().expect("rl lock").as_ref() {
             let remaining = rl.0;
-            if remaining < 300 {
+            if remaining < uwuwu_usecase::runtime_cfg::github::gql_budget_low() {
                 tracing::warn!(
                     event = "gql.budget_low",
                     remaining,

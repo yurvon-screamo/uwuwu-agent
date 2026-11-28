@@ -39,7 +39,7 @@ impl GitHubWiki {
                 .expect("reqwest client"),
             tree_cache: Mutex::new(None),
             shas_cache: Mutex::new(None),
-            ttl: Duration::from_secs(300),
+            ttl: Duration::from_secs(uwuwu_usecase::runtime_cfg::github::wiki_cache_ttl_secs()),
         }
     }
 
